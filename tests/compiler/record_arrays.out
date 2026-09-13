@@ -1,0 +1,10 @@
+b1.pos.x x10 = 20
+b3.pos.y x10 = 60
+b2.tags[0] = 2
+b2.tags[3] = 200
+b3.label[0] = 67
+sumx x10 = 90
+len(tags) = 4
+size = 80
+b1.id after copy = 3
+runtime error: array index out of range at record_arrays.wz:68

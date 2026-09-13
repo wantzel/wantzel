@@ -1,0 +1,7 @@
+// Must not compile: "no such field in this record".
+program t;
+type Pt = record x: int; end;
+var p: Pt;
+begin
+  p.z := 1;
+end.

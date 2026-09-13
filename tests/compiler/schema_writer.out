@@ -1,0 +1,4 @@
+{"id":42,"total":1234.5,"ok":true,"units":[],"kind":"probe"}
+{"id":42,"total":1234.5,"ok":true,"label":"a \"quoted\" label","units":[{"key":"kwh","factor":1.0},{"key":"m3","factor":9.769}],"values":[-1,0,70000000000],"kind":"probe"}
+{"id":42,"total":1e-06,"ok":true,"label":null,"note":"\u00e9 text","units":[{"key":"kwh","factor":1.0},{"key":"m3","factor":9.769}],"values":[-1,0,70000000000],"kind":null}
+{"type":"object","properties":{"id":{"type":"integer"},"total":{"type":"number"},"ok":{"type":"boolean"},"label":{"type":"string","maxLength":32},"note":{"type":"string"},"units":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string","maxLength":16},"factor":{"type":"number"}},"required":["key","factor"]},"maxItems":4},"values":{"type":"array","items":{"type":"integer"},"maxItems":8},"kind":{"type":"string","enum":["model","probe"]}},"required":["id","total","ok","units","kind"]}

@@ -1,0 +1,57 @@
+// slices: a[lo..hi] (inclusive, like a declaration) passed as an array view;
+// on globals, locals, array parameters and arrays of records; empty slices; bounds.
+program t;
+include "io.wz";
+type
+  Item = record
+    k: int;
+    v: real;
+  end;
+var
+  data: array[10..19] of int;
+  items: array[0..4] of Item;
+  i: int;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+function sum(a: array of int): int;
+var i, t: int;
+begin
+  i := 0;
+  while i < len(a) do begin t := t + a[i]; i := i + 1; end;
+  return t;
+end;
+function sumfirst(a: array of int; n: int): int;
+begin
+  return sum(a[0..n - 1]);            { slice of a parameter view }
+end;
+procedure bump(it: array of Item);
+begin
+  it[0].k := it[0].k + 100;           { a one-element slice stands in for a record parameter }
+end;
+procedure local;
+var buf: array[0..7] of int;
+begin
+  buf[2] := 5; buf[3] := 6; buf[4] := 7;
+  show("local slice = ", sum(buf[2..4]));            { 18 }
+  show("local empty = ", sum(buf[3..2]));            { 0 }
+end;
+begin
+  i := 10;
+  while i <= 19 do begin data[i] := i; i := i + 1; end;
+  show("all = ", sum(data));                          { 145 }
+  show("10..12 = ", sum(data[10..12]));               { 33 }
+  show("19..19 = ", sum(data[19..19]));               { 19 }
+  show("empty = ", sum(data[15..14]));                { 0 }
+  show("len of slice = ", len(data));                 { 10 }
+  show("sumfirst 3 = ", sumfirst(data, 3));           { 33 }
+  show("sumfirst 10 = ", sumfirst(data, 10));         { 145 }
+  show("sumfirst 0 = ", sumfirst(data, 0));           { 0 }
+  local;
+  items[3].k := 7;
+  bump(items[3..3]);
+  show("items[3].k = ", items[3].k);                  { 107 }
+  i := 20;
+  show("bad = ", sum(data[15..i]));                   { runtime error }
+end.

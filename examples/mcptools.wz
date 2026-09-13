@@ -1,0 +1,138 @@
+// mcptools.wz -- an MCP server from a declared tool table.
+//
+//   mcptools              speak MCP over stdin/stdout
+//   mcptools --http 8080  the same over HTTP: POST /mcp, and REST at POST /api/<tool>
+//
+// Every tool is one line in the `tools` block: the compiler generates the
+// tools/list text (with JSON Schemas), the argument parsers, the dispatch
+// and the result writers.  The program only writes the handlers.
+
+program mcptools;
+
+include "mcphttp.wz";
+
+schema AddArgs = record
+  a: int "first term";
+  b: int "second term";
+end;
+
+schema AddResult = record
+  sum: int;
+end;
+
+schema StatsArgs = record
+  values: array[0..1023] of real "the numbers to summarise";
+end;
+
+schema StatsResult = record
+  count: int;
+  total: real;
+  mean: real;
+  min: real;
+  max: real;
+end;
+
+schema GreetArgs = record
+  name: text[64] "who to greet";
+  times: int? "how often, default 1";
+end;
+
+schema GreetResult = record
+  greeting: text[4096];
+end;
+
+tools
+  add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
+  stats(StatsArgs): StatsResult "Count, total, mean, minimum and maximum of a list of numbers." readonly;
+  greet(GreetArgs): GreetResult "Greet someone, optionally more than once.";
+end;
+
+include "tools.wz";
+
+function tool.add(a: array of AddArgs; r: array of AddResult): int;
+begin
+  r[0].sum := a[0].a + a[0].b;
+  return 0;
+end;
+
+function tool.stats(a: array of StatsArgs; r: array of StatsResult): int;
+var i: int;
+begin
+  if a[0].values_n = 0 then return tool.fail("stats needs at least one value");
+  r[0].count := a[0].values_n;
+  r[0].min := a[0].values[0];
+  r[0].max := a[0].values[0];
+  for i := 0 to a[0].values_n - 1 do
+  begin
+    r[0].total := r[0].total + a[0].values[i];
+    if a[0].values[i] < r[0].min then r[0].min := a[0].values[i];
+    if a[0].values[i] > r[0].max then r[0].max := a[0].values[i];
+  end;
+  r[0].mean := r[0].total / real(r[0].count);
+  return 0;
+end;
+
+function tool.greet(a: array of GreetArgs; r: array of GreetResult): int;
+var i, n, at: int;
+begin
+  n := 1;
+  if a[0].times_ok and not a[0].times_null then n := a[0].times;
+  if (n < 1) or (n > 50) then return tool.fail("times must be between 1 and 50");
+  at := 0;
+  for i := 1 to n do
+  begin
+    if i > 1 then at := io.push(r[0].greeting, at, " ");
+    at := io.push(r[0].greeting, at, "hello, ");
+    at := json.putraw(r[0].greeting, at, a[0].name, 0, a[0].name_n);
+    at := io.push(r[0].greeting, at, "!");
+  end;
+  r[0].greeting_n := at;
+  return 0;
+end;
+
+// ---- HTTP: /mcp for MCP, /api/<tool> for REST ----------------------
+
+procedure app.request;
+begin
+  if tool.rest("/api/") then return;
+  if http.pathis("/mcp") then
+  begin
+    mcp.http;
+    return;
+  end;
+  http.add("{\"detail\":\"not found: MCP is at POST /mcp, REST at POST /api/<tool>\"}");
+  http.finish(404, "application/json");
+end;
+
+var
+  port, i: int;
+  usehttp: bool;
+  c: char;
+
+begin
+  mcp.name := "wantzel-tools";
+  mcp.version := "1.0";
+  usehttp := false;
+  port := 8080;
+  if argc() > 1 then
+  begin
+    if (argch(1, 0) = '-') and (argch(1, 2) = 'h') then
+    begin
+      usehttp := true;
+      if argc() > 2 then
+      begin
+        port := 0;
+        i := 0;
+        while true do
+        begin
+          c := argch(2, i);
+          if c = chr(0) then break;
+          if (c >= '0') and (c <= '9') then port := port * 10 + (ord(c) - 48);
+          i := i + 1;
+        end;
+        if port = 0 then port := 8080;
+      end;
+    end;
+  end;
+  if usehttp then http.serve(port, 1) else mcp.stdio;
+end.

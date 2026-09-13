@@ -1,0 +1,112 @@
+program feat;
+
+const
+  N = 10;
+  NL = '\n';
+
+var
+  a: array[1..N] of int;
+  s: array[0..63] of char;
+  i, j: int;
+  ok: bool;
+
+function fib(n: int): int; forward;
+
+procedure emit(n: int);
+begin
+  sys3(1, 1, addr(s[0]), n);
+end;
+
+procedure puts(x: str);
+var k: int;
+begin
+  k := 0;
+  while k < slen(x) do
+  begin
+    s[k] := schar(x, k);
+    k := k + 1;
+  end;
+  emit(slen(x));
+end;
+
+procedure putn(v: int);
+var k, m: int;
+    d: array[0..31] of char;
+begin
+  k := 0;
+  if v < 0 then
+  begin
+    puts("-");
+    v := 0 - v;
+  end;
+  if v = 0 then
+  begin
+    d[0] := '0';
+    k := 1;
+  end;
+  while v > 0 do
+  begin
+    d[k] := chr(48 + (v mod 10));
+    v := v div 10;
+    k := k + 1;
+  end;
+  m := 0;
+  while m < k do
+  begin
+    s[m] := d[k - m - 1];
+    m := m + 1;
+  end;
+  emit(k);
+end;
+
+function fib(n: int): int;
+begin
+  if n < 2 then return n;
+  return fib(n - 1) + fib(n - 2);
+end;
+
+begin
+  i := 1;
+  while i <= N do
+  begin
+    a[i] := i * i;
+    i := i + 1;
+  end;
+  i := 1;
+  j := 0;
+  repeat
+    j := j + a[i];
+    i := i + 1;
+  until i > N;
+  puts("sum of squares 1..10 = "); putn(j); puts("\n");
+
+  puts("fib(20) = "); putn(fib(20)); puts("\n");
+
+  i := 0;
+  j := 0;
+  while true do
+  begin
+    i := i + 1;
+    if i > 100 then break;
+    if (i mod 3) <> 0 then continue;
+    j := j + i;
+  end;
+  puts("multiples of 3 below 101 sum to "); putn(j); puts("\n");
+
+  ok := (N = 10) and (fib(7) = 13) or false;
+  if ok then puts("logic ok\n") else puts("logic broken\n");
+
+  puts("bits: "); putn(band(0xF0, 0x3C)); puts(" ");
+  putn(bor(1, 6)); puts(" "); putn(bxor(5, 3)); puts(" ");
+  putn(bnot(0)); puts(" "); putn(1 shl 10); puts(" "); putn(-64 shr 2);
+  puts("\n");
+
+  puts("ord/chr: "); putn(ord('A')); puts(" ");
+  s[0] := chr(66); emit(1); puts("\n");
+
+  puts("argc = "); putn(argc()); puts(", argv[1][0] = ");
+  s[0] := argch(1, 0); emit(1); puts("\n");
+
+  puts("len(a) = "); putn(len(a)); puts(", negative div: ");
+  putn(-7 div 2); puts(" "); putn(-7 mod 2); puts("\n");
+end.

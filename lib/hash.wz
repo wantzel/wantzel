@@ -1,0 +1,155 @@
+// lib/hash.wz -- open-addressing hash tables on caller-supplied arrays.
+//
+// A table is two arrays the caller declares: `keys` holds fixed-width keys
+// (klen bytes each, capacity = len(rows)) and `rows` holds the value for
+// each slot (any int, usually a row index).  A slot is empty when rows[i]
+// is HASH.EMPTY, deleted when HASH.DEAD.  Keep tables at most about 70 %
+// full; hash.put refuses beyond that so lookups stay short.
+//
+//   var
+//     idx.keys: array[0..16 * 4096 - 1] of char;   // 4096 slots of 16-byte keys
+//     idx.rows: array[0..4095] of int;
+//   hash.clear(idx.rows);
+//   ok := hash.put(idx.keys, idx.rows, 16, key, row);
+//   row := hash.get(idx.keys, idx.rows, 16, key);   // HASH.EMPTY when absent
+//
+// Keys shorter than klen are padded with zero bytes by the caller (or use
+// hash.putpad/hash.getpad, which pad for you).
+
+include "io.wz";
+
+const
+  HASH.EMPTY = -1;
+  HASH.DEAD  = -2;
+
+var
+  hash.pad: array[0..255] of char;      // a padded copy of a short key (klen <= 256)
+
+// FNV-1a over the key bytes
+function hash.fnv(key: array of char): int;
+var i, h: int;
+begin
+  h := -3750763034362895579;            // 0xcbf29ce484222325 as a signed 64-bit value
+  for i := 0 to len(key) - 1 do
+  begin
+    h := bxor(h, ord(key[i]));
+    h := h * 1099511628211;
+  end;
+  return h;
+end;
+
+procedure hash.clear(rows: array of int);
+var i: int;
+begin
+  for i := 0 to len(rows) - 1 do rows[i] := HASH.EMPTY;
+end;
+
+function hash.count(rows: array of int): int;
+var i, n: int;
+begin
+  for i := 0 to len(rows) - 1 do if rows[i] >= 0 then n := n + 1;
+  return n;
+end;
+
+function hash.same(keys: array of char; klen: int; slot: int; key: array of char): bool;
+var i: int;
+begin
+  for i := 0 to klen - 1 do if keys[slot * klen + i] <> key[i] then return false;
+  return true;
+end;
+
+// the slot holding key, or the slot where it would go (an empty or dead one); -1 when the table is full
+function hash.slot(keys: array of char; rows: array of int; klen: int; key: array of char): int;
+var i, n, first, cap: int;
+begin
+  cap := len(rows);
+  i := band(hash.fnv(key), 0x7FFFFFFFFFFFFFFF) mod cap;
+  first := -1;
+  n := 0;
+  while n < cap do
+  begin
+    if rows[i] = HASH.EMPTY then
+    begin
+      if first >= 0 then return first;
+      return i;
+    end;
+    if rows[i] = HASH.DEAD then
+    begin
+      if first < 0 then first := i;
+    end
+    else if hash.same(keys, klen, i, key) then return i;
+    i := i + 1;
+    if i = cap then i := 0;
+    n := n + 1;
+  end;
+  return first;
+end;
+
+// the value stored for key, or HASH.EMPTY
+function hash.get(keys: array of char; rows: array of int; klen: int; key: array of char): int;
+var i: int;
+begin
+  if len(key) <> klen then return HASH.EMPTY;
+  i := hash.slot(keys, rows, klen, key);
+  if i < 0 then return HASH.EMPTY;
+  if rows[i] < 0 then return HASH.EMPTY;
+  return rows[i];
+end;
+
+// store value for key (replacing an earlier value); false when the table is too full
+function hash.put(keys: array of char; rows: array of int; klen: int; key: array of char; value: int): bool;
+var i, k: int;
+begin
+  if len(key) <> klen then return false;
+  if value < 0 then return false;
+  i := hash.slot(keys, rows, klen, key);
+  if i < 0 then return false;
+  if rows[i] < 0 then
+  begin
+    if hash.count(rows) * 10 >= len(rows) * 7 then return false;
+    for k := 0 to klen - 1 do keys[i * klen + k] := key[k];
+  end;
+  rows[i] := value;
+  return true;
+end;
+
+// remove key; true when it was there
+function hash.del(keys: array of char; rows: array of int; klen: int; key: array of char): bool;
+var i: int;
+begin
+  if len(key) <> klen then return false;
+  i := hash.slot(keys, rows, klen, key);
+  if i < 0 then return false;
+  if rows[i] < 0 then return false;
+  rows[i] := HASH.DEAD;
+  return true;
+end;
+
+// the same three, for keys shorter than klen (zero-padded); klen <= 256
+procedure hash.padkey(klen: int; key: array of char);
+var i: int;
+begin
+  for i := 0 to klen - 1 do
+    if i < len(key) then hash.pad[i] := key[i] else hash.pad[i] := chr(0);
+end;
+
+function hash.getpad(keys: array of char; rows: array of int; klen: int; key: array of char): int;
+begin
+  if len(key) > klen then return HASH.EMPTY;
+  hash.padkey(klen, key);
+  return hash.get(keys, rows, klen, hash.pad[0..klen - 1]);
+end;
+
+function hash.putpad(keys: array of char; rows: array of int; klen: int; key: array of char; value: int): bool;
+begin
+  if len(key) > klen then return false;
+  hash.padkey(klen, key);
+  return hash.put(keys, rows, klen, hash.pad[0..klen - 1], value);
+end;
+
+function hash.delpad(keys: array of char; rows: array of int; klen: int; key: array of char): bool;
+begin
+  if len(key) > klen then return false;
+  hash.padkey(klen, key);
+  return hash.del(keys, rows, klen, hash.pad[0..klen - 1]);
+end;

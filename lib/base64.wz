@@ -1,0 +1,136 @@
+// lib/base64.wz -- base64 encoding and decoding (RFC 4648).
+//
+// Two alphabets: the standard one ("+/", with '=' padding) and the URL-safe
+// one ("-_", without padding, as PKCE and JWT use it).  The decoder accepts
+// both, padded or not.  Nothing is skipped: whitespace or any other byte
+// outside the alphabet is an error.
+
+include "io.wz";
+
+const
+  B64.STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  B64.URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+function base64.sym(v: int; url: bool): char;
+begin
+  if url then return schar(B64.URL, v);
+  return schar(B64.STD, v);
+end;
+
+// the shared encoder: 3 bytes -> 4 symbols; returns the new position
+function base64.enc(dst: array of char; at: int; src: array of char; url: bool; pad: bool): int;
+var i, n, v: int;
+begin
+  n := len(src);
+  i := 0;
+  while i + 3 <= n do
+  begin
+    v := bor(bor(ord(src[i]) shl 16, ord(src[i + 1]) shl 8), ord(src[i + 2]));
+    dst[at]     := base64.sym(band(v shr 18, 63), url);
+    dst[at + 1] := base64.sym(band(v shr 12, 63), url);
+    dst[at + 2] := base64.sym(band(v shr 6, 63), url);
+    dst[at + 3] := base64.sym(band(v, 63), url);
+    at := at + 4;
+    i := i + 3;
+  end;
+  if n - i = 1 then
+  begin
+    v := ord(src[i]) shl 16;
+    dst[at]     := base64.sym(band(v shr 18, 63), url);
+    dst[at + 1] := base64.sym(band(v shr 12, 63), url);
+    at := at + 2;
+    if pad then
+    begin
+      dst[at] := '='; dst[at + 1] := '=';
+      at := at + 2;
+    end;
+  end
+  else if n - i = 2 then
+  begin
+    v := bor(ord(src[i]) shl 16, ord(src[i + 1]) shl 8);
+    dst[at]     := base64.sym(band(v shr 18, 63), url);
+    dst[at + 1] := base64.sym(band(v shr 12, 63), url);
+    dst[at + 2] := base64.sym(band(v shr 6, 63), url);
+    at := at + 3;
+    if pad then
+    begin
+      dst[at] := '=';
+      at := at + 1;
+    end;
+  end;
+  return at;
+end;
+
+// standard alphabet with '=' padding; returns the new position
+function base64.encode(dst: array of char; at: int; src: array of char): int;
+begin
+  return base64.enc(dst, at, src, false, true);
+end;
+
+// URL-safe alphabet without padding; returns the new position
+function base64.urlencode(dst: array of char; at: int; src: array of char): int;
+begin
+  return base64.enc(dst, at, src, true, false);
+end;
+
+// value of one symbol in either alphabet, or -1
+function base64.val(c: char): int;
+begin
+  if (c >= 'A') and (c <= 'Z') then return ord(c) - 65;
+  if (c >= 'a') and (c <= 'z') then return ord(c) - 97 + 26;
+  if (c >= '0') and (c <= '9') then return ord(c) - 48 + 52;
+  if (c = '+') or (c = '-') then return 62;
+  if (c = '/') or (c = '_') then return 63;
+  return -1;
+end;
+
+// decode src into dst; returns the number of bytes written, or -1 on an
+// invalid character, a bad length, or when dst is too small
+function base64.decode(src: array of char; dst: array of char): int;
+var i, n, k, v, acc, out: int;
+begin
+  n := len(src);
+  acc := 0;                                   // up to 24 bits pending
+  k := 0;                                     // symbols pending (0..3)
+  out := 0;
+  i := 0;
+  while i < n do
+  begin
+    if src[i] = '=' then break;
+    v := base64.val(src[i]);
+    if v < 0 then return -1;
+    acc := bor(acc shl 6, v);
+    k := k + 1;
+    if k = 4 then
+    begin
+      if out + 3 > len(dst) then return -1;
+      dst[out]     := chr(band(acc shr 16, 255));
+      dst[out + 1] := chr(band(acc shr 8, 255));
+      dst[out + 2] := chr(band(acc, 255));
+      out := out + 3;
+      acc := 0;
+      k := 0;
+    end;
+    i := i + 1;
+  end;
+  while i < n do                              // only padding may follow
+  begin
+    if src[i] <> '=' then return -1;
+    i := i + 1;
+  end;
+  if k = 1 then return -1;                    // a lone symbol carries < 1 byte
+  if k = 2 then
+  begin
+    if out + 1 > len(dst) then return -1;
+    dst[out] := chr(band(acc shr 4, 255));
+    out := out + 1;
+  end
+  else if k = 3 then
+  begin
+    if out + 2 > len(dst) then return -1;
+    dst[out]     := chr(band(acc shr 10, 255));
+    dst[out + 1] := chr(band(acc shr 2, 255));
+    out := out + 2;
+  end;
+  return out;
+end;

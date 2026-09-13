@@ -1,0 +1,10 @@
+unescape too small = -1
+unescape exact fit = 4
+unescape roomy = 8
+unescape with at=2 = -1
+unescape euro into 4 = 3
+unescape euro at at=2 = -1
+putslice too small = -1
+putslice roomy = 10
+putslice control char into 4 = -1
+putslice control char roomy = 8

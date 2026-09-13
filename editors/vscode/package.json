@@ -1,0 +1,24 @@
+{
+  "name": "wantzel",
+  "displayName": "Wantzel",
+  "description": "Syntax highlighting for the Wantzel language (.wz)",
+  "version": "0.1.0",
+  "publisher": "wantzel",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/wantzel/wantzel" },
+  "engines": { "vscode": "^1.60.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [{
+      "id": "wantzel",
+      "aliases": ["Wantzel", "wantzel"],
+      "extensions": [".wz"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "wantzel",
+      "scopeName": "source.wantzel",
+      "path": "./syntaxes/wantzel.tmLanguage.json"
+    }]
+  }
+}

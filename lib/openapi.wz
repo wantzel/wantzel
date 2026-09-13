@@ -1,0 +1,602 @@
+// lib/openapi.wz -- an OpenAPI 3.1 document and a Swagger UI page, generated from
+// the same tool declarations that feed MCP tools/list.
+//
+// The compiler bakes `tool.list` into the binary: a JSON array of
+// {name, description, inputSchema, outputSchema, annotations} for every tool in the
+// `tools` block.  OpenAPI is a second rendering of exactly that, so the spec cannot
+// drift from what the server actually does -- there is nothing to keep in sync by
+// hand.  Add a tool and it appears in /docs.
+//
+//   GET /openapi.json   the spec
+//   GET /docs           Swagger UI, pointed at /openapi.json
+//
+// Every operation carries an `example` request body built from its own input schema,
+// so "Try it out" starts from a valid, filled-in call instead of an empty object.
+// That is the difference between a page you can read and a page you can use.
+//
+// The caller supplies the prefix its REST routes live under (tool.rest uses the same
+// one) and the title; everything else comes out of the declarations.
+
+include "json.wz";
+include "http.wz";
+
+const
+  OAPI.MAXTOOLS = 256;
+
+var
+  oapi.at: array[0..OAPI.MAXTOOLS - 1] of int;      // start of each tool object in tool.list
+  oapi.n: int;                                      // how many we found
+  oapi.scanned: bool;
+
+// Walk tool.list once and remember where each tool object starts.  tool.list is a
+// str constant, so we read it with schar rather than indexing a buffer.
+procedure oapi.scan;
+var i, depth, n: int;
+    instr, esc: bool;
+    c: char;
+begin
+  if oapi.scanned then return;
+  oapi.scanned := true;
+  oapi.n := 0;
+  n := slen(tool.list);
+  depth := 0; instr := false; esc := false;
+  i := 0;
+  while i < n do
+  begin
+    c := schar(tool.list, i);
+    if instr then
+    begin
+      if esc then esc := false
+      else if c = '\\' then esc := true
+      else if c = '"' then instr := false;
+    end
+    else
+    begin
+      if c = '"' then instr := true
+      else if c = '{' then
+      begin
+        if depth = 0 then
+          if oapi.n < OAPI.MAXTOOLS then
+          begin
+            oapi.at[oapi.n] := i;
+            oapi.n := oapi.n + 1;
+          end;
+        depth := depth + 1;
+      end
+      else if c = '}' then depth := depth - 1;
+    end;
+    i := i + 1;
+  end;
+end;
+
+// The exclusive end of the JSON value that starts at `at`.
+function oapi.valueend(at: int): int;
+var i, n, depth: int;
+    instr, esc: bool;
+    c: char;
+begin
+  n := slen(tool.list);
+  c := schar(tool.list, at);
+  if c = '"' then
+  begin
+    i := at + 1; esc := false;
+    while i < n do
+    begin
+      c := schar(tool.list, i);
+      if esc then esc := false
+      else if c = '\\' then esc := true
+      else if c = '"' then return i + 1;
+      i := i + 1;
+    end;
+    return n;
+  end;
+  if (c = '{') or (c = '[') then
+  begin
+    depth := 0; instr := false; esc := false;
+    i := at;
+    while i < n do
+    begin
+      c := schar(tool.list, i);
+      if instr then
+      begin
+        if esc then esc := false
+        else if c = '\\' then esc := true
+        else if c = '"' then instr := false;
+      end
+      else if c = '"' then instr := true
+      else if (c = '{') or (c = '[') then depth := depth + 1
+      else if (c = '}') or (c = ']') then
+      begin
+        depth := depth - 1;
+        if depth = 0 then return i + 1;
+      end;
+      i := i + 1;
+    end;
+    return n;
+  end;
+  { a bare word: true, false, null, a number }
+  i := at;
+  while i < n do
+  begin
+    c := schar(tool.list, i);
+    if (c = ',') or (c = '}') or (c = ']') then return i;
+    i := i + 1;
+  end;
+  return n;
+end;
+
+// The value of `key` inside the tool object that starts at `from`: the slice
+// [oapi.vat, oapi.vend) of tool.list.  Works for a string ("name") as well as for a
+// nested object ("inputSchema"), because it simply spans whatever the value is.
+var
+  oapi.vat, oapi.vend: int;
+
+function oapi.field(from: int; key: str): bool;
+var i, n, depth, klen: int;
+    instr, esc, atkey: bool;
+    c: char;
+begin
+  n := slen(tool.list);
+  klen := slen(key);
+  depth := 0; instr := false; esc := false;
+  i := from;
+  while i < n do
+  begin
+    c := schar(tool.list, i);
+    if instr then
+    begin
+      if esc then esc := false
+      else if c = '\\' then esc := true
+      else if c = '"' then instr := false;
+    end
+    else if c = '"' then
+    begin
+      { a key at depth 1 of this object? }
+      if depth = 1 then
+      begin
+        atkey := true;
+        n := 0;
+        while n < klen do
+        begin
+          if schar(tool.list, i + 1 + n) <> schar(key, n) then atkey := false;
+          n := n + 1;
+        end;
+        n := slen(tool.list);
+        if atkey then
+          if schar(tool.list, i + 1 + klen) = '"' then
+          begin
+            i := i + klen + 2;
+            while (i < n) and ((schar(tool.list, i) = ':') or (schar(tool.list, i) = ' ')) do i := i + 1;
+            oapi.vat := i;
+            oapi.vend := oapi.valueend(i);
+            return true;
+          end;
+      end;
+      instr := true;
+    end
+    else if c = '{' then depth := depth + 1
+    else if c = '}' then
+    begin
+      depth := depth - 1;
+      if depth = 0 then return false;          { past this tool object }
+    end;
+    i := i + 1;
+  end;
+  return false;
+end;
+
+procedure oapi.addslice(at: int; upto: int);
+var i: int;
+begin
+  for i := at to upto - 1 do http.addc(schar(tool.list, i));
+end;
+
+// ---- examples ---------------------------------------------------------------
+//
+// A filled-in request body, built from the tool's own inputSchema.  Swagger UI puts
+// whatever we hand it in the "Try it out" box, so this is what decides whether a
+// reader can press the button or has to go and write JSON by hand first.
+//
+// We walk the schema's properties and give each one a value that is plausible for
+// its type and, where the schema says so, actually valid (an enum picks its first
+// member, a string with a format gets something of that shape).  Required properties
+// are always present; the rest are left out, so the example stays short and is the
+// smallest call that should work.
+
+var
+  oapi.reqat, oapi.reqend: int;      // the "required" array of the schema being rendered
+
+// Is `name` (the slice [nat, nend) of tool.list) listed in the required array?
+function oapi.isrequired(nat: int; nend: int): bool;
+var i, j, n: int;
+    ok: bool;
+begin
+  if oapi.reqat >= oapi.reqend then return false;
+  i := oapi.reqat;
+  while i < oapi.reqend do
+  begin
+    if schar(tool.list, i) = '"' then
+    begin
+      j := i + 1;
+      n := nat;
+      ok := true;
+      while (j < oapi.reqend) and (schar(tool.list, j) <> '"') do
+      begin
+        if (n >= nend) or (schar(tool.list, j) <> schar(tool.list, n)) then ok := false;
+        j := j + 1; n := n + 1;
+      end;
+      if ok and (n = nend) then return true;
+      i := j;
+    end;
+    i := i + 1;
+  end;
+  return false;
+end;
+
+// Find `key` at depth 1 inside the object [from, upto) of tool.list.
+function oapi.sub(from: int; upto: int; key: str): bool;
+var i, depth, klen, j: int;
+    instr, esc, atkey: bool;
+    c: char;
+begin
+  klen := slen(key);
+  depth := 0; instr := false; esc := false;
+  i := from;
+  while i < upto do
+  begin
+    c := schar(tool.list, i);
+    if instr then
+    begin
+      if esc then esc := false
+      else if c = '\\' then esc := true
+      else if c = '"' then instr := false;
+    end
+    else if c = '"' then
+    begin
+      if depth = 1 then
+      begin
+        atkey := true;
+        j := 0;
+        while j < klen do
+        begin
+          if schar(tool.list, i + 1 + j) <> schar(key, j) then atkey := false;
+          j := j + 1;
+        end;
+        if atkey then
+          if schar(tool.list, i + 1 + klen) = '"' then
+          begin
+            i := i + klen + 2;
+            while (i < upto) and ((schar(tool.list, i) = ':') or (schar(tool.list, i) = ' ')) do i := i + 1;
+            oapi.vat := i;
+            oapi.vend := oapi.valueend(i);
+            return true;
+          end;
+      end;
+      instr := true;
+    end
+    else if (c = '{') or (c = '[') then depth := depth + 1
+    else if (c = '}') or (c = ']') then
+    begin
+      depth := depth - 1;
+      if depth = 0 then return false;
+    end;
+    i := i + 1;
+  end;
+  return false;
+end;
+
+// Is the JSON string [at, upto) of tool.list equal to s (quotes included in the slice)?
+function oapi.istext(at: int; upto: int; s: str): bool;
+var i, n: int;
+begin
+  n := slen(s);
+  if upto - at <> n + 2 then return false;
+  i := 0;
+  while i < n do
+  begin
+    if schar(tool.list, at + 1 + i) <> schar(s, i) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// does the property name [nat, nend) end with / equal s?
+function oapi.nameends(nat: int; nend: int; s: str): bool;
+var i, n: int;
+begin
+  n := slen(s);
+  if nend - nat < n then return false;
+  i := 0;
+  while i < n do
+  begin
+    if schar(tool.list, nend - n + i) <> schar(s, i) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+function oapi.nameis(nat: int; nend: int; s: str): bool;
+begin
+  if nend - nat <> slen(s) then return false;
+  return oapi.nameends(nat, nend, s);
+end;
+
+// Optional fields worth putting in an example anyway: the application knows which
+// fields make a call do something VISIBLE instead of returning all or nothing.  That is
+// domain knowledge, so it does not live here but in the application: write your own
+// app.worthshowing.  If you want nothing special, always return false.
+function app.worthshowing(nat: int; nend: int): bool; forward;
+
+function oapi.worthshowing(nat: int; nend: int): bool;
+begin
+  return app.worthshowing(nat, nend);
+end;
+
+// A list value.  An empty list is a valid call but shows nothing; where we know the
+// vocabulary, name a couple of real members.  The application may fill in a list example
+// from ITS vocabulary; if it returns false, the library writes an empty list.  That way
+// domain knowledge stays in the application and this library holds only the shape.
+function app.exarray(nat: int; nend: int): bool; forward;
+
+procedure oapi.exarray(nat: int; nend: int);
+begin
+  if app.exarray(nat, nend) then return;
+  http.add("[]");
+end;
+
+// A field the schema gives no type for -- our `json` columns.  The name still says
+// what belongs there, and a list-shaped name wants a list, not null.
+procedure oapi.exuntyped(nat: int; nend: int);
+begin
+  { the domain first (the application knows its own lists), then the shape }
+  if app.exarray(nat, nend) then return;
+  if oapi.nameends(nat, nend, "_keys") or oapi.nameends(nat, nend, "_ids") then http.add("[]")
+  else if oapi.nameis(nat, nend, "info") then http.add("{}")
+  else http.add("null");
+end;
+
+// A number, chosen so the example is a sensible call rather than a degenerate one.
+procedure oapi.exint(nat: int; nend: int);
+begin
+  if oapi.nameis(nat, nend, "max_results") then http.add("30")
+  else if oapi.nameis(nat, nend, "max_combinations") then http.add("5000")
+  else if oapi.nameis(nat, nend, "house_number") then http.add("123")
+  else http.add("1");
+end;
+
+// Does this property name have an answer of its own?  Writes it and reports true.
+function oapi.namedvalue(nat: int; nend: int): bool;
+begin
+  if oapi.nameis(nat, nend, "output_time_scale") or oapi.nameis(nat, nend, "time_scale") then
+  begin
+    http.add("\"year\"");
+    return true;
+  end;
+  return false;
+end;
+
+// A sample value for a string property.  An empty string is valid JSON but useless in
+// a "Try it out" box: the reader still has to think of something.  The property name
+// says what it wants, so we answer it with a value from the real vocabulary.
+//
+// A hand-written API often does the same for its key endpoints: the schema carries a
+// working call, so a consumer can paste one instead of reconstructing it from field
+// descriptions.  We derive it from the property name instead, so every tool gets one
+// rather than just the two someone had time to write by hand.
+//
+// The uuid is deliberately a well-formed placeholder, not a random one: a call with it
+// returns a clean 400 naming the id, which is the example doing its job.  The
+// application fills in its own vocabulary; if it returns false, this falls back to the
+// generic rules below.
+function app.exstring(nat: int; nend: int): bool; forward;
+
+procedure oapi.exstring(nat: int; nend: int);
+begin
+  { Generic and name-driven: this holds for every application, so it stays here. }
+  if oapi.nameends(nat, nend, "_id") or oapi.nameis(nat, nend, "id") then
+  begin
+    { a WELL-FORMED placeholder and not a random one: a call with it gives a clean
+      400 that names the id, and then the example is doing its work }
+    http.add("\"9c1f8f0e-2c47-4a4e-9a5e-000000000000\""); return;
+  end;
+  if oapi.nameends(nat, nend, "_at") or oapi.nameends(nat, nend, "_date") then
+  begin
+    http.add("\"2026-01-01T00:00:00Z\""); return;
+  end;
+  { Then the domain: the application knows that and this library does not. }
+  if app.exstring(nat, nend) then return;
+  http.add("\"\"");
+end;
+
+// Write an example value for the property whose schema is [sat, send).  The schema
+// is what the compiler generated from the Wantzel declaration, so "type" is always there
+// and an enum shows up as "enum": [...].
+procedure oapi.exvalue(sat: int; send: int; nat: int; nend: int);
+var save_at, save_end, i: int;
+    c: char;
+begin
+  save_at := oapi.vat; save_end := oapi.vend;
+  // A name we have a considered answer for beats the schema's first enum member:
+  // output_time_scale enumerates minute first, and a year of minute values is a
+  // 525600-element reply -- a valid call, but a hostile first thing to press.
+  if oapi.namedvalue(nat, nend) then
+  begin
+    oapi.vat := save_at; oapi.vend := save_end;
+    return;
+  end;
+  // an enum: take its first member, which is by construction a valid value
+  if oapi.sub(sat, send, "enum") then
+  begin
+    i := oapi.vat + 1;
+    while (i < oapi.vend) and (schar(tool.list, i) <> '"') do i := i + 1;
+    if i < oapi.vend then
+    begin
+      c := '"';
+      http.addc(c);
+      i := i + 1;
+      while (i < oapi.vend) and (schar(tool.list, i) <> '"') do
+      begin
+        http.addc(schar(tool.list, i));
+        i := i + 1;
+      end;
+      http.addc(c);
+      oapi.vat := save_at; oapi.vend := save_end;
+      return;
+    end;
+  end;
+  if oapi.sub(sat, send, "type") then
+  begin
+    if oapi.istext(oapi.vat, oapi.vend, "integer") then oapi.exint(nat, nend)
+    else if oapi.istext(oapi.vat, oapi.vend, "number") then http.add("1.0")
+    else if oapi.istext(oapi.vat, oapi.vend, "boolean") then http.add("false")
+    else if oapi.istext(oapi.vat, oapi.vend, "array") then oapi.exarray(nat, nend)
+    else if oapi.istext(oapi.vat, oapi.vend, "object") then http.add("{}")
+    else oapi.exstring(nat, nend);
+  end
+  else oapi.exuntyped(nat, nend);
+  oapi.vat := save_at; oapi.vend := save_end;
+end;
+
+// The example body for the tool whose inputSchema is [sat, send).
+procedure oapi.example(sat: int; send: int);
+var i, depth, pat, pend, nat, nend, vend: int;
+    instr, esc, first: bool;
+    c: char;
+begin
+  http.addc('{');
+  first := true;
+  oapi.reqat := 0; oapi.reqend := 0;
+  if oapi.sub(sat, send, "required") then
+  begin
+    oapi.reqat := oapi.vat; oapi.reqend := oapi.vend;
+  end;
+  if not oapi.sub(sat, send, "properties") then begin http.addc('}'); return; end;
+  pat := oapi.vat; pend := oapi.vend;
+  { walk the property names at depth 1 of the properties object }
+  depth := 0; instr := false; esc := false;
+  i := pat;
+  while i < pend do
+  begin
+    c := schar(tool.list, i);
+    if instr then
+    begin
+      if esc then esc := false
+      else if c = '\\' then esc := true
+      else if c = '"' then instr := false;
+    end
+    else if c = '"' then
+    begin
+      if depth = 1 then
+      begin
+        nat := i + 1;
+        nend := nat;
+        while (nend < pend) and (schar(tool.list, nend) <> '"') do nend := nend + 1;
+        { its schema follows the colon }
+        vend := nend + 1;
+        while (vend < pend) and ((schar(tool.list, vend) = ':') or (schar(tool.list, vend) = ' ')) do vend := vend + 1;
+        // Required fields are always in.  Beyond that we take a few optional ones a
+        // caller almost always wants filled in: a tool whose fields are all optional
+        // would otherwise get an empty object as its example, which teaches nobody
+        // anything.  Keeping it to the named ones stops the example from ballooning
+        // into every field the schema has.
+        if oapi.isrequired(nat, nend) or oapi.worthshowing(nat, nend) then
+        begin
+          if not first then http.addc(',');
+          first := false;
+          http.addc('"');
+          oapi.addslice(nat, nend);
+          http.add("\":");
+          oapi.exvalue(vend, oapi.valueend(vend), nat, nend);
+        end;
+        i := oapi.valueend(vend) - 1;
+      end
+      else instr := true;
+    end
+    else if (c = '{') or (c = '[') then depth := depth + 1
+    else if (c = '}') or (c = ']') then depth := depth - 1;
+    i := i + 1;
+  end;
+  http.addc('}');
+end;
+
+// ---- the document and the page ----------------------------------------------
+
+// GET /openapi.json.  `prefix` is the REST prefix the tools live under (the same one
+// tool.rest is called with) and `title` names the API.
+procedure oapi.spec(prefix: str; title: str);
+var t, i: int;
+    ro: bool;
+begin
+  oapi.scan;
+  http.add("{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"");
+  http.add(title);
+  http.add("\",\"version\":\"1\",\"description\":\"Generated from the server's tool declarations; what is written here is what the server does.\"},");
+  http.add("\"servers\":[{\"url\":\"");
+  http.addb(oauth.issuer, 0, oauth.issuern);
+  http.add("\"}],");
+  http.add("\"components\":{\"securitySchemes\":{\"bearer\":{\"type\":\"http\",\"scheme\":\"bearer\"},");
+  http.add("\"session\":{\"type\":\"apiKey\",\"in\":\"cookie\",\"name\":\"");
+  http.add(OAUTH.CNAME);
+  http.add("\"}}},");
+  http.add("\"security\":[{\"bearer\":[]},{\"session\":[]}],");
+  http.add("\"paths\":{");
+  for t := 0 to oapi.n - 1 do
+  begin
+    if t > 0 then http.addc(',');
+    http.addc('"');
+    http.add(prefix);
+    if oapi.field(oapi.at[t], "name") then oapi.addslice(oapi.vat + 1, oapi.vend - 1);
+    http.add("\":{\"post\":{\"operationId\":\"");
+    if oapi.field(oapi.at[t], "name") then oapi.addslice(oapi.vat + 1, oapi.vend - 1);
+    // Swagger UI shows `summary` on the collapsed row and `description` when you open
+    // it.  A typical live API puts a short title in summary
+    // and the real text in description; a whole paragraph on the collapsed row makes
+    // the list unreadable, so we do the same: the tool name as the title, the declared
+    // description underneath.
+    http.add("\",\"summary\":\"");
+    if oapi.field(oapi.at[t], "name") then oapi.addslice(oapi.vat + 1, oapi.vend - 1);
+    http.add("\",\"description\":");
+    if oapi.field(oapi.at[t], "description") then oapi.addslice(oapi.vat, oapi.vend)
+    else http.add("\"\"");
+    { readonly tools get their own tag, so the page separates reading from writing }
+    ro := false;
+    if oapi.field(oapi.at[t], "annotations") then
+      if oapi.sub(oapi.vat, oapi.vend, "readOnlyHint") then
+        if oapi.vend - oapi.vat = 4 then ro := true;
+    http.add(",\"tags\":[\"");
+    if ro then http.add("lezen") else http.add("schrijven");
+    http.add("\"],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":");
+    if oapi.field(oapi.at[t], "inputSchema") then
+    begin
+      i := oapi.vat;
+      oapi.addslice(oapi.vat, oapi.vend);
+      http.add(",\"example\":");
+      oapi.example(i, oapi.valueend(i));
+    end
+    else http.add("{\"type\":\"object\"}");
+    http.add("}}},\"responses\":{\"200\":{\"description\":\"Successful Response\",\"content\":{\"application/json\":{\"schema\":");
+    if oapi.field(oapi.at[t], "outputSchema") then oapi.addslice(oapi.vat, oapi.vend)
+    else http.add("{\"type\":\"object\"}");
+    http.add("}}},\"400\":{\"description\":\"Bad Request: the message names the field\"},\"401\":{\"description\":\"Unauthorized: sign in at /login or send a bearer token\"},\"422\":{\"description\":\"Validation Error: the body does not fit the schema\"}}}}");
+  end;
+  http.add("}}");
+  http.finish(200, "application/json");
+end;
+
+// GET /docs: Swagger UI from a CDN, pointed at our own spec.  The page itself is
+// tiny; the viewer is fetched by the browser, which reaches the internet even when
+// this server does not.
+procedure oapi.page(title: str);
+begin
+  http.add("<!doctype html><html><head><meta charset=\"utf-8\"><title>");
+  http.add(title);
+  http.add("</title><link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css\">");
+  http.add("<style>body{margin:0}.topbar{display:none}</style></head><body><div id=\"ui\"></div>");
+  http.add("<script src=\"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js\"></script>");
+  http.add("<script>window.ui=SwaggerUIBundle({url:'/openapi.json',dom_id:'#ui',");
+  { the browser already has the session cookie; send it with every try-it-out call }
+  http.add("requestInterceptor:function(r){r.credentials='same-origin';return r},");
+  http.add("docExpansion:'none',filter:true,tryItOutEnabled:true,persistAuthorization:true});</script>");
+  http.add("</body></html>");
+  http.finish(200, "text/html; charset=utf-8");
+end;

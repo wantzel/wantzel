@@ -1,0 +1,9 @@
+by value: g[1] = 7
+view writes through: g[3] = 13
+ten = 55
+fact(10) = 3628800
+zeroed 1 = 0
+zeroed 2 = 0
+sign(-5) = -1
+sign(0) = 0
+hook got 42

@@ -1,0 +1,70 @@
+// lib/router.wz -- a few helpers on top of lib/http.wz for routing by path
+// and method, and the standard JSON error replies.
+//
+//   if router.get("/status") then ... else
+//   if router.post_under("/api/") then ... (the rest is http.restat..http.restend)
+//   router.notfound; router.methodnotallowed; router.error(422, "...");
+
+include "http.wz";
+
+// GET and HEAD share a route: for HEAD, http.finish drops the body
+function router.get(path: str): bool;
+begin
+  return ((http.method = HTTP.GET) or (http.method = HTTP.HEAD)) and http.pathis(path);
+end;
+
+function router.post(path: str): bool;
+begin
+  return (http.method = HTTP.POST) and http.pathis(path);
+end;
+
+function router.post_under(prefix: str): bool;
+begin
+  return (http.method = HTTP.POST) and http.pathstarts(prefix);
+end;
+
+function router.get_under(prefix: str): bool;
+begin
+  return ((http.method = HTTP.GET) or (http.method = HTTP.HEAD)) and http.pathstarts(prefix);
+end;
+
+// {"detail": "<msg>"} with the given status
+procedure router.error(status: int; msg: str);
+begin
+  http.add("{\"detail\":");
+  http.wpos := json.putstr(http.outbuf, http.wpos, msg);
+  http.add("}");
+  http.finish(status, "application/json");
+end;
+
+procedure router.notfound;
+begin
+  router.error(404, "not found");
+end;
+
+procedure router.methodnotallowed;
+begin
+  router.error(405, "method not allowed");
+end;
+
+// a JSON reply from a buffer
+procedure router.json(status: int; b: array of char; from: int; upto: int);
+begin
+  http.addb(b, from, upto - from);
+  http.finish(status, "application/json");
+end;
+
+// plain text
+procedure router.text(status: int; s: str);
+begin
+  http.add(s);
+  http.finish(status, "text/plain; charset=utf-8");
+end;
+
+// permissive CORS for browser clients; call before finish when wanted
+procedure router.cors;
+begin
+  http.hdradd("Access-Control-Allow-Origin: *");
+  http.hdradd("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
+  http.hdradd("Access-Control-Allow-Headers: Authorization, Content-Type, Accept, Mcp-Session-Id, Mcp-Protocol-Version");
+end;

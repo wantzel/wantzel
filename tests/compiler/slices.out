@@ -1,0 +1,12 @@
+all = 145
+10..12 = 33
+19..19 = 19
+empty = 0
+len of slice = 10
+sumfirst 3 = 33
+sumfirst 10 = 145
+sumfirst 0 = 0
+local slice = 18
+local empty = 0
+items[3].k = 107
+runtime error: slice lies outside the array at slices.wz:56

@@ -1,0 +1,235 @@
+// mcpserver.wz -- a Model Context Protocol server.
+//
+//   mcpserver              speak MCP over stdin/stdout (how editors run it)
+//   mcpserver --http 8080  serve MCP over HTTP on that port
+//
+// Every request shape is declared as a schema, so the parsers are generated
+// at compile time.  Nothing is allocated while serving.
+
+program mcpserver;
+
+include "mcphttp.wz";
+
+// ---- tool argument shapes ------------------------------------------
+
+schema AddArgs = record
+  a: int;
+  b: int;
+end;
+
+schema EchoArgs = record
+  text: text;
+end;
+
+schema CountArgs = record
+  text: text;
+  word: text?;
+end;
+
+// ---- the tools -----------------------------------------------------
+
+procedure app.tools;
+begin
+  mcp.add("{\"name\":\"add\",\"description\":\"Add two whole numbers.\",");
+  mcp.add("\"inputSchema\":{\"type\":\"object\",\"properties\":{");
+  mcp.add("\"a\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"}},");
+  mcp.add("\"required\":[\"a\",\"b\"]}},");
+
+  mcp.add("{\"name\":\"echo\",\"description\":\"Return the text it is given.\",");
+  mcp.add("\"inputSchema\":{\"type\":\"object\",\"properties\":{");
+  mcp.add("\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}},");
+
+  mcp.add("{\"name\":\"count\",\"description\":\"Count characters, words, and optionally how often a word occurs.\",");
+  mcp.add("\"inputSchema\":{\"type\":\"object\",\"properties\":{");
+  mcp.add("\"text\":{\"type\":\"string\"},\"word\":{\"type\":\"string\"}},");
+  mcp.add("\"required\":[\"text\"]}}");
+end;
+
+procedure app.fail(msg: str);
+begin
+  mcp.failed := true;
+  mcp.text(msg);
+end;
+
+var
+  app.add: AddArgs;
+  app.echo: EchoArgs;
+  app.cnt: CountArgs;
+  app.text: array[0..65535] of char;
+  app.word: array[0..255] of char;
+  app.textlen, app.wordlen: int;
+
+function app.same(from: int; upto: int; wlen: int): bool;
+var i: int;
+begin
+  if upto - from <> wlen then return false;
+  i := 0;
+  while i < wlen do
+  begin
+    if app.text[from + i] <> app.word[i] then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// Count characters and words in the decoded text, and how often the needle
+// occurs if one was given.
+procedure app.count;
+var i, n, wlen, words, hits, wstart: int;
+    inword: bool;
+begin
+  words := 0;
+  hits := 0;
+  inword := false;
+  wstart := 0;
+  n := app.textlen;
+  wlen := app.wordlen;
+  i := 0;
+  while i <= n do
+  begin
+    if (i = n) or (app.text[i] = ' ') or (app.text[i] = chr(10))
+       or (app.text[i] = chr(9)) or (app.text[i] = chr(13)) then
+    begin
+      if inword then
+      begin
+        words := words + 1;
+        if (wlen > 0) and app.same(wstart, i, wlen) then hits := hits + 1;
+      end;
+      inword := false;
+    end
+    else if not inword then
+    begin
+      inword := true;
+      wstart := i;
+    end;
+    i := i + 1;
+  end;
+  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":\"");
+  mcp.addn(n);
+  mcp.add(" characters, ");
+  mcp.addn(words);
+  mcp.add(" words");
+  if wlen > 0 then
+  begin
+    mcp.add(", ");
+    mcp.addn(hits);
+    mcp.add(" of them ");
+    mcp.addslice(app.word, 0, wlen);
+  end;
+  mcp.add("\"}]}");
+end;
+
+procedure app.call(b: array of char; last: int);
+begin
+  if json.eq(b, mcp.callp.name_at, mcp.callp.name_end, "add") then
+  begin
+    if not mcp.callp.arguments_ok then
+    begin
+      app.fail("add needs arguments a and b");
+      return;
+    end;
+    if AddArgs.parse(b, mcp.callp.arguments_at, mcp.callp.arguments_end, app.add) < 0 then
+    begin
+      app.fail("add needs two integers a and b");
+      return;
+    end;
+    mcp.textnum(app.add.a + app.add.b);
+    return;
+  end;
+
+  if json.eq(b, mcp.callp.name_at, mcp.callp.name_end, "echo") then
+  begin
+    if not mcp.callp.arguments_ok then
+    begin
+      app.fail("echo needs a text argument");
+      return;
+    end;
+    if EchoArgs.parse(b, mcp.callp.arguments_at, mcp.callp.arguments_end, app.echo) < 0 then
+    begin
+      app.fail("echo needs a text argument");
+      return;
+    end;
+    mcp.textslice(b, app.echo.text_at, app.echo.text_end);
+    return;
+  end;
+
+  if json.eq(b, mcp.callp.name_at, mcp.callp.name_end, "count") then
+  begin
+    if not mcp.callp.arguments_ok then
+    begin
+      app.fail("count needs a text argument");
+      return;
+    end;
+    if CountArgs.parse(b, mcp.callp.arguments_at, mcp.callp.arguments_end, app.cnt) < 0 then
+    begin
+      app.fail("count needs a text argument");
+      return;
+    end;
+    app.textlen := json.unescape(b, app.cnt.text_at, app.cnt.text_end, app.text, 0);
+    if app.textlen < 0 then
+    begin
+      app.fail("the text contains malformed escapes");
+      return;
+    end;
+    app.wordlen := 0;
+    if app.cnt.word_ok then
+    begin
+      app.wordlen := json.unescape(b, app.cnt.word_at, app.cnt.word_end, app.word, 0);
+      if app.wordlen < 0 then app.wordlen := 0;
+    end;
+    app.count;
+    return;
+  end;
+
+  app.fail("no such tool");
+end;
+
+// ---- HTTP transport -------------------------------------------------
+
+// MCP on every path: the whole server is the endpoint
+procedure app.request;
+begin
+  mcp.http;
+end;
+
+// ---- start ----------------------------------------------------------
+
+var
+  port, i: int;
+  usehttp: bool;
+  c: char;
+
+begin
+  mcp.name := "wantzel-mcp";
+  mcp.version := "1.0";
+  usehttp := false;
+  port := 8080;
+  if argc() > 1 then
+  begin
+    if (argch(1, 0) = '-') and (argch(1, 2) = 'h') then
+    begin
+      usehttp := true;
+      if argc() > 2 then
+      begin
+        port := 0;
+        i := 0;
+        while true do
+        begin
+          c := argch(2, i);
+          if c = chr(0) then break;
+          if (c >= '0') and (c <= '9') then port := port * 10 + (ord(c) - 48);
+          i := i + 1;
+        end;
+        if port = 0 then port := 8080;
+      end;
+    end;
+  end;
+  if usehttp then
+  begin
+    io.puts(STDERR, "wantzel-mcp listening on http://127.0.0.1:");
+    io.putn(STDERR, port);
+    io.puts(STDERR, "/\n");
+    http.serve(port, 4);
+  end
+  else mcp.stdio;
+end.

@@ -1,0 +1,44 @@
+// spec §3: precedence, div/mod truncate toward zero, bits, shifts, comparisons on
+// int/char/real, short-circuit and/or, no implicit conversions.
+program t;
+include "io.wz";
+var
+  calls: int;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+function side(v: bool): bool;
+begin
+  calls := calls + 1;
+  return v;
+end;
+begin
+  show("2+3*4 = ", 2 + 3 * 4);
+  show("(2+3)*4 = ", (2 + 3) * 4);
+  show("10-4-3 = ", 10 - 4 - 3);
+  show("100 div 7 = ", 100 div 7);
+  show("100 mod 7 = ", 100 mod 7);
+  show("-7 div 2 = ", -7 div 2);
+  show("-7 mod 2 = ", -7 mod 2);
+  show("7 div -2 = ", 7 div -2);
+  show("band = ", band(0xF0, 0x3C));
+  show("bor = ", bor(1, 6));
+  show("bxor = ", bxor(5, 3));
+  show("bnot 0 = ", bnot(0));
+  show("1 shl 10 = ", 1 shl 10);
+  show("-64 shr 2 = ", -64 shr 2);        { arithmetic shift }
+  show("1 shl 62 shr 62 = ", (1 shl 62) shr 62);
+  if 'a' < 'b' then show("char order ", 1) else show("char order ", 0);
+  if 3 <> 4 then show("ne ", 1) else show("ne ", 0);
+  if 2.5 >= 2.5 then show("real ge ", 1) else show("real ge ", 0);
+  if not (1 = 2) then show("not ", 1) else show("not ", 0);
+  calls := 0;
+  if side(false) and side(true) then show("and ", 1) else show("and ", 0);
+  show("and is short-circuit: calls = ", calls);
+  calls := 0;
+  if side(true) or side(false) then show("or ", 1) else show("or ", 0);
+  show("or is short-circuit: calls = ", calls);
+  show("unary minus = ", -(3 + 4));
+  show("nested = ", ((1 + 2) * (3 + 4)) div (2 * 2 - 1));
+end.

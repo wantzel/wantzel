@@ -1,0 +1,30 @@
+{ hello.wz -- the smallest useful Wantzel program }
+
+program hello;
+
+const
+  STDOUT = 1;
+
+var
+  buf: array[0..255] of char;
+
+procedure write(fd: int; n: int);
+begin
+  sys3(1, fd, addr(buf[0]), n);
+end;
+
+procedure puts(s: str);
+var i: int;
+begin
+  i := 0;
+  while i < slen(s) do
+  begin
+    buf[i] := schar(s, i);
+    i := i + 1;
+  end;
+  write(STDOUT, slen(s));
+end;
+
+begin
+  puts("hello, world\n");
+end.

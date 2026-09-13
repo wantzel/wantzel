@@ -1,0 +1,231 @@
+// mcpbridge.wz -- speak MCP on stdin/stdout, forward it to an HTTP server.
+//
+//   mcpbridge 8099            talk to 127.0.0.1:8099/mcp
+//   mcpbridge 8099 /mcp       the same, explicit path
+//
+// Claude Desktop only starts MCP servers over stdio: it refuses http:// URLs
+// as custom connectors, even on localhost.  This bridge is the missing half:
+// Claude starts this tiny program, which forwards every message to a server
+// that keeps running between sessions, over one keep-alive connection.
+
+program mcpbridge;
+
+include "net.wz";
+
+const
+  BUF = 1048576;
+
+var
+  inbuf:  array[0..BUF - 1] of char;      // messages from Claude
+  outbuf: array[0..BUF - 1] of char;      // HTTP replies
+  req:    array[0..BUF - 1] of char;
+  path:   array[0..255] of char;
+  pathlen, port, inlen, fd: int;
+
+function arg(k: int): int;
+var i, v: int;
+    c: char;
+begin
+  v := 0;
+  i := 0;
+  while true do
+  begin
+    c := argch(k, i);
+    if c = chr(0) then break;
+    if (c < '0') or (c > '9') then return 0;
+    v := v * 10 + (ord(c) - 48);
+    i := i + 1;
+  end;
+  return v;
+end;
+
+function connect: int;
+var s, r, i: int;
+begin
+  s := net.socket;
+  if s < 0 then return s;
+  i := 0;
+  while i < 16 do
+  begin
+    net.sa[i] := chr(0);
+    i := i + 1;
+  end;
+  net.sa[0] := chr(AF_INET);
+  net.sa[2] := chr(port shr 8);
+  net.sa[3] := chr(band(port, 255));
+  net.sa[4] := chr(127);
+  net.sa[7] := chr(1);
+  r := sys3(SYS.connect, s, addr(net.sa[0]), 16);
+  if r < 0 then
+  begin
+    net.close(s);
+    return r;
+  end;
+  return s;
+end;
+
+// Send one message and copy the reply body to stdout.  Returns false when the
+// connection broke, so the caller can reconnect and try once more.
+function relay(at: int; upto: int): bool;
+var n, r, got, hdrend, clen, j, k, bodylen: int;
+begin
+  n := 0;
+  n := io.push(req, n, "POST ");
+  j := 0;
+  while j < pathlen do
+  begin
+    req[n] := path[j];
+    n := n + 1;
+    j := j + 1;
+  end;
+  n := io.push(req, n, " HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: ");
+  n := io.pushnum(req, n, upto - at);
+  n := io.push(req, n, "\r\n\r\n");
+  j := at;
+  while j < upto do
+  begin
+    req[n] := inbuf[j];
+    n := n + 1;
+    j := j + 1;
+  end;
+  r := net.send(fd, addr(req[0]), n);
+  if r <> n then return false;
+
+  got := 0;
+  hdrend := 0;
+  clen := -1;
+  while true do
+  begin
+    r := net.recv(fd, addr(outbuf[got]), BUF - got);
+    if r <= 0 then return false;
+    got := got + r;
+    if hdrend = 0 then
+    begin
+      j := 0;
+      while j + 3 < got do
+      begin
+        if (outbuf[j] = chr(13)) and (outbuf[j + 1] = chr(10))
+           and (outbuf[j + 2] = chr(13)) and (outbuf[j + 3] = chr(10)) then
+        begin
+          hdrend := j + 4;
+          break;
+        end;
+        j := j + 1;
+      end;
+      if hdrend > 0 then
+      begin
+        // find Content-Length in the headers
+        j := 0;
+        while j < hdrend - 16 do
+        begin
+          if (outbuf[j] = 'C') or (outbuf[j] = 'c') then
+          begin
+            if (outbuf[j + 8] = 'L') or (outbuf[j + 8] = 'l') then
+            begin
+              k := j + 15;
+              while (k < hdrend) and (outbuf[k] = ' ') do k := k + 1;
+              clen := 0;
+              while (k < hdrend) and (outbuf[k] >= '0') and (outbuf[k] <= '9') do
+              begin
+                clen := clen * 10 + (ord(outbuf[k]) - 48);
+                k := k + 1;
+              end;
+              break;
+            end;
+          end;
+          j := j + 1;
+        end;
+      end;
+    end;
+    if hdrend > 0 then
+    begin
+      if clen < 0 then clen := 0;
+      if got >= hdrend + clen then
+      begin
+        bodylen := clen;
+        if bodylen > 0 then
+        begin
+          outbuf[hdrend + bodylen] := chr(10);
+          io.out(STDOUT, addr(outbuf[hdrend]), bodylen + 1);
+        end;
+        return true;
+      end;
+    end;
+    if got >= BUF then return false;
+  end;
+  return false;
+end;
+
+var
+  at, nl, i, keep: int;
+  ok: bool;
+
+begin
+  port := arg(1);
+  if port = 0 then
+  begin
+    io.puts(STDERR, "usage: mcpbridge <port> [path]\n");
+    halt(1);
+  end;
+  pathlen := 0;
+  if argc() > 2 then
+  begin
+    i := 0;
+    while true do
+    begin
+      if argch(2, i) = chr(0) then break;
+      path[pathlen] := argch(2, i);
+      pathlen := pathlen + 1;
+      i := i + 1;
+    end;
+  end;
+  if pathlen = 0 then pathlen := io.push(path, 0, "/mcp");
+
+  fd := connect;
+  if fd < 0 then
+  begin
+    io.puts(STDERR, "mcpbridge: cannot reach the server on port ");
+    io.putn(STDERR, port);
+    io.puts(STDERR, "\n");
+    halt(1);
+  end;
+
+  inlen := 0;
+  while true do
+  begin
+    i := io.read(STDIN, addr(inbuf[inlen]), BUF - inlen);
+    if i <= 0 then break;
+    inlen := inlen + i;
+    at := 0;
+    while true do
+    begin
+      nl := scan(inbuf, at, inlen, chr(10));
+      if nl >= inlen then break;
+      if nl > at then
+      begin
+        ok := relay(at, nl);
+        if not ok then
+        begin
+          // the server may have closed an idle connection: reconnect once
+          net.close(fd);
+          fd := connect;
+          if fd < 0 then halt(1);
+          if not relay(at, nl) then halt(1);
+        end;
+      end;
+      at := nl + 1;
+    end;
+    if at > 0 then
+    begin
+      keep := 0;
+      while at + keep < inlen do
+      begin
+        inbuf[keep] := inbuf[at + keep];
+        keep := keep + 1;
+      end;
+      inlen := keep;
+    end;
+    if inlen >= BUF then halt(1);
+  end;
+  net.close(fd);
+end.

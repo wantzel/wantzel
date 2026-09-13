@@ -1,0 +1,44 @@
+// time.parseiso accepts what Python's isoformat() and Postgres produce: a bare date,
+// a timestamp with or without a zone, a fraction, Z, and a +HH:MM or +HHMM offset.
+program t;
+include "time.wz";
+var buf: array[0..63] of char;
+procedure show(s: str);
+var n, v: int;
+begin
+  n := io.push(buf, 0, s);
+  v := time.parseiso(buf[0..n - 1]);
+  io.puts(STDOUT, s);
+  io.puts(STDOUT, " -> ");
+  if time.ok then io.putn(STDOUT, v) else io.puts(STDOUT, "geweigerd");
+  io.puts(STDOUT, "\n");
+end;
+begin
+  { the epoch and a known moment }
+  show("1970-01-01T00:00:00Z");
+  show("2026-09-11T12:34:56Z");
+  { without a zone: read as UTC, so the same number }
+  show("2026-09-11T12:34:56");
+  { a bare date is midnight UTC }
+  show("2026-09-11");
+  show("1970-01-02");
+  { a fraction is dropped }
+  show("2026-09-11T12:34:56.123456");
+  show("2026-09-11T12:34:56.5Z");
+  { offsets: east of UTC is earlier in UTC }
+  show("2026-09-11T12:34:56+02:00");
+  show("2026-09-11T12:34:56-05:00");
+  show("2026-09-11T12:34:56+0200");
+  show("2026-09-11T12:34:56+00:00");
+  { a space instead of T, as Postgres writes it }
+  show("2026-09-11 12:34:56Z");
+  { refusals }
+  show("2026-09-11T12:34");
+  show("2026-13-01T00:00:00Z");
+  show("2026-02-30T00:00:00Z");
+  show("2026-09-11T24:00:00Z");
+  show("2026-09-11T12:34:56+99:00");
+  show("2026-09-11T12:34:56Q");
+  show("gisteren");
+  show("2026-09-11T12:34:56.");
+end.

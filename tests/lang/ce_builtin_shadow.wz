@@ -1,0 +1,2 @@
+// Must not compile: "that name is built in".
+program t; var len: int; begin end.

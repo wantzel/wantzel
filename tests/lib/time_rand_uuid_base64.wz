@@ -1,0 +1,172 @@
+// lib/time.wz, lib/rand.wz, lib/uuid.wz and lib/base64.wz: the calendar
+// without a time zone, kernel randomness, UUID v4, and base64 in both
+// alphabets.  Random values are never printed, only facts about them.
+program t;
+include "time.wz";
+include "uuid.wz";
+include "base64.wz";
+var
+  enc, dec: array[0..63] of char;
+  u1, u2, u3: array[0..15] of char;
+  txt: array[0..35] of char;
+  raw: array[0..2] of char;
+  hits: array[0..9] of int;
+  n, m, i, v, t, distinct: int;
+  ok: bool;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+procedure showb(s: str; b: bool);
+begin
+  io.puts(STDOUT, s);
+  if b then io.puts(STDOUT, "true") else io.puts(STDOUT, "false");
+  io.puts(STDOUT, "\n");
+end;
+procedure outv(b: array of char);
+begin
+  if len(b) > 0 then io.out(STDOUT, addr(b[0]), len(b));
+end;
+procedure text(s: str; b: array of char);
+begin
+  io.puts(STDOUT, s); outv(b); io.puts(STDOUT, "\n");
+end;
+function same(a: array of char; b: array of char): bool;
+var i: int;
+begin
+  if len(a) <> len(b) then return false;
+  for i := 0 to len(a) - 1 do if a[i] <> b[i] then return false;
+  return true;
+end;
+{ encode s, print it, decode the result and check the round trip }
+procedure b64(s: array of char);
+var n, m: int;
+begin
+  n := base64.encode(enc, 0, s);
+  io.puts(STDOUT, "b64 \""); outv(s); io.puts(STDOUT, "\" = ");
+  outv(enc[0..n - 1]);
+  m := base64.decode(enc[0..n - 1], dec);
+  if (m = len(s)) and same(dec[0..m - 1], s) then io.puts(STDOUT, " roundtrip ok") else io.puts(STDOUT, " roundtrip FAIL");
+  { the same without padding }
+  while (n > 0) and (enc[n - 1] = '=') do n := n - 1;
+  m := base64.decode(enc[0..n - 1], dec);
+  if (m = len(s)) and same(dec[0..m - 1], s) then io.puts(STDOUT, ", unpadded ok") else io.puts(STDOUT, ", unpadded FAIL");
+  { and through the URL alphabet }
+  n := base64.urlencode(enc, 0, s);
+  m := base64.decode(enc[0..n - 1], dec);
+  if (m = len(s)) and same(dec[0..m - 1], s) then io.puts(STDOUT, ", url ok") else io.puts(STDOUT, ", url FAIL");
+  io.puts(STDOUT, "\n");
+end;
+procedure date(t: int);
+begin
+  time.split(t);
+  io.puts(STDOUT, "split "); io.putn(STDOUT, t); io.puts(STDOUT, " = ");
+  io.putn(STDOUT, time.year); io.puts(STDOUT, "-");
+  io.putn(STDOUT, time.month); io.puts(STDOUT, "-");
+  io.putn(STDOUT, time.day); io.puts(STDOUT, " ");
+  io.putn(STDOUT, time.hour); io.puts(STDOUT, ":");
+  io.putn(STDOUT, time.minute); io.puts(STDOUT, ":");
+  io.putn(STDOUT, time.second);
+  io.puts(STDOUT, " weekday "); io.putn(STDOUT, time.weekday);
+  io.puts(STDOUT, " yday "); io.putn(STDOUT, time.yday);
+  io.puts(STDOUT, "\n");
+end;
+procedure roundtrip(y, mo, d, hh, mi, ss: int);
+var t, n: int;
+begin
+  t := time.join(y, mo, d, hh, mi, ss);
+  show("join = ", t);
+  time.split(t);
+  showb("split matches ", (time.year = y) and (time.month = mo) and (time.day = d)
+    and (time.hour = hh) and (time.minute = mi) and (time.second = ss));
+  n := time.iso(enc, 0, t);
+  text("iso = ", enc[0..n - 1]);
+  show("iso length ", n);
+end;
+begin
+  { base64: the RFC 4648 test vectors }
+  b64("");
+  b64("f");
+  b64("fo");
+  b64("foo");
+  b64("foob");
+  b64("fooba");
+  b64("foobar");
+  raw[0] := chr(251); raw[1] := chr(255); raw[2] := chr(191);
+  n := base64.urlencode(enc, 0, raw);
+  text("urlencode FB FF BF = ", enc[0..n - 1]);
+  n := base64.encode(enc, 0, raw);
+  text("encode FB FF BF = ", enc[0..n - 1]);
+  m := base64.decode(enc[0..n - 1], dec);
+  showb("decode of +/ form matches ", (m = 3) and same(dec[0..2], raw));
+  m := base64.decode("-_-_", dec);
+  showb("decode of -_ form matches ", (m = 3) and same(dec[0..2], raw));
+  show("decode invalid = ", base64.decode("Zm9v YmFy", dec));
+  show("decode invalid = ", base64.decode("Zm9v*", dec));
+  show("decode lone symbol = ", base64.decode("Z", dec));
+  show("decode overflow = ", base64.decode("Zm9vYmFy", dec[0..3]));
+  show("decode empty = ", base64.decode("", dec));
+
+  { time.split }
+  date(0);
+  date(951782400);
+  date(1700000000);
+  date(-86400);
+  roundtrip(2024, 2, 29, 12, 34, 56);
+  roundtrip(1999, 12, 31, 23, 59, 59);
+  t := time.parseiso("2026-09-10T20:15:00Z");
+  show("parseiso Z = ", t); showb("ok ", time.ok);
+  t := time.parseiso("2026-09-10T20:15:00.123Z");
+  show("parseiso .123Z = ", t); showb("ok ", time.ok);
+  t := time.parseiso("2026-09-10T20:15:00");
+  show("parseiso bare = ", t); showb("ok ", time.ok);
+  t := time.parseiso("nonsense");
+  show("parseiso nonsense = ", t); showb("ok ", time.ok);
+  t := time.parseiso("2023-02-29T00:00:00Z");
+  show("parseiso feb 29 2023 = ", t); showb("ok ", time.ok);
+  t := time.parseiso("1969-12-31T23:59:59Z");
+  show("parseiso 1969 = ", t); showb("ok ", time.ok);
+  showb("leap 1900 ", time.leap(1900));
+  showb("leap 2000 ", time.leap(2000));
+  showb("leap 2024 ", time.leap(2024));
+  show("daysin 2023 2 = ", time.daysin(2023, 2));
+  show("daysin 2024 2 = ", time.daysin(2024, 2));
+  showb("nowsec after 2023 ", time.nowsec > 1700000000);
+
+  { uuid }
+  uuid.v4(u1);
+  uuid.v4(u2);
+  showb("uuids differ ", not same(u1, u2));
+  showb("version nibble 4 ", (band(ord(u1[6]), 240) = 64) and (band(ord(u2[6]), 240) = 64));
+  showb("variant 10xx ", (band(ord(u1[8]), 192) = 128) and (band(ord(u2[8]), 192) = 128));
+  n := uuid.text(u1, txt, 0);
+  show("text length ", n);
+  showb("dashes at 8 13 18 23 ", (txt[8] = '-') and (txt[13] = '-') and (txt[18] = '-') and (txt[23] = '-'));
+  ok := true;
+  for i := 0 to 35 do
+    if (txt[i] <> '-') and (uuid.hexval(txt[i]) < 0) then ok := false
+    else if (txt[i] >= 'A') and (txt[i] <= 'F') then ok := false;
+  showb("lowercase hex ", ok);
+  showb("parse(text(u)) = u ", uuid.parse(txt, u3) and same(u1, u3));
+  showb("parse of known ", uuid.parse("123E4567-e89b-12d3-a456-426614174000", u3)
+    and (ord(u3[0]) = 18) and (ord(u3[1]) = 62) and (ord(u3[15]) = 0));
+  n := uuid.text(u3, txt, 0);
+  text("text of known = ", txt);
+  showb("parse bad ", uuid.parse("123e4567-e89b-12d3-a456-42661417400g", u3));
+  showb("parse short ", uuid.parse("123e4567", u3));
+
+  { rand.below }
+  for i := 0 to 9 do hits[i] := 0;
+  ok := true;
+  for i := 1 to 1000 do
+  begin
+    v := rand.below(10);
+    if (v < 0) or (v > 9) then ok := false else hits[v] := hits[v] + 1;
+  end;
+  showb("below(10) in range ", ok);
+  distinct := 0;
+  for i := 0 to 9 do if hits[i] > 0 then distinct := distinct + 1;
+  showb("at least 8 distinct ", distinct >= 8);
+  show("below(1) = ", rand.below(1));
+  showb("rand.int differs ", rand.int <> rand.int);
+end.

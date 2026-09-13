@@ -1,0 +1,35 @@
+ok   0.0
+ok   1.0
+ok   -1.0
+ok   0.5
+ok   0.1
+ok   123456.789
+ok   1e+21
+ok   1.5e-07
+ok   -273.15
+ok   8760.0
+ok   0.000123
+ok   1000000000000000.0
+ok   9.769
+pos after -12.5e2 = 9
+value = -1250
+1E3 = 1000
+leading dot rejected = -1
+number 42 = 42
+bool true 1
+skip nested = 28
+isnull 1
+isnull short 0
+"a\"b\\c\nd\te"
+"x\"y"
+\u0001
+copystr len = 5
+byte 1 = 195
+byte 2 = 169
+copystr overflow = -1
+copystr bad escape len = 4
+copystr short unicode = -1
+[1,2]
+ws = 2
+eq 1
+eq len 0

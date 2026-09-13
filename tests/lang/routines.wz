@@ -1,0 +1,65 @@
+// spec §4: parameters by value, array views write through, ten arguments, forward,
+// recursion, locals zeroed on every call, return on every path, callbacks via forward.
+program t;
+include "io.wz";
+var
+  g: array[0..3] of int;
+  buf: array[0..7] of char;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+procedure app.hook(x: int); forward;              { a library-style callback }
+procedure byvalue(x: int);
+begin
+  x := x + 100;                                   { does not reach the caller }
+end;
+procedure fillarr(a: array of int; v: int);
+var i: int;
+begin
+  for i := 0 to len(a) - 1 do a[i] := v + i;
+end;
+function ten(a, b, c, d, e, f, g, h, i, j: int): int;
+begin
+  return a + b + c + d + e + f + g + h + i + j;
+end;
+function fact(n: int): int;
+begin
+  if n <= 1 then return 1;
+  return n * fact(n - 1);
+end;
+function zeroed: int;
+var k: int; a: array[0..3] of int;
+begin
+  k := k + a[3];                                  { both start at zero on every call }
+  a[3] := 9; 
+  return k;
+end;
+function sign(v: int): int;
+begin
+  if v > 0 then return 1
+  else if v < 0 then return -1
+  else return 0;
+end;
+procedure app.hook(x: int);
+begin
+  show("hook got ", x);
+end;
+procedure lib.fire;
+begin
+  app.hook(42);
+end;
+begin
+  g[1] := 7;
+  byvalue(g[1]);
+  show("by value: g[1] = ", g[1]);
+  fillarr(g, 10);
+  show("view writes through: g[3] = ", g[3]);
+  show("ten = ", ten(1, 2, 3, 4, 5, 6, 7, 8, 9, 10));
+  show("fact(10) = ", fact(10));
+  show("zeroed 1 = ", zeroed);
+  show("zeroed 2 = ", zeroed);
+  show("sign(-5) = ", sign(-5));
+  show("sign(0) = ", sign(0));
+  lib.fire;
+end.

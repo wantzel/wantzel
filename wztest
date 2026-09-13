@@ -1,0 +1,158 @@
+#!/bin/sh
+# wztest -- runs the test suite of the language and the compiler, in tests/.
+#
+#   ./wztest                       everything (tests/lang, tests/compiler, tests/lib)
+#   ./wztest tests/lang            one directory
+#   ./wztest tests/lang/hello.wz   one test
+#   ./wztest --time                show how long each test took
+#   ./wztest --toolchain           also the bootstrap fixed point and test.sh
+#   ./wztest --bench               also tests/bench/ (skipped by default); see below
+#
+# This suite tests THE LANGUAGE AND THE COMPILER: does the language do what the
+# specification says, and does the compiler translate that correctly?  The tests live in
+# tests/lang, tests/compiler and tests/lib, and take a little over a second together.
+# tests/toolchain runs only with --toolchain (the bootstrap fixed point, test.sh and the
+# Windows tests through Wine).
+#
+# The conventions are all decided by files sitting next to each other:
+#   foo.wz + foo.out    compile, run, compare stdout+stderr
+#   foo.wz + foo.err    compiling must FAIL, and stderr must contain that text
+#   foo.sh              shell script; exit 0 = pass
+#   progs/              helper files, not tests
+#   foo.args foo.stdin foo.exit foo.timeout   beside a test, each optional
+#
+# Benchmarks live in tests/bench/ as .sh and run only with --bench.  They print lines of
+# the form
+#   bench <name> <value> <unit>
+# which wztest shows and appends to tests/bench/results.tsv (date, name, value, unit,
+# git hash).  A file <name>.min or <name>.max beside the script turns that into a hard
+# limit: below or above it the test fails.
+
+cd "$(dirname "$0")" || exit 2
+ROOT=$(pwd)
+WANTZEL="$ROOT/bin/wantzel"
+WANTZEL0="$ROOT/bin/wantzel0"
+export WANTZEL WANTZEL0 ROOT
+
+[ -x "$WANTZEL" ] || { echo "wztest: $WANTZEL is missing; run ./build.sh" >&2; exit 2; }
+
+verbose=0; update=0; listonly=0; timing=0; toolchain=0; bench=0; filter=""; targets=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -v) verbose=1 ;;
+    --update) update=1 ;;
+    --list) listonly=1 ;;
+    --time) timing=1 ;;
+    --toolchain) toolchain=1 ;;
+    --bench) bench=1 ;;
+    -k) shift; filter="$1" ;;
+    -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
+    -*) echo "wztest: unknown option $1" >&2; exit 2 ;;
+    *) targets="$targets $1" ;;
+  esac
+  shift
+done
+[ -n "$targets" ] || targets="tests"
+
+have_timeout=0; command -v timeout >/dev/null 2>&1 && have_timeout=1
+pass=0; fail=0; skip=0; updated=0; toolskipped=0
+failed=""
+now_ms() { date +%s%3N 2>/dev/null || echo 0; }
+elapsed() { if [ $timing -eq 1 ]; then printf ' (%s ms)' $(( $(now_ms) - t0 )); fi; }
+ok()  { pass=$((pass+1)); printf '  ok    %s%s\n' "$1" "$(elapsed)"; }
+bad() { fail=$((fail+1)); failed="$failed
+  $1"; printf '  FAIL  %s\n' "$1"; [ -n "$2" ] && printf '%s\n' "$2" | sed 's/^/        /'; }
+limit() { if [ $verbose -eq 1 ]; then cat; else head -40; fi; }
+run() { secs="$1"; shift; if [ $have_timeout -eq 1 ]; then timeout "$secs" "$@"; else "$@"; fi; }
+
+list=$(for t in $targets; do
+  if [ -d "$t" ]; then find "$t" -type f \( -name '*.wz' -o -name '*.sh' \) | sort
+  elif [ -f "$t" ]; then echo "$t"
+  else echo "wztest: $t does not exist" >&2; fi
+done)
+
+for f in $list; do
+  case "$f" in tests/helpers.sh) continue ;; esac      # shared functions, not a test
+  case "$f" in tests/toolchain/*) [ $toolchain -eq 1 ] || { toolskipped=$((toolskipped+1)); continue; } ;; esac
+  case "$f" in tests/bench/*) [ $bench -eq 1 ] || continue ;; esac
+  case "$f" in *"$filter"*) ;; *) continue ;; esac
+  case "$f" in */progs/*) continue ;; esac
+  if [ $listonly -eq 1 ]; then echo "$f"; continue; fi
+  base="${f%.*}"
+  dir=$(dirname "$f")
+  secs=30; [ -f "$base.timeout" ] && secs=$(cat "$base.timeout")
+  T=$(mktemp -d) || exit 2
+  t0=$(now_ms)
+
+  case "$f" in
+  tests/bench/*.sh)
+    out=$(cd "$dir" && T="$T" run "$secs" sh "$ROOT/$f" 2>&1); rc=$?
+    if [ $rc -ne 0 ]; then bad "$f" "$(printf '%s' "$out" | limit)"; rm -rf "$T"; continue; fi
+    hash=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo -)
+    brc=0
+    printf '%s\n' "$out" | grep '^bench ' | while read -r _ name value unit; do
+      printf '  bench %-40s %12s %s\n' "$name" "$value" "$unit"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%F)" "$name" "$value" "$unit" "$hash" >> "$ROOT/tests/bench/results.tsv"
+      if [ -f "$dir/$name.min" ] && [ "$(printf '%s < %s\n' "$value" "$(cat "$dir/$name.min")" | bc 2>/dev/null)" = 1 ]; then echo "  SLOW $name below minimum $(cat "$dir/$name.min")"; exit 3; fi
+      if [ -f "$dir/$name.max" ] && [ "$(printf '%s > %s\n' "$value" "$(cat "$dir/$name.max")" | bc 2>/dev/null)" = 1 ]; then echo "  SLOW $name above maximum $(cat "$dir/$name.max")"; exit 3; fi
+    done || brc=$?
+    if [ $brc -eq 3 ]; then bad "$f" "benchmark limit exceeded"; else ok "$f"; fi
+    ;;
+  *.sh)
+    if ( cd "$dir" && T="$T" run "$secs" sh "$(basename "$f")" >"$T/out" 2>&1 ); then ok "$f"
+    else rc=$?
+      if [ $rc -eq 124 ]; then bad "$f" "timed out after ${secs}s"
+      else bad "$f" "$(limit <"$T/out")"; fi
+    fi
+    ;;
+  *.wz)
+    if [ -f "$base.err" ]; then
+      # Compiling must FAIL, with the text from .err in the message.  The working
+      # directory is the test's own, so that an error message carries the BARE file
+      # name: the .out files record "at rt_div_zero.wz:3" and not the path the suite
+      # happens to be run from.
+      if (cd "$dir" && "$WANTZEL" "$(basename "$f")" "$T/prog") >"$T/cerr" 2>&1; then
+        bad "$f" "compiled, but should have failed"
+      elif grep -qF "$(cat "$base.err")" "$T/cerr"; then ok "$f"
+      else bad "$f" "expected: $(cat "$base.err")
+got: $(limit <"$T/cerr")"; fi
+    else
+      if ! (cd "$dir" && "$WANTZEL" "$(basename "$f")" "$T/prog") >"$T/cerr" 2>&1; then
+        bad "$f" "$(limit <"$T/cerr")"
+      else
+        args=""; [ -f "$base.args" ] && args=$(cat "$base.args")
+        wantrc=0; [ -f "$base.exit" ] && wantrc=$(cat "$base.exit")
+        if [ -f "$base.stdin" ]; then
+          ( cd "$dir" && run "$secs" "$T/prog" $args <"$base.stdin" >"$T/out" 2>&1 ); rc=$?
+        else
+          ( cd "$dir" && run "$secs" "$T/prog" $args >"$T/out" 2>&1 ); rc=$?
+        fi
+        if [ $rc -eq 124 ] && [ "$wantrc" != "124" ]; then bad "$f" "timed out after ${secs}s"
+        elif [ $update -eq 1 ]; then cp "$T/out" "$base.out"; updated=$((updated+1)); printf '  upd   %s\n' "$f"
+        elif [ ! -f "$base.out" ]; then bad "$f" "$base.out is missing; create it with --update"
+        elif [ "$rc" != "$wantrc" ]; then bad "$f" "exit code $rc, expected $wantrc
+$(limit <"$T/out")"
+        elif cmp -s "$T/out" "$base.out"; then ok "$f"
+        else bad "$f" "$(diff -u "$base.out" "$T/out" | limit)"; fi
+      fi
+    fi
+    ;;
+  esac
+  rm -rf "$T"
+done
+
+[ $toolskipped -gt 0 ] && echo "($toolskipped toolchain tests not run; use --toolchain)"
+if [ $toolchain -eq 1 ]; then
+  echo "toolchain"
+  t0=$(now_ms)
+  if ./test.sh >/tmp/wztest-toolchain.$$ 2>&1; then ok "test.sh (bootstrap, fixed point, language behaviour)"
+  else bad "test.sh" "$(limit </tmp/wztest-toolchain.$$)"; fi
+  rm -f /tmp/wztest-toolchain.$$
+fi
+
+echo
+if [ $updated -gt 0 ]; then echo "$updated .out files updated; check the diff with git"; fi
+if [ $toolchain -eq 0 ]; then echo "(the toolchain tests were not run; use --toolchain)"; fi
+printf '%d passed, %d failed, %d skipped\n' $pass $fail $skip
+[ $fail -eq 0 ] || { printf 'failed:%s\n' "$failed"; exit 1; }
+exit 0

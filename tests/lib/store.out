@@ -1,0 +1,29 @@
+record size = 72
+count after open = 0
+count = 10
+high = 10
+del row 3 1
+count after del = 9
+alloc reuses = 3
+find item 5 -> row 4
+find item 4 (deleted) -> -1
+item 7 value x10 = 105
+item7
+replayed count = 9
+replayed live 2 = 1
+replayed live 3 = 0
+replayed item 10 kind = 1
+snapshot 1
+store.log0
+after snapshot+tail count = 10
+find item 11 -> row 3
+torn tail count = 10
+put after torn tail row = 10
+count after repair = 11
+filled up to = 100
+hash del 1
+hash get deleted -1
+hash get 18 18
+padded put 1
+padded get = 999
+rmdir = 0

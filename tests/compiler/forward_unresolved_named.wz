@@ -1,0 +1,18 @@
+// Must not compile.  Every unresolved forward is reported, not just the first, and each
+// one is NAMED at the file and line of its own declaration -- so a reader does not have
+// to guess which routine is missing, nor fix them one compile at a time.
+//
+// alpha (line 9) and gamma (line 11) are never defined; beta is, and must NOT be
+// reported.  The line numbers are the declarations themselves, not the line after them
+// and not the end of the program.
+program t;
+procedure alpha; forward;
+procedure beta; forward;
+procedure gamma; forward;
+
+procedure beta;
+begin
+end;
+
+begin
+end.

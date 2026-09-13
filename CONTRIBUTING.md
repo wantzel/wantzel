@@ -1,0 +1,97 @@
+# Contributing
+
+Thanks for looking. Wantzel is a small project and contributions are genuinely welcome —
+bug reports and worked-out pull requests alike.
+
+One thing to set expectations: this is a one-person project. Reckon on days rather than
+hours for a reply, and do not read silence as disinterest.
+
+## What is welcome
+
+**Bug reports.** The most useful kind by far. See below for what to include.
+
+**Pull requests**, in all three parts of the project:
+
+- **The language specification** ([docs/language.md](docs/language.md)) — the language is
+  frozen, so a change here needs an argument rather than a preference. That is not a
+  closed door: if the specification is unclear, contradicts the compiler, or describes
+  something that cannot be expressed, that is worth fixing.
+- **The compiler** (`src/wantzel.wz` and `bootstrap/boot.c`) — bug fixes, better error
+  messages, code generation.
+- **The standard library** (`lib/`) — the same, plus routines that are genuinely missing.
+
+Documentation, examples and tests are welcome everywhere, and a PR that only improves a
+confusing error message is a good PR.
+
+## Reporting a bug
+
+Include these four things and there is a good chance it can be fixed without a round trip:
+
+1. **The output of `wantzel --version`.**
+2. **Your platform** — Linux or Windows, and which distribution if that seems relevant.
+3. **A `.wz` file that reproduces it**, as small as you can make it. If a program stops
+   failing when you cut it down, that itself is worth mentioning.
+4. **What you expected, and what happened** — including the exact message. Compiler errors
+   look like `wantzel: file.wz:12: ...` and runtime errors like
+   `runtime error: ... at file.wz:42`; both name the line, so please paste them whole.
+
+A bug in the *specification* — where the compiler and [docs/language.md](docs/language.md)
+disagree — is worth reporting too. The specification is binding, so that is always a real
+bug in one of the two.
+
+## Before you open a pull request
+
+```bash
+./build.sh              # bootstrap, and check the fixed point
+./wztest --toolchain    # the whole suite, including the toolchain checks
+```
+
+Both must be green. `--toolchain` matters: it rebuilds the compiler with itself and
+checks the result is byte-identical, which is the check that catches most compiler
+changes going subtly wrong.
+
+Four things that are easy to miss, all of which the suite will tell you about:
+
+- **`src/wantzel.wz` and `bootstrap/boot.c` are counterparts.** They implement the same
+  compiler, one in Wantzel and one in C. Change one and you change the other in the same
+  commit, or the bootstrap fixed point breaks.
+- **Both targets, always.** A change to the compiler, the runtime or `lib/` carries the
+  Linux and the Windows side. "The tests run on Linux anyway" is not an argument.
+- **No external dependencies.** Zero is a hard requirement, not a score. The build and the
+  test suite use nothing beyond a C compiler and a POSIX shell — not even Python.
+- **A test with the change.** [docs/testing.md](docs/testing.md) explains the forms a test
+  can take; the shortest is a `.wz` file with a `.out` file beside it.
+
+If you are unsure whether an idea fits, open an issue before writing the code. That is
+cheaper for both of us than a finished PR that turns out to be the wrong direction.
+
+## Sign your commits (DCO)
+
+Please add a `Signed-off-by` line to your commits:
+
+```bash
+git commit -s -m "Your message"
+```
+
+That line is how you agree to the
+[Developer Certificate of Origin](https://developercertificate.org/) — a short statement
+used by the Linux kernel, Git and many others. In one sentence: you are saying you have
+the right to submit this code, because you wrote it, or because it came from somewhere
+with a compatible licence and you may pass it on.
+
+**You keep the copyright on what you write.** Nothing is assigned and there is no
+agreement to sign. Your contribution goes in under the same MIT licence as the rest of the
+repository, and your name stays on it in the history.
+
+## Style
+
+Match the code around what you are changing. Beyond that:
+
+- **Comments say why, not what.** The code already says what it does.
+- **English**, everywhere: code, comments, commit messages, documentation.
+- **A commit message explains the change**, not the file list. Why it was wrong, and why
+  this fixes it.
+
+## Security
+
+Please do not open a public issue for a vulnerability. See [SECURITY.md](SECURITY.md).

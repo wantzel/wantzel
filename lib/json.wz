@@ -1,0 +1,710 @@
+// lib/json.wz -- JSON scanning primitives.
+//
+// Nothing here builds a tree.  Values stay where they are, in the input
+// buffer, and are described by (offset, length) pairs.  The parsers that the
+// compiler generates from a `schema` declaration are built on these.
+
+include "io.wz";
+
+var
+  json.ival: int;          // last number scanned
+  json.bval: bool;         // last true/false scanned
+  json.sat, json.send: int;  // last string: text runs from sat up to send
+
+function json.ws(b: array of char; at: int; last: int): int;
+var c: char;
+begin
+  while at < last do
+  begin
+    c := b[at];
+    if (c <> ' ') and (c <> chr(9)) and (c <> chr(10)) and (c <> chr(13)) then return at;
+    at := at + 1;
+  end;
+  return at;
+end;
+
+// at points just past the opening quote; returns the index of the closing
+// quote, or -1 if the string never ends
+function json.strend(b: array of char; at: int; last: int): int;
+var q, n, s0: int;
+begin
+  s0 := at;
+  while true do
+  begin
+    q := scan(b, at, last, '"');
+    if q >= last then return -1;
+    n := 0;
+    while (q - n - 1 >= s0) and (b[q - n - 1] = '\\') do n := n + 1;
+    if (n mod 2) = 0 then return q;
+    at := q + 1;
+  end;
+  return -1;
+end;
+
+// scan a string value; fills json.sat/json.send; returns the position after it
+function json.string(b: array of char; at: int; last: int): int;
+var e: int;
+begin
+  at := json.ws(b, at, last);
+  if at >= last then return -1;
+  if b[at] <> '"' then return -1;
+  e := json.strend(b, at + 1, last);
+  if e < 0 then return -1;
+  json.sat := at + 1;
+  json.send := e;
+  return e + 1;
+end;
+
+// scan a number; the integer part lands in json.ival
+function json.number(b: array of char; at: int; last: int): int;
+var v: int;
+    neg: bool;
+begin
+  json.ival := 0;
+  at := json.ws(b, at, last);
+  if at >= last then return -1;
+  neg := false;
+  if b[at] = '-' then
+  begin
+    neg := true;
+    at := at + 1;
+  end;
+  if at >= last then return -1;
+  if (b[at] < '0') or (b[at] > '9') then return -1;
+  v := 0;
+  while (at < last) and (b[at] >= '0') and (b[at] <= '9') do
+  begin
+    v := v * 10 + (ord(b[at]) - 48);
+    at := at + 1;
+  end;
+  if neg then v := 0 - v;
+  json.ival := v;
+  if at < last then
+  begin
+    if (b[at] = '.') or (b[at] = 'e') or (b[at] = 'E') then
+    begin
+      at := at + 1;
+      while (at < last) and (((b[at] >= '0') and (b[at] <= '9'))
+            or (b[at] = '+') or (b[at] = '-') or (b[at] = 'e') or (b[at] = 'E')) do
+        at := at + 1;
+    end;
+  end;
+  return at;
+end;
+
+function json.literal(b: array of char; at: int; last: int; s: str): int;
+var i, n: int;
+begin
+  n := slen(s);
+  if at + n > last then return -1;
+  i := 0;
+  while i < n do
+  begin
+    if b[at + i] <> schar(s, i) then return -1;
+    i := i + 1;
+  end;
+  return at + n;
+end;
+
+// scan true/false into json.bval
+function json.boolean(b: array of char; at: int; last: int): int;
+var r: int;
+begin
+  at := json.ws(b, at, last);
+  r := json.literal(b, at, last, "true");
+  if r > 0 then
+  begin
+    json.bval := true;
+    return r;
+  end;
+  r := json.literal(b, at, last, "false");
+  if r > 0 then
+  begin
+    json.bval := false;
+    return r;
+  end;
+  return -1;
+end;
+
+// step over any value, however nested
+function json.skip(b: array of char; at: int; last: int): int;
+var c: char;
+    depth: int;
+begin
+  at := json.ws(b, at, last);
+  if at >= last then return -1;
+  c := b[at];
+  if c = '"' then
+  begin
+    at := json.strend(b, at + 1, last);
+    if at < 0 then return -1;
+    return at + 1;
+  end;
+  if (c = '{') or (c = '[') then
+  begin
+    depth := 0;
+    while at < last do
+    begin
+      c := b[at];
+      if c = '"' then
+      begin
+        at := json.strend(b, at + 1, last);
+        if at < 0 then return -1;
+      end
+      else if (c = '{') or (c = '[') then depth := depth + 1
+      else if (c = '}') or (c = ']') then
+      begin
+        depth := depth - 1;
+        if depth = 0 then return at + 1;
+      end;
+      at := at + 1;
+    end;
+    return -1;
+  end;
+  while at < last do
+  begin
+    c := b[at];
+    if (c = ',') or (c = '}') or (c = ']') or (c = ' ')
+       or (c = chr(9)) or (c = chr(10)) or (c = chr(13)) then return at;
+    at := at + 1;
+  end;
+  return at;
+end;
+
+// does the slice b[at..last) equal the literal s?
+function json.eq(b: array of char; at: int; last: int; s: str): bool;
+var i, n: int;
+begin
+  n := slen(s);
+  if last - at <> n then return false;
+  i := 0;
+  while i < n do
+  begin
+    if b[at + i] <> schar(s, i) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// does the string body b[from..upto) contain any escape?
+function json.escaped(b: array of char; from: int; upto: int): bool;
+begin
+  return scan(b, from, upto, '\\') < upto;
+end;
+
+// Decode the body of a JSON string into dst at position at.
+// Returns the number of bytes written, or -1 if the escapes are malformed.
+function json.unescape(src: array of char; from: int; upto: int; dst: array of char; at: int): int;
+var n, u, i, d: int;
+    c: char;
+begin
+  n := 0;
+  while from < upto do
+  begin
+    { DOES IT STILL FIT?  One check at the top of the loop instead of eleven at the
+      separate assignments: that way none can be forgotten when a write path is added.
+      Here ONE byte is tested (the ordinary case); the paths that write two or three --
+      only \uXXXX above 127 -- test for that themselves.  Without this line the routine
+      wrote outside dst and every caller had to guard it; now -1 is the answer, just as
+      for an invalid escape. }
+    if at + n >= len(dst) then return -1;
+    c := src[from];
+    if c <> '\\' then
+    begin
+      dst[at + n] := c;
+      n := n + 1;
+      from := from + 1;
+    end
+    else
+    begin
+      from := from + 1;
+      if from >= upto then return -1;
+      c := src[from];
+      from := from + 1;
+      if c = 'n' then
+      begin
+        dst[at + n] := chr(10); n := n + 1;
+      end
+      else if c = 't' then
+      begin
+        dst[at + n] := chr(9); n := n + 1;
+      end
+      else if c = 'r' then
+      begin
+        dst[at + n] := chr(13); n := n + 1;
+      end
+      else if c = 'b' then
+      begin
+        dst[at + n] := chr(8); n := n + 1;
+      end
+      else if c = 'f' then
+      begin
+        dst[at + n] := chr(12); n := n + 1;
+      end
+      else if c = 'u' then
+      begin
+        if from + 4 > upto then return -1;
+        u := 0;
+        i := 0;
+        while i < 4 do
+        begin
+          d := ord(src[from + i]);
+          if (d >= 48) and (d <= 57) then d := d - 48
+          else if (d >= 97) and (d <= 102) then d := d - 87
+          else if (d >= 65) and (d <= 70) then d := d - 55
+          else return -1;
+          u := u * 16 + d;
+          i := i + 1;
+        end;
+        from := from + 4;
+        if u < 128 then
+        begin
+          dst[at + n] := chr(u); n := n + 1;
+        end
+        else if u < 2048 then
+        begin
+          if at + n + 2 > len(dst) then return -1;
+          dst[at + n] := chr(bor(192, u shr 6));
+          dst[at + n + 1] := chr(bor(128, band(u, 63)));
+          n := n + 2;
+        end
+        else
+        begin
+          if at + n + 3 > len(dst) then return -1;
+          dst[at + n] := chr(bor(224, u shr 12));
+          dst[at + n + 1] := chr(bor(128, band(u shr 6, 63)));
+          dst[at + n + 2] := chr(bor(128, band(u, 63)));
+          n := n + 3;
+        end;
+      end
+      else
+      begin
+        dst[at + n] := c; n := n + 1;
+      end;
+    end;
+  end;
+  return n;
+end;
+
+// ------------------------------------------------------------- writing
+
+// append s to dst as a quoted, escaped JSON string
+function json.putstr(dst: array of char; at: int; s: str): int;
+var i, n: int;
+    c: char;
+begin
+  n := slen(s);
+  dst[at] := '"';
+  at := at + 1;
+  i := 0;
+  while i < n do
+  begin
+    c := schar(s, i);
+    if c = '"' then
+    begin
+      dst[at] := '\\'; dst[at + 1] := '"'; at := at + 2;
+    end
+    else if c = '\\' then
+    begin
+      dst[at] := '\\'; dst[at + 1] := '\\'; at := at + 2;
+    end
+    else if c = chr(10) then
+    begin
+      dst[at] := '\\'; dst[at + 1] := 'n'; at := at + 2;
+    end
+    else if c = chr(9) then
+    begin
+      dst[at] := '\\'; dst[at + 1] := 't'; at := at + 2;
+    end
+    else if c = chr(13) then
+    begin
+      dst[at] := '\\'; dst[at + 1] := 'r'; at := at + 2;
+    end
+    else if ord(c) < 32 then
+    begin
+      dst[at] := '\\'; dst[at + 1] := 'u'; dst[at + 2] := '0'; dst[at + 3] := '0';
+      dst[at + 4] := chr(48 + (ord(c) div 16));
+      if (ord(c) mod 16) < 10 then dst[at + 5] := chr(48 + (ord(c) mod 16))
+      else dst[at + 5] := chr(87 + (ord(c) mod 16));
+      at := at + 6;
+    end
+    else
+    begin
+      dst[at] := c;
+      at := at + 1;
+    end;
+    i := i + 1;
+  end;
+  dst[at] := '"';
+  return at + 1;
+end;
+
+// append a slice of src, escaped but without the surrounding quotes, for
+// building a larger JSON string piece by piece
+function json.escslice(dst: array of char; at: int; src: array of char; from: int; upto: int): int;
+var c: char;
+begin
+  while from < upto do
+  begin
+    c := src[from];
+    if (c = '"') or (c = '\\') then
+    begin
+      dst[at] := '\\'; dst[at + 1] := c; at := at + 2;
+    end
+    else if c = chr(10) then
+    begin
+      dst[at] := '\\'; dst[at + 1] := 'n'; at := at + 2;
+    end
+    else if c = chr(9) then
+    begin
+      dst[at] := '\\'; dst[at + 1] := 't'; at := at + 2;
+    end
+    else if c = chr(13) then
+    begin
+      dst[at] := '\\'; dst[at + 1] := 'r'; at := at + 2;
+    end
+    else if ord(c) < 32 then
+    begin
+      dst[at] := '\\'; dst[at + 1] := 'u'; dst[at + 2] := '0'; dst[at + 3] := '0';
+      dst[at + 4] := chr(48 + (ord(c) div 16));
+      if (ord(c) mod 16) < 10 then dst[at + 5] := chr(48 + (ord(c) mod 16))
+      else dst[at + 5] := chr(87 + (ord(c) mod 16));
+      at := at + 6;
+    end
+    else
+    begin
+      dst[at] := c;
+      at := at + 1;
+    end;
+    from := from + 1;
+  end;
+  return at;
+end;
+
+// append a slice of src as a quoted, escaped JSON string
+// Returns the new position, or -1 when it does not fit.
+//
+// A single character can become SIX bytes here (\u00XX for a control character), so the
+// check sits at the top of the loop and tests the heaviest case: if that fits, the
+// shorter paths fit too.  That is one check instead of ten, and none can be forgotten
+// when a write path is added.
+//
+// Why this matters: the callers write into HTTP output buffers with it (lib/http.wz,
+// lib/mcp.wz, lib/oauth.wz, lib/tools.wz) and the content comes partly from outside --
+// a path, an error message, a redirect uri.  Without a bound a long value writes past
+// the end of the buffer.
+function json.putslice(dst: array of char; at: int; src: array of char; from: int; upto: int): int;
+var c: char;
+begin
+  if at + 1 > len(dst) then return -1;
+  dst[at] := '"';
+  at := at + 1;
+  while from < upto do
+  begin
+    { six is the heaviest path (\u00XX); plus one for the closing quote }
+    if at + 7 > len(dst) then return -1;
+    c := src[from];
+    if (c = '"') or (c = '\\') then
+    begin
+      dst[at] := '\\'; dst[at + 1] := c; at := at + 2;
+    end
+    else if c = chr(10) then
+    begin
+      dst[at] := '\\'; dst[at + 1] := 'n'; at := at + 2;
+    end
+    else if c = chr(9) then
+    begin
+      dst[at] := '\\'; dst[at + 1] := 't'; at := at + 2;
+    end
+    else if c = chr(13) then
+    begin
+      dst[at] := '\\'; dst[at + 1] := 'r'; at := at + 2;
+    end
+    else if ord(c) < 32 then
+    begin
+      dst[at] := '\\'; dst[at + 1] := 'u'; dst[at + 2] := '0'; dst[at + 3] := '0';
+      dst[at + 4] := chr(48 + (ord(c) div 16));
+      if (ord(c) mod 16) < 10 then dst[at + 5] := chr(48 + (ord(c) mod 16))
+      else dst[at + 5] := chr(87 + (ord(c) mod 16));
+      at := at + 6;
+    end
+    else
+    begin
+      dst[at] := c;
+      at := at + 1;
+    end;
+    from := from + 1;
+  end;
+  dst[at] := '"';
+  return at + 1;
+end;
+
+// ------------------------------------------------------------- reals
+
+var
+  json.rval: real;           // last real scanned
+
+// is the value at `at` the literal null?
+function json.isnull(b: array of char; at: int; last: int): bool;
+begin
+  at := json.ws(b, at, last);
+  if at + 4 > last then return false;
+  return (b[at] = 'n') and (b[at + 1] = 'u') and (b[at + 2] = 'l') and (b[at + 3] = 'l');
+end;
+
+// scan a JSON number as a real into json.rval; returns the position after it
+// (mantissa up to 18 significant digits, one rounding for exponents to 22)
+function json.real(b: array of char; at: int; last: int): int;
+var m, nd, ex, ev, esign, d: int;
+    neg: bool;
+    p, ten: real;
+begin
+  json.rval := real(0);
+  at := json.ws(b, at, last);
+  if at >= last then return -1;
+  neg := false;
+  if b[at] = '-' then
+  begin
+    neg := true;
+    at := at + 1;
+  end;
+  if at >= last then return -1;
+  if (b[at] < '0') or (b[at] > '9') then return -1;
+  m := 0; nd := 0; ex := 0;
+  while (at < last) and (b[at] >= '0') and (b[at] <= '9') do
+  begin
+    d := ord(b[at]) - 48;
+    if nd < 18 then
+    begin
+      m := m * 10 + d;
+      if m <> 0 then nd := nd + 1;
+    end
+    else ex := ex + 1;
+    at := at + 1;
+  end;
+  if (at < last) and (b[at] = '.') then
+  begin
+    at := at + 1;
+    while (at < last) and (b[at] >= '0') and (b[at] <= '9') do
+    begin
+      d := ord(b[at]) - 48;
+      if nd < 18 then
+      begin
+        m := m * 10 + d;
+        if m <> 0 then nd := nd + 1;
+        ex := ex - 1;
+      end;
+      at := at + 1;
+    end;
+  end;
+  if (at < last) and ((b[at] = 'e') or (b[at] = 'E')) then
+  begin
+    at := at + 1;
+    esign := 1;
+    if at < last then
+    begin
+      if b[at] = '-' then begin esign := -1; at := at + 1; end
+      else if b[at] = '+' then at := at + 1;
+    end;
+    ev := 0;
+    while (at < last) and (b[at] >= '0') and (b[at] <= '9') do
+    begin
+      if ev < 100000 then ev := ev * 10 + (ord(b[at]) - 48);
+      at := at + 1;
+    end;
+    ex := ex + esign * ev;
+  end;
+  p := real(1);
+  ten := real(10);
+  ev := ex;
+  if ev < 0 then ev := 0 - ev;
+  while ev > 0 do
+  begin
+    p := p * ten;
+    ev := ev - 1;
+  end;
+  json.rval := real(m);
+  if ex < 0 then json.rval := json.rval / p else json.rval := json.rval * p;
+  if neg then json.rval := -json.rval;
+  return at;
+end;
+
+var
+  json.rdig: array[0..31] of char;
+
+// append v to dst at position at as a JSON number with up to 15 significant
+// digits (trailing zeros trimmed); NaN and infinities become null
+function json.putreal(dst: array of char; at: int; v: real): int;
+var e, i, n, m, k, ip, fp: int;
+    a, ten, lim: real;
+    neg: bool;
+begin
+  if not (v = v) then return io.push(dst, at, "null");
+  lim := real(1);
+  i := 0;
+  while i < 40 do begin lim := lim * real(10000000); i := i + 1; end;   { ~1e280 as an "infinite" bound }
+  if (v > lim) or (v < -lim) then return io.push(dst, at, "null");
+  neg := v < real(0);
+  a := v;
+  if neg then a := -a;
+  ten := real(10);
+  if a = real(0) then
+  begin
+    if neg then begin dst[at] := '-'; at := at + 1; end;
+    return io.push(dst, at, "0.0");       { a real always carries a point, as JSON floats do }
+  end;
+  { scale a into [1, 10) and count the decimal exponent }
+  e := 0;
+  while a >= ten do begin a := a / ten; e := e + 1; end;
+  while a < real(1) do begin a := a * ten; e := e - 1; end;
+  { 15 significant digits as an integer }
+  m := round(a * real(100000000000000));
+  if m >= 1000000000000000 then begin m := m div 10; e := e + 1; end;
+  n := 15;
+  while (n > 1) and ((m mod 10) = 0) do begin m := m div 10; n := n - 1; end;
+  i := 0;
+  k := m;
+  while k > 0 do begin json.rdig[i] := chr(48 + (k mod 10)); k := k div 10; i := i + 1; end;
+  { json.rdig holds the digits reversed; i = n }
+  if neg then begin dst[at] := '-'; at := at + 1; end;
+  { The threshold at which a number is written exponentially.  Python's repr switches
+    at 1e16 and not at 1e15, and at 1e-5 on the other side.  That threshold is adopted
+    here because JSON is often read or written by a Python side, and then a comparison
+    on TEXT has to match.  Measured 11-09-2026. }
+  if (e >= 16) or (e <= -5) then
+  begin
+    dst[at] := json.rdig[n - 1]; at := at + 1;
+    if n > 1 then
+    begin
+      dst[at] := '.'; at := at + 1;
+      k := n - 2;
+      while k >= 0 do begin dst[at] := json.rdig[k]; at := at + 1; k := k - 1; end;
+    end;
+    dst[at] := 'e'; at := at + 1;
+    { Python ALWAYS writes the sign and pads the exponent to two digits: 1e+16,
+      1e-05.  That is not taste but what a text comparison expects. }
+    if e < 0 then begin dst[at] := '-'; at := at + 1; e := 0 - e; end
+    else begin dst[at] := '+'; at := at + 1; end;
+    if e < 10 then begin dst[at] := '0'; at := at + 1; end;
+    return io.pushnum(dst, at, e);
+  end;
+  if e < 0 then
+  begin
+    at := io.push(dst, at, "0.");
+    k := e + 1;
+    while k < 0 do begin dst[at] := '0'; at := at + 1; k := k + 1; end;
+    k := n - 1;
+    while k >= 0 do begin dst[at] := json.rdig[k]; at := at + 1; k := k - 1; end;
+    return at;
+  end;
+  ip := e + 1;                   { digits before the point }
+  k := n - 1;
+  fp := 0;
+  while fp < ip do
+  begin
+    if k >= 0 then dst[at] := json.rdig[k] else dst[at] := '0';
+    at := at + 1; k := k - 1; fp := fp + 1;
+  end;
+  if k >= 0 then
+  begin
+    dst[at] := '.'; at := at + 1;
+    while k >= 0 do begin dst[at] := json.rdig[k]; at := at + 1; k := k - 1; end;
+  end
+  else
+  begin
+    dst[at] := '.'; at := at + 1;    { a whole value keeps its .0 so it stays a JSON float }
+    dst[at] := '0'; at := at + 1;
+  end;
+  return at;
+end;
+
+// ------------------------------------------------------- bounded copies
+
+// decode the JSON string body src[from..upto) into dst from position 0;
+// returns the length, or -1 when it does not fit or is malformed
+function json.copystr(src: array of char; from: int; upto: int; dst: array of char): int;
+var n, u, i, d, cap: int;
+    c: char;
+begin
+  cap := len(dst);
+  n := 0;
+  while from < upto do
+  begin
+    c := src[from];
+    if c <> '\\' then
+    begin
+      if n >= cap then return -1;
+      dst[n] := c;
+      n := n + 1;
+      from := from + 1;
+    end
+    else
+    begin
+      from := from + 1;
+      if from >= upto then return -1;
+      c := src[from];
+      from := from + 1;
+      if c = 'u' then
+      begin
+        if from + 4 > upto then return -1;
+        u := 0;
+        i := 0;
+        while i < 4 do
+        begin
+          d := ord(src[from + i]);
+          if (d >= 48) and (d <= 57) then d := d - 48
+          else if (d >= 97) and (d <= 102) then d := d - 87
+          else if (d >= 65) and (d <= 70) then d := d - 55
+          else return -1;
+          u := u * 16 + d;
+          i := i + 1;
+        end;
+        from := from + 4;
+        if u < 128 then
+        begin
+          if n >= cap then return -1;
+          dst[n] := chr(u); n := n + 1;
+        end
+        else if u < 2048 then
+        begin
+          if n + 2 > cap then return -1;
+          dst[n] := chr(bor(192, u shr 6));
+          dst[n + 1] := chr(bor(128, band(u, 63)));
+          n := n + 2;
+        end
+        else
+        begin
+          if n + 3 > cap then return -1;
+          dst[n] := chr(bor(224, u shr 12));
+          dst[n + 1] := chr(bor(128, band(u shr 6, 63)));
+          dst[n + 2] := chr(bor(128, band(u, 63)));
+          n := n + 3;
+        end;
+      end
+      else
+      begin
+        if n >= cap then return -1;
+        if c = 'n' then dst[n] := chr(10)
+        else if c = 't' then dst[n] := chr(9)
+        else if c = 'r' then dst[n] := chr(13)
+        else if c = 'b' then dst[n] := chr(8)
+        else if c = 'f' then dst[n] := chr(12)
+        else dst[n] := c;
+        n := n + 1;
+      end;
+    end;
+  end;
+  return n;
+end;
+
+// append src[from..upto) verbatim (already valid JSON text) to dst
+function json.putraw(dst: array of char; at: int; src: array of char; from: int; upto: int): int;
+begin
+  while from < upto do
+  begin
+    dst[at] := src[from];
+    at := at + 1;
+    from := from + 1;
+  end;
+  return at;
+end;

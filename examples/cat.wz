@@ -1,0 +1,52 @@
+// cat.wz -- copy the named files, or standard input, to standard output.
+
+program cat;
+
+const
+  BUFSZ = 65536;
+
+var
+  buf:  array[0..BUFSZ-1] of char;
+  path: array[0..1023] of char;
+  i, n, fd, argi: int;
+
+procedure fatal(m: str);
+begin
+  sys3(1, 2, sadr(m), slen(m));
+  halt(1);
+end;
+
+function copyfd(f: int): int;
+var k: int;
+begin
+  while true do
+  begin
+    k := sys3(0, f, addr(buf[0]), BUFSZ);
+    if k < 0 then return 1;
+    if k = 0 then return 0;
+    sys3(1, 1, addr(buf[0]), k);
+  end;
+  return 0;
+end;
+
+begin
+  if argc() = 1 then halt(copyfd(0));
+  argi := 1;
+  while argi < argc() do
+  begin
+    i := 0;
+    while argch(argi, i) <> chr(0) do
+    begin
+      if i >= 1023 then fatal("cat: path too long\n");
+      path[i] := argch(argi, i);
+      i := i + 1;
+    end;
+    path[i] := chr(0);
+    fd := sys3(2, addr(path[0]), 0, 0);
+    if fd < 0 then fatal("cat: cannot open file\n");
+    n := copyfd(fd);
+    sys1(3, fd);
+    if n <> 0 then fatal("cat: read error\n");
+    argi := argi + 1;
+  end;
+end.

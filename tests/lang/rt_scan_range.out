@@ -1,0 +1,1 @@
+runtime error: scan() range lies outside the array at rt_scan_range.wz:3

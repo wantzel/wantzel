@@ -1,0 +1,30 @@
+// lib/proc.wz: forking, reaping, and unpacking the exit status correctly.
+program proc_t;
+include "io.wz";
+include "proc.wz";
+var pid, st: int;
+procedure show(s: str; v: int); begin io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n"); end;
+begin
+  // a child that exits cleanly with code 7
+  pid := proc.fork;
+  if pid = 0 then halt(7);
+  st := proc.wait(pid);
+  show("reaped, status = ", proc.status[0]);
+  show("  exitcode = ", proc.exitcode(proc.status[0]));
+  if proc.exited(proc.status[0]) then io.puts(STDOUT, "  exited = yes\n") else io.puts(STDOUT, "  exited = no\n");
+  show("  signal = ", proc.signal(proc.status[0]));
+  { proc.ok is false: the child exited cleanly but with code 7, and that is not success }
+  if proc.ok(proc.status[0]) then io.puts(STDOUT, "  ok = yes\n") else io.puts(STDOUT, "  ok = no (code 7)\n");
+
+  // a child killed by a signal: the exit code is then 0, and without checking the
+  // signal it would look like success
+  pid := proc.fork;
+  if pid = 0 then begin st := sys4(SYS.nanosleep, 0, 0, 0, 0); halt(0); end;
+  st := proc.kill(pid, 9);
+  st := proc.wait(pid);
+  show("killed child, status = ", proc.status[0]);
+  show("  exit code says = ", proc.exitcode(proc.status[0]));
+  show("  signal says    = ", proc.signal(proc.status[0]));
+  if proc.ok(proc.status[0]) then io.puts(STDOUT, "  ok = yes (WRONG)\n") else io.puts(STDOUT, "  ok = no (correct)\n");
+  show("children still alive = ", proc.nchildren);
+end.

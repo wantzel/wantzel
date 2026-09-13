@@ -1,0 +1,259 @@
+// lib/io.wz -- output, numbers and little-endian byte packing.
+//
+// Everything here talks to the kernel directly; there is no buffering
+// layer and no allocation.
+
+const
+  STDIN  = 0;
+  STDOUT = 1;
+  STDERR = 2;
+
+  SYS.read   = 0;
+  SYS.write  = 1;
+  SYS.open   = 2;
+  SYS.close  = 3;
+  SYS.fcntl  = 72;
+  SYS.socket = 41;
+  SYS.accept = 43;
+  SYS.sendto = 44;
+  SYS.shutdown = 48;
+  SYS.bind   = 49;
+  SYS.listen = 50;
+  SYS.setsockopt = 54;
+  SYS.fork   = 57;
+  SYS.exit   = 231;
+  SYS.epwait = 232;
+  SYS.epctl  = 233;
+  SYS.accept4 = 288;
+  SYS.epcreate = 291;
+  SYS.clock  = 228;
+  SYS.wait4  = 61;
+  SYS.kill   = 62;                 // send a signal; sig 0 only tests existence
+  SYS.getpid = 39;
+  SYS.connect = 42;
+  SYS.nanosleep = 35;
+  SYS.stat = 4;
+  SYS.lstat = 6;
+  SYS.getdents = 217;
+
+var
+  io.nbuf: array[0..31] of char;
+  io.tmp:  array[0..255] of char;
+  io.ts:   array[0..15] of char;
+
+// monotonic nanoseconds
+function io.now: int;
+var i, sec, ns: int;
+begin
+  sys2(SYS.clock, 1, addr(io.ts[0]));
+  sec := 0;
+  i := 7;
+  while i >= 0 do
+  begin
+    sec := bor(sec shl 8, ord(io.ts[i]));
+    i := i - 1;
+  end;
+  ns := 0;
+  i := 15;
+  while i >= 8 do
+  begin
+    ns := bor(ns shl 8, ord(io.ts[i]));
+    i := i - 1;
+  end;
+  return sec * 1000000000 + ns;
+end;
+
+function io.write(fd: int; a: int; n: int): int;
+begin
+  return sys3(SYS.write, fd, a, n);
+end;
+
+function io.read(fd: int; a: int; n: int): int;
+begin
+  return sys3(SYS.read, fd, a, n);
+end;
+
+// write and forget: for output where a short write cannot be acted on anyway
+procedure io.out(fd: int; a: int; n: int);
+begin
+  sys3(SYS.write, fd, a, n);
+end;
+
+procedure io.puts(fd: int; s: str);
+begin
+  sys3(SYS.write, fd, sadr(s), slen(s));
+end;
+
+// render v into io.nbuf, returns the length
+function io.digits(v: int): int;
+var n, i, j: int;
+    c: char;
+begin
+  n := 0;
+  if v = 0 then
+  begin
+    io.nbuf[0] := '0';
+    return 1;
+  end;
+  if v < 0 then
+  begin
+    io.nbuf[0] := '-';
+    v := 0 - v;
+    n := 1;
+  end;
+  i := n;
+  while v > 0 do
+  begin
+    io.nbuf[n] := chr(48 + (v mod 10));
+    v := v div 10;
+    n := n + 1;
+  end;
+  j := n - 1;
+  while i < j do
+  begin
+    c := io.nbuf[i]; io.nbuf[i] := io.nbuf[j]; io.nbuf[j] := c;
+    i := i + 1; j := j - 1;
+  end;
+  return n;
+end;
+
+procedure io.putn(fd: int; v: int);
+var n: int;
+begin
+  n := io.digits(v);
+  sys3(SYS.write, fd, addr(io.nbuf[0]), n);
+end;
+
+procedure io.fatal(s: str);
+begin
+  io.puts(STDERR, s);
+  io.puts(STDERR, "\n");
+  halt(1);
+end;
+
+// append the decimal form of v to b at position at; returns the new position
+function io.pushnum(b: array of char; at: int; v: int): int;
+var n, i: int;
+begin
+  n := io.digits(v);
+  i := 0;
+  while i < n do
+  begin
+    b[at] := io.nbuf[i];
+    at := at + 1;
+    i := i + 1;
+  end;
+  return at;
+end;
+
+// append a string literal to b at position at
+function io.push(b: array of char; at: int; s: str): int;
+var i, n: int;
+begin
+  n := slen(s);
+  i := 0;
+  while i < n do
+  begin
+    b[at] := schar(s, i);
+    at := at + 1;
+    i := i + 1;
+  end;
+  return at;
+end;
+
+procedure io.put32(b: array of char; at: int; v: int);
+begin
+  b[at]     := chr(band(v, 255));
+  b[at + 1] := chr(band(v shr 8, 255));
+  b[at + 2] := chr(band(v shr 16, 255));
+  b[at + 3] := chr(band(v shr 24, 255));
+end;
+
+function io.get64(b: array of char; at: int): int;
+var v, i: int;
+begin
+  v := 0;
+  i := 7;
+  while i >= 0 do
+  begin
+    v := bor(v shl 8, ord(b[at + i]));
+    i := i - 1;
+  end;
+  return v;
+end;
+
+function io.get16(b: array of char; at: int): int;
+begin
+  return bor(ord(b[at]), ord(b[at + 1]) shl 8);
+end;
+
+function io.get32(b: array of char; at: int): int;
+var v: int;
+begin
+  v := ord(b[at]);
+  v := bor(v, ord(b[at + 1]) shl 8);
+  v := bor(v, ord(b[at + 2]) shl 16);
+  v := bor(v, ord(b[at + 3]) shl 24);
+  return v;
+end;
+
+// system calls for storage: files that are written, mapped memory, locks, randomness
+const
+  SYS.lseek     = 8;
+  SYS.mmap      = 9;
+  SYS.munmap    = 11;
+  SYS.msync     = 26;
+  SYS.flock     = 73;
+  SYS.fsync     = 74;
+  SYS.ftruncate = 77;
+  SYS.rename    = 82;
+  SYS.mkdir     = 83;
+  SYS.rmdir     = 84;
+  SYS.unlink    = 87;
+  SYS.getrandom = 318;
+
+  O_RDONLY = 0;
+  O_WRONLY = 1;
+  O_RDWR   = 2;
+  O_CREAT  = 64;
+  O_TRUNC  = 512;
+  O_APPEND = 1024;
+
+  PROT_READ  = 1;
+  PROT_WRITE = 2;
+  MAP_SHARED  = 1;
+  MAP_PRIVATE = 2;
+  MAP_ANONYMOUS = 32;
+
+  LOCK_SH = 1;
+  LOCK_EX = 2;
+  LOCK_NB = 4;
+  LOCK_UN = 8;
+
+  SEEK_SET = 0;
+  SEEK_CUR = 1;
+  SEEK_END = 2;
+
+  CLOCK_REALTIME = 0;
+
+// wall-clock nanoseconds since the Unix epoch
+function io.realtime: int;
+var i, sec, ns: int;
+begin
+  sys2(SYS.clock, CLOCK_REALTIME, addr(io.ts[0]));
+  sec := 0;
+  i := 7;
+  while i >= 0 do
+  begin
+    sec := bor(sec shl 8, ord(io.ts[i]));
+    i := i - 1;
+  end;
+  ns := 0;
+  i := 15;
+  while i >= 8 do
+  begin
+    ns := bor(ns shl 8, ord(io.ts[i]));
+    i := i - 1;
+  end;
+  return sec * 1000000000 + ns;
+end;

@@ -1,0 +1,48 @@
+// view(addr, count): any memory as an array view, for mmap and kernel buffers.
+program t;
+include "io.wz";
+var
+  words: array[0..3] of int;
+  bytes: array[0..31] of char;
+  i: int;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+function sumb(b: array of char): int;
+var i, t: int;
+begin
+  i := 0;
+  while i < len(b) do begin t := t + ord(b[i]); i := i + 1; end;
+  return t;
+end;
+function sumw(w: array of int): int;
+var i, t: int;
+begin
+  i := 0;
+  while i < len(w) do begin t := t + w[i]; i := i + 1; end;
+  return t;
+end;
+procedure fill(b: array of char; c: char);
+var i: int;
+begin
+  i := 0;
+  while i < len(b) do begin b[i] := c; i := i + 1; end;
+end;
+begin
+  words[0] := 1; words[1] := 256; words[2] := 65536; words[3] := 0;
+  show("bytes of words = ", sumb(view(addr(words[0]), 32)));      { 1 + 1 + 1 = 3 }
+  fill(view(addr(bytes[8]), 8), 'x');
+  show("bytes[7] = ", ord(bytes[7]));                              { 0 }
+  show("bytes[8] = ", ord(bytes[8]));                              { 120 }
+  show("bytes[15] = ", ord(bytes[15]));                            { 120 }
+  show("bytes[16] = ", ord(bytes[16]));                            { 0 }
+  show("words via view = ", sumw(view(addr(words[1]), 2)));       { 65792 }
+  show("literal via view = ", sumb(view(sadr("AB"), slen("AB")))); { 131 }
+  show("literal direct = ", sumb("AB"));                           { 131: a literal is an array of char }
+  show("empty view = ", sumb(view(0, 0)));                         { 0 }
+  i := 8;
+  show("view bounds = ", sumb(view(addr(bytes[0]), i)));           { 0 }
+  fill(view(addr(bytes[0]), 4), 'y');
+  show("bytes[3] = ", ord(bytes[3]));                              { 121 }
+end.

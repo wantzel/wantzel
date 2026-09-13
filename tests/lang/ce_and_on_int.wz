@@ -1,0 +1,2 @@
+// Must not compile: "type error in and: expected bool, found int".
+program t; var i: int; begin i := i and 1; end.

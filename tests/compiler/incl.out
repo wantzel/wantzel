@@ -1,0 +1,4 @@
+nested include ok
+array parameter writes 32 bytes
+########
+array parameter reads ok

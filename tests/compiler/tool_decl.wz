@@ -1,0 +1,46 @@
+// A tools block is a compile-time table: generated constants, the handler forward
+// declarations and tool.byname/tool.run exist without any transport included.
+program t;
+include "io.wz";
+include "json.wz";
+schema In = record
+  n: int;
+end;
+schema Out = record
+  twice: int;
+  label: text[8];
+end;
+tools
+  double(In): Out "Double a number." readonly;
+  shout(In): Out "Not implemented, always fails.";
+end;
+function tool.double(a: array of In; r: array of Out): int;
+begin
+  r[0].twice := a[0].n * 2;
+  r[0].label_n := io.push(r[0].label, 0, "ok");
+  return 0;
+end;
+function tool.shout(a: array of In; r: array of Out): int;
+begin
+  return tool.fail("no");
+end;
+var
+  doc: array[0..63] of char;
+  buf: array[0..255] of char;
+  n, i: int;
+begin
+  io.putn(STDOUT, tool.count); io.puts(STDOUT, "\n");
+  io.putn(STDOUT, tool.id_double); io.putn(STDOUT, tool.id_shout); io.puts(STDOUT, "\n");
+  n := io.push(doc, 0, "{\"n\":21}");
+  i := tool.byname(doc, 2, 3);                   { the key "n" is not a tool }
+  io.putn(STDOUT, i); io.puts(STDOUT, "\n");
+  n := tool.run(tool.id_double, doc, 0, n, buf);
+  io.out(STDOUT, addr(buf[0]), n); io.puts(STDOUT, "\n");
+  n := io.push(doc, 0, "{\"n\":1}");
+  n := tool.run(tool.id_shout, doc, 0, n, buf);
+  io.putn(STDOUT, n); io.puts(STDOUT, " ");
+  io.out(STDOUT, addr(tool.err[0]), tool.errn); io.puts(STDOUT, "\n");
+  n := io.push(doc, 0, "{}");
+  io.putn(STDOUT, tool.run(tool.id_double, doc, 0, n, buf)); io.puts(STDOUT, "\n");
+  io.puts(STDOUT, tool.list); io.puts(STDOUT, "\n");
+end.

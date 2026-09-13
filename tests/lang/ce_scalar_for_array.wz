@@ -1,0 +1,2 @@
+// Must not compile: "this parameter needs an array".
+program t; var i: int; procedure p(a: array of char); begin end; begin p(i); end.

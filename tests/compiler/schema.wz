@@ -1,0 +1,79 @@
+// schema.wz -- the compiled schema parser, end to end.
+program schematest;
+
+include "json.wz";
+
+schema Msg = record
+  jsonrpc: text;
+  id:      int?;
+  method:  text of ("initialize", "tools/list", "tools/call", "ping");
+  params:  json?;
+  loud:    bool?;
+end;
+
+var
+  m: Msg;
+  doc: array[0..2047] of char;
+  n: int;
+
+procedure load(s: str);
+var i: int;
+begin
+  n := slen(s);
+  i := 0;
+  while i < n do
+  begin
+    doc[i] := schar(s, i);
+    i := i + 1;
+  end;
+end;
+
+procedure show;
+var r: int;
+begin
+  r := Msg.parse(doc, 0, n, m);
+  if r < 0 then
+  begin
+    io.puts(STDOUT, "rejected\n");
+    return;
+  end;
+  io.puts(STDOUT, "method=");
+  io.putn(STDOUT, m.method);
+  io.puts(STDOUT, " id=");
+  if m.id_ok then io.putn(STDOUT, m.id) else io.puts(STDOUT, "-");
+  io.puts(STDOUT, " loud=");
+  if m.loud_ok then
+  begin
+    if m.loud then io.puts(STDOUT, "yes") else io.puts(STDOUT, "no");
+  end
+  else io.puts(STDOUT, "-");
+  io.puts(STDOUT, " params=");
+  if m.params_ok then io.out(STDOUT, addr(doc[m.params_at]), m.params_end - m.params_at)
+  else io.puts(STDOUT, "-");
+  io.puts(STDOUT, "\n");
+end;
+
+begin
+  load("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"a\":1}}");
+  show;
+  load("{ \"method\":\"ping\" , \"extra\":[1,{\"x\":\"}\"}], \"jsonrpc\":\"2.0\", \"id\":-3, \"loud\":true }");
+  show;
+  load("{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}");
+  show;
+  load("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\"}");
+  show;
+  load("{\"id\":1,\"method\":\"ping\"}");
+  show;
+  load("{\"jsonrpc\":\"2.0\",\"method\":");
+  show;
+  load("[1,2,3]");
+  show;
+  io.puts(STDOUT, "constants: ");
+  io.putn(STDOUT, Msg.method.initialize);
+  io.putn(STDOUT, Msg.method.tools_list);
+  io.putn(STDOUT, Msg.method.tools_call);
+  io.putn(STDOUT, Msg.method.ping);
+  io.puts(STDOUT, " fields=");
+  io.putn(STDOUT, Msg.fields);
+  io.puts(STDOUT, "\n");
+end.

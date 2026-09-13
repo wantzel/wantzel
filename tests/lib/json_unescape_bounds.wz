@@ -1,0 +1,47 @@
+// json.unescape and json.putslice do not write past their destination buffer.
+//
+// Both used to write without checking len(dst); the callers had to guard it themselves
+// and not all of them did. That is a real hole and not a theoretical one: json.putslice
+// writes HTTP output in lib/http.wz, lib/mcp.wz, lib/oauth.wz and lib/tools.wz, and part
+// of that content comes from outside -- a requested path, an error message, a redirect
+// URI.
+//
+// The worst cases are why checking one byte at a time is not enough: a \uXXXX above 127
+// becomes THREE bytes in unescape, and a control character becomes SIX in putslice. A
+// buffer with one byte to spare is therefore not enough.
+//
+// Both now return -1 when it does not fit, just as they do for an invalid escape.
+program json_bounds_t;
+include "json.wz";
+var src: array[0..63] of char;
+    small: array[0..3] of char;      // deliberately too small
+    big: array[0..63] of char;
+    sn: int;
+procedure show(s: str; v: int); begin io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n"); end;
+begin
+  { --- json.unescape --- }
+  sn := io.push(src, 0, "abcdefgh");
+  { does not fit: eight characters into a buffer of four }
+  show("unescape too small = ", json.unescape(src, 0, sn, small, 0));
+  { past precies: vier tekens in vier }
+  show("unescape exact fit = ", json.unescape(src, 0, 4, small, 0));
+  { fits in the large buffer }
+  show("unescape roomy = ", json.unescape(src, 0, sn, big, 0));
+  { an at-offset counts: from position 2 there is room for two more }
+  show("unescape with at=2 = ", json.unescape(src, 0, 4, small, 2));
+
+  { A \uXXXX ABOVE 127 WRITES THREE BYTES: with two free that must fail, and that is the
+    case a single-byte check would miss. }
+  sn := io.push(src, 0, "\\u20ac");
+  show("unescape euro into 4 = ", json.unescape(src, 0, sn, small, 0));
+  show("unescape euro at at=2 = ", json.unescape(src, 0, sn, small, 2));
+
+  { --- json.putslice --- }
+  sn := io.push(src, 0, "abcdefgh");
+  show("putslice too small = ", json.putslice(small, 0, src, 0, sn));
+  show("putslice roomy = ", json.putslice(big, 0, src, 0, sn));
+  { A CONTROL CHARACTER BECOMES SIX BYTES: that never fits in a buffer of four }
+  src[0] := chr(1);
+  show("putslice control char into 4 = ", json.putslice(small, 0, src, 0, 1));
+  show("putslice control char roomy = ", json.putslice(big, 0, src, 0, 1));
+end.

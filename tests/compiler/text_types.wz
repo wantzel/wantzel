@@ -1,0 +1,34 @@
+// One concept for text as a value: array of char + length.  A literal, an
+// array, a slice and a view all pass where 'array of char' is expected, so a
+// library routine needs only one form; 'str' stays a literal type for the
+// builtins slen/schar/sadr.
+program t;
+include "io.wz";
+var
+  buf: array[0..15] of char;
+  n: int;
+procedure put(s: array of char);
+begin
+  if len(s) > 0 then io.out(STDOUT, addr(s[0]), len(s));   { an empty view has no s[0] }
+  io.puts(STDOUT, "|");
+end;
+function count(s: array of char; c: char): int;
+var i, k: int;
+begin
+  i := 0;
+  while i < len(s) do begin if s[i] = c then k := k + 1; i := i + 1; end;
+  return k;
+end;
+begin
+  put("literal");
+  n := 0;
+  while n < 5 do begin buf[n] := chr(97 + n); n := n + 1; end;     { abcde }
+  put(buf[0..4]);
+  put(buf[1..3]);
+  put(view(addr(buf[2]), 2));
+  put("");
+  io.puts(STDOUT, "\n");
+  io.putn(STDOUT, count("banana", 'a')); io.puts(STDOUT, "\n");
+  io.putn(STDOUT, count(buf[0..4], 'c')); io.puts(STDOUT, "\n");
+  io.putn(STDOUT, len(buf)); io.puts(STDOUT, "\n");
+end.

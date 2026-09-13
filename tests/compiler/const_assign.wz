@@ -1,0 +1,8 @@
+// Must not compile: "cannot assign to or take the address of a constant".
+program t;
+procedure p;
+const K = 1;
+begin
+  K := 2;
+end;
+begin p; end.

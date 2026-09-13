@@ -1,0 +1,8 @@
+method=2 id=7 loud=- params={"a":1}
+method=3 id=-3 loud=yes params=-
+method=0 id=- loud=- params=-
+method=-1 id=1 loud=- params=-
+rejected
+rejected
+rejected
+constants: 0123 fields=5

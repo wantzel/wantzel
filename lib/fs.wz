@@ -1,0 +1,136 @@
+// lib/fs.wz -- directories, file metadata and reading, on raw syscalls.
+//
+// Read-only: nothing here creates, writes or deletes.
+
+include "io.wz";
+
+const
+  DT_DIR  = 4;
+  DT_REG  = 8;
+  DT_LNK  = 10;
+
+  S_IFMT  = 61440;      // 0xF000
+  S_IFDIR = 16384;      // 0x4000
+  S_IFREG = 32768;      // 0x8000
+
+  FS.DIRBUF = 32768;
+
+var
+  fs.st:   array[0..143] of char;      // struct stat
+  fs.size, fs.mode, fs.mtime: int;
+
+  fs.dbuf: array[0..FS.DIRBUF - 1] of char;
+  fs.dlen, fs.dpos: int;
+  fs.name: array[0..255] of char;
+  fs.namelen, fs.type: int;
+
+// fill fs.size/mode/mtime for the NUL-terminated path at address a
+function fs.stat(a: int): bool;
+var r: int;
+begin
+  r := sys2(SYS.stat, a, addr(fs.st[0]));
+  if r < 0 then return false;
+  fs.mode  := io.get32(fs.st, 24);
+  fs.size  := io.get64(fs.st, 48);
+  fs.mtime := io.get64(fs.st, 88);
+  return true;
+end;
+
+function fs.isdir: bool;
+begin
+  return band(fs.mode, S_IFMT) = S_IFDIR;
+end;
+
+function fs.isfile: bool;
+begin
+  return band(fs.mode, S_IFMT) = S_IFREG;
+end;
+
+procedure fs.close(fd: int);
+begin
+  sys1(SYS.close, fd);
+end;
+
+function fs.open(a: int): int;
+begin
+  return sys3(SYS.open, a, 0, 0);      // O_RDONLY
+end;
+
+// O_RDONLY | O_DIRECTORY (0x10000)
+function fs.opendir(a: int): int;
+begin
+  fs.dlen := 0;
+  fs.dpos := 0;
+  return sys3(SYS.open, a, 65536, 0);
+end;
+
+// Step to the next directory entry; fills fs.name/fs.namelen/fs.type.
+function fs.next(fd: int): bool;
+var reclen, nameat, i: int;
+    c: char;
+begin
+  while true do
+  begin
+    if fs.dpos >= fs.dlen then
+    begin
+      fs.dlen := sys3(SYS.getdents, fd, addr(fs.dbuf[0]), FS.DIRBUF);
+      fs.dpos := 0;
+      if fs.dlen <= 0 then return false;
+    end;
+    reclen := io.get16(fs.dbuf, fs.dpos + 16);
+    if reclen <= 0 then return false;
+    fs.type := ord(fs.dbuf[fs.dpos + 18]);
+    nameat := fs.dpos + 19;
+    i := 0;
+    while i < 255 do
+    begin
+      c := fs.dbuf[nameat + i];
+      if c = chr(0) then break;
+      fs.name[i] := c;
+      i := i + 1;
+    end;
+    fs.name[i] := chr(0);
+    fs.namelen := i;
+    fs.dpos := fs.dpos + reclen;
+    // skip "." and ".."
+    if fs.namelen = 1 then
+    begin
+      if fs.name[0] <> '.' then return true;
+    end
+    else if fs.namelen = 2 then
+    begin
+      if (fs.name[0] <> '.') or (fs.name[1] <> '.') then return true;
+    end
+    else return true;
+  end;
+  return false;
+end;
+
+// Find the bytes n[0..nlen) inside h[from..upto).  The first byte is located
+// with the SIMD scan, so this runs at memchr speed on the common case.
+function fs.find(h: array of char; from: int; upto: int; n: array of char; nlen: int): int;
+var at, i: int;
+    ok: bool;
+begin
+  if nlen = 0 then return from;
+  if nlen > upto - from then return -1;
+  while true do
+  begin
+    at := scan(h, from, upto, n[0]);
+    if at + nlen > upto then return -1;
+    ok := true;
+    i := 1;
+    while i < nlen do
+    begin
+      if h[at + i] <> n[i] then
+      begin
+        ok := false;
+        break;
+      end;
+      i := i + 1;
+    end;
+    if ok then return at;
+    from := at + 1;
+  end;
+  return -1;
+end;

@@ -1,0 +1,121 @@
+// lib/net.wz -- sockets and epoll, straight on top of the system calls.
+
+include "io.wz";
+
+const
+  AF_INET      = 2;
+  SOCK_STREAM  = 1;
+  SOL_SOCKET   = 1;
+  SO_REUSEADDR = 2;
+  SO_REUSEPORT = 15;
+  MSG_NOSIGNAL = 16384;
+
+  O_NONBLOCK = 2048;
+  F_SETFL    = 4;
+
+  EPOLLIN  = 1;
+  EPOLLOUT = 4;
+  EPOLLERR = 8;
+  EPOLLHUP = 16;
+  EPOLL_ADD = 1;
+  EPOLL_DEL = 2;
+  EPOLL_MOD = 3;
+
+  EAGAIN = -11;
+  EINTR  = -4;
+
+var
+  net.sa:  array[0..15] of char;
+  net.one: array[0..3] of char;
+  net.ev:  array[0..11] of char;
+
+function net.socket: int;
+begin
+  return sys3(SYS.socket, AF_INET, SOCK_STREAM, 0);
+end;
+
+procedure net.close(fd: int);
+begin
+  sys1(SYS.close, fd);
+end;
+
+procedure net.setopt(fd: int; opt: int);
+begin
+  net.one[0] := chr(1);
+  net.one[1] := chr(0);
+  net.one[2] := chr(0);
+  net.one[3] := chr(0);
+  sys5(SYS.setsockopt, fd, SOL_SOCKET, opt, addr(net.one[0]), 4);
+end;
+
+procedure net.nonblock(fd: int);
+begin
+  sys3(SYS.fcntl, fd, F_SETFL, O_NONBLOCK);
+end;
+
+// bind to 0.0.0.0:port and start listening; returns the socket or a negative errno
+function net.listen(port: int; backlog: int; reuseport: bool): int;
+var fd, r, i: int;
+begin
+  fd := net.socket;
+  if fd < 0 then return fd;
+  net.setopt(fd, SO_REUSEADDR);
+  if reuseport then net.setopt(fd, SO_REUSEPORT);
+  i := 0;
+  while i < 16 do
+  begin
+    net.sa[i] := chr(0);
+    i := i + 1;
+  end;
+  net.sa[0] := chr(AF_INET);
+  net.sa[2] := chr(port shr 8);          // network byte order
+  net.sa[3] := chr(band(port, 255));
+  r := sys3(SYS.bind, fd, addr(net.sa[0]), 16);
+  if r < 0 then
+  begin
+    net.close(fd);
+    return r;
+  end;
+  r := sys2(SYS.listen, fd, backlog);
+  if r < 0 then
+  begin
+    net.close(fd);
+    return r;
+  end;
+  net.nonblock(fd);
+  return fd;
+end;
+
+// accept4 with SOCK_NONBLOCK, so the connection is ready to use
+function net.accept(lfd: int): int;
+begin
+  return sys4(SYS.accept4, lfd, 0, 0, O_NONBLOCK);
+end;
+
+function net.send(fd: int; a: int; n: int): int;
+begin
+  return sys6(SYS.sendto, fd, a, n, MSG_NOSIGNAL, 0, 0);
+end;
+
+function net.recv(fd: int; a: int; n: int): int;
+begin
+  return sys3(SYS.read, fd, a, n);
+end;
+
+function net.epoll: int;
+begin
+  return sys1(SYS.epcreate, 0);
+end;
+
+procedure net.watch(ep: int; op: int; fd: int; events: int);
+begin
+  io.put32(net.ev, 0, events);
+  io.put32(net.ev, 4, fd);
+  io.put32(net.ev, 8, 0);
+  sys4(SYS.epctl, ep, op, fd, addr(net.ev[0]));
+end;
+
+function net.wait(ep: int; a: int; maxev: int; timeout: int): int;
+begin
+  return sys4(SYS.epwait, ep, a, maxev, timeout);
+end;

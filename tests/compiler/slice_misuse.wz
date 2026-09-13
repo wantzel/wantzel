@@ -1,0 +1,6 @@
+// Must not compile: "a slice can only be passed as an array argument".
+program t;
+var a: array[0..3] of int; i: int;
+begin
+  i := a[1..2];
+end.

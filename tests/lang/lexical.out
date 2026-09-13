@@ -1,0 +1,13 @@
+Big = 255
+neg = -17
+Expr = 19
+ord(Tab) = 9
+Yes = 1
+Half x10 = 5
+ns.value + NS.VALUE2 = 12
+quote = 39
+backslash = 92
+dquote = 34
+slen(Name) = 3
+escapes = 10
+0x10 + 010 = 26

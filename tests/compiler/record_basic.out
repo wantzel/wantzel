@@ -1,0 +1,14 @@
+p.x = 3
+p.y = 4
+p.x*p.y = 12
+weight x10 = 25
+active 1
+ord(name[1]) = 116
+len(name) = 16
+q.x = 70
+q.y = 140
+q.weight x10 = 35
+q.name[0] = 76
+p.x after copy = 70
+q.x+p.y = 210
+addr diff = 8

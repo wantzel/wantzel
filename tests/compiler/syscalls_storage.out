@@ -1,0 +1,28 @@
+create fd ok 1
+write 5
+fsync 0
+append 6
+hello world
+lseek end = 11
+lseek 6 = 6
+world
+ftruncate 0
+flock ex 0
+flock un 0
+hello
+rename 0
+old gone -1
+hello
+file mmap byte 1 = 101
+munmap 0
+anon mmap sum = 131064401
+munmap 0
+mkdir 0
+rmdir 0
+unlink 0
+gone -1
+getrandom 16
+getrandom 16
+random differs 1
+realtime after 2023 1
+monotonic 1

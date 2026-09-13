@@ -1,0 +1,2 @@
+// Must not compile: "forward declared routine f is never defined".
+program t; function f: int; forward; begin end.

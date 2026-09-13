@@ -1,0 +1,2 @@
+forward_unresolved_named.wz:9: forward declared routine alpha is never defined
+forward_unresolved_named.wz:11: forward declared routine gamma is never defined

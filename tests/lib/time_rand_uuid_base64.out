@@ -1,0 +1,61 @@
+b64 "" =  roundtrip ok, unpadded ok, url ok
+b64 "f" = Zg== roundtrip ok, unpadded ok, url ok
+b64 "fo" = Zm8= roundtrip ok, unpadded ok, url ok
+b64 "foo" = Zm9v roundtrip ok, unpadded ok, url ok
+b64 "foob" = Zm9vYg== roundtrip ok, unpadded ok, url ok
+b64 "fooba" = Zm9vYmE= roundtrip ok, unpadded ok, url ok
+b64 "foobar" = Zm9vYmFy roundtrip ok, unpadded ok, url ok
+urlencode FB FF BF = -_-_
+encode FB FF BF = +/+/
+decode of +/ form matches true
+decode of -_ form matches true
+decode invalid = -1
+decode invalid = -1
+decode lone symbol = -1
+decode overflow = -1
+decode empty = 0
+split 0 = 1970-1-1 0:0:0 weekday 3 yday 0
+split 951782400 = 2000-2-29 0:0:0 weekday 1 yday 59
+split 1700000000 = 2023-11-14 22:13:20 weekday 1 yday 317
+split -86400 = 1969-12-31 0:0:0 weekday 2 yday 364
+join = 1709210096
+split matches true
+iso = 2024-02-29T12:34:56Z
+iso length 20
+join = 946684799
+split matches true
+iso = 1999-12-31T23:59:59Z
+iso length 20
+parseiso Z = 1789071300
+ok true
+parseiso .123Z = 1789071300
+ok true
+parseiso bare = 1789071300
+ok true
+parseiso nonsense = -1
+ok false
+parseiso feb 29 2023 = -1
+ok false
+parseiso 1969 = -1
+ok true
+leap 1900 false
+leap 2000 true
+leap 2024 true
+daysin 2023 2 = 28
+daysin 2024 2 = 29
+nowsec after 2023 true
+uuids differ true
+version nibble 4 true
+variant 10xx true
+text length 36
+dashes at 8 13 18 23 true
+lowercase hex true
+parse(text(u)) = u true
+parse of known true
+text of known = 123e4567-e89b-12d3-a456-426614174000
+parse bad false
+parse short false
+below(10) in range true
+at least 8 distinct true
+below(1) = 0
+rand.int differs true

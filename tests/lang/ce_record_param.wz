@@ -1,0 +1,2 @@
+// Must not compile: "a record parameter is passed as".
+program t; type P = record x: int; end; procedure q(p: P); begin end; begin end.

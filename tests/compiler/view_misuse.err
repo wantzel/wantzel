@@ -1,0 +1,1 @@
+view(addr, count) can only be passed where an array parameter is expected

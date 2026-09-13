@@ -1,0 +1,38 @@
+// spec §1-2: comments, case-insensitive identifiers and keywords, dotted names,
+// int/hex/char/string literals and escapes, constants of every kind.
+Program Lexical;
+include "io.wz";
+{ a brace comment
+  over two lines }
+CONST
+  Big = 0xFF;                 // hex
+  neg = -17;
+  Expr = (2 + 3) * 4 - 1;     // constant expression: 19
+  Tab = '\t';
+  Yes = true;
+  Half = 0.5;
+  Name = "abc";               // a str constant (neutral on purpose: not a language name)
+var
+  ns.value: int;              // a dotted name is one identifier
+  NS.Value2: int;             // ... and case does not matter
+  c: char;
+Procedure Show(s: str; v: int);
+BEGIN
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+End;
+begin
+  show("Big = ", BIG);
+  show("neg = ", Neg);
+  show("Expr = ", expr);
+  show("ord(Tab) = ", ord(tab));
+  if yes then show("Yes = ", 1) else show("Yes = ", 0);
+  show("Half x10 = ", trunc(half * 10.0));
+  ns.value := 5; ns.value2 := 7;
+  show("ns.value + NS.VALUE2 = ", NS.VALUE + ns.value2);
+  c := '\'';  show("quote = ", ord(c));
+  c := '\\';  show("backslash = ", ord(c));
+  c := '"';   show("dquote = ", ord(c));
+  show("slen(Name) = ", slen(Name));
+  show("escapes = ", slen("a\"b\\c\nd\te\r"));   { 10 }
+  show("0x10 + 010 = ", 0x10 + 010);            { 16 + 10 = 26: no octal }
+end.

@@ -1,0 +1,2 @@
+// Must not compile: "too many arguments in call".
+program t; procedure p(x: int); begin end; begin p(1,2); end.

@@ -1,0 +1,6 @@
+// Must not compile: "a string literal can only be passed as an array of char".
+program t;
+procedure p(a: array of int); begin end;
+begin
+  p("abc");
+end.

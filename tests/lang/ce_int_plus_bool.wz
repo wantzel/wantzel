@@ -1,0 +1,2 @@
+// Must not compile: "type error in arithmetic: expected int, found bool".
+program t; var i: int; b: bool; begin i := i + b; end.

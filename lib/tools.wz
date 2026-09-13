@@ -1,0 +1,255 @@
+// lib/tools.wz -- MCP and REST glue for a declared `tools` block.
+//
+// Include this after the tools block (and after lib/mcp.wz and, for REST,
+// lib/http.wz).  It defines the two hooks lib/mcp.wz leaves open, so a
+// program with a tools block needs no app.tools/app.call of its own:
+//
+//   include "lib/mcp.wz";  include "lib/http.wz";
+//   schema ...;  tools ... end;
+//   include "lib/tools.wz";
+//   <the handlers tool.<name>(a, r)>
+//
+// The generated tool.run writes the result JSON; this file wraps it as an
+// MCP tool result (content + structuredContent) or a REST body.  For the
+// MCP endpoint itself over HTTP, include lib/mcphttp.wz and call mcp.http
+// from app.request.
+
+include "mcp.wz";
+include "http.wz";
+
+const
+  TOOLBUF = 1048576;
+
+var
+  tool.out: array[0..TOOLBUF - 1] of char;   // the result JSON of one call
+  tool.empty: array[0..1] of char;           // "{}" for calls without arguments
+
+procedure app.tools;
+begin
+  mcp.add(tool.list);
+end;
+
+// the MCP tools/call: name and arguments are in mcp.callp
+procedure app.call(b: array of char; last: int);
+var idx, n: int;
+begin
+  idx := tool.byname(b, mcp.callp.name_at, mcp.callp.name_end);
+  if idx < 0 then
+  begin
+    mcp.failed := true;
+    mcp.text("no such tool");
+    return;
+  end;
+  if mcp.callp.arguments_ok then
+    n := tool.run(idx, b, mcp.callp.arguments_at, mcp.callp.arguments_end, tool.out)
+  else
+  begin
+    tool.empty[0] := '{'; tool.empty[1] := '}';
+    n := tool.run(idx, tool.empty, 0, 2, tool.out);
+  end;
+  if n = -1 then
+  begin
+    mcp.failed := true;
+    mcp.text("the arguments do not match the tool's input schema");
+    return;
+  end;
+  if n < 0 then
+  begin
+    mcp.failed := true;
+    mcp.textbytes(tool.err, 0, tool.errn);
+    return;
+  end;
+  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":");
+  mcp.addqslice(tool.out, 0, n);
+  mcp.add("}],\"structuredContent\":");
+  mcp.addslice(tool.out, 0, n);
+  mcp.add(",\"isError\":false}");
+end;
+
+// Where the value of the leading "result" key starts, or -1 when the object does not
+// begin with one.  tool.listend is set to just past that value.
+//
+// Beside "result" only the two truncation fields are tolerated (total_matched,
+// truncated); any other key means the object carries something a bare list would lose,
+// and then it is not unwrapped.
+var
+  tool.listend: int;      // one past the result value, set by tool.solelist
+  tool.nmatched: int;     // total_matched, or -1 when the tool did not report one
+  tool.wascut: bool;      // truncated
+  tool.numbuf: array[0..23] of char;   // a header value that is a number
+  tool.numn: int;
+
+// Read the keys after the result value, starting at the comma at `from`.  True when
+// they are only total_matched/truncated (their values are picked up on the way); false
+// for any other key, which makes the answer stay wrapped.
+function tool.cutfields(from: int; n: int): bool;
+var i, v, sign: int;
+begin
+  i := from;
+  while i < n do
+  begin
+    if tool.out[i] <> ',' then return false;
+    i := i + 1;
+    while (i < n) and (tool.out[i] = ' ') do i := i + 1;
+    if json.eq(tool.out, i, i + 15, "\"total_matched\"") then
+    begin
+      i := i + 15;
+      while (i < n) and ((tool.out[i] = ':') or (tool.out[i] = ' ')) do i := i + 1;
+      sign := 1;
+      if (i < n) and (tool.out[i] = '-') then begin sign := -1; i := i + 1; end;
+      v := 0;
+      while (i < n) and (tool.out[i] >= '0') and (tool.out[i] <= '9') do
+      begin
+        v := v * 10 + (ord(tool.out[i]) - ord('0'));
+        i := i + 1;
+      end;
+      tool.nmatched := sign * v;
+    end
+    else if json.eq(tool.out, i, i + 11, "\"truncated\"") then
+    begin
+      i := i + 11;
+      while (i < n) and ((tool.out[i] = ':') or (tool.out[i] = ' ')) do i := i + 1;
+      tool.wascut := json.eq(tool.out, i, i + 4, "true");
+      while (i < n) and (tool.out[i] <> ',') and (tool.out[i] <> '}') do i := i + 1;
+    end
+    else return false;
+    while (i < n) and (tool.out[i] = ' ') do i := i + 1;
+    if (i < n) and (tool.out[i] = '}') then
+    begin
+      if i <> n - 1 then return false;
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+function tool.solelist(n: int): int;
+var i, at, depth: int;
+    instr, esc: bool;
+    c: char;
+begin
+  tool.listend := -1; tool.nmatched := -1; tool.wascut := false;
+  if n < 12 then return -1;
+  if tool.out[0] <> '{' then return -1;
+  { json.eq compares the raw slice, so the quotes are part of it }
+  if not json.eq(tool.out, 1, 9, "\"result\"") then return -1;
+  i := 9;
+  while (i < n) and ((tool.out[i] = ':') or (tool.out[i] = ' ')) do i := i + 1;
+  if i >= n then return -1;
+  at := i;
+  // Walk the value.  depth starts at 1 for the object we are inside, so the value's
+  // own brackets sit at 2 and up; depth dropping to 0 is the object's closing brace,
+  // and a comma back at depth 1 ends the value and starts the next key.
+  depth := 1; instr := false; esc := false;
+  while i < n do
+  begin
+    c := tool.out[i];
+    if instr then
+    begin
+      if esc then esc := false
+      else if c = '\\' then esc := true
+      else if c = '"' then instr := false;
+    end
+    else if c = '"' then instr := true
+    else if (c = '{') or (c = '[') then depth := depth + 1
+    else if (c = '}') or (c = ']') then
+    begin
+      depth := depth - 1;
+      if depth = 0 then
+      begin
+        if i <> n - 1 then return -1;
+        tool.listend := i;
+        return at;
+      end;
+    end
+    else if (c = ',') and (depth = 1) then
+    begin
+      tool.listend := i;
+      if not tool.cutfields(i, n) then return -1;
+      return at;
+    end;
+    i := i + 1;
+  end;
+  return -1;
+end;
+
+// Write the reply body of a REST call.
+//
+// A tool whose whole result is one `result` field is a list tool, and over REST that
+// list IS the answer: the reference implementation returns a bare array there, and a consumer does
+// `answer.length` or `answer.map(...)` straight on the body.  Our schemas wrap it
+// because MCP requires structuredContent to be an object -- so the wrapper is right
+// for MCP and wrong for REST, and this is the one place that knows the difference.
+//
+// Only an object led by "result" is unwrapped, and beside it only the truncation
+// fields; a result alongside anything else stays as it is, because then the object
+// carries something the bare list would lose.
+//
+// The truncation fields cannot ride along in the body without putting the wrapper back,
+// so they go out as headers instead (X-Total-Matched, X-Truncated) -- the body keeps
+// that shape and a cut answer still says it was cut.
+procedure tool.restbody(n: int);
+var at: int;
+begin
+  at := tool.solelist(n);
+  if (at < 0) or (tool.listend <= at) then begin http.addb(tool.out, 0, n); return; end;
+  if tool.nmatched >= 0 then
+  begin
+    tool.numn := io.pushnum(tool.numbuf, 0, tool.nmatched);
+    http.hdraddslice("X-Total-Matched", tool.numbuf, 0, tool.numn);
+  end;
+  if tool.wascut then http.hdradd("X-Truncated: true");
+  http.addb(tool.out, at, tool.listend - at);
+end;
+
+// REST: POST <prefix>/<name> with the arguments as the body.  Returns
+// true when the path named a tool (the reply has then been written).
+function tool.rest(prefix: str): bool;
+var at: int;
+    idx, n, p, plen: int;
+begin
+  p := http.pathat;
+  plen := http.pathlen;
+  if plen <= slen(prefix) then return false;
+  n := 0;
+  while n < slen(prefix) do
+  begin
+    if http.inbuf[p + n] <> schar(prefix, n) then return false;
+    n := n + 1;
+  end;
+  idx := tool.byname(http.inbuf, p + slen(prefix), p + plen);
+  if idx < 0 then return false;
+  if http.method <> 2 then
+  begin
+    http.add("{\"detail\":\"use POST\"}");
+    http.finish(405, "application/json");
+    return true;
+  end;
+  if http.bodylen = 0 then
+  begin
+    tool.empty[0] := '{'; tool.empty[1] := '}';
+    n := tool.run(idx, tool.empty, 0, 2, tool.out);
+  end
+  else n := tool.run(idx, http.inbuf, http.bodyat, http.bodyat + http.bodylen, tool.out);
+  if n = -1 then
+  begin
+    http.add("{\"detail\":\"the body does not match the tool's input schema\"}");
+    http.finish(422, "application/json");
+    return true;
+  end;
+  if n < 0 then
+  begin
+    http.add("{\"detail\":");
+    { -1 when an error message does not fit: better an empty string than a broken
+      position -- the status (400) already carries the meaning. }
+    at := json.putslice(http.outbuf, http.wpos, tool.err, 0, tool.errn);
+    if at >= 0 then http.wpos := at else http.add("\"\"");
+    http.add("}");
+    http.finish(400, "application/json");
+    return true;
+  end;
+  tool.restbody(n);
+  http.finish(200, "application/json");
+  return true;
+end;
+

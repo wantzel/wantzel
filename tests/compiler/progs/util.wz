@@ -1,0 +1,31 @@
+// utility routines, pulled in with include
+include "deep.wz";
+
+procedure puts(s: str);
+begin
+  sys3(1, 1, sadr(s), slen(s));
+end;
+
+function fill(b: array of char; c: char): int;
+var i: int;
+begin
+  i := 0;
+  while i < len(b) do
+  begin
+    b[i] := c;
+    i := i + 1;
+  end;
+  return len(b);
+end;
+
+function total(v: array of int): int;
+var i, s: int;
+begin
+  i := 0;
+  while i < len(v) do
+  begin
+    s := s + v[i];
+    i := i + 1;
+  end;
+  return s;
+end;

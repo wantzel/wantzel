@@ -1,0 +1,6 @@
+// Must not compile: "only a record has fields".
+program t;
+var i: int;
+begin
+  i.x := 1;
+end.

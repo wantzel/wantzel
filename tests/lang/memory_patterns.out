@@ -1,0 +1,20 @@
+nitems = 10
+total x10 = 275
+added until full = 990
+hello, world
+used = 12
+nodes sum = 150
+nodes sum after release = 100
+free nodes were = 252
+hash get 7919*200 = 200
+hash get missing = -1
+hash count = 400
+hash full 0
+arena[7] = 119
+arena[8] = 120
+anon sum = 3145728
+munmap = 0
+written = 160
+mapped total x10 = 275
+msync = 0
+key of item 3 in file = 104

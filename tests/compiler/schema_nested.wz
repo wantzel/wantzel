@@ -1,0 +1,61 @@
+// schema v2: nested schemas, arrays of schemas, enums, json views, record results, write with nesting.
+program t;
+include "io.wz";
+include "json.wz";
+
+schema Point = record
+  x: real;
+  y: real;
+  tag: text of ("start", "mid", "end")?;
+end;
+
+schema Path = record
+  id:     int;
+  origin: Point;
+  pts:    array[0..3] of Point;
+  meta:   json?;
+  kind:   text of ("open", "closed");
+end;
+
+var
+  p: Path;
+  paths: array[0..1] of Path;
+  doc: array[0..1023] of char;
+  out: array[0..1023] of char;
+  n, r: int;
+procedure show(t: str; v: int);
+begin
+  io.puts(STDOUT, t); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+begin
+  n := io.push(doc, 0, "{\"id\":7,\"kind\":\"closed\",\"origin\":{\"x\":1.5,\"y\":-2,\"tag\":\"start\"},\"pts\":[{\"x\":0,\"y\":0},{\"x\":3,\"y\":4,\"tag\":\"end\"}],\"meta\":{\"a\":[1,2,{\"b\":null}]}}");
+  r := Path.parse(doc, 0, n, p);
+  show("parse = ", r);
+  show("id = ", p.id);
+  show("kind = closed: ", p.kind);
+  if p.kind = Path.kind.closed then show("kind const ", 1) else show("kind const ", 0);
+  show("origin.x x10 = ", trunc(p.origin.x * 10.0));
+  show("origin.tag = start: ", p.origin.tag);
+  show("pts_n = ", p.pts_n);
+  show("pts[1].y = ", trunc(p.pts[1].y));
+  show("pts[1].tag = end: ", p.pts[1].tag);
+  if p.pts[0].tag_ok then show("pts[0].tag present ", 1) else show("pts[0].tag present ", 0);
+  show("meta length = ", p.meta_end - p.meta_at);
+  r := Path.write(out, 0, p, doc);
+  io.out(STDOUT, addr(out[0]), r); io.puts(STDOUT, "\n");
+  { two records side by side in an array, parsed through slices }
+  r := Path.parse(doc, 0, n, paths[1..1]);
+  paths[1].id := 8;
+  paths[0] := paths[1];
+  paths[0].id := 9;
+  show("paths[0].id = ", paths[0].id);
+  show("paths[1].id = ", paths[1].id);
+  show("paths[1].pts[1].x = ", trunc(paths[1].pts[1].x));
+  n := io.push(doc, 0, "{\"id\":1,\"kind\":\"open\",\"origin\":{\"x\":1}}");   { origin.y missing }
+  show("nested required = ", Path.parse(doc, 0, n, p));
+  n := io.push(doc, 0, "{\"id\":1,\"kind\":\"round\",\"origin\":{\"x\":1,\"y\":2},\"pts\":[]}");
+  r := Path.parse(doc, 0, n, p);
+  show("unknown enum parses = ", r);
+  show("unknown enum value = ", p.kind);
+  io.puts(STDOUT, Path.jsonschema); io.puts(STDOUT, "\n");
+end.

@@ -1,0 +1,25 @@
+2+3*4 = 14
+(2+3)*4 = 20
+10-4-3 = 3
+100 div 7 = 14
+100 mod 7 = 2
+-7 div 2 = -3
+-7 mod 2 = -1
+7 div -2 = -3
+band = 48
+bor = 7
+bxor = 6
+bnot 0 = -1
+1 shl 10 = 1024
+-64 shr 2 = -16
+1 shl 62 shr 62 = 1
+char order 1
+ne 1
+real ge 1
+not 1
+and 0
+and is short-circuit: calls = 1
+or 1
+or is short-circuit: calls = 1
+unary minus = -7
+nested = 7

@@ -1,0 +1,80 @@
+// lib/oauth.wz and lib/openapi.wz: what the library writes to a socket is
+// English, and the session cookie carries no language name.  Both used to
+// leak Dutch and a working name from before this compiler stood on its own;
+// nothing pinned that, which is why it survived.  This test prints the text itself, so a change to the
+// wording is visible in the diff instead of silent.
+program t;
+include "oauth.wz";
+var
+  i: int;
+{ oauth.wz forward-declares these two: the library does not know how an
+  application authenticates.  The pages under test never call them. }
+function app.authenticate(user: array of char; secret: array of char): int;
+begin
+  return -1;
+end;
+function app.machinetoken(token: array of char): int;
+begin
+  return -1;
+end;
+{ http.wz forward-declares this one; no request is served here. }
+procedure app.request;
+begin
+end;
+procedure body;
+var i: int;
+begin
+  for i := http.obase + HDRROOM to http.wpos - 1 do
+    io.out(STDOUT, addr(http.outbuf[i]), 1);
+  io.puts(STDOUT, "\n");
+end;
+procedure reset;
+begin
+  http.obase := 0;
+  http.wpos := http.obase + HDRROOM;
+  http.xlen := 0;
+end;
+{ true when needle occurs in the reply body }
+function has(needle: str): bool;
+var i, j, n: int;
+    hit: bool;
+begin
+  n := slen(needle);
+  if n = 0 then return true;
+  for i := http.obase + HDRROOM to http.wpos - n do
+  begin
+    hit := true;
+    for j := 0 to n - 1 do
+      if http.outbuf[i + j] <> schar(needle, j) then hit := false;
+    if hit then return true;
+  end;
+  return false;
+end;
+procedure yn(s: str; v: bool);
+begin
+  io.puts(STDOUT, s);
+  if v then io.puts(STDOUT, "true") else io.puts(STDOUT, "false");
+  io.puts(STDOUT, "\n");
+end;
+begin
+  { the cookie name: one source, and it says nothing about the language }
+  io.puts(STDOUT, "cookie = "); io.puts(STDOUT, OAUTH.CNAME); io.puts(STDOUT, "\n");
+
+  { the login page, in full, so the wording is pinned }
+  reset;
+  oauth.loginpage(false);
+  io.puts(STDOUT, "--- loginpage ---\n");
+  body;
+
+  { and the same page after a failed attempt }
+  reset;
+  oauth.loginpage(true);
+  io.puts(STDOUT, "--- loginpage failed ---\n");
+  yn("says unknown user ", has("Unknown user or wrong code."));
+
+  { no Dutch left in either }
+  yn("no Inloggen ", not has("Inloggen"));
+  yn("no Gebruiker ", not has("Gebruiker"));
+  yn("no Onbekende ", not has("Onbekende"));
+
+end.

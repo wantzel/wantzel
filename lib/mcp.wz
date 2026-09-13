@@ -1,0 +1,384 @@
+// lib/mcp.wz -- Model Context Protocol over JSON-RPC 2.0.
+//
+// The envelope and the tools/call parameters are described as schemas, so
+// the compiler generates their parsers: no dynamic objects, no allocation,
+// and method names arrive as integers rather than strings.
+//
+// The application supplies two routines:
+//   procedure app.tools;   -- writes the entries of the "tools" array
+//   procedure app.call;    -- handles one tool call
+// and uses the mcp.* helpers to write its replies.  Transports: mcp.stdio
+// (below) and mcp.http in lib/mcphttp.wz (one call from app.request).
+
+include "json.wz";
+
+const
+  MCPBUF = 1048576;           // a tools/list with hundreds of tools must fit
+
+  RPC.parse_error      = 0 - 32700;
+  RPC.invalid_request  = 0 - 32600;
+  RPC.method_not_found = 0 - 32601;
+  RPC.invalid_params   = 0 - 32602;
+  RPC.internal_error   = 0 - 32603;
+
+schema Rpc = record
+  jsonrpc: text;
+  id:      json?;                 // a number or a string; echoed verbatim
+  method:  text of ("initialize", "notifications/initialized", "tools/list",
+                    "tools/call", "ping", "resources/list", "prompts/list",
+                    "notifications/cancelled", "logging/setLevel",
+                    "notifications/progress", "notifications/roots/list_changed",
+                    "resources/read", "prompts/get", "resources/templates/list");
+  params:  json?;
+end;
+
+// enough of the initialize parameters to echo the client's protocol version
+schema Init = record
+  protocolVersion: text?;
+end;
+
+schema Call = record
+  name:      text;
+  arguments: json?;
+end;
+
+var
+  mcp.req:  Rpc;                  // the request being handled
+  mcp.init: Init;
+  mcp.callp: Call;
+  mcp.buf: array[0..MCPBUF - 1] of char;
+  mcp.wp:  int;                   // write cursor
+  mcp.idat, mcp.idend: int;       // the id of the request being answered
+  mcp.hasid: bool;
+  mcp.failed: bool;               // a tool reported an error
+  mcp.name: str;
+  mcp.version: str;
+  mcp.pv: str;                    // the protocol version negotiated by initialize
+  mcp.pvcode: int;                // the same as a number: 0 = 2024-11-05, 1 = 2025-03-26, 2 = 2025-06-18
+  mcp.inited: bool;               // an initialize has been answered (before that, assume 2025-06-18)
+
+// ------------------------------------------------------------- writing
+
+procedure mcp.add(s: str);
+begin
+  mcp.wp := io.push(mcp.buf, mcp.wp, s);
+end;
+
+procedure mcp.addn(v: int);
+begin
+  mcp.wp := io.pushnum(mcp.buf, mcp.wp, v);
+end;
+
+procedure mcp.addq(s: str);
+begin
+  mcp.wp := json.putstr(mcp.buf, mcp.wp, s);
+end;
+
+procedure mcp.addslice(b: array of char; from: int; upto: int);
+var i: int;
+begin
+  i := from;
+  while i < upto do
+  begin
+    mcp.buf[mcp.wp] := b[i];
+    mcp.wp := mcp.wp + 1;
+    i := i + 1;
+  end;
+end;
+
+// If it does not fit, mcp.wp stays where it was and the answer is truncated rather than
+// broken: json.putslice returns -1, and using that as a position would destroy
+// everything.  The overflow itself should be noticed elsewhere -- what matters here is
+// that an over-long value does not write a buffer outside its bounds.
+procedure mcp.addqslice(b: array of char; from: int; upto: int);
+var at: int;
+begin
+  at := json.putslice(mcp.buf, mcp.wp, b, from, upto);
+  if at >= 0 then mcp.wp := at;
+end;
+
+// escaped, but without quotes: for building one long text value in pieces
+procedure mcp.addesc(b: array of char; from: int; upto: int);
+begin
+  mcp.wp := json.escslice(mcp.buf, mcp.wp, b, from, upto);
+end;
+
+// ------------------------------------------------------- reply envelopes
+
+procedure mcp.startreply;
+begin
+  mcp.wp := 0;
+  mcp.add("{\"jsonrpc\":\"2.0\",\"id\":");
+  if mcp.hasid then mcp.addslice(mcp.buf, 0, 0);
+end;
+
+// the id lives in the request buffer, so it is copied in by the caller
+procedure mcp.begin_result(b: array of char);
+begin
+  mcp.wp := 0;
+  mcp.add("{\"jsonrpc\":\"2.0\",\"id\":");
+  if mcp.hasid then mcp.addslice(b, mcp.idat, mcp.idend)
+  else mcp.add("null");
+  mcp.add(",\"result\":");
+end;
+
+procedure mcp.end_result;
+begin
+  mcp.add("}");
+end;
+
+procedure mcp.error(b: array of char; code: int; msg: str);
+begin
+  mcp.wp := 0;
+  mcp.add("{\"jsonrpc\":\"2.0\",\"id\":");
+  if mcp.hasid then mcp.addslice(b, mcp.idat, mcp.idend)
+  else mcp.add("null");
+  mcp.add(",\"error\":{\"code\":");
+  mcp.addn(code);
+  mcp.add(",\"message\":");
+  mcp.addq(msg);
+  mcp.add("}}");
+end;
+
+// ------------------------------------------------ tool result helpers
+
+procedure mcp.text(s: str);
+begin
+  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":");
+  mcp.addq(s);
+  mcp.add("}]");
+  if mcp.failed then mcp.add(",\"isError\":true");
+  mcp.add("}");
+end;
+
+// The slice comes from a JSON string, so it is already escaped: copying it
+// verbatim is both correct and free.  Use mcp.textbytes for raw bytes.
+procedure mcp.textslice(b: array of char; from: int; upto: int);
+begin
+  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":\"");
+  mcp.addslice(b, from, upto);
+  mcp.add("\"}]");
+  if mcp.failed then mcp.add(",\"isError\":true");
+  mcp.add("}");
+end;
+
+procedure mcp.textbytes(b: array of char; from: int; upto: int);
+begin
+  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":");
+  mcp.addqslice(b, from, upto);
+  mcp.add("}]");
+  if mcp.failed then mcp.add(",\"isError\":true");
+  mcp.add("}");
+end;
+
+procedure mcp.textnum(v: int);
+begin
+  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":\"");
+  mcp.addn(v);
+  mcp.add("\"}]");
+  if mcp.failed then mcp.add(",\"isError\":true");
+  mcp.add("}");
+end;
+
+// the application implements these
+procedure app.tools; forward;
+procedure app.call(b: array of char; last: int); forward;
+
+// ---------------------------------------------------------- dispatch
+
+// Handle one JSON-RPC message in b[at..last).  Returns the number of bytes
+// of reply in mcp.buf, or 0 when the message is a notification.
+function mcp.handle(b: array of char; at: int; last: int): int;
+var r, p0, p1: int;
+begin
+  mcp.wp := 0;
+  mcp.hasid := false;
+  mcp.failed := false;
+  r := Rpc.parse(b, at, last, mcp.req);
+  if r < 0 then
+  begin
+    mcp.error(b, RPC.parse_error, "invalid JSON-RPC request");
+    return mcp.wp;
+  end;
+  if mcp.req.id_ok then
+  begin
+    mcp.hasid := true;
+    mcp.idat := mcp.req.id_at;
+    mcp.idend := mcp.req.id_end;
+  end;
+
+  if mcp.req.method = Rpc.method.notifications_initialized then return 0;
+  if mcp.req.method = Rpc.method.notifications_cancelled then return 0;
+  if mcp.req.method = Rpc.method.notifications_progress then return 0;
+  if mcp.req.method = Rpc.method.notifications_roots_list_changed then return 0;
+
+  // Answer the lists a client may ask for even though we do not advertise
+  // them, rather than making it deal with an error; reading one is an error
+  // in the parameters, since no such resource or prompt exists.
+  if mcp.req.method = Rpc.method.resources_list then
+  begin
+    mcp.begin_result(b);
+    mcp.add("{\"resources\":[]}");
+    mcp.end_result;
+    return mcp.wp;
+  end;
+  if mcp.req.method = Rpc.method.resources_templates_list then
+  begin
+    mcp.begin_result(b);
+    mcp.add("{\"resourceTemplates\":[]}");
+    mcp.end_result;
+    return mcp.wp;
+  end;
+  if mcp.req.method = Rpc.method.prompts_list then
+  begin
+    mcp.begin_result(b);
+    mcp.add("{\"prompts\":[]}");
+    mcp.end_result;
+    return mcp.wp;
+  end;
+  if mcp.req.method = Rpc.method.resources_read then
+  begin
+    mcp.error(b, RPC.invalid_params, "no such resource");
+    return mcp.wp;
+  end;
+  if mcp.req.method = Rpc.method.prompts_get then
+  begin
+    mcp.error(b, RPC.invalid_params, "no such prompt");
+    return mcp.wp;
+  end;
+  if mcp.req.method = Rpc.method.logging_setlevel then
+  begin
+    mcp.begin_result(b);
+    mcp.add("{}");
+    mcp.end_result;
+    return mcp.wp;
+  end;
+
+  if mcp.req.method = Rpc.method.initialize then
+  begin
+    // Answer in the version the client asked for when we know it, in the
+    // newest we support when we do not, and in the oldest when it named none.
+    mcp.pv := "2024-11-05";
+    mcp.pvcode := 0;
+    if mcp.req.params_ok then
+    begin
+      if Init.parse(b, mcp.req.params_at, mcp.req.params_end, mcp.init) >= 0 then
+      begin
+        if mcp.init.protocolVersion_ok and not mcp.init.protocolVersion_null then
+        begin
+          if json.eq(b, mcp.init.protocolVersion_at, mcp.init.protocolVersion_end, "2025-03-26") then
+          begin
+            mcp.pv := "2025-03-26";
+            mcp.pvcode := 1;
+          end
+          else if not json.eq(b, mcp.init.protocolVersion_at, mcp.init.protocolVersion_end, "2024-11-05") then
+          begin
+            mcp.pv := "2025-06-18";
+            mcp.pvcode := 2;
+          end;
+        end;
+      end;
+    end;
+    mcp.inited := true;
+    mcp.begin_result(b);
+    mcp.add("{\"protocolVersion\":");
+    mcp.addq(mcp.pv);
+    mcp.add(",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":");
+    mcp.addq(mcp.name);
+    mcp.add(",\"version\":");
+    mcp.addq(mcp.version);
+    mcp.add("}}");
+    mcp.end_result;
+    return mcp.wp;
+  end;
+
+  if mcp.req.method = Rpc.method.ping then
+  begin
+    mcp.begin_result(b);
+    mcp.add("{}");
+    mcp.end_result;
+    return mcp.wp;
+  end;
+
+  // tools/list: the whole list always fits in one reply, so a cursor in the
+  // params is ignored and no nextCursor is ever sent
+  if mcp.req.method = Rpc.method.tools_list then
+  begin
+    mcp.begin_result(b);
+    mcp.add("{\"tools\":[");
+    app.tools;
+    mcp.add("]}");
+    mcp.end_result;
+    return mcp.wp;
+  end;
+
+  if mcp.req.method = Rpc.method.tools_call then
+  begin
+    if not mcp.req.params_ok then
+    begin
+      mcp.error(b, RPC.invalid_params, "tools/call needs params");
+      return mcp.wp;
+    end;
+    p0 := mcp.req.params_at;
+    p1 := mcp.req.params_end;
+    if Call.parse(b, p0, p1, mcp.callp) < 0 then
+    begin
+      mcp.error(b, RPC.invalid_params, "tools/call needs a tool name");
+      return mcp.wp;
+    end;
+    mcp.begin_result(b);
+    app.call(b, p1);
+    mcp.end_result;
+    return mcp.wp;
+  end;
+
+  mcp.error(b, RPC.method_not_found, "no such method");
+  return mcp.wp;
+end;
+
+// ------------------------------------------------------ stdio transport
+
+var
+  mcp.in: array[0..MCPBUF - 1] of char;
+  mcp.inlen: int;
+
+// Read newline-delimited JSON-RPC messages from standard input and write
+// the replies to standard output.  This is how editors start an MCP server.
+procedure mcp.stdio;
+var r, at, nl, n: int;
+begin
+  mcp.inlen := 0;
+  while true do
+  begin
+    r := io.read(STDIN, addr(mcp.in[mcp.inlen]), MCPBUF - mcp.inlen);
+    if r <= 0 then return;
+    mcp.inlen := mcp.inlen + r;
+    at := 0;
+    while true do
+    begin
+      nl := scan(mcp.in, at, mcp.inlen, chr(10));
+      if nl >= mcp.inlen then break;
+      if nl > at then
+      begin
+        n := mcp.handle(mcp.in, at, nl);
+        if n > 0 then
+        begin
+          mcp.buf[n] := chr(10);
+          io.out(STDOUT, addr(mcp.buf[0]), n + 1);
+        end;
+      end;
+      at := nl + 1;
+    end;
+    if at > 0 then
+    begin
+      n := 0;
+      while at + n < mcp.inlen do
+      begin
+        mcp.in[n] := mcp.in[at + n];
+        n := n + 1;
+      end;
+      mcp.inlen := n;
+    end;
+    if mcp.inlen >= MCPBUF then return;
+  end;
+end;

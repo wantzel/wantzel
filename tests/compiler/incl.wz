@@ -1,0 +1,22 @@
+program incl;
+include "progs/util.wz";
+include "progs/util.wz";      // twice on purpose; the second must be ignored
+
+var
+  buf:  array[0..31] of char;
+  nums: array[1..5] of int;
+  i, n: int;
+
+begin
+  deep;
+  n := fill(buf, '#');
+  if n = 32 then puts("array parameter writes 32 bytes\n") else puts("wrong length\n");
+  sys3(1, 1, addr(buf[0]), 8); puts("\n");
+  i := 1;
+  while i <= 5 do
+  begin
+    nums[i] := i * 10;
+    i := i + 1;
+  end;
+  if total(nums) = 150 then puts("array parameter reads ok\n") else puts("sum wrong\n");
+end.

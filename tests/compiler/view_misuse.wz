@@ -1,0 +1,6 @@
+// Must not compile: "view(addr, count) can only be passed where an array parameter is expected".
+program t;
+var i: int;
+begin
+  i := view(0, 1);
+end.

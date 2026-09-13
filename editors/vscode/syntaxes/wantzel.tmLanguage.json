@@ -1,0 +1,152 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Wantzel",
+  "scopeName": "source.wantzel",
+  "fileTypes": [
+    "wz"
+  ],
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#builtins"
+    },
+    {
+      "include": "#attributes"
+    },
+    {
+      "include": "#routine"
+    },
+    {
+      "include": "#identifiers"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.wantzel",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.wantzel",
+          "begin": "\\{",
+          "end": "\\}"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.wantzel",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.wantzel",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.wantzel",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.wantzel",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.wantzel",
+          "match": "\\b0[xX][0-9a-fA-F]+\\b"
+        },
+        {
+          "name": "constant.numeric.float.wantzel",
+          "match": "\\b\\d+\\.\\d+([eE][-+]?\\d+)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.wantzel",
+          "match": "\\b\\d+\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.wantzel",
+          "match": "(?i)\\b(continue|repeat|downto|return|while|until|break|then|else|case|halt|for|if|of|do|to)\\b"
+        },
+        {
+          "name": "keyword.declaration.wantzel",
+          "match": "(?i)\\b(procedure|function|program|forward|include|schema|winapi|const|begin|tools|type|var|end)\\b"
+        },
+        {
+          "name": "constant.language.wantzel",
+          "match": "(?i)\\b(false|true)\\b"
+        }
+      ]
+    },
+    "types": {
+      "name": "storage.type.wantzel",
+      "match": "(?i)\\b(record|array|char|bool|real|text|json|int|str)\\b"
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.word.wantzel",
+          "match": "(?i)\\b(band|bxor|bnot|and|not|div|mod|bor|shl|shr|or)\\b"
+        },
+        {
+          "name": "keyword.operator.wantzel",
+          "match": ":=|<>|<=|>=|[-+*/<>=]"
+        }
+      ]
+    },
+    "builtins": {
+      "name": "support.function.builtin.wantzel",
+      "match": "(?i)\\b(unpack32|pack32|argch|round|schar|trunc|addr|argc|peek|poke|sadr|scan|slen|sqrt|sys1|sys2|sys3|sys4|sys5|sys6|view|chr|len|ord)\\b"
+    },
+    "attributes": {
+      "name": "storage.modifier.wantzel",
+      "match": "(?i)\\b(destructive|idempotent|readonly)\\b"
+    },
+    "routine": {
+      "match": "(?i)\\b(procedure|function)\\s+([A-Za-z_][A-Za-z0-9_.]*)",
+      "captures": {
+        "1": {
+          "name": "keyword.declaration.wantzel"
+        },
+        "2": {
+          "name": "entity.name.function.wantzel"
+        }
+      }
+    },
+    "identifiers": {
+      "name": "variable.other.wantzel",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_.]*\\b"
+    }
+  }
+}

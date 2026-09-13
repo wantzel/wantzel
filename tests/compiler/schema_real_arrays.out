@@ -1,0 +1,22 @@
+parse = 146
+name_n = 7
+name[5] = 10
+value x100 = 250
+points_n = 4
+points[2] = -300
+points[3] x1000 = 125
+keys_n = 3
+keys_len[2] = 4
+keys[1] first = 98
+flags_n = 2
+flags 1
+count null 1
+note present 0
+{"name":"probe\n1","value":2.5,"count":null,"flags":[true,false],"points":[1.0,2.25,-300.0,0.125],"keys":["a","bc","déf"]}
+reparse = 123
+value x100 = 250
+missing required = -1
+too many points = -1
+name too long = -1
+string for real = -1
+{"type":"object","properties":{"name":{"type":"string","maxLength":16,"description":"a short name"},"value":{"type":"number"},"count":{"type":"integer"},"flags":{"type":"array","items":{"type":"boolean"},"maxItems":4},"points":{"type":"array","items":{"type":"number"},"maxItems":10},"keys":{"type":"array","items":{"type":"string","maxLength":8},"maxItems":4},"note":{"type":"string","description":"free text"}},"required":["name","value","points","keys"]}

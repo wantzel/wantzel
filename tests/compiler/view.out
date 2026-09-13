@@ -1,0 +1,11 @@
+bytes of words = 3
+bytes[7] = 0
+bytes[8] = 120
+bytes[15] = 120
+bytes[16] = 0
+words via view = 65792
+literal via view = 131
+literal direct = 131
+empty view = 0
+view bounds = 0
+bytes[3] = 121

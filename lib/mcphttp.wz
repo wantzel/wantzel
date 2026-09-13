@@ -1,0 +1,51 @@
+// lib/mcphttp.wz -- MCP over HTTP: the endpoint routine for app.request.
+//
+//   include "lib/mcphttp.wz";       (brings in lib/mcp.wz and lib/http.wz)
+//   procedure app.request;
+//   begin
+//     if http.pathis("/mcp") then mcp.http else ...
+//   end;
+//
+// Stateless streamable HTTP as in the 2025-06-18 spec: one JSON-RPC message
+// per POST, answered with 200 and application/json; a notification gets 202
+// with an empty body; anything but POST gets 405 (there is no server push,
+// so no GET stream, and no sessions, so nothing to DELETE).  Every reply
+// carries Mcp-Protocol-Version with the version negotiated by initialize
+// (the newest we support until a client has initialized).
+
+include "mcp.wz";
+include "http.wz";
+
+procedure mcp.pvheader;
+begin
+  if not mcp.inited then http.hdradd("Mcp-Protocol-Version: 2025-06-18")
+  else
+    case mcp.pvcode of
+      1: http.hdradd("Mcp-Protocol-Version: 2025-03-26");
+      2: http.hdradd("Mcp-Protocol-Version: 2025-06-18");
+    else
+      http.hdradd("Mcp-Protocol-Version: 2024-11-05");
+    end;
+end;
+
+// handle the current request as an MCP message and write the reply
+procedure mcp.http;
+var n: int;
+begin
+  if http.method <> HTTP.POST then
+  begin
+    mcp.pvheader;
+    http.add("this endpoint speaks MCP over POST\n");
+    http.finish(405, "text/plain");
+    return;
+  end;
+  n := mcp.handle(http.inbuf, http.bodyat, http.bodyat + http.bodylen);
+  mcp.pvheader;
+  if n = 0 then
+  begin
+    http.finish(202, "application/json");
+    return;
+  end;
+  http.addb(mcp.buf, 0, n);
+  http.finish(200, "application/json");
+end;

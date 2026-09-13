@@ -1,0 +1,593 @@
+// lib/http.wz -- a non-blocking HTTP/1.1 server on epoll.
+//
+// One process, one event loop, no threads and no allocation: every
+// connection owns a fixed slice of two static buffers, indexed by its file
+// descriptor.  The application supplies app.request, which is called once
+// per complete request.
+
+include "net.wz";
+include "json.wz";
+
+const
+  MAXCONN = 256;
+  INBUF   = 262144;         // largest request (headers + body) per connection
+  OUTBUF  = 524288;         // largest reply per connection
+  HDRROOM = 2048;           // space reserved in front of the body for the status line and headers
+  MAXEV   = 256;
+
+  // http.method values
+  HTTP.GET = 1;  HTTP.POST = 2;  HTTP.PUT = 3;  HTTP.DELETE = 4;
+  HTTP.PATCH = 5;  HTTP.OPTIONS = 6;  HTTP.HEAD = 7;
+
+var
+  http.inbuf:  array[0..MAXCONN * INBUF - 1] of char;
+  http.outbuf: array[0..MAXCONN * OUTBUF - 1] of char;
+  http.inlen:  array[0..MAXCONN - 1] of int;
+  http.osend:  array[0..MAXCONN - 1] of int;   // first byte still to send
+  http.oend:   array[0..MAXCONN - 1] of int;   // one past the last byte
+  http.open:   array[0..MAXCONN - 1] of bool;
+  http.evs:    array[0..MAXEV * 12 - 1] of char;
+  http.hdr:    array[0..HDRROOM - 1] of char;
+
+  http.ep, http.lfd: int;
+  http.fd, http.ibase, http.obase: int;        // the connection being served
+  http.method: int;                            // HTTP.GET .. HTTP.HEAD, 0 = other
+  http.pathat, http.pathlen: int;              // the path without the query string
+  http.queryat, http.querylen: int;            // the query string after '?', may be empty
+  http.hdrat, http.hdrend: int;                // the header lines (after the request line)
+  http.bodyat, http.bodylen: int;
+  http.keep: bool;
+  http.wpos: int;                              // write cursor for the reply body
+  http.requests: int;
+  http.xhdr: array[0..HDRROOM - 1] of char;    // extra response headers for the current reply
+  http.xlen: int;
+  http.hvat, http.hvend: int;                  // the value found by http.header
+  http.pval: array[0..4095] of char;           // the decoded value found by http.param/http.form
+  http.pvlen: int;
+  http.started: int;                           // io.now at the start of the request
+  http.logging: bool;                          // one JSON line per request on stderr
+
+// the application must define this; it is called with a parsed request
+procedure app.request; forward;
+
+// ---------------------------------------------------------------- replies
+
+procedure http.start;
+begin
+  http.wpos := http.obase + HDRROOM;
+  http.xlen := 0;
+end;
+
+// add a response header to the current reply: http.hdradd("Cache-Control: no-store")
+procedure http.hdradd(s: str);
+begin
+  if http.xlen + slen(s) + 2 > HDRROOM - 256 then return;      // silently dropped: no room
+  http.xlen := io.push(http.xhdr, http.xlen, s);
+  http.xlen := io.push(http.xhdr, http.xlen, "\r\n");
+end;
+
+// the same, with a value taken from a buffer (for values copied from the request)
+procedure http.hdraddslice(name: str; b: array of char; from: int; upto: int);
+begin
+  if http.xlen + slen(name) + (upto - from) + 4 > HDRROOM - 256 then return;
+  http.xlen := io.push(http.xhdr, http.xlen, name);
+  http.xlen := io.push(http.xhdr, http.xlen, ": ");
+  while from < upto do
+  begin
+    http.xhdr[http.xlen] := b[from];
+    http.xlen := http.xlen + 1;
+    from := from + 1;
+  end;
+  http.xlen := io.push(http.xhdr, http.xlen, "\r\n");
+end;
+
+// one JSON line per request on stderr:
+// {"t":<epoch ms>,"method":"POST","path":"/x","status":200,"us":123,"bytes":45}
+var
+  http.logbuf: array[0..1023] of char;
+
+procedure http.log(status: int; blen: int);
+var at: int;
+    n: int;
+begin
+  n := io.push(http.logbuf, 0, "{\"t\":");
+  n := io.pushnum(http.logbuf, n, io.realtime div 1000000);
+  n := io.push(http.logbuf, n, ",\"method\":\"");
+  case http.method of
+    HTTP.GET: n := io.push(http.logbuf, n, "GET");
+    HTTP.POST: n := io.push(http.logbuf, n, "POST");
+    HTTP.PUT: n := io.push(http.logbuf, n, "PUT");
+    HTTP.DELETE: n := io.push(http.logbuf, n, "DELETE");
+    HTTP.PATCH: n := io.push(http.logbuf, n, "PATCH");
+    HTTP.OPTIONS: n := io.push(http.logbuf, n, "OPTIONS");
+    HTTP.HEAD: n := io.push(http.logbuf, n, "HEAD");
+  else
+    n := io.push(http.logbuf, n, "?");
+  end;
+  n := io.push(http.logbuf, n, "\",\"path\":");
+  { json.putslice returns -1 when it does not fit.  A log line is not an answer:
+    better an empty path value than a truncated line or a negative position. }
+  if http.pathlen > 200 then at := json.putslice(http.logbuf, n, http.inbuf, http.pathat, http.pathat + 200)
+  else at := json.putslice(http.logbuf, n, http.inbuf, http.pathat, http.pathat + http.pathlen);
+  if at < 0 then n := io.push(http.logbuf, n, "\"\"") else n := at;
+  n := io.push(http.logbuf, n, ",\"status\":");
+  n := io.pushnum(http.logbuf, n, status);
+  n := io.push(http.logbuf, n, ",\"us\":");
+  n := io.pushnum(http.logbuf, n, (io.now - http.started) div 1000);
+  n := io.push(http.logbuf, n, ",\"bytes\":");
+  n := io.pushnum(http.logbuf, n, blen);
+  n := io.push(http.logbuf, n, "}\n");
+  io.out(STDERR, addr(http.logbuf[0]), n);
+end;
+
+procedure http.add(s: str);
+begin
+  http.wpos := io.push(http.outbuf, http.wpos, s);
+end;
+
+procedure http.addn(v: int);
+begin
+  http.wpos := io.pushnum(http.outbuf, http.wpos, v);
+end;
+
+procedure http.addc(c: char);
+begin
+  http.outbuf[http.wpos] := c;
+  http.wpos := http.wpos + 1;
+end;
+
+procedure http.addb(b: array of char; at: int; n: int);
+var i: int;
+begin
+  i := 0;
+  while i < n do
+  begin
+    http.outbuf[http.wpos] := b[at + i];
+    http.wpos := http.wpos + 1;
+    i := i + 1;
+  end;
+end;
+
+// write the status line and headers directly in front of the body, so the
+// whole reply goes out in one write
+procedure http.finish(status: int; ctype: str);
+var n, blen, i, start: int;
+begin
+  blen := http.wpos - (http.obase + HDRROOM);
+  n := 0;
+  n := io.push(http.hdr, n, "HTTP/1.1 ");
+  n := io.pushnum(http.hdr, n, status);
+  case status of
+    200: n := io.push(http.hdr, n, " OK\r\n");
+    201: n := io.push(http.hdr, n, " Created\r\n");
+    202: n := io.push(http.hdr, n, " Accepted\r\n");
+    204: n := io.push(http.hdr, n, " No Content\r\n");
+    301: n := io.push(http.hdr, n, " Moved Permanently\r\n");
+    302: n := io.push(http.hdr, n, " Found\r\n");
+    304: n := io.push(http.hdr, n, " Not Modified\r\n");
+    400: n := io.push(http.hdr, n, " Bad Request\r\n");
+    401: n := io.push(http.hdr, n, " Unauthorized\r\n");
+    403: n := io.push(http.hdr, n, " Forbidden\r\n");
+    404: n := io.push(http.hdr, n, " Not Found\r\n");
+    405: n := io.push(http.hdr, n, " Method Not Allowed\r\n");
+    409: n := io.push(http.hdr, n, " Conflict\r\n");
+    413: n := io.push(http.hdr, n, " Payload Too Large\r\n");
+    415: n := io.push(http.hdr, n, " Unsupported Media Type\r\n");
+    422: n := io.push(http.hdr, n, " Unprocessable Entity\r\n");
+    429: n := io.push(http.hdr, n, " Too Many Requests\r\n");
+    500: n := io.push(http.hdr, n, " Internal Server Error\r\n");
+    501: n := io.push(http.hdr, n, " Not Implemented\r\n");
+    503: n := io.push(http.hdr, n, " Service Unavailable\r\n");
+  else
+    n := io.push(http.hdr, n, " Status\r\n");
+  end;
+  n := io.push(http.hdr, n, "Content-Type: ");
+  n := io.push(http.hdr, n, ctype);
+  n := io.push(http.hdr, n, "\r\nContent-Length: ");
+  n := io.pushnum(http.hdr, n, blen);
+  n := io.push(http.hdr, n, "\r\n");
+  i := 0;
+  while i < http.xlen do
+  begin
+    http.hdr[n] := http.xhdr[i];
+    n := n + 1;
+    i := i + 1;
+  end;
+  if http.keep then n := io.push(http.hdr, n, "Connection: keep-alive\r\n\r\n")
+  else n := io.push(http.hdr, n, "Connection: close\r\n\r\n");
+  start := http.obase + HDRROOM - n;
+  i := 0;
+  while i < n do
+  begin
+    http.outbuf[start + i] := http.hdr[i];
+    i := i + 1;
+  end;
+  http.osend[http.fd] := start;
+  if http.method = HTTP.HEAD then http.oend[http.fd] := http.obase + HDRROOM   // headers only
+  else http.oend[http.fd] := http.wpos;
+  if http.logging then http.log(status, blen);
+end;
+
+// ---------------------------------------------------------------- parsing
+
+// case-insensitive compare of the header name at position at
+function http.hdreq(at: int; last: int; s: str): bool;
+var i, n: int;
+    c: char;
+begin
+  n := slen(s);
+  if at + n > last then return false;
+  i := 0;
+  while i < n do
+  begin
+    c := http.inbuf[at + i];
+    if (c >= 'A') and (c <= 'Z') then c := chr(ord(c) + 32);
+    if c <> schar(s, i) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// Returns the total length of the request once it is complete, 0 while more
+// data is needed, or -1 when the request is malformed.
+function http.parse(base: int; n: int): int;
+var at, eoh, sp1, sp2, lineend, clen, v: int;
+    c: char;
+begin
+  eoh := -1;
+  at := base;
+  while true do
+  begin
+    at := scan(http.inbuf, at, base + n, chr(13));
+    if at + 3 >= base + n then break;
+    if (http.inbuf[at + 1] = chr(10)) and (http.inbuf[at + 2] = chr(13))
+       and (http.inbuf[at + 3] = chr(10)) then
+    begin
+      eoh := at + 4;
+      break;
+    end;
+    at := at + 1;
+  end;
+  if eoh < 0 then return 0;
+
+  sp1 := scan(http.inbuf, base, eoh, ' ');
+  if sp1 >= eoh then return -1;
+  sp2 := scan(http.inbuf, sp1 + 1, eoh, ' ');
+  if sp2 >= eoh then return -1;
+  http.method := 0;
+  if http.hdreq(base, sp1, "get") and (sp1 - base = 3) then http.method := HTTP.GET
+  else if http.hdreq(base, sp1, "post") and (sp1 - base = 4) then http.method := HTTP.POST
+  else if http.hdreq(base, sp1, "put") and (sp1 - base = 3) then http.method := HTTP.PUT
+  else if http.hdreq(base, sp1, "delete") and (sp1 - base = 6) then http.method := HTTP.DELETE
+  else if http.hdreq(base, sp1, "patch") and (sp1 - base = 5) then http.method := HTTP.PATCH
+  else if http.hdreq(base, sp1, "options") and (sp1 - base = 7) then http.method := HTTP.OPTIONS
+  else if http.hdreq(base, sp1, "head") and (sp1 - base = 4) then http.method := HTTP.HEAD;
+  http.pathat := sp1 + 1;
+  http.pathlen := sp2 - sp1 - 1;
+  http.queryat := scan(http.inbuf, http.pathat, sp2, '?');
+  if http.queryat < sp2 then
+  begin
+    http.querylen := sp2 - http.queryat - 1;
+    http.pathlen := http.queryat - http.pathat;
+    http.queryat := http.queryat + 1;
+  end
+  else http.querylen := 0;
+
+  http.keep := true;
+  clen := 0;
+  at := scan(http.inbuf, base, eoh, chr(10));
+  at := at + 1;
+  http.hdrat := at;
+  http.hdrend := eoh - 2;
+  while at < eoh - 2 do
+  begin
+    lineend := scan(http.inbuf, at, eoh, chr(13));
+    if http.hdreq(at, eoh, "content-length:") then
+    begin
+      v := at + 15;
+      while (v < lineend) and (http.inbuf[v] = ' ') do v := v + 1;
+      clen := 0;
+      while (v < lineend) and (http.inbuf[v] >= '0') and (http.inbuf[v] <= '9') do
+      begin
+        clen := clen * 10 + (ord(http.inbuf[v]) - 48);
+        v := v + 1;
+      end;
+    end
+    else if http.hdreq(at, eoh, "connection:") then
+    begin
+      v := at + 11;
+      while (v < lineend) and (http.inbuf[v] = ' ') do v := v + 1;
+      if http.hdreq(v, eoh, "close") then http.keep := false;
+    end;
+    at := lineend + 2;
+  end;
+
+  if clen < 0 then return -1;
+  if eoh - base + clen > n then return 0;
+  http.bodyat := eoh;
+  http.bodylen := clen;
+  return eoh - base + clen;
+end;
+
+// ---------------------------------------------------------------- request access
+
+// find a request header (case-insensitive name); its trimmed value is
+// http.inbuf[http.hvat..http.hvend)
+function http.header(name: str): bool;
+var at, lineend, v: int;
+begin
+  at := http.hdrat;
+  while at < http.hdrend do
+  begin
+    lineend := scan(http.inbuf, at, http.hdrend, chr(13));
+    if http.hdreq(at, lineend, name) then
+    begin
+      v := at + slen(name);
+      if (v < lineend) and (http.inbuf[v] = ':') then
+      begin
+        v := v + 1;
+        while (v < lineend) and ((http.inbuf[v] = ' ') or (http.inbuf[v] = chr(9))) do v := v + 1;
+        http.hvat := v;
+        http.hvend := lineend;
+        while (http.hvend > http.hvat) and (http.inbuf[http.hvend - 1] = ' ') do http.hvend := http.hvend - 1;
+        return true;
+      end;
+    end;
+    at := lineend + 2;
+  end;
+  return false;
+end;
+
+// the bearer token of an Authorization header, as the slice http.inbuf[http.hvat..http.hvend)
+function http.bearer: bool;
+begin
+  if not http.header("authorization") then return false;
+  if http.hvend - http.hvat < 8 then return false;
+  if not http.hdreq(http.hvat, http.hvend, "bearer ") then return false;
+  http.hvat := http.hvat + 7;
+  while (http.hvat < http.hvend) and (http.inbuf[http.hvat] = ' ') do http.hvat := http.hvat + 1;
+  return http.hvat < http.hvend;
+end;
+
+function http.hexval(c: char): int;
+begin
+  if (c >= '0') and (c <= '9') then return ord(c) - 48;
+  if (c >= 'a') and (c <= 'f') then return ord(c) - 87;
+  if (c >= 'A') and (c <= 'F') then return ord(c) - 55;
+  return -1;
+end;
+
+// percent-decode src[from..upto) into dst ('+' becomes a space); -1 when malformed or too long
+function http.urldecode(src: array of char; from: int; upto: int; dst: array of char): int;
+var n, h, l: int;
+begin
+  n := 0;
+  while from < upto do
+  begin
+    if n >= len(dst) then return -1;
+    if src[from] = '+' then dst[n] := ' '
+    else if src[from] = '%' then
+    begin
+      if from + 2 >= upto then return -1;
+      h := http.hexval(src[from + 1]);
+      l := http.hexval(src[from + 2]);
+      if (h < 0) or (l < 0) then return -1;
+      dst[n] := chr(h * 16 + l);
+      from := from + 2;
+    end
+    else dst[n] := src[from];
+    n := n + 1;
+    from := from + 1;
+  end;
+  return n;
+end;
+
+// look up key in a urlencoded string b[from..upto); the decoded value lands in http.pval/http.pvlen
+function http.lookup(b: array of char; from: int; upto: int; key: str): bool;
+var eq, amp, k: int;
+    same: bool;
+begin
+  while from < upto do
+  begin
+    amp := scan(b, from, upto, '&');
+    eq := scan(b, from, amp, '=');
+    same := (eq - from = slen(key));
+    k := 0;
+    while same and (k < slen(key)) do
+    begin
+      if b[from + k] <> schar(key, k) then same := false;
+      k := k + 1;
+    end;
+    if same then
+    begin
+      if eq < amp then http.pvlen := http.urldecode(b, eq + 1, amp, http.pval)
+      else http.pvlen := 0;
+      return http.pvlen >= 0;
+    end;
+    from := amp + 1;
+  end;
+  return false;
+end;
+
+// a query-string parameter: GET /x?a=1&name=hello%20world
+function http.param(key: str): bool;
+begin
+  return http.lookup(http.inbuf, http.queryat, http.queryat + http.querylen, key);
+end;
+
+// a field of an application/x-www-form-urlencoded body
+function http.form(key: str): bool;
+begin
+  return http.lookup(http.inbuf, http.bodyat, http.bodyat + http.bodylen, key);
+end;
+
+// does the path equal s?
+function http.pathis(s: str): bool;
+var i: int;
+begin
+  if http.pathlen <> slen(s) then return false;
+  for i := 0 to http.pathlen - 1 do if http.inbuf[http.pathat + i] <> schar(s, i) then return false;
+  return true;
+end;
+
+// does the path start with prefix?  The rest is http.inbuf[http.restat..http.restend)
+var
+  http.restat, http.restend: int;
+
+function http.pathstarts(prefix: str): bool;
+var i: int;
+begin
+  if http.pathlen < slen(prefix) then return false;
+  for i := 0 to slen(prefix) - 1 do if http.inbuf[http.pathat + i] <> schar(prefix, i) then return false;
+  http.restat := http.pathat + slen(prefix);
+  http.restend := http.pathat + http.pathlen;
+  return true;
+end;
+
+// ---------------------------------------------------------------- the loop
+
+procedure http.drop(fd: int);
+begin
+  net.watch(http.ep, EPOLL_DEL, fd, 0);
+  net.close(fd);
+  http.open[fd] := false;
+end;
+
+// push whatever is pending; ask for EPOLLOUT if the socket is full
+procedure http.flush(fd: int);
+var n, r: int;
+begin
+  while http.osend[fd] < http.oend[fd] do
+  begin
+    n := http.oend[fd] - http.osend[fd];
+    r := net.send(fd, addr(http.outbuf[http.osend[fd]]), n);
+    if r > 0 then http.osend[fd] := http.osend[fd] + r
+    else if r = EAGAIN then
+    begin
+      net.watch(http.ep, EPOLL_MOD, fd, bor(EPOLLIN, EPOLLOUT));
+      return;
+    end
+    else if r <> EINTR then
+    begin
+      http.drop(fd);
+      return;
+    end;
+  end;
+  net.watch(http.ep, EPOLL_MOD, fd, EPOLLIN);
+  if not http.keep then http.drop(fd);
+end;
+
+procedure http.readable(fd: int);
+var r, used, total, base: int;
+begin
+  base := fd * INBUF;
+  while true do
+  begin
+    used := http.inlen[fd];
+    if used >= INBUF then
+    begin
+      http.drop(fd);
+      return;
+    end;
+    r := net.recv(fd, addr(http.inbuf[base + used]), INBUF - used);
+    if r > 0 then
+    begin
+      http.inlen[fd] := used + r;
+      total := http.parse(base, http.inlen[fd]);
+      if total < 0 then
+      begin
+        http.drop(fd);
+        return;
+      end;
+      if total > 0 then
+      begin
+        http.fd := fd;
+        http.ibase := base;
+        http.obase := fd * OUTBUF;
+        http.requests := http.requests + 1;
+        http.started := io.now;
+        http.start;
+        app.request;
+        http.inlen[fd] := 0;
+        http.flush(fd);
+        if not http.open[fd] then return;
+      end;
+    end
+    else if r = EAGAIN then return
+    else if r <> EINTR then
+    begin
+      http.drop(fd);
+      return;
+    end;
+  end;
+end;
+
+procedure http.accept;
+var fd: int;
+begin
+  while true do
+  begin
+    fd := net.accept(http.lfd);
+    if fd < 0 then return;
+    if fd >= MAXCONN then
+    begin
+      net.close(fd);
+      return;
+    end;
+    http.inlen[fd] := 0;
+    http.osend[fd] := 0;
+    http.oend[fd] := 0;
+    http.open[fd] := true;
+    net.watch(http.ep, EPOLL_ADD, fd, EPOLLIN);
+  end;
+end;
+
+// Run the event loop in `workers` independent processes.  Each opens its own
+// listening socket with SO_REUSEPORT, so the kernel spreads incoming
+// connections across them: all cores, no threads, no locks, nothing shared.
+procedure http.serve(port: int; workers: int);
+var n, i, fd, ev, pid: int;
+begin
+  i := 1;
+  while i < workers do
+  begin
+    pid := sys1(SYS.fork, 0);
+    if pid < 0 then io.fatal("cannot fork a worker");
+    if pid = 0 then break;
+    i := i + 1;
+  end;
+  http.lfd := net.listen(port, 1024, workers > 1);   // SO_REUSEPORT only when workers share the port
+  if http.lfd < 0 then io.fatal("cannot bind the port");
+  http.ep := net.epoll;
+  if http.ep < 0 then io.fatal("cannot create the epoll set");
+  net.watch(http.ep, EPOLL_ADD, http.lfd, EPOLLIN);
+  while true do
+  begin
+    n := net.wait(http.ep, addr(http.evs[0]), MAXEV, -1);
+    if n < 0 then
+    begin
+      if n <> EINTR then io.fatal("epoll_wait failed");
+      n := 0;
+    end;
+    i := 0;
+    while i < n do
+    begin
+      ev := io.get32(http.evs, i * 12);
+      fd := io.get32(http.evs, i * 12 + 4);
+      if fd = http.lfd then http.accept
+      else if (fd >= 0) and (fd < MAXCONN) then
+      begin
+        if http.open[fd] then
+        begin
+          if band(ev, bor(EPOLLERR, EPOLLHUP)) <> 0 then http.drop(fd)
+          else
+          begin
+            if band(ev, EPOLLOUT) <> 0 then http.flush(fd);
+            if http.open[fd] and (band(ev, EPOLLIN) <> 0) then http.readable(fd);
+          end;
+        end;
+      end;
+      i := i + 1;
+    end;
+  end;
+end;

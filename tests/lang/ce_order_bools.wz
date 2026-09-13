@@ -1,0 +1,2 @@
+// Must not compile: "only int, char and real can be ordered".
+program t; var b, c: bool; begin c := b < b; end.

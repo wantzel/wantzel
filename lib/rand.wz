@@ -1,0 +1,43 @@
+// lib/rand.wz -- random bytes and numbers from the kernel.
+//
+// Everything comes from getrandom(2), so the bytes are suitable for keys,
+// tokens and identifiers.  There is no seed and no user-space generator.
+
+include "io.wz";
+
+var
+  rand.buf: array[0..7] of char;
+
+// fill the whole view with random bytes
+procedure rand.bytes(b: array of char);
+var got, r: int;
+begin
+  got := 0;
+  while got < len(b) do
+  begin
+    r := sys3(SYS.getrandom, addr(b[got]), len(b) - got, 0);
+    if r = -4 then continue;                  // EINTR: try again
+    if r < 0 then io.fatal("rand: getrandom failed");
+    got := got + r;
+  end;
+end;
+
+// 64 random bits (may be negative)
+function rand.int: int;
+begin
+  rand.bytes(rand.buf);
+  return io.get64(rand.buf, 0);
+end;
+
+// uniform in [0, n), n > 0; rejection sampling, so no modulo bias
+function rand.below(n: int): int;
+const M = 0x7FFFFFFFFFFFFFFF;
+var r, k: int;
+begin
+  if n <= 0 then io.fatal("rand.below: n must be positive");
+  k := ((M mod n) + 1) mod n;                 // 2^63 mod n
+  repeat
+    r := band(rand.int, M);                   // 63 bits, never negative
+  until (k = 0) or (r <= M - k);              // reject the top partial block
+  return r mod n;
+end;

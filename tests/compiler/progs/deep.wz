@@ -1,0 +1,4 @@
+procedure deep;
+begin
+  sys3(1, 1, sadr("nested include ok\n"), 18);
+end;

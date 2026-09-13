@@ -1,0 +1,276 @@
+// gen.wz -- writes the source files that limits.sh compiles.
+//
+// This used to be 26 calls to python3. A test suite that needs another language to
+// produce its inputs sits badly with a compiler whose whole claim is that it needs
+// nothing, and it was the first thing a reader would notice. Doing it in Wantzel also
+// makes the generator itself a test: if the language cannot write these files, that is
+// worth knowing.
+//
+//   gen <kind> <count> <output>
+//
+// The kinds match the limits being proved; limits.sh passes the number that just fits
+// and the one that just does not, so the knowledge of what the limit IS stays there.
+
+program gen;
+
+include "io.wz";
+
+const
+  BUFSZ = 4194304;
+
+var
+  buf: array[0..BUFSZ - 1] of char;
+  blen: int;
+  kind: array[0..63] of char;
+  kindn: int;
+  n, i: int;
+  out: array[0..1023] of char;
+  root: array[0..1023] of char;
+  rootn: int;
+  fd, pa: int;
+
+// Append a literal.
+procedure put(s: str);
+begin
+  blen := io.push(buf, blen, s);
+end;
+
+// The include line that schema and tools programs need. The root is passed in because
+// the generator must not guess where the library lives.
+procedure putinclude;
+var j: int;
+begin
+  put("include \"");
+  j := 0;
+  while j < rootn do begin buf[blen] := root[j]; blen := blen + 1; j := j + 1; end;
+  put("/lib/json.wz\";\n");
+end;
+
+// Append a decimal number.
+procedure putn(v: int);
+var d: array[0..31] of char; m, k: int;
+begin
+  if v = 0 then begin buf[blen] := '0'; blen := blen + 1; return; end;
+  m := 0;
+  while v > 0 do begin d[m] := chr(48 + (v mod 10)); v := v div 10; m := m + 1; end;
+  k := m - 1;
+  while k >= 0 do begin buf[blen] := d[k]; blen := blen + 1; k := k - 1; end;
+end;
+
+// Append the same character n times: identifiers and string literals are measured in
+// bytes, so the test needs exactly as many as the limit allows and one more.
+procedure putrep(c: char; count: int);
+var j: int;
+begin
+  j := 0;
+  while j < count do begin buf[blen] := c; blen := blen + 1; j := j + 1; end;
+end;
+
+// Copy argument a into dst, nul-terminated; returns the length. There are no
+// var-parameters in this language, so the length comes back as the result.
+function argstr(a: int; dst: array of char): int;
+var j: int;
+begin
+  j := 0;
+  while argch(a, j) <> chr(0) do begin dst[j] := argch(a, j); j := j + 1; end;
+  dst[j] := chr(0);
+  return j;
+end;
+
+// schar traps past the end of a literal, so compare the length first and only then
+// the bytes -- walking to the nul the way you would in C reads one character too far.
+function iskind(s: str): bool;
+var j, n: int;
+begin
+  n := slen(s);
+  if kindn <> n then return false;
+  j := 0;
+  while j < n do
+  begin
+    if ord(kind[j]) <> ord(schar(s, j)) then return false;
+    j := j + 1;
+  end;
+  return true;
+end;
+
+begin
+  if (argc() < 4) or (argc() > 5) then
+  begin
+    io.puts(STDERR, "usage: gen <kind> <count> <output.wz> [root]\n");
+    halt(1);
+  end;
+  rootn := 0;
+  if argc() = 5 then rootn := argstr(4, root);
+  kindn := argstr(1, kind);
+  n := 0;
+  i := 0;
+  while argch(2, i) <> chr(0) do
+  begin
+    n := n * 10 + (ord(argch(2, i)) - 48);
+    i := i + 1;
+  end;
+  i := argstr(3, out);
+
+  blen := 0;
+
+  // Routine parameters: n of them, one per name.
+  if iskind("params") then
+  begin
+    // a,b,c,... like the Python this replaces: byte-identical output matters, so the
+    // comparison in limits_gen.sh can be a plain cmp rather than a judgement.
+    put("program t; procedure p(");
+    i := 0;
+    while i < n do
+    begin
+      if i > 0 then put(",");
+      buf[blen] := chr(97 + (i mod 26)); blen := blen + 1;
+      if i >= 26 then putn(i div 26);
+      i := i + 1;
+    end;
+    put(": int); begin end; begin end.\n");
+  end
+
+  // One identifier of exactly n bytes, declared and assigned.
+  else if iskind("ident") then
+  begin
+    put("program t; var ");
+    putrep('a', n);
+    put(": int; begin ");
+    putrep('a', n);
+    put(" := 1; end.\n");
+  end
+
+  // One string literal of exactly n bytes.
+  else if iskind("strlit") then
+  begin
+    put("program t; var s: str; begin s := \"");
+    putrep('x', n);
+    put("\"; end.\n");
+  end
+
+  // n globals.
+  else if iskind("globals") then
+  begin
+    put("program t;\nvar\n");
+    i := 0;
+    while i < n do begin put("g"); putn(i); put(": int;\n"); i := i + 1; end;
+    put("begin end.\n");
+  end
+
+  // n locals in one routine.
+  else if iskind("locals") then
+  begin
+    put("program t;\nprocedure p;\nvar\n");
+    i := 0;
+    while i < n do begin put("l"); putn(i); put(": int;\n"); i := i + 1; end;
+    put("begin end;\nbegin p; end.\n");
+  end
+
+  // n routines.
+  else if iskind("routines") then
+  begin
+    put("program t;\n");
+    i := 0;
+    while i < n do begin put("procedure p"); putn(i); put("; begin end;\n"); i := i + 1; end;
+    put("begin end.\n");
+  end
+
+  // n names in a single record field declaration.
+  else if iskind("fields") then
+  begin
+    put("program t;\ntype R = record ");
+    i := 0;
+    while i < n do
+    begin
+      if i > 0 then put(", ");
+      put("f"); putn(i);
+      i := i + 1;
+    end;
+    // Touch the last field: a record whose fields are never used could be optimised
+    // away, and then the test would prove nothing about the limit.
+    put(": int; end;\nvar rec: R;\nbegin rec.f");
+    putn(n - 1);
+    put(" := 1; end.\n");
+  end
+
+  // n optional fields in one schema.
+  else if iskind("schemafields") then
+  begin
+    put("program t;\n"); putinclude;
+    put("schema S = record\n");
+    i := 0;
+    while i < n do begin put("f"); putn(i); put(": int?;\n"); i := i + 1; end;
+    put("end;\nbegin end.\n");
+  end
+
+  // n schemas.
+  else if iskind("schemas") then
+  begin
+    put("program t;\n"); putinclude;
+    i := 0;
+    while i < n do begin put("schema S"); putn(i); put(" = record a: int; end;\n"); i := i + 1; end;
+    put("begin end.\n");
+  end
+
+  // n tools, each with the handler it needs.
+  else if iskind("tools") then
+  begin
+    put("program t;\n"); putinclude;
+    put("schema S = record a: int; end;\ntools\n");
+    i := 0;
+    while i < n do begin put("t"); putn(i); put("(S): S \"d\";\n"); i := i + 1; end;
+    put("end;\n");
+    i := 0;
+    while i < n do
+    begin
+      put("function tool.t"); putn(i);
+      put("(a: array of S; r: array of S): int; begin return 0; end;\n");
+      i := i + 1;
+    end;
+    put("begin end.\n");
+  end
+
+  // n tools WITHOUT handlers: for the case that must be refused before the missing
+  // handlers can matter.
+  else if iskind("toolsonly") then
+  begin
+    put("program t;\n"); putinclude;
+    put("schema S = record a: int; end;\ntools\n");
+    i := 0;
+    while i < n do begin put("t"); putn(i); put("(S): S \"d\";\n"); i := i + 1; end;
+    put("end;\nbegin end.\n");
+  end
+
+  // A static array of n bytes, with the last element touched.
+  else if iskind("bss") then
+  begin
+    put("program t;\nvar big: array[0..");
+    putn(n - 1);
+    put("] of char;\nbegin big[len(big)-1] := chr(1); end.\n");
+  end
+
+  // Recursion to depth n.
+  else if iskind("recurse") then
+  begin
+    put("program t;\nfunction d(n: int): int; var a, b, c: int; begin if n = 0 then return 0; return d(n - 1) + 1; end;\nbegin if d(");
+    putn(n);
+    put(") = ");
+    putn(n);
+    put(" then halt(0); halt(1); end.\n");
+  end
+
+  else
+  begin
+    io.puts(STDERR, "gen: unknown kind\n");
+    halt(1);
+  end;
+
+  // O_WRONLY|O_CREAT|O_TRUNC = 577, mode 0644 = 420. lib/fs.wz only opens for
+  // reading, and the spec is explicit that a syscall needs no compiler support.
+  pa := addr(out);
+  fd := sys3(SYS.open, pa, 577, 420);
+  if fd < 0 then begin io.puts(STDERR, "gen: cannot write\n"); halt(1); end;
+  pa := addr(buf);
+  if io.write(fd, pa, blen) <> blen then begin io.puts(STDERR, "gen: short write\n"); halt(1); end;
+  i := sys1(SYS.close, fd);
+end.

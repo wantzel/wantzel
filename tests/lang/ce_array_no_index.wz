@@ -1,0 +1,2 @@
+// Must not compile: "an array can only be used with a subscript, len() or addr()".
+program t; var a: array[0..3] of int; i: int; begin i := a; end.

@@ -1,0 +1,208 @@
+// lib/time.wz -- calendar time without a time zone.
+//
+// A moment is an int: seconds since 1970-01-01T00:00:00Z, negative before
+// it.  The calendar is proleptic Gregorian and everything is UTC; there are
+// no zones, no DST and no leap seconds.  The day arithmetic (Hinnant's
+// days-from-civil) is exact for years 1..9999 and well beyond.
+
+include "io.wz";
+
+var
+  time.year, time.month, time.day: int;       // month 1..12, day 1..31
+  time.hour, time.minute, time.second: int;
+  time.weekday: int;                          // 0 = Monday .. 6 = Sunday
+  time.yday: int;                             // 0 = January 1st
+  time.ok: bool;                              // result of the last time.parseiso
+
+function time.leap(y: int): bool;
+begin
+  if y mod 4 <> 0 then return false;
+  if y mod 100 <> 0 then return true;
+  return y mod 400 = 0;
+end;
+
+// days in month m of year y; 0 for a month outside 1..12
+function time.daysin(y, m: int): int;
+begin
+  case m of
+    1, 3, 5, 7, 8, 10, 12: return 31;
+    4, 6, 9, 11: return 30;
+    2: if time.leap(y) then return 29 else return 28;
+  end;
+  return 0;
+end;
+
+// days since 1970-01-01 of the civil date y-m-d
+function time.days(y, m, d: int): int;
+var era, yoe, doy, doe: int;
+begin
+  if m <= 2 then y := y - 1;
+  if y >= 0 then era := y div 400 else era := (y - 399) div 400;
+  yoe := y - era * 400;
+  if m > 2 then doy := m - 3 else doy := m + 9;
+  doy := (153 * doy + 2) div 5 + d - 1;
+  doe := yoe * 365 + yoe div 4 - yoe div 100 + doy;
+  return era * 146097 + doe - 719468;
+end;
+
+// seconds since the epoch for the civil moment
+function time.join(y, m, d, hh, mm, ss: int): int;
+begin
+  return time.days(y, m, d) * 86400 + hh * 3600 + mm * 60 + ss;
+end;
+
+// fill time.year .. time.yday from seconds since the epoch
+procedure time.split(t: int);
+var z, rem, era, doe, yoe, doy, mp: int;
+begin
+  z := t div 86400;
+  rem := t mod 86400;
+  if rem < 0 then                             // div truncates; we want floor
+  begin
+    rem := rem + 86400;
+    z := z - 1;
+  end;
+  time.hour := rem div 3600;
+  time.minute := (rem mod 3600) div 60;
+  time.second := rem mod 60;
+  time.weekday := (z + 3) mod 7;              // day 0 was a Thursday
+  if time.weekday < 0 then time.weekday := time.weekday + 7;
+  z := z + 719468;
+  if z >= 0 then era := z div 146097 else era := (z - 146096) div 146097;
+  doe := z - era * 146097;
+  yoe := (doe - doe div 1460 + doe div 36524 - doe div 146096) div 365;
+  doy := doe - (365 * yoe + yoe div 4 - yoe div 100);
+  mp := (5 * doy + 2) div 153;
+  time.day := doy - (153 * mp + 2) div 5 + 1;
+  if mp < 10 then time.month := mp + 3 else time.month := mp - 9;
+  time.year := yoe + era * 400;
+  if time.month <= 2 then time.year := time.year + 1;
+  time.yday := (z - 719468) - time.days(time.year, 1, 1);
+end;
+
+// write v as exactly w decimal digits, zero padded (0 <= v < 10^w)
+function time.pad(dst: array of char; at: int; v: int; w: int): int;
+var i: int;
+begin
+  for i := w - 1 downto 0 do
+  begin
+    dst[at + i] := chr(48 + v mod 10);
+    v := v div 10;
+  end;
+  return at + w;
+end;
+
+// write t as "YYYY-MM-DDTHH:MM:SSZ" (20 characters); returns the new position.
+// Years outside 0..9999 are written with as many digits as they need.
+function time.iso(dst: array of char; at: int; t: int): int;
+begin
+  time.split(t);
+  if (time.year >= 0) and (time.year <= 9999) then at := time.pad(dst, at, time.year, 4)
+  else at := io.pushnum(dst, at, time.year);
+  dst[at] := '-';
+  at := time.pad(dst, at + 1, time.month, 2);
+  dst[at] := '-';
+  at := time.pad(dst, at + 1, time.day, 2);
+  dst[at] := 'T';
+  at := time.pad(dst, at + 1, time.hour, 2);
+  dst[at] := ':';
+  at := time.pad(dst, at + 1, time.minute, 2);
+  dst[at] := ':';
+  at := time.pad(dst, at + 1, time.second, 2);
+  dst[at] := 'Z';
+  return at + 1;
+end;
+
+// read exactly n decimal digits at s[at]; -1 if any is not a digit
+function time.num(s: array of char; at: int; n: int): int;
+var i, v: int;
+begin
+  v := 0;
+  for i := at to at + n - 1 do
+  begin
+    if (s[i] < '0') or (s[i] > '9') then return -1;
+    v := v * 10 + (ord(s[i]) - 48);
+  end;
+  return v;
+end;
+
+// parse "YYYY-MM-DDTHH:MM:SS", optionally followed by fractional seconds
+// ".d..." (ignored) and/or a trailing "Z".  Sets time.ok; returns the
+// seconds, or -1 when time.ok is false.  Note that -1 is also the valid
+// moment 1969-12-31T23:59:59Z, so callers that accept dates before 1970
+// must test time.ok rather than the result.
+// Accepts the shapes Python's datetime.isoformat() produces:
+//   2026-09-11                     a bare date, midnight UTC
+//   2026-09-11T12:00:00            without a zone, read as UTC
+//   2026-09-11T12:00:00.123456     with a fraction, which is dropped
+//   2026-09-11T12:00:00Z           explicit UTC
+//   2026-09-11T12:00:00+02:00      an offset, subtracted to give UTC
+// A space instead of the T is allowed, as Postgres writes it.
+function time.parseiso(s: array of char): int;
+var y, m, d, hh, mm, ss, i, n, oh, om, sign: int;
+    c: char;
+begin
+  time.ok := false;
+  n := len(s);
+  if n < 10 then return -1;
+  if (s[4] <> '-') or (s[7] <> '-') then return -1;
+  y := time.num(s, 0, 4);
+  m := time.num(s, 5, 2);
+  d := time.num(s, 8, 2);
+  if (y < 0) or (m < 1) or (m > 12) or (d < 1) or (d > time.daysin(y, m)) then return -1;
+  hh := 0; mm := 0; ss := 0;
+  i := 10;
+  if i < n then
+  begin
+    c := s[i];
+    if (c <> 'T') and (c <> ' ') then return -1;
+    if n < 19 then return -1;
+    if (s[13] <> ':') or (s[16] <> ':') then return -1;
+    hh := time.num(s, 11, 2);
+    mm := time.num(s, 14, 2);
+    ss := time.num(s, 17, 2);
+    if (hh < 0) or (hh > 23) or (mm < 0) or (mm > 59) or (ss < 0) or (ss > 59) then return -1;
+    i := 19;
+    if (i < n) and (s[i] = '.') then
+    begin
+      i := i + 1;
+      if (i >= n) or (s[i] < '0') or (s[i] > '9') then return -1;
+      while (i < n) and (s[i] >= '0') and (s[i] <= '9') do i := i + 1;
+    end;
+  end;
+  sign := 0;
+  if i < n then
+  begin
+    c := s[i];
+    if c = 'Z' then i := i + 1
+    else if (c = '+') or (c = '-') then
+    begin
+      { an offset of the form +HH:MM or +HHMM }
+      if c = '-' then sign := 1 else sign := -1;    { east of UTC means subtracting }
+      if i + 5 > n then return -1;
+      oh := time.num(s, i + 1, 2);
+      if s[i + 3] = ':' then
+      begin
+        if i + 6 > n then return -1;
+        om := time.num(s, i + 4, 2);
+        i := i + 6;
+      end
+      else
+      begin
+        om := time.num(s, i + 3, 2);
+        i := i + 5;
+      end;
+      if (oh < 0) or (oh > 23) or (om < 0) or (om > 59) then return -1;
+    end;
+  end;
+  if i <> n then return -1;
+  time.ok := true;
+  if sign = 0 then return time.join(y, m, d, hh, mm, ss);
+  return time.join(y, m, d, hh, mm, ss) + sign * (oh * 3600 + om * 60);
+end;
+
+// the current moment in seconds since the epoch
+function time.nowsec: int;
+begin
+  return io.realtime div 1000000000;
+end;

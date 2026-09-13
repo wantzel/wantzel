@@ -1,0 +1,30 @@
+// httpd.wz -- a small HTTP server: proof that the event loop works.
+
+program httpd;
+
+include "http.wz";
+
+var
+  hits: int;
+
+procedure app.request;
+begin
+  hits := hits + 1;
+  if http.method <> 1 then
+  begin
+    http.add("only GET is served here\n");
+    http.finish(405, "text/plain");
+    return;
+  end;
+  http.add("hello from wantzel\npath: ");
+  http.addb(http.inbuf, http.pathat, http.pathlen);
+  http.add("\nrequest number: ");
+  http.addn(hits);
+  http.add("\n");
+  http.finish(200, "text/plain");
+end;
+
+begin
+  io.puts(STDOUT, "listening on http://127.0.0.1:8080/ with 8 workers\n");
+  http.serve(8080, 8);
+end.

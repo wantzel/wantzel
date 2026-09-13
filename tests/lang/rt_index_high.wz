@@ -1,0 +1,3 @@
+// Must stop at run time: "array index out of range", with exit status 1.
+program t; var a: array[10..20] of int; i: int;
+begin i := 21; a[i] := 1; end.

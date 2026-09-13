@@ -1,0 +1,42 @@
+// lib/hmac.wz -- HMAC-SHA256 (RFC 2104 / RFC 4231).
+//
+// hmac.sha256(key, msg, digest) writes the 32-byte MAC into digest[0..31].
+// A key longer than the 64-byte block is hashed first, as the RFC requires.
+// Uses the global sha256 state, so it must not be interleaved with another
+// sha256.update sequence.
+
+include "sha256.wz";
+
+var
+  hmac.kb:    array[0..63] of char;   // the (padded) key block, xored with ipad/opad
+  hmac.kh:    array[0..31] of char;   // hash of a long key
+  hmac.inner: array[0..31] of char;   // inner digest
+
+procedure hmac.sha256(key: array of char; msg: array of char; digest: array of char);
+var i: int;
+begin
+  for i := 0 to 63 do hmac.kb[i] := chr(0);
+  if len(key) > 64 then
+  begin
+    sha256.hash(key, hmac.kh);
+    for i := 0 to 31 do hmac.kb[i] := hmac.kh[i];
+  end
+  else
+    for i := 0 to len(key) - 1 do hmac.kb[i] := key[i];
+
+  // inner: H((K xor ipad) || msg)
+  for i := 0 to 63 do hmac.kb[i] := chr(bxor(ord(hmac.kb[i]), 0x36));
+  sha256.init;
+  sha256.update(hmac.kb);
+  sha256.update(msg);
+  sha256.final(hmac.inner);
+
+  // outer: H((K xor opad) || inner); 0x36 xor 0x5C = 0x6A undoes the ipad
+  for i := 0 to 63 do hmac.kb[i] := chr(bxor(ord(hmac.kb[i]), 0x6A));
+  sha256.init;
+  sha256.update(hmac.kb);
+  sha256.update(hmac.inner);
+  sha256.final(digest);
+
+  for i := 0 to 63 do hmac.kb[i] := chr(0);   // do not leave key material behind
+end;

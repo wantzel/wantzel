@@ -1,0 +1,121 @@
+// mcpoauth.wz -- the mcptools example behind OAuth 2.1, for a Claude connector.
+//
+//   mcpoauth <port> <datadir> <issuer> <user> <secret>
+//
+// Discovery, dynamic client registration, the login form, PKCE, tokens and
+// the 401 challenge come from lib/oauth.wz; the tools from a `tools` block.
+// One person can log in: the user/secret pair given on the command line.
+
+program mcpoauth;
+
+include "oauth.wz";
+include "mcphttp.wz";
+
+schema AddArgs = record
+  a: int "first term";
+  b: int "second term";
+end;
+
+schema AddResult = record
+  sum: int;
+end;
+
+schema GreetArgs = record
+  name: text[64] "who to greet";
+end;
+
+schema GreetResult = record
+  greeting: text[256];
+end;
+
+tools
+  add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
+  greet(GreetArgs): GreetResult "Greet someone." readonly;
+end;
+
+include "tools.wz";
+
+var
+  demo.user: array[0..127] of char;
+  demo.usern: int;
+  demo.secret: array[0..127] of char;
+  demo.secretn: int;
+
+function tool.add(a: array of AddArgs; r: array of AddResult): int;
+begin
+  r[0].sum := a[0].a + a[0].b;
+  return 0;
+end;
+
+function tool.greet(a: array of GreetArgs; r: array of GreetResult): int;
+var at: int;
+begin
+  at := io.push(r[0].greeting, 0, "hello, ");
+  at := json.putraw(r[0].greeting, at, a[0].name, 0, a[0].name_n);
+  at := io.push(r[0].greeting, at, "!");
+  r[0].greeting_n := at;
+  return 0;
+end;
+
+function app.authenticate(user: array of char; secret: array of char): int;
+var i: int;
+begin
+  if (len(user) <> demo.usern) or (len(secret) <> demo.secretn) then return -1;
+  for i := 0 to demo.usern - 1 do if user[i] <> demo.user[i] then return -1;
+  for i := 0 to demo.secretn - 1 do if secret[i] <> demo.secret[i] then return -1;
+  return 1;
+end;
+
+function app.machinetoken(token: array of char): int;
+begin
+  return -1;
+end;
+
+procedure app.request;
+var uid: int;
+begin
+  if oauth.route then return;
+  if router.get("/") then begin router.text(200, "wantzel mcpoauth: MCP at POST / and POST /mcp"); return; end;
+  uid := oauth.verify;
+  if uid < 0 then begin oauth.challenge; return; end;
+  if tool.rest("/api/") then return;
+  if http.pathis("/mcp") or http.pathis("/") then begin mcp.http; return; end;   { connectors may be given the bare host }
+  router.notfound;
+end;
+
+var
+  port, i: int;
+  c: char;
+  datadir: array[0..255] of char;
+  datan: int;
+  issuer: array[0..255] of char;
+  issn: int;
+
+begin
+  port := 0;
+  i := 0;
+  while true do
+  begin
+    c := argch(1, i);
+    if c = chr(0) then break;
+    port := port * 10 + (ord(c) - 48);
+    i := i + 1;
+  end;
+  datan := 0;
+  while argch(2, datan) <> chr(0) do begin datadir[datan] := argch(2, datan); datan := datan + 1; end;
+  issn := 0;
+  while argch(3, issn) <> chr(0) do begin issuer[issn] := argch(3, issn); issn := issn + 1; end;
+  demo.usern := 0;
+  while argch(4, demo.usern) <> chr(0) do begin demo.user[demo.usern] := argch(4, demo.usern); demo.usern := demo.usern + 1; end;
+  demo.secretn := 0;
+  while argch(5, demo.secretn) <> chr(0) do begin demo.secret[demo.secretn] := argch(5, demo.secretn); demo.secretn := demo.secretn + 1; end;
+  if (port = 0) or (datan = 0) or (issn = 0) or (demo.usern = 0) then io.fatal("usage: mcpoauth <port> <datadir> <issuer> <user> <secret>");
+  http.logging := true;
+  mcp.name := "wantzel-mcpoauth";
+  mcp.version := "1.0";
+  oauth.configure(issuer[0..issn - 1]);
+  oauth.tables;
+  if not store.opendir(datadir[0..datan - 1]) then io.fatal("cannot open the data directory");
+  oauth.load;
+  http.serve(port, 1);
+end.

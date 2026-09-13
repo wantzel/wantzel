@@ -1,0 +1,6 @@
+// No implicit conversion between int and real.
+program t;
+var r: real; i: int;
+begin
+  r := i;
+end.

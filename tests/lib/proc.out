@@ -1,0 +1,10 @@
+reaped, status = 1792
+  exitcode = 7
+  exited = yes
+  signal = 0
+  ok = no (code 7)
+killed child, status = 9
+  exit code says = 0
+  signal says    = 9
+  ok = no (correct)
+children still alive = 0

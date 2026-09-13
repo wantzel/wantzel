@@ -1,0 +1,94 @@
+isobject {"a":1} -> 1
+isobject   {"a":1,"b":[1,2]}   -> 1
+isobject {} -> 1
+isobject  { }  -> 1
+isobject  -> 0
+isobject [1] -> 0
+isobject {"a":1} x -> 0
+isobject {"a":1 -> 0
+isobject {"a"} -> 0
+isobject {"a":} -> 0
+isobject {"a":1,} -> 0
+isobject {,} -> 0
+isobject {a:1} -> 0
+isobject {"a":"unterminated} -> 0
+isobject {"a":[1,2} -> 0
+isobject {"a":1 "b":2} -> 0
+key n = 1
+key arr = [1, 2, {"x": "]"}]
+key obj = { "k" : "v" }
+first of {} = -1
+first of junk = -1
+find n 1
+find arr = [1,2]
+find escaped key 1
+find empty key = null
+find zz 0
+find ar (prefix) 0
+find in malformed 0
+same 3 ~ 3 -> 1
+same 3 ~ 3.0 -> 1
+same 3 ~ 3e0 -> 1
+same 3 ~ "3" -> 0
+same 3 ~ 3.5 -> 0
+same -2 ~ -2.0 -> 1
+same 1.5 ~ 1.50 -> 1
+same 10 ~ 1e1 -> 1
+same 0.1 ~ 0.10 -> 1
+same "a" ~ "a" -> 1
+same "a" ~ "b" -> 0
+same "a\nb" ~ "a\nb" -> 1
+same true ~ true -> 1
+same true ~ false -> 0
+same null ~ null -> 1
+same null ~ "null" -> 0
+same [1,2] ~  [1,2]  -> 1
+same [1,2] ~ [1, 2] -> 0
+same {"k":1} ~ {"k":1} -> 1
+same  ~  -> 1
+same - ~ - -> 0
+match {"a":1} -> 1
+match {"a":1.0} -> 1
+match {"a":2} -> 0
+match {"a":"1"} -> 0
+match {"b":["y","x"]} -> 1
+match {"b":["y","z"]} -> 0
+match {"b":[]} -> 0
+match {"zz":1} -> 0
+match {"zz":[1]} -> 0
+match {"d":{"k":1}} -> 1
+match {"d":{"k":2}} -> 0
+match {"c":[1,2]} -> 0
+match {"c":[[1,2]]} -> 1
+match {"e":null} -> 1
+match {"a":1,"b":"x"} -> 1
+match {"a":1,"b":"q"} -> 0
+match {} -> 1
+match  { }  -> 1
+match {"a":1 -> 0
+match {"a":[1,2} -> 0
+match [] -> 0
+match  -> 0
+merge {"a":1,"b":"x","c":true} + {"b":"y","d":[1, 2],"c":null,"zz":null} -> {"a":1,"b":"y","d":[1, 2]}
+merge {"a":1} + {} -> {"a":1}
+merge {} + {"a":{"k":[1]}} -> {"a":{"k":[1]}}
+merge {} + {} -> {}
+merge  + {"x":1,"y":null} -> {"x":1}
+merge    + {} -> {}
+merge {"a":1,"b":2} + {"a":null,"b":null} -> {}
+merge  { "a" : 1 , "b" : "s" }  +  { "b" : 2 }  -> {"a":1,"b":2}
+merge {"a":1} + {"a":null,"a":3} -> {}
+merge {"a":1 + {} -> -1
+merge {} + {"a":} -> -1
+merge [1] + {} -> -1
+merge {} + [1] -> -1
+merge into tiny = -1
+merge {} into tiny = 2
+merge into empty slice = -1
+#{"a":1}
+count {} -> 0
+count {"a":1,"b":[1,{"c":2}],"d":{"e":1,"f":2}} -> 3
+count {"a":{"b":1,"c":2}} -> 1
+count {"a":1, -> 0
+count  -> 0
+count {"a":1} tail -> 1

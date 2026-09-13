@@ -1,0 +1,19 @@
+parse = 142
+id = 7
+kind = closed: 1
+kind const 1
+origin.x x10 = 15
+origin.tag = start: 0
+pts_n = 2
+pts[1].y = 4
+pts[1].tag = end: 2
+pts[0].tag present 0
+meta length = 22
+{"id":7,"origin":{"x":1.5,"y":-2.0,"tag":"start"},"pts":[{"x":0.0,"y":0.0},{"x":3.0,"y":4.0,"tag":"end"}],"meta":{"a":[1,2,{"b":null}]},"kind":"closed"}
+paths[0].id = 9
+paths[1].id = 8
+paths[1].pts[1].x = 3
+nested required = -1
+unknown enum parses = 55
+unknown enum value = -1
+{"type":"object","properties":{"id":{"type":"integer"},"origin":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"},"tag":{"type":"string","enum":["start","mid","end"]}},"required":["x","y"]},"pts":{"type":"array","items":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"},"tag":{"type":"string","enum":["start","mid","end"]}},"required":["x","y"]},"maxItems":4},"meta":{},"kind":{"type":"string","enum":["open","closed"]}},"required":["id","origin","pts","kind"]}

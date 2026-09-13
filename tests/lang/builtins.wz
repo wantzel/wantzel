@@ -1,0 +1,34 @@
+// spec §6: ord/chr, len/addr, slen/schar/sadr, scan, argc/argch, sys calls.
+program t;
+include "io.wz";
+var
+  a: array[5..9] of int;
+  b: array[0..15] of char;
+  i: int;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+begin
+  show("ord(A) = ", ord('A'));
+  show("chr(66) = ", ord(chr(66)));
+  show("len(a) = ", len(a));
+  show("addr(a[6]) - addr(a[5]) = ", addr(a[6]) - addr(a[5]));
+  show("addr(b[1]) - addr(b[0]) = ", addr(b[1]) - addr(b[0]));
+  show("slen = ", slen("hello"));
+  show("schar = ", ord(schar("hello", 1)));
+  show("sadr byte = ", peek(sadr("hello") + 4));
+  for i := 0 to 15 do b[i] := 'x';
+  b[9] := 'q';
+  show("scan hit = ", scan(b, 0, 16, 'q'));
+  show("scan miss = ", scan(b, 0, 16, 'z'));       { returns upto }
+  show("scan window = ", scan(b, 10, 16, 'q'));    { 16: outside the window }
+  show("argc = ", argc());
+  show("argv[1][0] = ", ord(argch(1, 0)));
+  show("argv[1][3] = ", ord(argch(1, 3)));         { past the end: 0 }
+  show("argv[9][0] = ", ord(argch(9, 0)));         { no such argument: 0 }
+  i := sys3(1, 1, sadr("sys write\n"), 10);        { write(1, ...) }
+  show("sys3 returned ", i);
+  i := sys1(3, 999);                               { close(999): -EBADF }
+  show("close(999) = ", i);
+end.

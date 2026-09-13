@@ -1,0 +1,359 @@
+// lib/kv.wz -- helpers for a small JSON object kept as compact text (the
+// `info` field of typical entities: at most a few KB, scalar or small nested
+// values).
+//
+// Nothing is decoded: keys and values are described by positions in the
+// input buffer, exactly like lib/json.wz.  Every position pair is
+// (at, upto) with upto exclusive.  Nothing here assumes the input is
+// well-formed; every read is guarded by upto.
+//
+// Cursor: kv.first/kv.next put the current key (without quotes) in
+// b[kv.kat..kv.kend) and its raw value in b[kv.vat..kv.vend).  The cursor
+// they return is an int that kv.next re-parses; it is not kept in a global,
+// so a nested kv.find (which also moves kv.k*/kv.v*) does not break an outer
+// loop as long as the caller saved what it needs first.
+
+include "json.wz";
+
+var
+  kv.kat, kv.kend: int;      // current key without quotes
+  kv.vat, kv.vend: int;      // current value, raw JSON, trimmed of whitespace
+
+// can a JSON value start with c?
+function kv.vstart(c: char): bool;
+begin
+  if (c >= '0') and (c <= '9') then return true;
+  return (c = '"') or (c = '{') or (c = '[') or (c = '-')
+      or (c = 't') or (c = 'f') or (c = 'n');
+end;
+
+// parse one "key": value pair starting at (or after whitespace from) at;
+// fills kv.k*/kv.v*; returns the position after the value, or -1
+function kv.pair(b: array of char; at: int; upto: int): int;
+var e: int;
+begin
+  at := json.ws(b, at, upto);
+  if at >= upto then return -1;
+  if b[at] <> '"' then return -1;
+  e := json.strend(b, at + 1, upto);
+  if e < 0 then return -1;
+  kv.kat := at + 1;
+  kv.kend := e;
+  at := json.ws(b, e + 1, upto);
+  if at >= upto then return -1;
+  if b[at] <> ':' then return -1;
+  at := json.ws(b, at + 1, upto);
+  if at >= upto then return -1;
+  if not kv.vstart(b[at]) then return -1;
+  e := json.skip(b, at, upto);
+  if e < 0 then return -1;
+  kv.vat := at;
+  kv.vend := e;
+  return e;
+end;
+
+// walk a whole object; returns the position just after its closing brace,
+// or -1 when it is malformed (the cursor variables are left on the last pair)
+function kv.scanobj(b: array of char; at: int; upto: int): int;
+var c: char;
+begin
+  at := json.ws(b, at, upto);
+  if at >= upto then return -1;
+  if b[at] <> '{' then return -1;
+  at := json.ws(b, at + 1, upto);
+  if at >= upto then return -1;
+  if b[at] = '}' then return at + 1;
+  while true do
+  begin
+    at := kv.pair(b, at, upto);
+    if at < 0 then return -1;
+    at := json.ws(b, at, upto);
+    if at >= upto then return -1;
+    c := b[at];
+    if c = '}' then return at + 1;
+    if c <> ',' then return -1;
+    at := at + 1;
+  end;
+  return -1;
+end;
+
+// true when b[at..upto) is whitespace + one complete JSON object + whitespace
+function kv.isobject(b: array of char; at: int; upto: int): bool;
+var e: int;
+begin
+  e := kv.scanobj(b, at, upto);
+  if e < 0 then return false;
+  return json.ws(b, e, upto) = upto;
+end;
+
+// position the cursor on the first key of the object starting at `at`
+// (after whitespace); returns a cursor >= 0, or -1 when the object is empty
+// or malformed
+function kv.first(b: array of char; at: int; upto: int): int;
+begin
+  at := json.ws(b, at, upto);
+  if at >= upto then return -1;
+  if b[at] <> '{' then return -1;
+  at := json.ws(b, at + 1, upto);
+  if at >= upto then return -1;
+  if b[at] = '}' then return -1;
+  return kv.pair(b, at, upto);
+end;
+
+// advance from a cursor returned by kv.first/kv.next to the next key;
+// -1 at the end of the object or on malformed input
+function kv.next(b: array of char; cur: int; upto: int): int;
+begin
+  if cur < 0 then return -1;
+  cur := json.ws(b, cur, upto);
+  if cur >= upto then return -1;
+  if b[cur] <> ',' then return -1;
+  return kv.pair(b, cur + 1, upto);
+end;
+
+// number of keys; 0 for {} or a malformed object
+function kv.count(b: array of char; at: int; upto: int): int;
+var cur, cnt: int;
+begin
+  if kv.scanobj(b, at, upto) < 0 then return 0;
+  cnt := 0;
+  cur := kv.first(b, at, upto);
+  while cur >= 0 do
+  begin
+    cnt := cnt + 1;
+    cur := kv.next(b, cur, upto);
+  end;
+  return cnt;
+end;
+
+// are the raw bytes a[aat..aend) and b[bat..bend) identical?
+function kv.bytes(a: array of char; aat: int; aend: int; b: array of char; bat: int; bend: int): bool;
+var i, cnt: int;
+begin
+  if aat < 0 then return false;
+  if bat < 0 then return false;
+  if aend > len(a) then return false;
+  if bend > len(b) then return false;
+  cnt := aend - aat;
+  if bend - bat <> cnt then return false;
+  i := 0;
+  while i < cnt do
+  begin
+    if a[aat + i] <> b[bat + i] then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// find a key (raw bytes, no quotes) in the object; on success kv.vat/kv.vend
+// hold its value
+function kv.find(b: array of char; at: int; upto: int; key: array of char): bool;
+var cur: int;
+begin
+  cur := kv.first(b, at, upto);
+  while cur >= 0 do
+  begin
+    if kv.bytes(b, kv.kat, kv.kend, key, 0, len(key)) then return true;
+    cur := kv.next(b, cur, upto);
+  end;
+  return false;
+end;
+
+// the exclusive end of b[at..upto) with trailing whitespace removed
+function kv.rtrim(b: array of char; at: int; upto: int): int;
+var c: char;
+begin
+  while upto > at do
+  begin
+    c := b[upto - 1];
+    if (c <> ' ') and (c <> chr(9)) and (c <> chr(10)) and (c <> chr(13)) then return upto;
+    upto := upto - 1;
+  end;
+  return upto;
+end;
+
+// does the number text b[at..upto) have a fraction or an exponent?
+function kv.hasfrac(b: array of char; at: int; upto: int): bool;
+begin
+  if scan(b, at, upto, '.') < upto then return true;
+  if scan(b, at, upto, 'e') < upto then return true;
+  return scan(b, at, upto, 'E') < upto;
+end;
+
+// are two JSON values equal?  Strings byte-for-byte (escapes included),
+// numbers numerically (3 = 3.0 = 3e0), true/false/null by text; arrays and
+// objects byte-for-byte after trimming the surrounding whitespace.
+function kv.same(a: array of char; aat: int; aend: int; b: array of char; bat: int; bend: int): bool;
+var r, av: int;
+    ar: real;
+begin
+  if (aat < 0) or (bat < 0) then return false;
+  if (aend > len(a)) or (bend > len(b)) then return false;
+  aat := json.ws(a, aat, aend);
+  aend := kv.rtrim(a, aat, aend);
+  bat := json.ws(b, bat, bend);
+  bend := kv.rtrim(b, bat, bend);
+  if (aat >= aend) or (bat >= bend) then return kv.bytes(a, aat, aend, b, bat, bend);
+  if ((a[aat] = '-') or ((a[aat] >= '0') and (a[aat] <= '9')))
+     and ((b[bat] = '-') or ((b[bat] >= '0') and (b[bat] <= '9'))) then
+  begin
+    if kv.hasfrac(a, aat, aend) or kv.hasfrac(b, bat, bend) then
+    begin
+      r := json.real(a, aat, aend);
+      if r <> aend then return false;
+      ar := json.rval;
+      r := json.real(b, bat, bend);
+      if r <> bend then return false;
+      return ar = json.rval;
+    end;
+    r := json.number(a, aat, aend);
+    if r <> aend then return false;
+    av := json.ival;
+    r := json.number(b, bat, bend);
+    if r <> bend then return false;
+    return av = json.ival;
+  end;
+  return kv.bytes(a, aat, aend, b, bat, bend);
+end;
+
+// does the object value obj[oat..oend) equal any element of the array
+// f[fat..fend)?  An empty or malformed array matches nothing.
+function kv.anyof(obj: array of char; oat: int; oend: int; f: array of char; fat: int; fend: int): bool;
+var at, e: int;
+begin
+  at := json.ws(f, fat, fend);
+  if at >= fend then return false;
+  if f[at] <> '[' then return false;
+  at := json.ws(f, at + 1, fend);
+  while at < fend do
+  begin
+    if f[at] = ']' then return false;
+    if not kv.vstart(f[at]) then return false;
+    e := json.skip(f, at, fend);
+    if e < 0 then return false;
+    if kv.same(obj, oat, oend, f, at, e) then return true;
+    at := json.ws(f, e, fend);
+    if at >= fend then return false;
+    if f[at] = ']' then return false;
+    if f[at] <> ',' then return false;
+    at := json.ws(f, at + 1, fend);
+  end;
+  return false;
+end;
+
+// subset match as used by entity searches: every key of the filter object f
+// must exist in obj and its value must kv.same the filter value, or, when
+// the filter value is an array, equal any of its elements.  An empty filter
+// matches everything; a malformed filter matches nothing.
+function kv.match(obj: array of char; oat: int; oend: int; f: array of char; fat: int; fend: int): bool;
+var cur, fkat, fkend, fvat, fvend: int;
+    ok: bool;
+begin
+  if kv.scanobj(f, fat, fend) < 0 then return false;
+  cur := kv.first(f, fat, fend);
+  while cur >= 0 do
+  begin
+    fkat := kv.kat; fkend := kv.kend; fvat := kv.vat; fvend := kv.vend;
+    if not kv.find(obj, oat, oend, f[fkat..fkend - 1]) then return false;
+    if f[fvat] = '[' then ok := kv.anyof(obj, kv.vat, kv.vend, f, fvat, fvend)
+    else ok := kv.same(obj, kv.vat, kv.vend, f, fvat, fvend);
+    if not ok then return false;
+    cur := kv.next(f, cur, fend);
+  end;
+  return true;
+end;
+
+// ------------------------------------------------------------- merge
+
+// append one byte to dst; -1 when it does not fit
+function kv.putc(dst: array of char; at: int; c: char): int;
+begin
+  if at < 0 then return -1;
+  if at >= len(dst) then return -1;
+  dst[at] := c;
+  return at + 1;
+end;
+
+// append src[from..upto) raw to dst; -1 when it does not fit
+function kv.put(dst: array of char; at: int; src: array of char; from: int; upto: int): int;
+begin
+  if at < 0 then return -1;
+  if from > upto then return -1;
+  if at + (upto - from) > len(dst) then return -1;
+  return json.putraw(dst, at, src, from, upto);
+end;
+
+// append "key": (raw key bytes), preceded by a comma when not the first pair
+function kv.putkey(dst: array of char; at: int; first: bool; k: array of char; kat: int; kend: int): int;
+begin
+  if not first then at := kv.putc(dst, at, ',');
+  at := kv.putc(dst, at, '"');
+  at := kv.put(dst, at, k, kat, kend);
+  at := kv.putc(dst, at, '"');
+  return kv.putc(dst, at, ':');
+end;
+
+// jsonb-merge as Postgres does it: the keys of base in their order, each replaced
+// by the patch value when the patch has the key (a patch value null removes
+// the key); keys only in the patch (and not null) are appended in patch
+// order.  Writes the compact result to dst from position 0 and returns the
+// length, or -1 when it does not fit or an input is malformed.  An empty
+// base (only whitespace) counts as {}.  To write at an offset pass a slice:
+// n := kv.merge(b, 0, bn, p, 0, pn, out[at..len(out) - 1]).
+// (A routine takes at most ten argument slots and an array costs two, so
+// there is no room for a separate `at` parameter.)
+function kv.merge(base: array of char; bat: int; bend: int; patch: array of char; pat: int; pend: int; dst: array of char): int;
+var at, cur, bkat, bkend, bvat, bvend, pkat, pkend, pvat, pvend: int;
+    first, empty: bool;
+begin
+  if (bat < 0) or (pat < 0) then return -1;
+  if (bend > len(base)) or (pend > len(patch)) then return -1;
+  empty := json.ws(base, bat, bend) >= bend;
+  if not empty then
+    if kv.scanobj(base, bat, bend) < 0 then return -1;
+  if kv.scanobj(patch, pat, pend) < 0 then return -1;
+  at := kv.putc(dst, 0, '{');
+  first := true;
+  if not empty then
+  begin
+    cur := kv.first(base, bat, bend);
+    while cur >= 0 do
+    begin
+      bkat := kv.kat; bkend := kv.kend; bvat := kv.vat; bvend := kv.vend;
+      if kv.find(patch, pat, pend, base[bkat..bkend - 1]) then
+      begin
+        if not json.isnull(patch, kv.vat, kv.vend) then
+        begin
+          at := kv.putkey(dst, at, first, base, bkat, bkend);
+          at := kv.put(dst, at, patch, kv.vat, kv.vend);
+          first := false;
+        end;
+      end
+      else
+      begin
+        at := kv.putkey(dst, at, first, base, bkat, bkend);
+        at := kv.put(dst, at, base, bvat, bvend);
+        first := false;
+      end;
+      if at < 0 then return -1;
+      cur := kv.next(base, cur, bend);
+    end;
+  end;
+  cur := kv.first(patch, pat, pend);
+  while cur >= 0 do
+  begin
+    pkat := kv.kat; pkend := kv.kend; pvat := kv.vat; pvend := kv.vend;
+    if not json.isnull(patch, pvat, pvend) then
+    begin
+      if empty or (not kv.find(base, bat, bend, patch[pkat..pkend - 1])) then
+      begin
+        at := kv.putkey(dst, at, first, patch, pkat, pkend);
+        at := kv.put(dst, at, patch, pvat, pvend);
+        first := false;
+      end;
+    end;
+    if at < 0 then return -1;
+    cur := kv.next(patch, cur, pend);
+  end;
+  return kv.putc(dst, at, '}');
+end;

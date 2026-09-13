@@ -1,0 +1,50 @@
+// type/record: declaration, fields, assignment, records in locals and globals, whole-record copy.
+program t;
+include "io.wz";
+type
+  Point = record
+    x, y: int;
+    name: array[0..15] of char;
+    weight: real;
+    active: bool;
+  end;
+var
+  p, q: Point;
+  n: int;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+procedure fill(k: int);
+var loc: Point;
+begin
+  loc.x := k * 10;
+  loc.y := k * 20;
+  loc.weight := real(k) * 0.5;
+  loc.active := true;
+  loc.name[0] := 'L';
+  q := loc;                         { whole-record copy }
+end;
+begin
+  p.x := 3; p.y := 4;
+  p.weight := 2.5;
+  p.active := p.x < p.y;
+  p.name[0] := 'p'; p.name[1] := 't'; p.name[2] := chr(0);
+  show("p.x = ", p.x);
+  show("p.y = ", p.y);
+  show("p.x*p.y = ", p.x * p.y);
+  show("weight x10 = ", trunc(p.weight * 10.0));
+  if p.active then show("active ", 1) else show("active ", 0);
+  show("ord(name[1]) = ", ord(p.name[1]));
+  show("len(name) = ", len(p.name));
+  fill(7);
+  show("q.x = ", q.x);
+  show("q.y = ", q.y);
+  show("q.weight x10 = ", trunc(q.weight * 10.0));
+  show("q.name[0] = ", ord(q.name[0]));
+  p := q;
+  show("p.x after copy = ", p.x);
+  n := q.x + p.y;
+  show("q.x+p.y = ", n);
+  show("addr diff = ", addr(p.y) - addr(p.x));
+end.

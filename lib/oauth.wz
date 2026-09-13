@@ -1,0 +1,984 @@
+// lib/oauth.wz -- an OAuth 2.1 authorization server for MCP clients, in one
+// process with the resource server it protects.
+//
+// What a Claude connector needs (MCP authorization, RFC 9728/8414/7591/7636):
+//   GET  /.well-known/oauth-protected-resource[/...]   oauth.metadata_resource
+//   GET  /.well-known/oauth-authorization-server       oauth.metadata_server
+//   POST /register                                     oauth.register   (dynamic client registration)
+//   GET  /authorize                                    oauth.authorize  (shows the login form)
+//   POST /authorize                                    oauth.login      (checks the credentials, issues a code)
+//   POST /token                                        oauth.token      (code + PKCE -> tokens; refresh)
+//   any protected route: uid := oauth.verify; if uid < 0 then oauth.challenge
+//
+// The application supplies two routines (forward-declared here):
+//   function app.authenticate(user: array of char; secret: array of char): int;
+//     -> a user id >= 0 when the credentials are right (an e-mail + one-time
+//        code, a password, ...), -1 otherwise.
+//   function app.machinetoken(token: array of char): int;
+//     -> a user id >= 0 for a configured shared secret (CI, benchmarks), -1 otherwise.
+//
+// Clients, codes and tokens live in three lib/store.wz tables that the
+// application declares by calling oauth.tables before store.opendir and
+// oauth.load after it.  Codes and tokens are stored as SHA-256 hashes, so a
+// copied snapshot does not leak them.  Codes are single-use and expire after
+// ten minutes; access tokens after OAUTH.ACCESS_TTL seconds; refresh tokens
+// are rotated on every use.
+
+include "router.wz";
+include "store.wz";
+include "hash.wz";
+include "sha256.wz";
+include "base64.wz";
+include "rand.wz";
+include "json.wz";
+include "time.wz";
+
+const
+  OAUTH.MAXCLIENTS = 256;
+  OAUTH.MAXCODES = 1024;
+  OAUTH.MAXTOKENS = 4096;
+  OAUTH.CODE_TTL = 600;
+  OAUTH.ACCESS_TTL = 3600;
+  OAUTH.REFRESH_TTL = 2592000;          // 30 days
+  OAUTH.URILEN = 256;
+  OAUTH.NURIS = 4;
+  OAUTH.KIND_ACCESS = 1;
+  OAUTH.KIND_REFRESH = 2;
+  // A browser session is a third kind of token: same store, same index, same
+  // expiry sweep.  It rides in a cookie instead of an Authorization header, so a
+  // person can use a page while a client keeps using a bearer token -- one
+  // authorisation path, two ways of presenting yourself.
+  OAUTH.KIND_SESSION = 3;
+  OAUTH.SESSION_TTL = 43200;            // twelve hours: a working day plus slack
+  OAUTH.CNAME = "session";
+
+type
+  OClient = record
+    id: array[0..31] of char;                        // 32 hex chars
+    secret: array[0..31] of char;                    // sha256 of the secret, or zeros for a public client
+    hassecret: bool;
+    uris: array[0..OAUTH.NURIS * OAUTH.URILEN - 1] of char;
+    urilen: array[0..OAUTH.NURIS - 1] of int;
+    nuris: int;
+    name: array[0..63] of char;
+    name_n: int;
+    created: int;
+  end;
+  OCode = record
+    hash: array[0..31] of char;
+    client: array[0..31] of char;
+    uri: array[0..OAUTH.URILEN - 1] of char;
+    urilen: int;
+    challenge: array[0..63] of char;                 // base64url of sha256(verifier), 43 chars
+    chlen: int;
+    user: int;
+    expires: int;
+    used: bool;
+  end;
+  OToken = record
+    hash: array[0..31] of char;
+    kind: int;
+    user: int;
+    client: array[0..31] of char;
+    expires: int;
+    created: int;
+  end;
+
+const
+  OCLIENT_SIZE = 32 + 32 + 8 + OAUTH.NURIS * OAUTH.URILEN + OAUTH.NURIS * 8 + 8 + 64 + 8 + 8;
+  OCODE_SIZE = 32 + 32 + OAUTH.URILEN + 8 + 64 + 8 + 8 + 8 + 8;
+  OTOKEN_SIZE = 32 + 8 + 8 + 32 + 8 + 8;
+
+function app.authenticate(user: array of char; secret: array of char): int; forward;
+function app.machinetoken(token: array of char): int; forward;
+
+var
+  oauth.issuer: array[0..255] of char;              // "https://host" without a trailing slash
+  oauth.issuern: int;
+  oauth.tc, oauth.tcode, oauth.ttok: int;           // store tables
+  oauth.cidx.keys: array[0..32 * OAUTH.MAXCLIENTS * 2 - 1] of char;
+  oauth.cidx.rows: array[0..OAUTH.MAXCLIENTS * 2 - 1] of int;
+  oauth.kidx.keys: array[0..32 * OAUTH.MAXCODES * 2 - 1] of char;
+  oauth.kidx.rows: array[0..OAUTH.MAXCODES * 2 - 1] of int;
+  oauth.tidx.keys: array[0..32 * OAUTH.MAXTOKENS * 2 - 1] of char;
+  oauth.tidx.rows: array[0..OAUTH.MAXTOKENS * 2 - 1] of int;
+  oauth.cl: OClient;
+  oauth.cd: OCode;
+  oauth.tk: OToken;
+  oauth.raw: array[0..31] of char;                  // random bytes of a new secret
+  oauth.txt: array[0..63] of char;                  // its base64url text
+  oauth.txtn: int;
+  oauth.dig: array[0..31] of char;
+  oauth.hex: array[0..63] of char;
+  oauth.uid: int;                                    // the user of the last verified token
+  oauth.ok: bool;                                    // results this module does not act on
+  oauth.dummy: int;
+
+// ------------------------------------------------------------- setup
+
+procedure oauth.configure(issuer: array of char);
+var i: int;
+begin
+  oauth.issuern := len(issuer);
+  if oauth.issuern > 255 then io.fatal("oauth issuer too long");
+  for i := 0 to oauth.issuern - 1 do oauth.issuer[i] := issuer[i];
+  while (oauth.issuern > 0) and (oauth.issuer[oauth.issuern - 1] = '/') do oauth.issuern := oauth.issuern - 1;
+end;
+
+// declare the store tables (before store.opendir)
+procedure oauth.tables;
+begin
+  oauth.tc := store.table("oauth_clients", OCLIENT_SIZE, OAUTH.MAXCLIENTS);
+  oauth.tcode := store.table("oauth_codes", OCODE_SIZE, OAUTH.MAXCODES);
+  oauth.ttok := store.table("oauth_tokens", OTOKEN_SIZE, OAUTH.MAXTOKENS);
+end;
+
+// record <-> store row copies (a record passes as a one-element view)
+procedure oauth.rdclient(src: array of OClient); begin oauth.cl := src[0]; end;
+procedure oauth.wrclient(dst: array of OClient); begin dst[0] := oauth.cl; end;
+procedure oauth.rdcode(src: array of OCode); begin oauth.cd := src[0]; end;
+procedure oauth.wrcode(dst: array of OCode); begin dst[0] := oauth.cd; end;
+procedure oauth.rdtoken(src: array of OToken); begin oauth.tk := src[0]; end;
+procedure oauth.wrtoken(dst: array of OToken); begin dst[0] := oauth.tk; end;
+
+procedure oauth.loadclient(row: int); begin oauth.rdclient(view(store.rowaddr(oauth.tc, row), 1)); end;
+procedure oauth.loadcode(row: int); begin oauth.rdcode(view(store.rowaddr(oauth.tcode, row), 1)); end;
+procedure oauth.loadtoken(row: int); begin oauth.rdtoken(view(store.rowaddr(oauth.ttok, row), 1)); end;
+
+function oauth.saveclient(row: int): bool;
+begin
+  oauth.wrclient(view(store.rowaddr(oauth.tc, row), 1));
+  return store.set(oauth.tc, row, view(store.rowaddr(oauth.tc, row), OCLIENT_SIZE));
+end;
+
+function oauth.savecode(row: int): bool;
+begin
+  oauth.wrcode(view(store.rowaddr(oauth.tcode, row), 1));
+  return store.set(oauth.tcode, row, view(store.rowaddr(oauth.tcode, row), OCODE_SIZE));
+end;
+
+function oauth.savetoken(row: int): bool;
+begin
+  oauth.wrtoken(view(store.rowaddr(oauth.ttok, row), 1));
+  return store.set(oauth.ttok, row, view(store.rowaddr(oauth.ttok, row), OTOKEN_SIZE));
+end;
+
+// rebuild the indexes from the rows (after store.opendir)
+procedure oauth.load;
+var r: int;
+begin
+  hash.clear(oauth.cidx.rows);
+  hash.clear(oauth.kidx.rows);
+  hash.clear(oauth.tidx.rows);
+  for r := 0 to store.high(oauth.tc) - 1 do
+    if store.live(oauth.tc, r) then
+    begin
+      oauth.loadclient(r);
+      if not hash.put(oauth.cidx.keys, oauth.cidx.rows, 32, oauth.cl.id, r) then io.fatal("oauth client index full");
+    end;
+  for r := 0 to store.high(oauth.tcode) - 1 do
+    if store.live(oauth.tcode, r) then
+    begin
+      oauth.loadcode(r);
+      if not hash.put(oauth.kidx.keys, oauth.kidx.rows, 32, oauth.cd.hash, r) then io.fatal("oauth code index full");
+    end;
+  for r := 0 to store.high(oauth.ttok) - 1 do
+    if store.live(oauth.ttok, r) then
+    begin
+      oauth.loadtoken(r);
+      if not hash.put(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.tk.hash, r) then io.fatal("oauth token index full");
+    end;
+end;
+
+// ------------------------------------------------------------- helpers
+
+// 16 bytes as 32 lowercase hex chars
+procedure oauth.hex16(src: array of char; dst: array of char);
+var i, v: int;
+begin
+  for i := 0 to 15 do
+  begin
+    v := ord(src[i]) div 16;
+    if v < 10 then dst[2 * i] := chr(48 + v) else dst[2 * i] := chr(87 + v);
+    v := ord(src[i]) mod 16;
+    if v < 10 then dst[2 * i + 1] := chr(48 + v) else dst[2 * i + 1] := chr(87 + v);
+  end;
+end;
+
+// a fresh 32-byte secret: oauth.raw holds the bytes, oauth.txt/oauth.txtn its base64url text
+procedure oauth.newsecret;
+begin
+  rand.bytes(oauth.raw);
+  oauth.txtn := base64.urlencode(oauth.txt, 0, oauth.raw);
+end;
+
+// sha256 of a text into oauth.dig
+procedure oauth.hashtext(t: array of char);
+begin
+  sha256.hash(t, oauth.dig);
+end;
+
+function oauth.sameid(a: array of char; b: array of char): bool;
+var i: int;
+begin
+  if len(a) <> len(b) then return false;
+  for i := 0 to len(a) - 1 do if a[i] <> b[i] then return false;
+  return true;
+end;
+
+// constant-time comparison of two 32-byte digests
+function oauth.samedigest(a: array of char; b: array of char): bool;
+var i, d: int;
+begin
+  d := 0;
+  for i := 0 to 31 do d := bor(d, bxor(ord(a[i]), ord(b[i])));
+  return d = 0;
+end;
+
+// find a client row by its id text, -1 when unknown
+function oauth.findclient(id: array of char): int;
+begin
+  if len(id) <> 32 then return -1;
+  return hash.get(oauth.cidx.keys, oauth.cidx.rows, 32, id);
+end;
+
+// does the client allow this redirect uri?
+function oauth.uriallowed(b: array of char; from: int; upto: int): bool;
+var i, k, n: int;
+    same: bool;
+begin
+  n := upto - from;
+  for i := 0 to oauth.cl.nuris - 1 do
+  begin
+    if oauth.cl.urilen[i] = n then
+    begin
+      same := true;
+      for k := 0 to n - 1 do if oauth.cl.uris[i * OAUTH.URILEN + k] <> b[from + k] then same := false;
+      if same then return true;
+    end;
+  end;
+  return false;
+end;
+
+procedure oauth.addissuer;
+begin
+  http.addb(oauth.issuer, 0, oauth.issuern);
+end;
+
+// ------------------------------------------------------------- discovery
+
+// GET /.well-known/oauth-protected-resource[/<mcp path>]: the resource is the issuer plus the path after the prefix
+procedure oauth.metadata_resource;
+begin
+  http.add("{\"resource\":\"");
+  oauth.addissuer;
+  if http.pathstarts("/.well-known/oauth-protected-resource") then
+    http.addb(http.inbuf, http.restat, http.restend - http.restat);
+  http.add("\",\"authorization_servers\":[\"");
+  oauth.addissuer;
+  http.add("\"],\"scopes_supported\":[],\"bearer_methods_supported\":[\"header\"]}");
+  http.hdradd("Cache-Control: no-store");
+  router.cors;
+  http.finish(200, "application/json");
+end;
+
+// GET /.well-known/oauth-authorization-server
+procedure oauth.metadata_server;
+begin
+  http.add("{\"issuer\":\""); oauth.addissuer;
+  http.add("\",\"authorization_endpoint\":\""); oauth.addissuer; http.add("/authorize");
+  http.add("\",\"token_endpoint\":\""); oauth.addissuer; http.add("/token");
+  http.add("\",\"registration_endpoint\":\""); oauth.addissuer; http.add("/register");
+  http.add("\",\"response_types_supported\":[\"code\"],\"grant_types_supported\":[\"authorization_code\",\"refresh_token\"],");
+  http.add("\"code_challenge_methods_supported\":[\"S256\"],\"token_endpoint_auth_methods_supported\":[\"none\",\"client_secret_post\"],");
+  http.add("\"scopes_supported\":[]}");
+  http.hdradd("Cache-Control: no-store");
+  router.cors;
+  http.finish(200, "application/json");
+end;
+
+// ------------------------------------------------------------- registration
+
+schema ORegister = record
+  redirect_uris: array[0..3] of text[256];
+  client_name: text[64]?;
+  token_endpoint_auth_method: text[32]?;
+end;
+
+var
+  oauth.reg: ORegister;
+
+// POST /register: {"redirect_uris":[...],"client_name":...,"token_endpoint_auth_method":"none"|"client_secret_post"}
+procedure oauth.register;
+var at: int;
+    row, i, k: int;
+    public: bool;
+begin
+  if http.method <> HTTP.POST then begin router.methodnotallowed; return; end;
+  if ORegister.parse(http.inbuf, http.bodyat, http.bodyat + http.bodylen, oauth.reg) < 0 then
+  begin
+    router.error(400, "invalid_client_metadata: redirect_uris is required");
+    return;
+  end;
+  if oauth.reg.redirect_uris_n = 0 then begin router.error(400, "invalid_client_metadata: at least one redirect_uri"); return; end;
+  for i := 0 to oauth.reg.redirect_uris_n - 1 do
+  begin
+    k := oauth.reg.redirect_uris_len[i];
+    if k < 8 then begin router.error(400, "invalid_redirect_uri"); return; end;
+    if not ((oauth.reg.redirect_uris[i * 256] = 'h') and (oauth.reg.redirect_uris[i * 256 + 1] = 't')) then
+    begin
+      router.error(400, "invalid_redirect_uri: must be http(s)");
+      return;
+    end;
+  end;
+  public := true;
+  if oauth.reg.token_endpoint_auth_method_ok then
+    if json.eq(oauth.reg.token_endpoint_auth_method, 0, oauth.reg.token_endpoint_auth_method_n, "client_secret_post") then public := false;
+  row := store.alloc(oauth.tc);
+  if row < 0 then begin router.error(503, "no room for more clients"); return; end;
+  oauth.newsecret;
+  oauth.hex16(oauth.raw, oauth.cl.id);                 { the client id: 32 hex chars of 16 random bytes }
+  oauth.cl.hassecret := not public;
+  for i := 0 to 31 do oauth.cl.secret[i] := chr(0);
+  if not public then
+  begin
+    oauth.newsecret;                                     { a second secret: the client secret }
+    oauth.hashtext(oauth.txt[0..oauth.txtn - 1]);
+    for i := 0 to 31 do oauth.cl.secret[i] := oauth.dig[i];
+  end;
+  oauth.cl.nuris := oauth.reg.redirect_uris_n;
+  for i := 0 to oauth.cl.nuris - 1 do
+  begin
+    oauth.cl.urilen[i] := oauth.reg.redirect_uris_len[i];
+    for k := 0 to OAUTH.URILEN - 1 do oauth.cl.uris[i * OAUTH.URILEN + k] := oauth.reg.redirect_uris[i * 256 + k];
+  end;
+  oauth.cl.name_n := 0;
+  if oauth.reg.client_name_ok then
+  begin
+    oauth.cl.name_n := oauth.reg.client_name_n;
+    for k := 0 to 63 do oauth.cl.name[k] := oauth.reg.client_name[k];
+  end;
+  oauth.cl.created := time.nowsec;
+  if not oauth.saveclient(row) then begin router.error(500, "cannot store the client"); return; end;
+  if not hash.put(oauth.cidx.keys, oauth.cidx.rows, 32, oauth.cl.id, row) then begin router.error(503, "client index full"); return; end;
+  http.add("{\"client_id\":\""); http.addb(oauth.cl.id, 0, 32);
+  if not public then
+  begin
+    http.add("\",\"client_secret\":\""); http.addb(oauth.txt, 0, oauth.txtn);
+    http.add("\",\"token_endpoint_auth_method\":\"client_secret_post");
+  end
+  else http.add("\",\"token_endpoint_auth_method\":\"none");
+  http.add("\",\"redirect_uris\":[");
+  for i := 0 to oauth.cl.nuris - 1 do
+  begin
+    if i > 0 then http.add(",");
+    { -1: the uri no longer fits in the answer; skip it rather than destroying the
+      position }
+    at := json.putslice(http.outbuf, http.wpos, oauth.cl.uris, i * OAUTH.URILEN, i * OAUTH.URILEN + oauth.cl.urilen[i]);
+    if at >= 0 then http.wpos := at;
+  end;
+  http.add("],\"grant_types\":[\"authorization_code\",\"refresh_token\"],\"response_types\":[\"code\"],\"client_id_issued_at\":");
+  http.addn(oauth.cl.created);
+  http.add("}");
+  http.hdradd("Cache-Control: no-store");
+  router.cors;
+  http.finish(201, "application/json");
+end;
+
+// ------------------------------------------------------------- authorize
+
+var
+  oauth.q.client: array[0..31] of char;
+  oauth.q.uri: array[0..OAUTH.URILEN - 1] of char;
+  oauth.q.urin: int;
+  oauth.q.state: array[0..255] of char;
+  oauth.q.staten: int;
+  oauth.q.chal: array[0..63] of char;
+  oauth.q.chaln: int;
+
+// copy http.pval into dst; false when it does not fit
+function oauth.take(dst: array of char): bool;
+var i: int;
+begin
+  if http.pvlen > len(dst) then return false;
+  for i := 0 to http.pvlen - 1 do dst[i] := http.pval[i];
+  return true;
+end;
+
+// read the authorization request from the query (GET) or the form (POST); false + a reply on error
+function oauth.readrequest(fromform: bool): bool;
+var ok, crow: bool;
+    row: int;
+begin
+  if fromform then ok := http.form("client_id") else ok := http.param("client_id");
+  if (not ok) or (http.pvlen <> 32) then begin router.error(400, "invalid_request: client_id"); return false; end;
+  oauth.ok := oauth.take(oauth.q.client);
+  row := oauth.findclient(oauth.q.client);
+  if row < 0 then begin router.error(400, "invalid_client: unknown client_id"); return false; end;
+  oauth.loadclient(row);
+  if fromform then ok := http.form("redirect_uri") else ok := http.param("redirect_uri");
+  if (not ok) or (http.pvlen = 0) or (http.pvlen > OAUTH.URILEN) then begin router.error(400, "invalid_request: redirect_uri"); return false; end;
+  oauth.ok := oauth.take(oauth.q.uri);
+  oauth.q.urin := http.pvlen;
+  if not oauth.uriallowed(oauth.q.uri, 0, oauth.q.urin) then begin router.error(400, "invalid_request: redirect_uri is not registered"); return false; end;
+  oauth.q.staten := 0;
+  if fromform then ok := http.form("state") else ok := http.param("state");
+  if ok then
+  begin
+    if http.pvlen > 255 then begin router.error(400, "invalid_request: state too long"); return false; end;
+    oauth.ok := oauth.take(oauth.q.state);
+    oauth.q.staten := http.pvlen;
+  end;
+  if fromform then ok := http.form("code_challenge") else ok := http.param("code_challenge");
+  if (not ok) or (http.pvlen < 43) or (http.pvlen > 64) then begin router.error(400, "invalid_request: code_challenge (PKCE S256) is required"); return false; end;
+  oauth.ok := oauth.take(oauth.q.chal);
+  oauth.q.chaln := http.pvlen;
+  if fromform then ok := http.form("code_challenge_method") else ok := http.param("code_challenge_method");
+  if ok then
+    if not json.eq(http.pval, 0, http.pvlen, "S256") then begin router.error(400, "invalid_request: only S256"); return false; end;
+  if fromform then ok := http.form("response_type") else ok := http.param("response_type");
+  if ok then
+    if not json.eq(http.pval, 0, http.pvlen, "code") then begin router.error(400, "unsupported_response_type"); return false; end;
+  return true;
+end;
+
+procedure oauth.hidden(name: str; v: array of char; n: int);
+begin
+  http.add("<input type=\"hidden\" name=\""); http.add(name); http.add("\" value=\"");
+  http.addb(v, 0, n);                       { values are our own or already validated; quotes are not allowed in them }
+  http.add("\">\n");
+end;
+
+// GET /authorize: validate, then show the login form (the form posts back to /authorize)
+procedure oauth.authorize;
+var i: int;
+begin
+  if not oauth.readrequest(false) then return;
+  for i := 0 to oauth.q.staten - 1 do
+    if (oauth.q.state[i] = '"') or (oauth.q.state[i] = '<') or (oauth.q.state[i] = '&') then begin router.error(400, "invalid_request: state"); return; end;
+  http.add("<!doctype html><html><head><meta charset=\"utf-8\"><title>Sign in</title>");
+  http.add("<style>body{font-family:sans-serif;max-width:24em;margin:4em auto}input{width:100%;margin:.3em 0 1em;padding:.5em}button{padding:.6em 1.2em}</style></head><body>");
+  http.add("<h1>Sign in</h1><p>");
+  if oauth.cl.name_n > 0 then begin http.addb(oauth.cl.name, 0, oauth.cl.name_n); http.add(" is asking for access."); end
+  else http.add("An application is asking for access.");
+  http.add("</p><form method=\"post\" action=\"/authorize\">\n");
+  oauth.hidden("client_id", oauth.q.client, 32);
+  oauth.hidden("redirect_uri", oauth.q.uri, oauth.q.urin);
+  oauth.hidden("state", oauth.q.state, oauth.q.staten);
+  oauth.hidden("code_challenge", oauth.q.chal, oauth.q.chaln);
+  http.add("<label>E-mail<input name=\"user\" autofocus></label>");
+  http.add("<label>Code<input name=\"secret\" type=\"password\"></label>");
+  http.add("<button type=\"submit\">Allow</button></form></body></html>");
+  http.hdradd("Cache-Control: no-store");
+  http.finish(200, "text/html; charset=utf-8");
+end;
+
+var
+  oauth.user: array[0..255] of char;
+  oauth.usern: int;
+  oauth.secret: array[0..255] of char;
+  oauth.secretn: int;
+
+// POST /authorize: check the credentials through app.authenticate, issue a code, redirect
+procedure oauth.login;
+var uid, row, i: int;
+begin
+  if not oauth.readrequest(true) then return;
+  if (not http.form("user")) or (http.pvlen = 0) or (http.pvlen > 255) then begin router.error(400, "user is required"); return; end;
+  oauth.ok := oauth.take(oauth.user); oauth.usern := http.pvlen;
+  if (not http.form("secret")) or (http.pvlen > 255) then begin router.error(400, "secret is required"); return; end;
+  oauth.ok := oauth.take(oauth.secret); oauth.secretn := http.pvlen;
+  uid := app.authenticate(oauth.user[0..oauth.usern - 1], oauth.secret[0..oauth.secretn - 1]);
+  if uid < 0 then
+  begin
+    http.add("<!doctype html><html><body><h1>Sign in failed</h1><p>Unknown user or wrong code.</p><p><a href=\"javascript:history.back()\">Try again</a></p></body></html>");
+    http.finish(401, "text/html; charset=utf-8");
+    return;
+  end;
+  row := store.alloc(oauth.tcode);
+  if row < 0 then begin router.error(503, "no room for more codes"); return; end;
+  oauth.newsecret;                                     { the code: oauth.txt }
+  oauth.hashtext(oauth.txt[0..oauth.txtn - 1]);
+  for i := 0 to 31 do oauth.cd.hash[i] := oauth.dig[i];
+  for i := 0 to 31 do oauth.cd.client[i] := oauth.q.client[i];
+  for i := 0 to OAUTH.URILEN - 1 do oauth.cd.uri[i] := oauth.q.uri[i];
+  oauth.cd.urilen := oauth.q.urin;
+  for i := 0 to 63 do oauth.cd.challenge[i] := oauth.q.chal[i];
+  oauth.cd.chlen := oauth.q.chaln;
+  oauth.cd.user := uid;
+  oauth.cd.expires := time.nowsec + OAUTH.CODE_TTL;
+  oauth.cd.used := false;
+  if not oauth.savecode(row) then begin router.error(500, "cannot store the code"); return; end;
+  if not hash.put(oauth.kidx.keys, oauth.kidx.rows, 32, oauth.cd.hash, row) then begin router.error(503, "code index full"); return; end;
+  http.hdradd("Cache-Control: no-store");
+  http.xlen := io.push(http.xhdr, http.xlen, "Location: ");
+  for i := 0 to oauth.q.urin - 1 do begin http.xhdr[http.xlen] := oauth.q.uri[i]; http.xlen := http.xlen + 1; end;
+  if scan(oauth.q.uri, 0, oauth.q.urin, '?') < oauth.q.urin then http.xhdr[http.xlen] := '&' else http.xhdr[http.xlen] := '?';
+  http.xlen := http.xlen + 1;
+  http.xlen := io.push(http.xhdr, http.xlen, "code=");
+  for i := 0 to oauth.txtn - 1 do begin http.xhdr[http.xlen] := oauth.txt[i]; http.xlen := http.xlen + 1; end;
+  if oauth.q.staten > 0 then
+  begin
+    http.xlen := io.push(http.xhdr, http.xlen, "&state=");
+    for i := 0 to oauth.q.staten - 1 do begin http.xhdr[http.xlen] := oauth.q.state[i]; http.xlen := http.xlen + 1; end;
+  end;
+  http.xlen := io.push(http.xhdr, http.xlen, "\r\n");
+  http.add("redirecting");
+  http.finish(302, "text/plain");
+end;
+
+// ------------------------------------------------------------- tokens
+
+// issue an access + refresh token pair for uid/client and write the JSON reply
+procedure oauth.issue(uid: int; client: array of char);
+var row, i: int;
+begin
+  http.add("{\"token_type\":\"Bearer\",\"expires_in\":");
+  http.addn(OAUTH.ACCESS_TTL);
+  http.add(",\"scope\":\"\",\"access_token\":\"");
+  oauth.newsecret;
+  oauth.hashtext(oauth.txt[0..oauth.txtn - 1]);
+  row := store.alloc(oauth.ttok);
+  if row < 0 then begin http.wpos := http.obase + HDRROOM; router.error(503, "no room for more tokens"); return; end;
+  for i := 0 to 31 do oauth.tk.hash[i] := oauth.dig[i];
+  oauth.tk.kind := OAUTH.KIND_ACCESS;
+  oauth.tk.user := uid;
+  for i := 0 to 31 do oauth.tk.client[i] := client[i];
+  oauth.tk.created := time.nowsec;
+  oauth.tk.expires := oauth.tk.created + OAUTH.ACCESS_TTL;
+  if not oauth.savetoken(row) then begin http.wpos := http.obase + HDRROOM; router.error(500, "cannot store the token"); return; end;
+  oauth.ok := hash.put(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.tk.hash, row);
+  http.addb(oauth.txt, 0, oauth.txtn);
+  http.add("\",\"refresh_token\":\"");
+  oauth.newsecret;
+  oauth.hashtext(oauth.txt[0..oauth.txtn - 1]);
+  row := store.alloc(oauth.ttok);
+  if row < 0 then begin http.wpos := http.obase + HDRROOM; router.error(503, "no room for more tokens"); return; end;
+  for i := 0 to 31 do oauth.tk.hash[i] := oauth.dig[i];
+  oauth.tk.kind := OAUTH.KIND_REFRESH;
+  oauth.tk.expires := oauth.tk.created + OAUTH.REFRESH_TTL;
+  if not oauth.savetoken(row) then begin http.wpos := http.obase + HDRROOM; router.error(500, "cannot store the token"); return; end;
+  oauth.ok := hash.put(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.tk.hash, row);
+  http.addb(oauth.txt, 0, oauth.txtn);
+  http.add("\"}");
+  http.hdradd("Cache-Control: no-store");
+  http.hdradd("Pragma: no-cache");
+  router.cors;
+  http.finish(200, "application/json");
+end;
+
+procedure oauth.tokenerror(status: int; code: str; msg: str);
+begin
+  http.add("{\"error\":\""); http.add(code); http.add("\",\"error_description\":");
+  http.wpos := json.putstr(http.outbuf, http.wpos, msg);
+  http.add("}");
+  http.hdradd("Cache-Control: no-store");
+  router.cors;
+  http.finish(status, "application/json");
+end;
+
+var
+  oauth.verifier: array[0..255] of char;
+  oauth.vn: int;
+  oauth.presented: array[0..255] of char;
+  oauth.pn: int;
+
+// the client_id from the form must exist; a confidential client must also present its secret
+function oauth.clientauth: bool;
+var row, i: int;
+begin
+  if (not http.form("client_id")) or (http.pvlen <> 32) then begin oauth.tokenerror(401, "invalid_client", "client_id is required"); return false; end;
+  oauth.ok := oauth.take(oauth.q.client);
+  row := oauth.findclient(oauth.q.client);
+  if row < 0 then begin oauth.tokenerror(401, "invalid_client", "unknown client"); return false; end;
+  oauth.loadclient(row);
+  if oauth.cl.hassecret then
+  begin
+    if (not http.form("client_secret")) or (http.pvlen = 0) or (http.pvlen > 255) then begin oauth.tokenerror(401, "invalid_client", "client_secret is required"); return false; end;
+    oauth.ok := oauth.take(oauth.presented); oauth.pn := http.pvlen;
+    oauth.hashtext(oauth.presented[0..oauth.pn - 1]);
+    if not oauth.samedigest(oauth.dig, oauth.cl.secret) then begin oauth.tokenerror(401, "invalid_client", "wrong client_secret"); return false; end;
+  end;
+  return true;
+end;
+
+// POST /token (application/x-www-form-urlencoded)
+procedure oauth.token;
+var row, i, uid: int;
+begin
+  if http.method <> HTTP.POST then begin router.methodnotallowed; return; end;
+  if not http.form("grant_type") then begin oauth.tokenerror(400, "invalid_request", "grant_type is required"); return; end;
+  if json.eq(http.pval, 0, http.pvlen, "authorization_code") then
+  begin
+    if not oauth.clientauth then return;
+    if (not http.form("code")) or (http.pvlen = 0) or (http.pvlen > 255) then begin oauth.tokenerror(400, "invalid_request", "code is required"); return; end;
+    oauth.ok := oauth.take(oauth.presented); oauth.pn := http.pvlen;
+    oauth.hashtext(oauth.presented[0..oauth.pn - 1]);
+    row := hash.get(oauth.kidx.keys, oauth.kidx.rows, 32, oauth.dig);
+    if row < 0 then begin oauth.tokenerror(400, "invalid_grant", "unknown code"); return; end;
+    oauth.loadcode(row);
+    if oauth.cd.used then begin oauth.tokenerror(400, "invalid_grant", "code already used"); return; end;
+    if oauth.cd.expires < time.nowsec then begin oauth.tokenerror(400, "invalid_grant", "code expired"); return; end;
+    if not oauth.sameid(oauth.cd.client, oauth.q.client) then begin oauth.tokenerror(400, "invalid_grant", "code belongs to another client"); return; end;
+    if (not http.form("redirect_uri")) or (http.pvlen <> oauth.cd.urilen) then begin oauth.tokenerror(400, "invalid_grant", "redirect_uri differs"); return; end;
+    for i := 0 to http.pvlen - 1 do if http.pval[i] <> oauth.cd.uri[i] then begin oauth.tokenerror(400, "invalid_grant", "redirect_uri differs"); return; end;
+    if (not http.form("code_verifier")) or (http.pvlen < 43) or (http.pvlen > 128) then begin oauth.tokenerror(400, "invalid_grant", "code_verifier is required"); return; end;
+    oauth.ok := oauth.take(oauth.verifier); oauth.vn := http.pvlen;
+    oauth.hashtext(oauth.verifier[0..oauth.vn - 1]);
+    oauth.txtn := base64.urlencode(oauth.txt, 0, oauth.dig);
+    if (oauth.txtn <> oauth.cd.chlen) or (not oauth.sameid(oauth.txt[0..oauth.txtn - 1], oauth.cd.challenge[0..oauth.cd.chlen - 1])) then
+    begin
+      oauth.tokenerror(400, "invalid_grant", "PKCE verification failed");
+      return;
+    end;
+    oauth.cd.used := true;                             { single use: mark before issuing }
+    oauth.ok := oauth.savecode(row);
+    uid := oauth.cd.user;
+    oauth.issue(uid, oauth.q.client);
+    return;
+  end;
+  if json.eq(http.pval, 0, http.pvlen, "refresh_token") then
+  begin
+    if not oauth.clientauth then return;
+    if (not http.form("refresh_token")) or (http.pvlen = 0) or (http.pvlen > 255) then begin oauth.tokenerror(400, "invalid_request", "refresh_token is required"); return; end;
+    oauth.ok := oauth.take(oauth.presented); oauth.pn := http.pvlen;
+    oauth.hashtext(oauth.presented[0..oauth.pn - 1]);
+    row := hash.get(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.dig);
+    if row < 0 then begin oauth.tokenerror(400, "invalid_grant", "unknown refresh token"); return; end;
+    oauth.loadtoken(row);
+    if oauth.tk.kind <> OAUTH.KIND_REFRESH then begin oauth.tokenerror(400, "invalid_grant", "not a refresh token"); return; end;
+    if oauth.tk.expires < time.nowsec then begin oauth.tokenerror(400, "invalid_grant", "refresh token expired"); return; end;
+    if not oauth.sameid(oauth.tk.client, oauth.q.client) then begin oauth.tokenerror(400, "invalid_grant", "token belongs to another client"); return; end;
+    uid := oauth.tk.user;
+    oauth.ok := store.del(oauth.ttok, row);                        { rotation: the old refresh token dies }
+    oauth.ok := hash.del(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.tk.hash);
+    oauth.issue(uid, oauth.q.client);
+    return;
+  end;
+  oauth.tokenerror(400, "unsupported_grant_type", "use authorization_code or refresh_token");
+end;
+
+// ------------------------------------------------------------- verification
+
+procedure oauth.take_slice(b: array of char; from: int; upto: int); forward;
+
+// the user id of the bearer token of the current request, or -1
+// The value of our session cookie, into oauth.presented, or false.  A Cookie header
+// holds "a=1; b=2", so we walk the pairs rather than matching the whole header.
+function oauth.readcookie: bool;
+var at, upto, i, j, n: int;
+    ok: bool;
+begin
+  if not http.header("cookie") then return false;
+  at := http.hvat; upto := http.hvend;
+  n := slen(OAUTH.CNAME);
+  while at < upto do
+  begin
+    while (at < upto) and ((http.inbuf[at] = ' ') or (http.inbuf[at] = ';')) do at := at + 1;
+    i := at;
+    while (i < upto) and (http.inbuf[i] <> '=') and (http.inbuf[i] <> ';') do i := i + 1;
+    if (i < upto) and (http.inbuf[i] = '=') and (i - at = n) then
+    begin
+      ok := true;
+      for j := 0 to n - 1 do
+        if http.inbuf[at + j] <> schar(OAUTH.CNAME, j) then ok := false;
+      if ok then
+      begin
+        j := i + 1;
+        while (j < upto) and (http.inbuf[j] <> ';') do j := j + 1;
+        if j - (i + 1) > 255 then return false;
+        oauth.take_slice(http.inbuf, i + 1, j);
+        return oauth.pn > 0;
+      end;
+    end;
+    while (at < upto) and (http.inbuf[at] <> ';') do at := at + 1;
+  end;
+  return false;
+end;
+
+// Look up the presented secret in the token store and return its user, or -1.
+// Shared by the bearer path and the cookie path so the two can never drift apart.
+function oauth.bykind(kind: int): int;
+var row: int;
+begin
+  oauth.hashtext(oauth.presented[0..oauth.pn - 1]);
+  row := hash.get(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.dig);
+  if row < 0 then return -1;
+  oauth.loadtoken(row);
+  if oauth.tk.kind <> kind then return -1;
+  if oauth.tk.expires < time.nowsec then return -1;
+  return oauth.tk.user;
+end;
+
+// Who is asking: a bearer token, or -- for a browser -- a session cookie.  Both
+// end up as the same user id, so everything behind this sees one kind of caller.
+function oauth.verify: int;
+var row: int;
+begin
+  oauth.uid := -1;
+  if not http.bearer then
+  begin
+    if oauth.readcookie then oauth.uid := oauth.bykind(OAUTH.KIND_SESSION);
+    return oauth.uid;
+  end;
+  if http.hvend - http.hvat > 255 then return -1;
+  oauth.pn := http.hvend - http.hvat;
+  oauth.take_slice(http.inbuf, http.hvat, http.hvend);
+  oauth.uid := app.machinetoken(oauth.presented[0..oauth.pn - 1]);
+  if oauth.uid >= 0 then return oauth.uid;
+  oauth.hashtext(oauth.presented[0..oauth.pn - 1]);
+  row := hash.get(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.dig);
+  if row < 0 then return -1;
+  oauth.loadtoken(row);
+  if oauth.tk.kind <> OAUTH.KIND_ACCESS then return -1;
+  if oauth.tk.expires < time.nowsec then return -1;
+  oauth.uid := oauth.tk.user;
+  return oauth.uid;
+end;
+
+procedure oauth.take_slice(b: array of char; from: int; upto: int);
+var i: int;
+begin
+  oauth.pn := upto - from;
+  for i := 0 to oauth.pn - 1 do oauth.presented[i] := b[from + i];
+end;
+
+// Does this look like a person in a browser rather than an API client?  A browser
+// says it accepts text/html; curl and an MCP client do not.  The difference decides
+// whether an unauthenticated request gets a login page or a 401 with a challenge --
+// a person should not be looking at JSON they cannot act on.
+function oauth.wantshtml: bool;
+var i: int;
+begin
+  if not http.header("accept") then return false;
+  i := http.hvat;
+  while i + 9 <= http.hvend do
+  begin
+    if http.inbuf[i] = 't' then
+      if json.eq(http.inbuf, i, i + 9, "text/html") then return true;
+    i := i + 1;
+  end;
+  return false;
+end;
+
+// Send a browser to the login page, remembering where it wanted to go.
+procedure oauth.tologin;
+var i: int;
+begin
+  http.xlen := io.push(http.xhdr, http.xlen, "Location: /login?next=");
+  for i := 0 to http.pathlen - 1 do
+  begin
+    http.xhdr[http.xlen] := http.inbuf[http.pathat + i];
+    http.xlen := http.xlen + 1;
+  end;
+  http.xlen := io.push(http.xhdr, http.xlen, "\r\n");
+  http.hdradd("Cache-Control: no-store");
+  http.add("sign in");
+  http.finish(302, "text/plain");
+end;
+
+// 401 with the RFC 9728 challenge pointing at the protected-resource document for this path
+procedure oauth.challenge;
+begin
+  if oauth.wantshtml then begin oauth.tologin; return; end;
+  http.xlen := io.push(http.xhdr, http.xlen, "WWW-Authenticate: Bearer realm=\"mcp\", error=\"invalid_token\", resource_metadata=\"");
+  http.xlen := json.putraw(http.xhdr, http.xlen, oauth.issuer, 0, oauth.issuern);
+  http.xlen := io.push(http.xhdr, http.xlen, "/.well-known/oauth-protected-resource");
+  http.xlen := json.putraw(http.xhdr, http.xlen, http.inbuf, http.pathat, http.pathat + http.pathlen);
+  http.xlen := io.push(http.xhdr, http.xlen, "\"\r\n");
+  router.cors;
+  http.add("{\"error\":\"unauthorized\",\"error_description\":\"a valid bearer token is required\"}");
+  http.finish(401, "application/json");
+end;
+
+// route the OAuth endpoints; true when the request was one of them
+// Did this request arrive over TLS?  Behind the tunnel the connection to us is plain
+// http, so the only honest signal is what the proxy tells us, plus the issuer we were
+// started with (a launcher may set it to a public tunnel URL).
+function oauth.istls: bool;
+begin
+  if http.header("x-forwarded-proto") then
+    if http.hvend - http.hvat = 5 then
+      if (http.inbuf[http.hvat] = 'h') and (http.inbuf[http.hvat + 4] = 's') then return true;
+  if oauth.issuern > 5 then
+    if (oauth.issuer[0] = 'h') and (oauth.issuer[4] = 's') then return true;
+  return false;
+end;
+
+// Store a session for uid and set the cookie.  Secure only when the request came in
+// over TLS: through the tunnel everything is https, but plain 127.0.0.1 during
+// development is not, and a blindly Secure cookie would simply never come back.
+function oauth.newsession(uid: int): bool;
+var row, i: int;
+begin
+  row := store.alloc(oauth.ttok);
+  if row < 0 then return false;
+  oauth.newsecret;                                     { the session id: oauth.txt }
+  oauth.hashtext(oauth.txt[0..oauth.txtn - 1]);
+  for i := 0 to 31 do oauth.tk.hash[i] := oauth.dig[i];
+  oauth.tk.kind := OAUTH.KIND_SESSION;
+  oauth.tk.user := uid;
+  for i := 0 to 31 do oauth.tk.client[i] := '0';
+  oauth.tk.created := time.nowsec;
+  oauth.tk.expires := oauth.tk.created + OAUTH.SESSION_TTL;
+  if not oauth.savetoken(row) then return false;
+  if not hash.put(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.tk.hash, row) then return false;
+  http.xlen := io.push(http.xhdr, http.xlen, "Set-Cookie: ");
+  http.xlen := io.push(http.xhdr, http.xlen, OAUTH.CNAME);
+  http.xlen := io.push(http.xhdr, http.xlen, "=");
+  for i := 0 to oauth.txtn - 1 do begin http.xhdr[http.xlen] := oauth.txt[i]; http.xlen := http.xlen + 1; end;
+  http.xlen := io.push(http.xhdr, http.xlen, "; Path=/; HttpOnly; SameSite=Lax; Max-Age=");
+  http.xlen := io.pushnum(http.xhdr, http.xlen, OAUTH.SESSION_TTL);
+  if oauth.istls then http.xlen := io.push(http.xhdr, http.xlen, "; Secure");
+  http.xlen := io.push(http.xhdr, http.xlen, "\r\n");
+  return true;
+end;
+
+// Is the value now in http.pval a safe place to go after logging in?  It must be a
+// path on this server: starting with one "/" and not a second (which would be
+// "//host" and thus another site), and no scheme.  Anything else is an open redirect.
+function oauth.safenext(n: int): bool;
+var i: int;
+begin
+  if (n < 1) or (n > 255) then return false;
+  if http.pval[0] <> '/' then return false;
+  if n > 1 then if http.pval[1] = '/' then return false;
+  for i := 0 to n - 1 do
+    if (http.pval[i] = ':') or (http.pval[i] < ' ') then return false;
+  return true;
+end;
+
+// The login page for ourselves, not for an OAuth client.  ?next= says where to go
+// afterwards; it must be a path on this server, never an absolute URL, or the form
+// becomes an open redirect.
+procedure oauth.loginpage(failed: bool);
+var i, n: int;
+begin
+  http.add("<!doctype html><html><head><meta charset=\"utf-8\"><title>Sign in</title>");
+  http.add("<style>body{font-family:sans-serif;max-width:24em;margin:4em auto}input{width:100%;margin:.3em 0 1em;padding:.5em}button{padding:.6em 1.2em}.e{color:#b00}</style></head><body>");
+  http.add("<h1>Sign in</h1>");
+  if failed then http.add("<p class=\"e\">Unknown user or wrong code.</p>");
+  http.add("<form method=\"post\" action=\"/login\">");
+  if http.param("next") then
+  begin
+    n := http.pvlen;
+    { only a path on this server: "/x" yes, "//evil.example" and "https://..." no,
+      or the form turns into an open redirect }
+    if oauth.safenext(n) then
+    begin
+      http.add("<input type=\"hidden\" name=\"next\" value=\"");
+      for i := 0 to n - 1 do
+        if (http.pval[i] <> '"') and (http.pval[i] <> '<') and (http.pval[i] <> '&') then
+          http.addb(http.pval, i, 1);
+      http.add("\">");
+    end;
+  end;
+  http.add("<label>User<input name=\"user\" autofocus></label>");
+  http.add("<label>Code<input name=\"secret\" type=\"password\"></label>");
+  http.add("<button type=\"submit\">Sign in</button></form></body></html>");
+  http.hdradd("Cache-Control: no-store");
+  if failed then http.finish(401, "text/html; charset=utf-8")
+  else http.finish(200, "text/html; charset=utf-8");
+end;
+
+// POST /login: check, set the cookie, go to ?next= or the root.
+procedure oauth.dologin;
+var uid, i, n: int;
+begin
+  if (not http.form("user")) or (http.pvlen = 0) or (http.pvlen > 255) then begin oauth.loginpage(true); return; end;
+  oauth.ok := oauth.take(oauth.user); oauth.usern := http.pvlen;
+  if (not http.form("secret")) or (http.pvlen > 255) then begin oauth.loginpage(true); return; end;
+  oauth.ok := oauth.take(oauth.secret); oauth.secretn := http.pvlen;
+  uid := app.authenticate(oauth.user[0..oauth.usern - 1], oauth.secret[0..oauth.secretn - 1]);
+  if uid < 0 then begin oauth.loginpage(true); return; end;
+  if not oauth.newsession(uid) then begin router.error(503, "no room for more sessions"); return; end;
+  http.hdradd("Cache-Control: no-store");
+  http.xlen := io.push(http.xhdr, http.xlen, "Location: ");
+  n := 0;
+  if http.form("next") then n := http.pvlen;
+  if oauth.safenext(n) then
+    for i := 0 to n - 1 do begin http.xhdr[http.xlen] := http.pval[i]; http.xlen := http.xlen + 1; end
+  else http.xlen := io.push(http.xhdr, http.xlen, "/");
+  http.xlen := io.push(http.xhdr, http.xlen, "\r\n");
+  http.add("ingelogd");
+  http.finish(302, "text/plain");
+end;
+
+// GET /logout: throw the session away, both here and in the browser.
+procedure oauth.logout;
+var row: int;
+begin
+  if oauth.readcookie then
+  begin
+    oauth.hashtext(oauth.presented[0..oauth.pn - 1]);
+    row := hash.get(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.dig);
+    if row >= 0 then
+    begin
+      oauth.loadtoken(row);
+      if oauth.tk.kind = OAUTH.KIND_SESSION then
+      begin
+        oauth.ok := store.del(oauth.ttok, row);
+        oauth.ok := hash.del(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.tk.hash);
+      end;
+    end;
+  end;
+  http.xlen := io.push(http.xhdr, http.xlen, "Set-Cookie: ");
+  http.xlen := io.push(http.xhdr, http.xlen, OAUTH.CNAME);
+  http.xlen := io.push(http.xhdr, http.xlen, "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0\r\n");
+  http.hdradd("Cache-Control: no-store");
+  http.add("<!doctype html><html><body><h1>Signed out</h1><p><a href=\"/login\">Sign in again</a></p></body></html>");
+  http.finish(200, "text/html; charset=utf-8");
+end;
+
+function oauth.route: bool;
+begin
+  if http.method = HTTP.OPTIONS then                   { CORS preflight for browser-based clients }
+  begin
+    router.cors;
+    http.finish(204, "text/plain");
+    return true;
+  end;
+  if http.pathstarts("/.well-known/oauth-protected-resource") then begin oauth.metadata_resource; return true; end;
+  if http.pathis("/.well-known/oauth-authorization-server") then begin oauth.metadata_server; return true; end;
+  if http.pathis("/register") then begin oauth.register; return true; end;
+  if http.pathis("/authorize") then
+  begin
+    if http.method = HTTP.POST then oauth.login else oauth.authorize;
+    return true;
+  end;
+  if http.pathis("/token") then begin oauth.token; return true; end;
+  if http.pathis("/login") then
+  begin
+    if http.method = HTTP.POST then oauth.dologin else oauth.loginpage(false);
+    return true;
+  end;
+  if http.pathis("/logout") then begin oauth.logout; return true; end;
+  return false;
+end;
+
+// drop expired codes and tokens (call now and then, e.g. every N requests)
+procedure oauth.expire;
+var r, now: int;
+begin
+  now := time.nowsec;
+  for r := 0 to store.high(oauth.tcode) - 1 do
+    if store.live(oauth.tcode, r) then
+    begin
+      oauth.loadcode(r);
+      if oauth.cd.used or (oauth.cd.expires < now) then
+      begin
+        oauth.ok := store.del(oauth.tcode, r);
+        oauth.ok := hash.del(oauth.kidx.keys, oauth.kidx.rows, 32, oauth.cd.hash);
+      end;
+    end;
+  for r := 0 to store.high(oauth.ttok) - 1 do
+    if store.live(oauth.ttok, r) then
+    begin
+      oauth.loadtoken(r);
+      if oauth.tk.expires < now then
+      begin
+        oauth.ok := store.del(oauth.ttok, r);
+        oauth.ok := hash.del(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.tk.hash);
+      end;
+    end;
+end;

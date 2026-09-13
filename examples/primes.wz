@@ -1,0 +1,87 @@
+// primes.wz -- sieve of Eratosthenes, with the runtime bounds checks left on.
+
+program primes;
+
+const
+  N = 200000;
+
+var
+  composite: array[2..N] of bool;
+  i, j, count: int;
+
+procedure puts(s: str);
+begin
+  sys3(1, 1, sadr(s), slen(s));
+end;
+
+procedure putn(v: int);
+var k, m: int;
+    d, o: array[0..31] of char;
+begin
+  k := 0;
+  if v < 0 then
+  begin
+    puts("-");
+    v := 0 - v;
+  end;
+  if v = 0 then
+  begin
+    d[0] := '0';
+    k := 1;
+  end;
+  while v > 0 do
+  begin
+    d[k] := chr(48 + (v mod 10));
+    v := v div 10;
+    k := k + 1;
+  end;
+  m := 0;
+  while m < k do
+  begin
+    o[m] := d[k - m - 1];
+    m := m + 1;
+  end;
+  sys3(1, 1, addr(o[0]), k);
+end;
+
+begin
+  i := 2;
+  while i * i <= N do
+  begin
+    if not composite[i] then
+    begin
+      j := i * i;
+      while j <= N do
+      begin
+        composite[j] := true;
+        j := j + i;
+      end;
+    end;
+    i := i + 1;
+  end;
+  count := 0;
+  i := 2;
+  while i <= N do
+  begin
+    if not composite[i] then count := count + 1;
+    i := i + 1;
+  end;
+  puts("primes below "); putn(N); puts(": "); putn(count); puts("\n");
+  puts("the 1000th, 2000th and 3000th are: ");
+  count := 0;
+  i := 2;
+  while i <= N do
+  begin
+    if not composite[i] then
+    begin
+      count := count + 1;
+      if (count = 1000) or (count = 2000) or (count = 3000) then
+      begin
+        putn(i);
+        puts(" ");
+      end;
+    end;
+    i := i + 1;
+  end;
+  puts("\n");
+end.

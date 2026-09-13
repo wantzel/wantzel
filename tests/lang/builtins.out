@@ -1,0 +1,18 @@
+ord(A) = 65
+chr(66) = 66
+len(a) = 5
+addr(a[6]) - addr(a[5]) = 8
+addr(b[1]) - addr(b[0]) = 1
+slen = 5
+schar = 101
+sadr byte = 111
+scan hit = 9
+scan miss = 16
+scan window = 16
+argc = 2
+argv[1][0] = 97
+argv[1][3] = 0
+argv[9][0] = 0
+sys write
+sys3 returned 10
+close(999) = -9

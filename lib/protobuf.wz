@@ -1,0 +1,226 @@
+// lib/protobuf.wz -- reader for the protobuf wire format.
+//
+// The wire format is five things: a varint, a 64-bit fixed, a
+// length-delimited block, a 32-bit fixed, and a tag that says which of
+// those follows and for which field number.  Nothing else.  A reader that
+// understands the tag can therefore skip every field it does not know,
+// which is exactly what makes a small reader safe against newer files.
+//
+// Nothing is copied.  The caller holds an `array of char` (usually a view
+// on an mmap of the whole file) and this module returns positions in it.
+// One cursor's state lives in globals (pb.fn, pb.wt, pb.vat, pb.vend,
+// pb.ival); a message is walked with:
+//
+//   at := start;
+//   while at < upto do
+//   begin
+//     at := pb.next(b, at, upto);
+//     if at < 0 then <malformed>;
+//     if pb.fn = 7 then ... pb.vat .. pb.vend ...   // submessage
+//     ...
+//   end;
+//
+// Nesting works because pb.next is re-entrant on its arguments: save
+// pb.vat/pb.vend into locals before you walk the child.
+
+include "io.wz";
+
+const
+  PB.WVAR = 0;
+  PB.W64  = 1;
+  PB.WLEN = 2;
+  PB.W32  = 5;
+
+var
+  pb.fn:   int;     // field number of the field just read
+  pb.wt:   int;     // wire type of the field just read
+  pb.ival: int;     // VARINT/I64/I32: the raw value
+  pb.vat:  int;     // LEN: first byte of the payload
+  pb.vend: int;     // LEN: one past the last byte of the payload
+  pb.err:  bool;    // set by any routine that hit a malformed encoding
+
+// Read a varint at `at`.  Leaves the value in pb.ival and returns the
+// position just past it, or -1 when the buffer ends first or the varint is
+// longer than ten bytes (which cannot encode a 64-bit value).
+function pb.varint(b: array of char; at: int; upto: int): int;
+var v, sh, n, c: int;
+begin
+  v := 0; sh := 0; n := 0;
+  while at < upto do
+  begin
+    c := ord(b[at]);
+    at := at + 1;
+    if sh < 64 then v := bor(v, band(c, 127) shl sh);
+    sh := sh + 7;
+    n := n + 1;
+    if band(c, 128) = 0 then
+    begin
+      pb.ival := v;
+      return at;
+    end;
+    if n >= 10 then begin pb.err := true; return -1; end;
+  end;
+  pb.err := true;
+  return -1;
+end;
+
+// Read the next tag+value starting at `at`.  Fills pb.fn/pb.wt and either
+// pb.ival (VARINT, I64, I32) or pb.vat/pb.vend (LEN).  Returns the position
+// after the whole field, or -1 on a malformed encoding.
+function pb.next(b: array of char; at: int; upto: int): int;
+var key, ln: int;
+begin
+  at := pb.varint(b, at, upto);
+  if at < 0 then return -1;
+  key := pb.ival;
+  pb.fn := key shr 3;
+  pb.wt := band(key, 7);
+  if pb.fn = 0 then begin pb.err := true; return -1; end;
+  if pb.wt = PB.WVAR then
+  begin
+    at := pb.varint(b, at, upto);
+    if at < 0 then return -1;
+    return at;
+  end;
+  if pb.wt = PB.W64 then
+  begin
+    if at + 8 > upto then begin pb.err := true; return -1; end;
+    pb.ival := io.get64(b, at);
+    return at + 8;
+  end;
+  if pb.wt = PB.W32 then
+  begin
+    if at + 4 > upto then begin pb.err := true; return -1; end;
+    pb.ival := io.get32(b, at);
+    return at + 4;
+  end;
+  if pb.wt = PB.WLEN then
+  begin
+    at := pb.varint(b, at, upto);
+    if at < 0 then return -1;
+    ln := pb.ival;
+    if (ln < 0) or (at + ln > upto) then begin pb.err := true; return -1; end;
+    pb.vat := at;
+    pb.vend := at + ln;
+    return at + ln;
+  end;
+  // wire types 3 and 4 are the deprecated groups; 6 and 7 do not exist
+  pb.err := true;
+  return -1;
+end;
+
+// A varint holding a signed 64-bit value is stored sign-extended to ten
+// bytes, so the raw int is already correct on a 64-bit machine.  This is
+// the identity; it exists so call sites read as intent.
+function pb.i64(v: int): int;
+begin
+  return v;
+end;
+
+// ZigZag decoding, for sint32/sint64 fields.  ONNX does not use them; this
+// is here so the reader is complete for other schemas.
+function pb.zigzag(v: int): int;
+begin
+  if band(v, 1) = 0 then return v shr 1;
+  return -((v shr 1) + 1);
+end;
+
+// A signed 32-bit varint stored by a 32-bit writer: negative values are
+// still ten bytes, so the raw value is already sign-extended.  But a value
+// written by a 32-bit-only writer may carry garbage above bit 31; clamp.
+function pb.i32(v: int): int;
+begin
+  v := band(v, 0xFFFFFFFF);
+  if v >= 0x80000000 then return v - 0x100000000;
+  return v;
+end;
+
+// The IEEE-754 single at `at` (wire type I32 payload), as a real.
+function pb.f32(b: array of char; at: int): real;
+begin
+  return unpack32(io.get32(b, at));
+end;
+
+function pb.asreal(a: array of real): real;
+begin
+  return a[0];
+end;
+
+// The IEEE-754 double at `at` (wire type I64 payload), as a real.
+// The eight bytes are reinterpreted through a view of one real.
+function pb.f64(b: array of char; at: int): real;
+begin
+  return pb.asreal(view(addr(b[at]), 1));
+end;
+
+// ---- packed repeated fields ------------------------------------------
+//
+// A packed repeated field of varints is one LEN block holding varints back
+// to back.  pb.packn counts them; pb.packat reads the k-th.  Both walk the
+// block, which is O(n) per element -- fine for the few-element axes lists
+// in ONNX, and the caller that wants them all uses pb.packnext.
+
+function pb.packn(b: array of char; at: int; upto: int): int;
+var n: int;
+begin
+  n := 0;
+  while at < upto do
+  begin
+    at := pb.varint(b, at, upto);
+    if at < 0 then return -1;
+    n := n + 1;
+  end;
+  return n;
+end;
+
+// Read the next packed varint; same contract as pb.varint (value in
+// pb.ival, returns the new position).  Named for readability at call sites.
+function pb.packnext(b: array of char; at: int; upto: int): int;
+begin
+  return pb.varint(b, at, upto);
+end;
+
+// ---- finding one field ------------------------------------------------
+//
+// Walk a message and stop at the first occurrence of field `want`.  Returns
+// the position after that field (so pb.vat/pb.vend or pb.ival are valid),
+// or -1 when the field is absent or the message is malformed.  Use the
+// explicit loop when a field repeats.
+function pb.find(b: array of char; at: int; upto: int; want: int): int;
+begin
+  while at < upto do
+  begin
+    at := pb.next(b, at, upto);
+    if at < 0 then return -1;
+    if pb.fn = want then return at;
+  end;
+  return -1;
+end;
+
+// True when every field in [at, upto) parses.  Used to validate a buffer
+// before trusting offsets taken from it.
+function pb.wellformed(b: array of char; at: int; upto: int): bool;
+begin
+  while at < upto do
+  begin
+    at := pb.next(b, at, upto);
+    if at < 0 then return false;
+  end;
+  return true;
+end;
+
+// ---- comparing a length-delimited field to a literal ------------------
+
+function pb.iseq(b: array of char; at: int; upto: int; s: str): bool;
+var i, n: int;
+begin
+  n := slen(s);
+  if upto - at <> n then return false;
+  i := 0;
+  while i < n do
+  begin
+    if b[at + i] <> schar(s, i) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;

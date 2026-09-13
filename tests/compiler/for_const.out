@@ -1,0 +1,10 @@
+1..10 = 55
+10..1 = 55
+empty = 0
+odd below 10 = 25
+i after break = 11
+nested = 36
+tri(4) = 10
+limit calls = 1
+iterations = 5
+321

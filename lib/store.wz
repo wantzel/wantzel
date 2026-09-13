@@ -1,0 +1,388 @@
+// lib/store.wz -- durable tables of fixed-size records: an append-only log
+// as the source of truth, a snapshot for fast starts, and the rows in memory
+// as one anonymous mapping per table so a row is read through a view.
+//
+//   store.table("profiles", PROFILE_SIZE, 10000);     // declare before open
+//   store.open(dir);                                   // load snapshot, replay the log
+//   row := store.alloc(T_PROFILES);                    // a free row, or -1
+//   ...fill view(store.rowaddr(T_PROFILES, row), PROFILE_SIZE) through a one-element record view...
+//   store.set(T_PROFILES, row, view(store.rowaddr(T_PROFILES, row), PROFILE_SIZE));  // log + live
+//   store.del(T_PROFILES, row);
+//   store.snapshot;                                    // atomic; then the log is truncated
+//
+// The log (<dir>/store.log) holds one record per set/del:
+//   magic 'PXL1' u32 | len u32 | table u16 | op u8 (1 set, 2 del) | pad u8 | row u32 | payload | crc32 u32
+// A torn or corrupted tail (crash mid-write) stops the replay at the last
+// good record.  The snapshot (<dir>/store.snap) is written to a temporary
+// file, fsynced and renamed; its header names the tables and their sizes,
+// so a recompiled program with a different layout refuses it instead of
+// misreading it.  One process writes; readers of a shared directory are
+// not supported (there is nothing to lock yet but the log, see flock).
+
+include "io.wz";
+
+const
+  STORE.MAXT = 64;
+  STORE.NAMELEN = 32;
+  STORE.OPSET = 1;
+  STORE.OPDEL = 2;
+  STORE.HDR = 20;                        // log record header bytes before the payload
+  STORE.MAGIC = 0x314C5850;              // 'PXL1' little-endian
+  STORE.SNAPMAGIC = 0x31534850;          // 'PHS1'
+
+var
+  store.nt: int;
+  store.name: array[0..STORE.MAXT * STORE.NAMELEN - 1] of char;
+  store.rs:   array[0..STORE.MAXT - 1] of int;     // record size
+  store.cap:  array[0..STORE.MAXT - 1] of int;     // rows
+  store.base: array[0..STORE.MAXT - 1] of int;     // address of the rows (mmap)
+  store.lv:   array[0..STORE.MAXT - 1] of int;     // address of the live bytes (mmap)
+  store.n:    array[0..STORE.MAXT - 1] of int;     // live rows
+  store.hi:   array[0..STORE.MAXT - 1] of int;     // rows ever used (high-water mark)
+  store.free: array[0..STORE.MAXT - 1] of int;     // hint: lowest possibly free row
+  store.dir:  array[0..1023] of char;
+  store.dirn: int;
+  store.path: array[0..1099] of char;
+  store.logfd: int;
+  store.logsize: int;                              // bytes of the log that are applied
+  store.crctab: array[0..255] of int;
+  store.crcready: bool;
+  store.open: bool;
+  store.err: str;                                  // the reason of the last failure
+
+// ------------------------------------------------------------- crc32
+
+procedure store.crcsetup;
+var i, k, c: int;
+begin
+  if store.crcready then return;
+  for i := 0 to 255 do
+  begin
+    c := i;
+    for k := 1 to 8 do
+      if band(c, 1) <> 0 then c := bxor(band(c shr 1, 0x7FFFFFFF), 0xEDB88320)
+      else c := band(c shr 1, 0x7FFFFFFF);
+    store.crctab[i] := c;
+  end;
+  store.crcready := true;
+end;
+
+function store.crc(b: array of char; from: int; upto: int; seed: int): int;
+var c, i: int;
+begin
+  c := bxor(seed, 0xFFFFFFFF);
+  for i := from to upto - 1 do
+    c := bxor(store.crctab[band(bxor(c, ord(b[i])), 255)], band(c shr 8, 0xFFFFFF));
+  return band(bxor(c, 0xFFFFFFFF), 0xFFFFFFFF);
+end;
+
+// ------------------------------------------------------------- tables
+
+// declare a table; returns its index (needed by every other call)
+function store.table(name: str; recsize: int; cap: int): int;
+var t, i: int;
+begin
+  if store.open then io.fatal("store.table after store.open");
+  if store.nt >= STORE.MAXT then io.fatal("too many store tables");
+  if (recsize <= 0) or (cap <= 0) then io.fatal("store.table needs a record size and a capacity");
+  t := store.nt;
+  for i := 0 to STORE.NAMELEN - 1 do
+    if i < slen(name) then store.name[t * STORE.NAMELEN + i] := schar(name, i)
+    else store.name[t * STORE.NAMELEN + i] := chr(0);
+  store.rs[t] := recsize;
+  store.cap[t] := cap;
+  store.nt := store.nt + 1;
+  return t;
+end;
+
+function store.rowaddr(t: int; row: int): int;
+begin
+  if (row < 0) or (row >= store.cap[t]) then io.fatal("store row out of range");
+  return store.base[t] + row * store.rs[t];
+end;
+
+function store.live(t: int; row: int): bool;
+begin
+  if (row < 0) or (row >= store.cap[t]) then return false;
+  return peek(store.lv[t] + row) <> 0;
+end;
+
+function store.count(t: int): int;
+begin
+  return store.n[t];
+end;
+
+function store.high(t: int): int;
+begin
+  return store.hi[t];
+end;
+
+// a free row (not live), or -1 when the table is full
+function store.alloc(t: int): int;
+var i: int;
+begin
+  i := store.free[t];
+  while i < store.cap[t] do
+  begin
+    if peek(store.lv[t] + i) = 0 then
+    begin
+      store.free[t] := i;
+      return i;
+    end;
+    i := i + 1;
+  end;
+  return -1;
+end;
+
+// ------------------------------------------------------------- files
+
+procedure store.mkpath(suffix: str);
+var n: int;
+begin
+  n := 0;
+  while n < store.dirn do begin store.path[n] := store.dir[n]; n := n + 1; end;
+  store.path[n] := '/';
+  n := io.push(store.path, n + 1, suffix);
+  store.path[n] := chr(0);
+end;
+
+procedure store.putu32(b: array of char; at: int; v: int);
+begin
+  io.put32(b, at, v);
+end;
+
+function store.mapzero(bytes: int): int;
+var p: int;
+begin
+  p := sys6(SYS.mmap, 0, bytes, bor(PROT_READ, PROT_WRITE), bor(MAP_PRIVATE, MAP_ANONYMOUS), -1, 0);
+  if p < 0 then io.fatal("store: cannot map memory");
+  return p;
+end;
+
+// apply one record to memory (no logging)
+procedure store.apply(t: int; op: int; row: int; payload: array of char);
+var a, i: int;
+begin
+  if (t < 0) or (t >= store.nt) then return;
+  if (row < 0) or (row >= store.cap[t]) then return;
+  if op = STORE.OPSET then
+  begin
+    if len(payload) <> store.rs[t] then return;
+    a := store.base[t] + row * store.rs[t];
+    for i := 0 to len(payload) - 1 do poke(a + i, ord(payload[i]));
+    if peek(store.lv[t] + row) = 0 then store.n[t] := store.n[t] + 1;
+    poke(store.lv[t] + row, 1);
+    if row + 1 > store.hi[t] then store.hi[t] := row + 1;
+  end
+  else if op = STORE.OPDEL then
+  begin
+    if peek(store.lv[t] + row) <> 0 then store.n[t] := store.n[t] - 1;
+    poke(store.lv[t] + row, 0);
+    if row < store.free[t] then store.free[t] := row;
+  end;
+end;
+
+var
+  store.rd: array[0..1048575] of char;            // log replay buffer (one record at a time)
+
+// replay the log from offset `from`; stops at the first bad record; returns the applied size
+function store.replay(from: int): int;
+var fd, got, n, plen, t, op, row, crc, want, at: int;
+begin
+  store.mkpath("store.log");
+  fd := sys3(SYS.open, addr(store.path[0]), O_RDONLY, 0);
+  if fd < 0 then return from;
+  at := from;
+  if sys3(SYS.lseek, fd, from, SEEK_SET) < 0 then begin sys1(SYS.close, fd); return from; end;
+  while true do
+  begin
+    got := sys3(SYS.read, fd, addr(store.rd[0]), STORE.HDR);
+    if got < STORE.HDR then break;
+    if io.get32(store.rd, 0) <> STORE.MAGIC then break;
+    plen := io.get32(store.rd, 4);
+    if (plen < 0) or (plen > len(store.rd) - STORE.HDR - 4) then break;
+    got := sys3(SYS.read, fd, addr(store.rd[STORE.HDR]), plen + 4);
+    if got < plen + 4 then break;
+    crc := store.crc(store.rd, 0, STORE.HDR + plen, 0);
+    want := io.get32(store.rd, STORE.HDR + plen);
+    if crc <> want then break;
+    t := io.get16(store.rd, 8);
+    op := ord(store.rd[10]);
+    row := io.get32(store.rd, 12);
+    if plen > 0 then store.apply(t, op, row, store.rd[STORE.HDR..STORE.HDR + plen - 1])
+    else store.apply(t, op, row, store.rd[0..-1]);
+    at := at + STORE.HDR + plen + 4;
+  end;
+  sys1(SYS.close, fd);
+  return at;
+end;
+
+var
+  store.sh: array[0..4095] of char;               // snapshot header scratch
+
+// load <dir>/store.snap if it matches the declared tables; returns the log offset it covers
+function store.loadsnap: int;
+var fd, n, t, i, k, off, cnt: int;
+begin
+  store.mkpath("store.snap");
+  fd := sys3(SYS.open, addr(store.path[0]), O_RDONLY, 0);
+  if fd < 0 then return 0;
+  n := sys3(SYS.read, fd, addr(store.sh[0]), 16);
+  if (n < 16) or (io.get32(store.sh, 0) <> STORE.SNAPMAGIC) or (io.get32(store.sh, 4) <> store.nt) then
+  begin
+    sys1(SYS.close, fd);
+    store.err := "snapshot does not match the declared tables";
+    return -1;
+  end;
+  off := io.get64(store.sh, 8);
+  for t := 0 to store.nt - 1 do
+  begin
+    n := sys3(SYS.read, fd, addr(store.sh[0]), STORE.NAMELEN + 24);
+    if n < STORE.NAMELEN + 24 then begin sys1(SYS.close, fd); store.err := "snapshot truncated"; return -1; end;
+    for i := 0 to STORE.NAMELEN - 1 do
+      if store.sh[i] <> store.name[t * STORE.NAMELEN + i] then begin sys1(SYS.close, fd); store.err := "snapshot table names differ"; return -1; end;
+    if (io.get64(store.sh, STORE.NAMELEN) <> store.rs[t]) or (io.get64(store.sh, STORE.NAMELEN + 8) <> store.cap[t]) then
+    begin
+      sys1(SYS.close, fd); store.err := "snapshot record size or capacity differs"; return -1;
+    end;
+    cnt := io.get64(store.sh, STORE.NAMELEN + 16);        { rows written = high-water mark }
+    if (cnt < 0) or (cnt > store.cap[t]) then begin sys1(SYS.close, fd); store.err := "snapshot row count invalid"; return -1; end;
+    if cnt > 0 then
+    begin
+      if sys3(SYS.read, fd, store.lv[t], cnt) <> cnt then begin sys1(SYS.close, fd); store.err := "snapshot truncated"; return -1; end;
+      k := cnt * store.rs[t];
+      if sys3(SYS.read, fd, store.base[t], k) <> k then begin sys1(SYS.close, fd); store.err := "snapshot truncated"; return -1; end;
+    end;
+    store.hi[t] := cnt;
+    store.n[t] := 0;
+    for i := 0 to cnt - 1 do if peek(store.lv[t] + i) <> 0 then store.n[t] := store.n[t] + 1;
+  end;
+  sys1(SYS.close, fd);
+  return off;
+end;
+
+// open the store in dir: map the tables, load the snapshot, replay the log tail
+function store.opendir(dir: array of char): bool;
+var t, i, off: int;
+begin
+  if store.open then io.fatal("store already open");
+  if store.nt = 0 then io.fatal("no tables declared");
+  store.crcsetup;
+  if len(dir) > 1000 then io.fatal("store directory name too long");
+  for i := 0 to len(dir) - 1 do store.dir[i] := dir[i];
+  store.dirn := len(dir);
+  store.mkpath("");
+  store.path[store.dirn] := chr(0);
+  sys2(SYS.mkdir, addr(store.path[0]), 493);             { harmless when it exists }
+  for t := 0 to store.nt - 1 do
+  begin
+    store.base[t] := store.mapzero(store.rs[t] * store.cap[t]);
+    store.lv[t] := store.mapzero(store.cap[t]);
+    store.n[t] := 0; store.hi[t] := 0; store.free[t] := 0;
+  end;
+  store.err := "";
+  off := store.loadsnap;
+  if off < 0 then return false;
+  store.logsize := store.replay(off);
+  store.mkpath("store.log");
+  store.logfd := sys3(SYS.open, addr(store.path[0]), bor(bor(O_WRONLY, O_CREAT), O_APPEND), 420);
+  if store.logfd < 0 then begin store.err := "cannot open the log"; return false; end;
+  { a torn tail is cut off so the next record lands right after the last good one }
+  if sys2(SYS.ftruncate, store.logfd, store.logsize) < 0 then begin store.err := "cannot truncate the log"; return false; end;
+  store.open := true;
+  return true;
+end;
+
+var
+  store.wr: array[0..1048575] of char;
+
+// append one record to the log with fsync, then apply it
+function store.write(t: int; op: int; row: int; payload: array of char): bool;
+var n, crc: int;
+begin
+  if not store.open then io.fatal("store not open");
+  if (t < 0) or (t >= store.nt) then return false;
+  if (row < 0) or (row >= store.cap[t]) then return false;
+  if len(payload) + STORE.HDR + 4 > len(store.wr) then return false;
+  io.put32(store.wr, 0, STORE.MAGIC);
+  io.put32(store.wr, 4, len(payload));
+  store.wr[8] := chr(band(t, 255)); store.wr[9] := chr(band(t shr 8, 255));
+  store.wr[10] := chr(op); store.wr[11] := chr(0);
+  io.put32(store.wr, 12, row);
+  io.put32(store.wr, 16, 0);
+  for n := 0 to len(payload) - 1 do store.wr[STORE.HDR + n] := payload[n];
+  n := STORE.HDR + len(payload);
+  crc := store.crc(store.wr, 0, n, 0);
+  io.put32(store.wr, n, crc);
+  n := n + 4;
+  if sys3(SYS.write, store.logfd, addr(store.wr[0]), n) <> n then begin store.err := "log write failed"; return false; end;
+  if sys1(SYS.fsync, store.logfd) < 0 then begin store.err := "log fsync failed"; return false; end;
+  store.logsize := store.logsize + n;
+  store.apply(t, op, row, payload);
+  return true;
+end;
+
+// write the record bytes into row (len must equal the record size) and mark it live
+function store.set(t: int; row: int; rec: array of char): bool;
+begin
+  if len(rec) <> store.rs[t] then begin store.err := "record size differs"; return false; end;
+  return store.write(t, STORE.OPSET, row, rec);
+end;
+
+function store.del(t: int; row: int): bool;
+begin
+  return store.write(t, STORE.OPDEL, row, store.wr[0..-1]);
+end;
+
+// write <dir>/store.snap atomically (temporary file, fsync, rename), then truncate the log
+function store.snapshot: bool;
+var fd, t, i, k, n: int;
+begin
+  if not store.open then io.fatal("store not open");
+  store.mkpath("store.snap.tmp");
+  fd := sys3(SYS.open, addr(store.path[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
+  if fd < 0 then begin store.err := "cannot create the snapshot"; return false; end;
+  io.put32(store.sh, 0, STORE.SNAPMAGIC);
+  io.put32(store.sh, 4, store.nt);
+  for i := 0 to 7 do store.sh[8 + i] := chr(0);      { the log is truncated after the snapshot: replay from 0 }
+  if sys3(SYS.write, fd, addr(store.sh[0]), 16) <> 16 then begin sys1(SYS.close, fd); return false; end;
+  for t := 0 to store.nt - 1 do
+  begin
+    for i := 0 to STORE.NAMELEN - 1 do store.sh[i] := store.name[t * STORE.NAMELEN + i];
+    for i := 0 to 7 do store.sh[STORE.NAMELEN + i] := chr(band(store.rs[t] shr (8 * i), 255));
+    for i := 0 to 7 do store.sh[STORE.NAMELEN + 8 + i] := chr(band(store.cap[t] shr (8 * i), 255));
+    for i := 0 to 7 do store.sh[STORE.NAMELEN + 16 + i] := chr(band(store.hi[t] shr (8 * i), 255));
+    n := STORE.NAMELEN + 24;
+    if sys3(SYS.write, fd, addr(store.sh[0]), n) <> n then begin sys1(SYS.close, fd); return false; end;
+    if store.hi[t] > 0 then
+    begin
+      if sys3(SYS.write, fd, store.lv[t], store.hi[t]) <> store.hi[t] then begin sys1(SYS.close, fd); return false; end;
+      k := store.hi[t] * store.rs[t];
+      if sys3(SYS.write, fd, store.base[t], k) <> k then begin sys1(SYS.close, fd); return false; end;
+    end;
+  end;
+  if sys1(SYS.fsync, fd) < 0 then begin sys1(SYS.close, fd); return false; end;
+  sys1(SYS.close, fd);
+  store.mkpath("store.snap");
+  for i := 0 to 1099 do store.rd[i] := store.path[i];          { the final name, NUL-terminated }
+  store.mkpath("store.snap.tmp");
+  if sys2(SYS.rename, addr(store.path[0]), addr(store.rd[0])) < 0 then begin store.err := "rename failed"; return false; end;
+  { the log is now fully covered by the snapshot: start it afresh }
+  if sys2(SYS.ftruncate, store.logfd, 0) < 0 then return false;
+  store.logsize := 0;
+  return true;
+end;
+
+procedure store.close;
+var t: int;
+begin
+  if not store.open then return;
+  sys1(SYS.close, store.logfd);
+  for t := 0 to store.nt - 1 do
+  begin
+    sys2(SYS.munmap, store.base[t], store.rs[t] * store.cap[t]);
+    sys2(SYS.munmap, store.lv[t], store.cap[t]);
+  end;
+  store.open := false;
+  store.nt := 0;
+end;

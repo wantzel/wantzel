@@ -1,0 +1,27 @@
+// spec §2: text as a value is array of char + length; literals compare by character.
+program t;
+include "io.wz";
+var
+  name: array[0..31] of char;
+  n: int;
+function same(a: array of char; b: array of char): bool;
+var i: int;
+begin
+  if len(a) <> len(b) then return false;
+  for i := 0 to len(a) - 1 do if a[i] <> b[i] then return false;
+  return true;
+end;
+procedure put(s: array of char);
+begin
+  if len(s) > 0 then io.out(STDOUT, addr(s[0]), len(s));
+  io.puts(STDOUT, "\n");
+end;
+begin
+  n := io.push(name, 0, "hello, ");
+  n := io.push(name, n, "world");
+  put(name[0..n - 1]);
+  if same(name[0..4], "hello") then io.puts(STDOUT, "same\n") else io.puts(STDOUT, "different\n");
+  if same(name[0..4], "hallo") then io.puts(STDOUT, "same\n") else io.puts(STDOUT, "different\n");
+  n := io.pushnum(name, 0, -1234);
+  put(name[0..n - 1]);
+end.

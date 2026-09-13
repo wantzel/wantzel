@@ -1,0 +1,165 @@
+// lib/sha256.wz -- SHA-256 (FIPS 180-4).
+//
+// A streaming interface over one global state (sha256.init / update / final)
+// and a one-shot wrapper (sha256.hash).  All 32-bit arithmetic is done in
+// 64-bit ints and masked with band(.., 0xFFFFFFFF) after every add and shift;
+// nothing here allocates.
+
+include "io.wz";
+
+var
+  sha256.k:     array[0..63] of int;    // round constants, filled by sha256.setup
+  sha256.ready: bool;                   // sha256.k has been filled
+  sha256.h:     array[0..7] of int;     // running hash state
+  sha256.w:     array[0..63] of int;    // message schedule of the current block
+  sha256.buf:   array[0..63] of char;   // partial block
+  sha256.n:     int;                    // bytes in sha256.buf
+  sha256.total: int;                    // bytes hashed so far
+
+// fill the round-constant table (first 32 bits of the fractional parts of
+// the cube roots of the first 64 primes); safe to call more than once
+procedure sha256.setup;
+begin
+  if sha256.ready then return;
+  sha256.k[0]  := 0x428a2f98; sha256.k[1]  := 0x71374491; sha256.k[2]  := 0xb5c0fbcf; sha256.k[3]  := 0xe9b5dba5;
+  sha256.k[4]  := 0x3956c25b; sha256.k[5]  := 0x59f111f1; sha256.k[6]  := 0x923f82a4; sha256.k[7]  := 0xab1c5ed5;
+  sha256.k[8]  := 0xd807aa98; sha256.k[9]  := 0x12835b01; sha256.k[10] := 0x243185be; sha256.k[11] := 0x550c7dc3;
+  sha256.k[12] := 0x72be5d74; sha256.k[13] := 0x80deb1fe; sha256.k[14] := 0x9bdc06a7; sha256.k[15] := 0xc19bf174;
+  sha256.k[16] := 0xe49b69c1; sha256.k[17] := 0xefbe4786; sha256.k[18] := 0x0fc19dc6; sha256.k[19] := 0x240ca1cc;
+  sha256.k[20] := 0x2de92c6f; sha256.k[21] := 0x4a7484aa; sha256.k[22] := 0x5cb0a9dc; sha256.k[23] := 0x76f988da;
+  sha256.k[24] := 0x983e5152; sha256.k[25] := 0xa831c66d; sha256.k[26] := 0xb00327c8; sha256.k[27] := 0xbf597fc7;
+  sha256.k[28] := 0xc6e00bf3; sha256.k[29] := 0xd5a79147; sha256.k[30] := 0x06ca6351; sha256.k[31] := 0x14292967;
+  sha256.k[32] := 0x27b70a85; sha256.k[33] := 0x2e1b2138; sha256.k[34] := 0x4d2c6dfc; sha256.k[35] := 0x53380d13;
+  sha256.k[36] := 0x650a7354; sha256.k[37] := 0x766a0abb; sha256.k[38] := 0x81c2c92e; sha256.k[39] := 0x92722c85;
+  sha256.k[40] := 0xa2bfe8a1; sha256.k[41] := 0xa81a664b; sha256.k[42] := 0xc24b8b70; sha256.k[43] := 0xc76c51a3;
+  sha256.k[44] := 0xd192e819; sha256.k[45] := 0xd6990624; sha256.k[46] := 0xf40e3585; sha256.k[47] := 0x106aa070;
+  sha256.k[48] := 0x19a4c116; sha256.k[49] := 0x1e376c08; sha256.k[50] := 0x2748774c; sha256.k[51] := 0x34b0bcb5;
+  sha256.k[52] := 0x391c0cb3; sha256.k[53] := 0x4ed8aa4a; sha256.k[54] := 0x5b9cca4f; sha256.k[55] := 0x682e6ff3;
+  sha256.k[56] := 0x748f82ee; sha256.k[57] := 0x78a5636f; sha256.k[58] := 0x84c87814; sha256.k[59] := 0x8cc70208;
+  sha256.k[60] := 0x90befffa; sha256.k[61] := 0xa4506ceb; sha256.k[62] := 0xbef9a3f7; sha256.k[63] := 0xc67178f2;
+  sha256.ready := true;
+end;
+
+// rotate a 32-bit value right by n (0 < n < 32); x must already be masked
+function sha256.rotr(x: int; n: int): int;
+begin
+  return band(bor(x shr n, x shl (32 - n)), 0xFFFFFFFF);
+end;
+
+// compress the 64 bytes in sha256.buf into sha256.h
+procedure sha256.block;
+var i, a, b, c, d, e, f, g, h, s0, s1, t1, t2: int;
+begin
+  for i := 0 to 15 do
+    sha256.w[i] := bor(bor(ord(sha256.buf[i * 4]) shl 24, ord(sha256.buf[i * 4 + 1]) shl 16),
+                       bor(ord(sha256.buf[i * 4 + 2]) shl 8, ord(sha256.buf[i * 4 + 3])));
+  for i := 16 to 63 do
+  begin
+    s0 := bxor(bxor(sha256.rotr(sha256.w[i - 15], 7), sha256.rotr(sha256.w[i - 15], 18)), sha256.w[i - 15] shr 3);
+    s1 := bxor(bxor(sha256.rotr(sha256.w[i - 2], 17), sha256.rotr(sha256.w[i - 2], 19)), sha256.w[i - 2] shr 10);
+    sha256.w[i] := band(sha256.w[i - 16] + s0 + sha256.w[i - 7] + s1, 0xFFFFFFFF);
+  end;
+  a := sha256.h[0]; b := sha256.h[1]; c := sha256.h[2]; d := sha256.h[3];
+  e := sha256.h[4]; f := sha256.h[5]; g := sha256.h[6]; h := sha256.h[7];
+  for i := 0 to 63 do
+  begin
+    s1 := bxor(bxor(sha256.rotr(e, 6), sha256.rotr(e, 11)), sha256.rotr(e, 25));
+    t1 := band(h + s1 + bxor(band(e, f), band(band(bnot(e), 0xFFFFFFFF), g)) + sha256.k[i] + sha256.w[i], 0xFFFFFFFF);
+    s0 := bxor(bxor(sha256.rotr(a, 2), sha256.rotr(a, 13)), sha256.rotr(a, 22));
+    t2 := band(s0 + bxor(bxor(band(a, b), band(a, c)), band(b, c)), 0xFFFFFFFF);
+    h := g;
+    g := f;
+    f := e;
+    e := band(d + t1, 0xFFFFFFFF);
+    d := c;
+    c := b;
+    b := a;
+    a := band(t1 + t2, 0xFFFFFFFF);
+  end;
+  sha256.h[0] := band(sha256.h[0] + a, 0xFFFFFFFF);
+  sha256.h[1] := band(sha256.h[1] + b, 0xFFFFFFFF);
+  sha256.h[2] := band(sha256.h[2] + c, 0xFFFFFFFF);
+  sha256.h[3] := band(sha256.h[3] + d, 0xFFFFFFFF);
+  sha256.h[4] := band(sha256.h[4] + e, 0xFFFFFFFF);
+  sha256.h[5] := band(sha256.h[5] + f, 0xFFFFFFFF);
+  sha256.h[6] := band(sha256.h[6] + g, 0xFFFFFFFF);
+  sha256.h[7] := band(sha256.h[7] + h, 0xFFFFFFFF);
+end;
+
+// start a new hash
+procedure sha256.init;
+begin
+  sha256.setup;
+  sha256.h[0] := 0x6a09e667; sha256.h[1] := 0xbb67ae85; sha256.h[2] := 0x3c6ef372; sha256.h[3] := 0xa54ff53a;
+  sha256.h[4] := 0x510e527f; sha256.h[5] := 0x9b05688c; sha256.h[6] := 0x1f83d9ab; sha256.h[7] := 0x5be0cd19;
+  sha256.n := 0;
+  sha256.total := 0;
+end;
+
+// feed bytes; may be called any number of times with any lengths
+procedure sha256.update(b: array of char);
+var i: int;
+begin
+  for i := 0 to len(b) - 1 do
+  begin
+    sha256.buf[sha256.n] := b[i];
+    sha256.n := sha256.n + 1;
+    if sha256.n = 64 then
+    begin
+      sha256.block;
+      sha256.n := 0;
+    end;
+  end;
+  sha256.total := sha256.total + len(b);
+end;
+
+// pad, run the last block(s) and write the 32-byte digest into digest[0..31]
+procedure sha256.final(digest: array of char);
+var i, bits: int;
+begin
+  bits := sha256.total * 8;
+  sha256.buf[sha256.n] := chr(0x80);
+  sha256.n := sha256.n + 1;
+  if sha256.n > 56 then
+  begin
+    for i := sha256.n to 63 do sha256.buf[i] := chr(0);
+    sha256.block;
+    sha256.n := 0;
+  end;
+  for i := sha256.n to 55 do sha256.buf[i] := chr(0);
+  for i := 0 to 7 do
+    sha256.buf[56 + i] := chr(band(bits shr (56 - i * 8), 255));
+  sha256.block;
+  for i := 0 to 7 do
+  begin
+    digest[i * 4]     := chr(band(sha256.h[i] shr 24, 255));
+    digest[i * 4 + 1] := chr(band(sha256.h[i] shr 16, 255));
+    digest[i * 4 + 2] := chr(band(sha256.h[i] shr 8, 255));
+    digest[i * 4 + 3] := chr(band(sha256.h[i], 255));
+  end;
+  sha256.n := 0;
+end;
+
+// one-shot: digest[0..31] := SHA-256(b)
+procedure sha256.hash(b: array of char; digest: array of char);
+begin
+  sha256.init;
+  sha256.update(b);
+  sha256.final(digest);
+end;
+
+// write the 32-byte digest as 64 lowercase hex chars into dst at position at;
+// returns the new position
+function sha256.hex(digest: array of char; dst: array of char; at: int): int;
+var i, v: int;
+begin
+  for i := 0 to 31 do
+  begin
+    v := ord(digest[i]) shr 4;
+    if v < 10 then dst[at] := chr(48 + v) else dst[at] := chr(87 + v);
+    v := band(ord(digest[i]), 15);
+    if v < 10 then dst[at + 1] := chr(48 + v) else dst[at + 1] := chr(87 + v);
+    at := at + 2;
+  end;
+  return at;
+end;

@@ -1,0 +1,10 @@
+# What build.sh produces: the compiler itself, and the bootstrap that built it. The whole
+# point is that you can rebuild them from bootstrap/boot.c, so they do not belong in git.
+/bin/
+
+# Temporary output of the toolchain tests.
+/tmp/
+
+# Never a token in a repository. This is a safety net: nothing here reads a .env, but
+# if a copy ever drifts in, it must not be committed.
+.env

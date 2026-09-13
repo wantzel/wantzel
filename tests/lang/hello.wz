@@ -1,0 +1,8 @@
+// The smallest test: the toolchain works and wztest can compare stdout.
+program hello;
+include "io.wz";
+begin
+  io.puts(STDOUT, "hallo, wztest\n");
+  io.putn(STDOUT, 6 * 7);
+  io.puts(STDOUT, "\n");
+end.

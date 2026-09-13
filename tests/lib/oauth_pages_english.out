@@ -1,0 +1,8 @@
+cookie = session
+--- loginpage ---
+<!doctype html><html><head><meta charset="utf-8"><title>Sign in</title><style>body{font-family:sans-serif;max-width:24em;margin:4em auto}input{width:100%;margin:.3em 0 1em;padding:.5em}button{padding:.6em 1.2em}.e{color:#b00}</style></head><body><h1>Sign in</h1><form method="post" action="/login"><label>User<input name="user" autofocus></label><label>Code<input name="secret" type="password"></label><button type="submit">Sign in</button></form></body></html>
+--- loginpage failed ---
+says unknown user true
+no Inloggen true
+no Gebruiker true
+no Onbekende true

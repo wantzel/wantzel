@@ -1,0 +1,7 @@
+2
+01
+-1
+{"twice":42,"label":"ok"}
+-2 no
+-1
+{"name":"double","description":"Double a number.","inputSchema":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]},"outputSchema":{"type":"object","properties":{"twice":{"type":"integer"},"label":{"type":"string","maxLength":8}},"required":["twice","label"]},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":false}},{"name":"shout","description":"Not implemented, always fails.","inputSchema":{"type":"object","properties":{"n":{"type":"integer"}},"required":["n"]},"outputSchema":{"type":"object","properties":{"twice":{"type":"integer"},"label":{"type":"string","maxLength":8}},"required":["twice","label"]},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false}}

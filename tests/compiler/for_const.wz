@@ -1,0 +1,59 @@
+// for/to, for/downto, break and continue in for, nested for, local const, end value evaluated once.
+program t;
+include "io.wz";
+var
+  i, j, s, n: int;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+function tri(n: int): int;
+const
+  STEP = 1;
+  NAME = 'T';
+var i, t: int;
+begin
+  for i := 1 to n do t := t + i * STEP;
+  if NAME = 'T' then return t;
+  return 0;
+end;
+function limit: int;
+begin
+  n := n + 1;          { called once per loop, not per iteration }
+  return 5;
+end;
+begin
+  s := 0;
+  for i := 1 to 10 do s := s + i;
+  show("1..10 = ", s);                       { 55 }
+  s := 0;
+  for i := 10 downto 1 do s := s + i;
+  show("10..1 = ", s);                       { 55 }
+  s := 0;
+  for i := 5 to 4 do s := s + 1;
+  show("empty = ", s);                       { 0 }
+  s := 0;
+  for i := 1 to 100 do
+  begin
+    if i mod 2 = 0 then continue;
+    if i > 9 then break;
+    s := s + i;
+  end;
+  show("odd below 10 = ", s);                { 25 }
+  show("i after break = ", i);               { 11 }
+  s := 0;
+  for i := 1 to 3 do
+    for j := 1 to 3 do
+      s := s + i * j;
+  show("nested = ", s);                      { 36 }
+  show("tri(4) = ", tri(4));                 { 10 }
+  n := 0; s := 0;
+  for i := 1 to limit do s := s + 1;
+  show("limit calls = ", n);                 { 1 }
+  show("iterations = ", s);                  { 5 }
+  for i := 3 downto 1 do
+  begin
+    io.putn(STDOUT, i);
+  end;
+  io.puts(STDOUT, "\n");
+end.

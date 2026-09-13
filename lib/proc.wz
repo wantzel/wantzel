@@ -1,0 +1,115 @@
+// lib/proc.wz -- processes: forking, reaping, and knowing how it ended.
+//
+// Why this is a library and not a compiler feature: `sys1`..`sys6` are builtins that
+// emit the SYSCALL instruction literally, and the syscall number is an ordinary
+// constant.  The compiler knows no syscall by name.  Everything the operating system
+// offers is therefore reachable without touching the language -- and so without
+// breaking the language freeze.
+//
+// Why it is a library and not a piece of application: otherwise the first user who
+// needs fork writes their own version, and the second writes it again.  The unpacking
+// rules of an exit status are exactly the kind of detail you want right once.
+//
+// **The pitfall this file exists to remove.**  An exit status from wait4 is not the exit
+// code: it is encoded.  Ended normally is `(status >> 8) & 255`, but a process that died
+// from a signal has zero in those bits and the signal number in the lowest seven.  Read
+// only `shr 8` and a crashed child looks like "done, code 0" -- a silent error of
+// exactly the kind this project makes most often.
+
+const
+  PROC.WNOHANG = 1;              // wait4: do not wait when nothing is ready
+
+var
+  proc.status: array[0..0] of int;    // the raw status of the last proc.reap
+  proc.nchildren: int;                // how many children are running now
+
+// Create a child process.  Returns, in the PARENT, the child's pid (> 0), in the CHILD
+// zero, and negative on an error (-errno).
+//
+// The child is a full copy: the same code, the same data, the same open file
+// descriptors.  Memory is shared copy-on-write, so forking is cheap even with a large
+// binary -- but there is NO shared memory: what the child writes the parent never sees.
+// A result therefore has to go to disk.
+function proc.fork: int;
+var pid: int;
+begin
+  pid := sys1(SYS.fork, 0);
+  if pid > 0 then proc.nchildren := proc.nchildren + 1;
+  return pid;
+end;
+
+// Wait until this child is done and return its raw status; negative on an error.
+function proc.wait(pid: int): int;
+var r: int;
+begin
+  proc.status[0] := 0;
+  r := sys4(SYS.wait4, pid, addr(proc.status[0]), 0, 0);
+  if r > 0 then if proc.nchildren > 0 then proc.nchildren := proc.nchildren - 1;
+  return r;
+end;
+
+// Is a child done?  Returns its pid, or 0 when nothing is ready, or negative on an
+// error.  Does NOT block.
+//
+// This is the shape that fits an epoll loop: each round, ask whether there is anything
+// to reap.  Without reaping, a finished child stays in the process table as a zombie --
+// not a memory leak but a leak of process numbers, and a server that forks a thousand
+// tasks without reaping eventually fails on fork.
+function proc.reap: int;
+var r: int;
+begin
+  proc.status[0] := 0;
+  r := sys4(SYS.wait4, -1, addr(proc.status[0]), PROC.WNOHANG, 0);
+  if r > 0 then if proc.nchildren > 0 then proc.nchildren := proc.nchildren - 1;
+  return r;
+end;
+
+// Did this process end normally (and not get killed by a signal)?
+//
+// The lowest seven bits carry the signal number; zero means "just ended".
+function proc.exited(status: int): bool;
+begin
+  return band(status, 127) = 0;
+end;
+
+// The exit code from a status.  Only meaningful when proc.exited is true.
+function proc.exitcode(status: int): int;
+begin
+  return band(status shr 8, 255);
+end;
+
+// The signal this process died from, or 0 when it ended normally.
+//
+// This is the case you forget: a child that segfaults or is hit by the OOM killer has
+// exit code 0 in the upper bits.  Without this test it looks like it succeeded.
+function proc.signal(status: int): int;
+begin
+  return band(status, 127);
+end;
+
+// Did this process go well: ended normally with exit code zero.
+function proc.ok(status: int): bool;
+begin
+  if not proc.exited(status) then return false;
+  return proc.exitcode(status) = 0;
+end;
+
+// Send a signal.  0 when it worked, negative on an error.
+function proc.kill(pid: int; sig: int): int;
+begin
+  return sys2(SYS.kill, pid, sig);
+end;
+
+// Is this process still running?  Signal 0 sends nothing but does test whether the
+// process exists and whether we are allowed to send it anything.
+function proc.alive(pid: int): bool;
+begin
+  if pid <= 0 then return false;
+  return sys2(SYS.kill, pid, 0) = 0;
+end;
+
+// Our own process identity.
+function proc.self: int;
+begin
+  return sys1(SYS.getpid, 0);
+end;

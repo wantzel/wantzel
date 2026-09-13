@@ -1,0 +1,69 @@
+// lib/log.wz -- one JSON line per event on stderr, for journald or a file.
+//
+//   log.info("started");                      {"t":...,"level":"info","msg":"started"}
+//   log.kv("port", 8080); log.info("listening");   extra fields go before the message
+//   log.error("cannot bind");
+// The request line of lib/http.wz is the same shape (http.logging := true).
+
+include "io.wz";
+include "json.wz";
+
+var
+  log.buf: array[0..4095] of char;
+  log.n: int;
+  log.fields: bool;
+
+procedure log.begin;
+begin
+  log.n := io.push(log.buf, 0, "{\"t\":");
+  log.n := io.pushnum(log.buf, log.n, io.realtime div 1000000);
+  log.fields := false;
+end;
+
+// an extra field; call any number of times before log.info/log.error
+procedure log.kv(key: str; v: int);
+begin
+  if log.n = 0 then log.begin;
+  log.n := io.push(log.buf, log.n, ",");
+  log.n := json.putstr(log.buf, log.n, key);
+  log.n := io.push(log.buf, log.n, ":");
+  log.n := io.pushnum(log.buf, log.n, v);
+  log.fields := true;
+end;
+
+procedure log.kvs(key: str; v: str);
+begin
+  if log.n = 0 then log.begin;
+  log.n := io.push(log.buf, log.n, ",");
+  log.n := json.putstr(log.buf, log.n, key);
+  log.n := io.push(log.buf, log.n, ":");
+  log.n := json.putstr(log.buf, log.n, v);
+  log.fields := true;
+end;
+
+procedure log.emit(level: str; msg: str);
+begin
+  if log.n = 0 then log.begin;
+  log.n := io.push(log.buf, log.n, ",\"level\":\"");
+  log.n := io.push(log.buf, log.n, level);
+  log.n := io.push(log.buf, log.n, "\",\"msg\":");
+  log.n := json.putstr(log.buf, log.n, msg);
+  log.n := io.push(log.buf, log.n, "}\n");
+  io.out(STDERR, addr(log.buf[0]), log.n);
+  log.n := 0;
+end;
+
+procedure log.info(msg: str);
+begin
+  log.emit("info", msg);
+end;
+
+procedure log.warn(msg: str);
+begin
+  log.emit("warn", msg);
+end;
+
+procedure log.error(msg: str);
+begin
+  log.emit("error", msg);
+end;

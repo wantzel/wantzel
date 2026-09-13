@@ -1,0 +1,57 @@
+// schema v2 writer: a record built by hand (not parsed) is written as JSON;
+// required fields always, optional only when _ok, null when _null; jsonschema constant.
+program t;
+include "io.wz";
+include "json.wz";
+
+schema Unit = record
+  key: text[16];
+  factor: real;
+end;
+
+schema Reply = record
+  id:     int;
+  total:  real;
+  ok:     bool;
+  label:  text[32]?;
+  note:   text?;
+  units:  array[0..3] of Unit;
+  values: array[0..7] of int?;
+  kind:   text of ("model", "probe");
+end;
+
+var
+  r: Reply;
+  out: array[0..1023] of char;
+  src: array[0..63] of char;
+  n: int;
+procedure emit;
+begin
+  n := Reply.write(out, 0, r, src);
+  io.out(STDOUT, addr(out[0]), n); io.puts(STDOUT, "\n");
+end;
+begin
+  Reply.clear(r);
+  r.id := 42;
+  r.total := 1234.5;
+  r.ok := true;
+  r.kind := Reply.kind.probe;
+  emit;                                            { required only; empty units array }
+  r.label_n := io.push(r.label, 0, "a \"quoted\" label");
+  r.label_ok := true;
+  r.units_n := 2;
+  r.units[0].key_n := io.push(r.units[0].key, 0, "kwh"); r.units[0].factor := 1.0;
+  r.units[1].key_n := io.push(r.units[1].key, 0, "m3");  r.units[1].factor := 9.769;
+  r.values_ok := true;
+  r.values_n := 3;
+  r.values[0] := -1; r.values[1] := 0; r.values[2] := 70000000000;
+  emit;
+  r.label_ok := true; r.label_null := true;        { an explicit null }
+  n := io.push(src, 0, "raw \\u00e9 text");
+  r.note_at := 4; r.note_end := n;                 { a view into src is copied raw, escapes and all }
+  r.note_ok := true;
+  r.kind := 7;                                     { outside the enum: written as null }
+  r.total := 0.000001;
+  emit;
+  io.puts(STDOUT, Reply.jsonschema); io.puts(STDOUT, "\n");
+end.

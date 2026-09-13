@@ -1,0 +1,4 @@
+// Must not compile: "cannot open the included file".
+program t;
+include "nowhere/nothing.wz";
+begin end.

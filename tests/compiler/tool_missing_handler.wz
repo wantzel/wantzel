@@ -1,0 +1,10 @@
+// Must not compile: "forward declared routine tool.x is never defined" -- the handler a
+// tools block forward-declares is named, so the reader knows which one is missing.
+program t;
+include "io.wz";
+include "json.wz";
+schema In = record n: int; end;
+tools
+  x(In): In "no handler follows";
+end;
+begin end.

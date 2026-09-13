@@ -1,0 +1,28 @@
+# What GitHub shows about this repository, and why.
+#
+# GitHub decides a project's language by counting bytes per file, using Linguist.
+# Two things need saying, and one thing must NOT be said.
+
+# bootstrap/boot.c is 4600 lines of C that exist only to compile the compiler once,
+# after which the language builds itself. Counted plainly it would make a self-hosting
+# language look like a C project, which is the opposite of the claim it makes.
+bootstrap/boot.c linguist-vendored
+
+# .wz is mapped to Pascal, and that is a deliberate compromise rather than a mistake.
+#
+# Linguist does not know Wantzel, and it will not for a long time: a new language is
+# only accepted once its extension appears in roughly 2000 files across public
+# repositories. Until then there are two options, and only one of them works:
+#
+#   *.wz linguist-language=Wantzel   -- FAILS SILENTLY. Linguist looks the name up,
+#       finds nothing, and treats every .wz file as undetected: no highlighting, and
+#       excluded from the language bar. That is worse than doing nothing, so it must
+#       not go in this file however much we would prefer it to be true.
+#
+#   *.wz linguist-language=Pascal    -- works. Pascal is a language Linguist knows,
+#       so the files are counted and highlighted. The grammar is not exact, but it
+#       agrees on what matters here: begin/end, :=, both comment forms, strings.
+#
+# The label is wrong and the highlighting is right. Until Linguist knows the language,
+# that trade is the better of the two.
+*.wz linguist-language=Pascal
