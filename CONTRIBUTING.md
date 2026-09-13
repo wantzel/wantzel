@@ -59,6 +59,10 @@ Four things that are easy to miss, all of which the suite will tell you about:
   Linux and the Windows side. "The tests run on Linux anyway" is not an argument.
 - **No external dependencies.** Zero is a hard requirement, not a score. The build and the
   test suite use nothing beyond a C compiler and a POSIX shell — not even Python.
+- **A new keyword means a new grammar entry.** The syntax highlighting in
+  `editors/vscode/` is generated from the compiler's own keyword table, so a word the
+  lexer learns must be added there too, under the rule it belongs to.
+  `tests/toolchain/grammar_matches_compiler.sh` fails if it is not.
 - **A test with the change.** [docs/testing.md](docs/testing.md) explains the forms a test
   can take; the shortest is a `.wz` file with a `.out` file beside it.
 

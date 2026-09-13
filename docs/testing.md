@@ -11,7 +11,7 @@ in the root.
 | `tests/lib/` | the standard library |
 | `tests/examples/` | that every program in `examples/` still compiles, for both targets |
 | `tests/limits/` | the measured limits (schema fields, tools, include depth) |
-| `tests/toolchain/` | the bootstrap fixed point, `test.sh`, the Windows side through Wine |
+| `tests/toolchain/` | the bootstrap fixed point, `test.sh`, the Windows side through Wine, and that the editor grammar still knows every keyword |
 | `tests/bench/` | speed, with a hard bound beside it |
 
 `tests/toolchain/` runs **only** with `--toolchain` (slow, needs Wine); `tests/bench/`
