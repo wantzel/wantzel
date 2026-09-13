@@ -21,7 +21,7 @@
 /* limits                                                              */
 /* ------------------------------------------------------------------ */
 /* The release this compiler was built from; src/wantzel.wz has the same string. */
-#define VERSION "0.1.0"
+#define VERSION "0.1.1"
 #define SRCMAX  16777216
 #define CODEMAX 16777216
 #define DATMAX   8388608

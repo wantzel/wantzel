@@ -18,7 +18,7 @@ const
     tests/toolchain/release_assets.sh checks it against the git tag: a binary that
     cannot say which version it is cannot be matched to a published checksum.
     bootstrap/boot.c carries the same string. }
-  VERSION = "0.1.0";
+  VERSION = "0.1.1";
   SRCMAX  = 16777216;
   CODEMAX = 16777216;
   DATMAX  = 8388608;
