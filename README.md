@@ -49,8 +49,10 @@ time; it is a program that does not compile.
 ```
 
 **Or download a binary.** Each release carries a Linux x86-64 binary and a Windows
-x86-64 `.exe`, built from the tagged commit. The Linux one is statically linked, so
-there is nothing to install.
+x86-64 `.exe`, built from the tagged commit. The Linux one is statically linked, and the
+standard library travels inside the compiler, so a downloaded file is the whole toolchain:
+`include "io.wz"` works with nothing else on disk. A checked-out `lib/` still takes
+precedence, so editing a library file in the repository has the effect you expect.
 
 The Windows binary is built on Linux and exercised through Wine, including a round trip
 where `wantzel.exe` compiles a program back to a Linux ELF that must be byte-identical to

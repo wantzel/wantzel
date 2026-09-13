@@ -41,6 +41,11 @@ const
   SF_TEXTN = 7;     { text[N]: an unescaped copy }
   SF_SUB   = 8;     { a nested schema }
   TBMAX   = 4096;
+  { The standard library carried inside the compiler.  EMBMAX is the room for all of
+    lib/ together; the generated file is checked against these by the build. }
+  EMBMAX  = 4194304;
+  EMBFILES = 64;
+  EMBNAMES = 2048;
 
   { types }
   T_VOID = 0;
@@ -152,12 +157,35 @@ var
   pathbuf: array[0..1023] of char;
   libdir:  array[0..1023] of char;      { where the compiler looks for its library }
   libdirlen: int;
+
+  { THE LIBRARY, CARRIED INSIDE THE COMPILER.
+
+    A compiler that was downloaded rather than built has no lib/ beside it, so
+    include "io.wz" had nowhere to read from and the binary was useless for anything
+    but a program that includes nothing.  The sources now travel with it.
+
+    A file on disk still wins.  That way someone working in the repository edits
+    lib/io.wz and sees the effect immediately, which is the behaviour that matters
+    while the language is young; the embedded copy only answers when the file is not
+    there.  Filled by emb.fill in the generated src/embedded.wz. }
+  emb.src: array[0..EMBMAX - 1] of char;   { every library file, end to end }
+  emb.len: int;
+  emb.nm: array[0..EMBNAMES - 1] of char;  { the names, nul-separated }
+  emb.nmlen: int;
+  emb.nmat: array[0..EMBFILES - 1] of int; { where each name starts in emb.nm }
+  emb.off: array[0..EMBFILES - 1] of int;  { where each source starts in emb.src }
+  emb.fin: array[0..EMBFILES - 1] of int;  { and where it stops }
+  emb.n: int;
   { The IDENTITY of every file read in: st_dev and st_ino from stat(2).  That makes
     "lib/io.wz" the same file as "../../elsewhere/lib/io.wz" -- and makes a TEST called
     kv.wz something DIFFERENT from the library kv.wz, because the inode differs.
     Comparing on the path string could do neither. }
   stbuf:  array[0..143] of char;
   fdev:   array[0..1023] of int;
+  { -1 for a real file, otherwise the index in the embedded table.  An embedded file has
+    no device and inode, so samefile cannot recognise it; this is how a second include of
+    the same library file is caught. }
+  filemb: array[0..1023] of int;
   fino:   array[0..1023] of int;
 
   gnam, gkind, gtyp, gval: array[0..MAXG-1] of int;
@@ -774,6 +802,7 @@ begin
   filelen[nfiles] := i;
   { keep this file's identity, so samefile can compare it }
   fdev[nfiles] := 0; fino[nfiles] := 0;
+  filemb[nfiles] := -1;
   if stt(addr(pathbuf[0])) >= 0 then
   begin
     fdev[nfiles] := stfield(0);
@@ -894,6 +923,85 @@ begin
 end;
 
 { does pathbuf exist? -- for the choice between relative and the search path }
+{ Filling the table.  The three below are called only by emb.fill in the generated
+  file, which is why they are so plain: a name, then the bytes in chunks, then done. }
+procedure emb.begin(nm: str);
+var i, n: int;
+begin
+  if emb.n >= EMBFILES then fail("too many embedded library files");
+  emb.nmat[emb.n] := emb.nmlen;
+  n := slen(nm);
+  i := 0;
+  while i < n do
+  begin
+    if emb.nmlen >= EMBNAMES - 1 then fail("embedded library names too long");
+    emb.nm[emb.nmlen] := schar(nm, i);
+    emb.nmlen := emb.nmlen + 1;
+    i := i + 1;
+  end;
+  emb.nm[emb.nmlen] := chr(0);
+  emb.nmlen := emb.nmlen + 1;
+  emb.off[emb.n] := emb.len;
+end;
+
+procedure emb.add(part: str);
+var i, n: int;
+begin
+  n := slen(part);
+  i := 0;
+  while i < n do
+  begin
+    if emb.len >= EMBMAX then fail("embedded library too large");
+    emb.src[emb.len] := schar(part, i);
+    emb.len := emb.len + 1;
+    i := i + 1;
+  end;
+end;
+
+procedure emb.done;
+begin
+  emb.fin[emb.n] := emb.len;
+  emb.n := emb.n + 1;
+end;
+
+{ Which embedded file is called <name>, or -1.  The name comes from the include as a
+  nul-terminated string in dat. }
+function emb.find(doff: int): int;
+var i, j, at: int;
+begin
+  i := 0;
+  while i < emb.n do
+  begin
+    at := emb.nmat[i];
+    j := 0;
+    while (dat[doff + j] <> chr(0)) and (emb.nm[at + j] <> chr(0))
+          and (dat[doff + j] = emb.nm[at + j]) do j := j + 1;
+    if (dat[doff + j] = chr(0)) and (emb.nm[at + j] = chr(0)) then return i;
+    i := i + 1;
+  end;
+  return -1;
+end;
+
+{ Copy embedded file i into the source buffer, the way readfile would have. }
+function emb.read(i: int): int;
+var j, n: int;
+begin
+  n := emb.fin[i] - emb.off[i];
+  if srclen + n > SRCMAX then fail("source is too large");
+  j := 0;
+  while j < n do
+  begin
+    src[srclen + j] := emb.src[emb.off[i] + j];
+    j := j + 1;
+  end;
+  srclen := srclen + n;
+  return n;
+end;
+
+{ emb.fill, generated from lib/ by tools/embedlib.wz.  It is a separate file because it
+  is generated: nothing in it is written by hand, and build.sh remakes it. }
+include "embedded.wz";
+
 function fileexists: bool;
 var fd: int;
 begin
@@ -1030,7 +1138,7 @@ begin
 end;
 
 procedure doinclude;
-var doff, i, fi, n, start: int;
+var doff, i, fi, n, start, embi: int;
 begin
   next;
   if tok <> TK_STR then fail("include needs a file name in quotes");
@@ -1051,11 +1159,46 @@ begin
 
     If the library name does not exist it falls back to relative: that way files lying
     next to each other and naming each other by name keep working. }
+  { A bare library name that is on NEITHER path comes from the embedded copy, if the
+    compiler carries one.  Disk first, always: someone editing lib/io.wz in a checkout
+    must see the effect without rebuilding. }
+  embi := -1;
   if haspath(doff) then makepath(doff)
   else
   begin
     makelibpath(doff);
-    if not fileexists then makepath(doff);
+    if not fileexists then
+    begin
+      makepath(doff);
+      if not fileexists then embi := emb.find(doff);
+    end;
+  end;
+  if embi >= 0 then
+  begin
+    { An embedded file is not a file, so the same-file check below cannot apply to it;
+      guard against including one twice by its position in the table. }
+    i := 0;
+    while i < nfiles do
+    begin
+      if filemb[i] = embi then break;
+      i := i + 1;
+    end;
+    if i < nfiles then begin next; return; end;
+    if incdepth >= 16 then fail("includes nested too deeply");
+    { The name an error message will carry.  makelibpath already put <libdir>/<name>
+      there, which is the path this file WOULD have had -- the most useful thing to
+      show, since it is where a reader would look for it. }
+    makelibpath(doff);
+    fi := addfile;
+    filemb[fi] := embi;
+    incpos[incdepth] := pos; incend[incdepth] := srcend;
+    incline[incdepth] := line; incfile[incdepth] := curfile;
+    incdepth := incdepth + 1;
+    start := srclen;
+    n := emb.read(embi);
+    pos := start; srcend := start + n; line := 1; curfile := fi;
+    next;
+    return;
   end;
   normpath;
   datlen := datmark;
@@ -6115,6 +6258,7 @@ function compile: int;
 var n: int;
 begin
   line := 1;
+  emb.fill;                              { the library carried inside this binary }
   srclen := 0; fnplen := 0; nfiles := 0; incdepth := 0;
   curfile := addfile;
   n := readfile;

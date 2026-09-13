@@ -12,6 +12,17 @@ mkdir -p bin
 echo "1. cc bootstrap/boot.c -> bin/wantzel0    (the one and only external step)"
 cc -w -o bin/wantzel0 bootstrap/boot.c
 
+# The standard library goes INSIDE the compiler, so a binary that was downloaded rather
+# than built can still resolve include "io.wz". Regenerated every build: src/embedded.wz
+# is generated, never edited, and a stale copy would ship a library that differs from
+# lib/ -- which tests/toolchain/embedded_lib_current.sh refuses.
+#
+# The generator is itself written in Wantzel and compiled by wantzel0, which needs no
+# embedded copy: it reads lib/ from disk, and in this repository lib/ is right there.
+echo "1b. generating src/embedded.wz from lib/"
+./bin/wantzel0 tools/embedlib.wz bin/embedlib
+./bin/embedlib src/embedded.wz $(for f in lib/*.wz; do printf '%s %s ' "$(basename "$f")" "$f"; done)
+
 echo "2. boot   src/wantzel.wz       -> bin/wantzel.stage1 (first self-hosted compiler)"
 ./bin/wantzel0 src/wantzel.wz bin/wantzel.stage1
 

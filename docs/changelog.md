@@ -16,6 +16,23 @@ Newest first. Dates are the day the change landed.
 
 ---
 
+## Unreleased
+
+### Compiler
+
+- **The standard library travels inside the compiler.** A binary that was downloaded
+  rather than built had no `lib/` beside it, so `include "io.wz"` failed with
+  `cannot open the included file` — which made the release useless for almost any real
+  program, since nearly all of them start with an include. The sources are now carried in
+  the binary and used when the file is not found on disk.
+
+  **A file on disk still wins.** If you have the repository checked out, editing
+  `lib/io.wz` has the effect you expect, with no rebuild needed; the embedded copy only
+  answers when there is nothing to read. An include naming a path (`include "sub/x.wz"`)
+  is unchanged and always comes from disk.
+
+  The compiler is about 500 kB instead of 274 kB as a result. *13-09-2026, W-0000-0042.*
+
 ## 0.1.0 — 13 September 2026
 
 The first public release. Everything below landed before it; the entries are kept
