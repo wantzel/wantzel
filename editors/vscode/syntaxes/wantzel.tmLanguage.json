@@ -16,6 +16,9 @@
       "include": "#numbers"
     },
     {
+      "include": "#routine"
+    },
+    {
       "include": "#keywords"
     },
     {
@@ -29,9 +32,6 @@
     },
     {
       "include": "#attributes"
-    },
-    {
-      "include": "#routine"
     },
     {
       "include": "#identifiers"
@@ -97,7 +97,7 @@
       "patterns": [
         {
           "name": "keyword.control.wantzel",
-          "match": "(?i)\\b(continue|repeat|downto|return|while|until|break|then|else|case|halt|for|if|of|do|to)\\b"
+          "match": "(?i)\\b(continue|repeat|downto|return|while|until|break|then|else|case|for|if|of|do|to)\\b"
         },
         {
           "name": "keyword.declaration.wantzel",
@@ -127,7 +127,7 @@
     },
     "builtins": {
       "name": "support.function.builtin.wantzel",
-      "match": "(?i)\\b(unpack32|pack32|argch|round|schar|trunc|addr|argc|peek|poke|sadr|scan|slen|sqrt|sys1|sys2|sys3|sys4|sys5|sys6|view|chr|len|ord)\\b"
+      "match": "(?i)\\b(halt|unpack32|pack32|argch|round|schar|trunc|addr|argc|peek|poke|sadr|scan|slen|sqrt|sys1|sys2|sys3|sys4|sys5|sys6|view|chr|len|ord)\\b"
     },
     "attributes": {
       "name": "storage.modifier.wantzel",
