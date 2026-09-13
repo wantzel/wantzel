@@ -35,8 +35,9 @@ end.
 ./bin/wantzel hello.wz hello.exe          # a Windows binary, from Linux
 ```
 
-The second line is not a cross-compiler: the target follows from the name, and either
-host builds either one, because the compiler is the whole toolchain.
+That second line cross-compiles, and there is nothing to install for it: the target
+follows from the output name, one compiler emits both, and a Windows build of that
+compiler does the same in reverse.
 
 ## What it can do
 
