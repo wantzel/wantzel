@@ -167,6 +167,94 @@ So the tool has to hold what you used to hold:
 None of that removes the need to review. It changes what a review is: reading for whether
 the program does the right thing, rather than whether it is allowed to do what it says.
 
+### The standard every compiler decision is measured against
+
+Stated by the maintainer, 14 September 2026, as the sentence to weigh a proposal against:
+
+> **A compact, fast, strict language, fit to be used in iterations by AI when agents write
+> code.**
+
+Four words, and each of them decides something. Compact: the whole specification is
+readable in a sitting, so an agent that must consult it does not spend its attention
+there. Fast: a build is short enough that a loop can afford to compile on every change,
+which is what makes iteration possible at all. Strict: what the compiler refuses is what
+nobody has to review. And *in iterations* is the one that is easy to miss -- the unit of
+work is not a program a person writes once, but a cycle that runs many times, where every
+signal is read by a machine before a human sees it.
+
+That last point turns several ordinary preferences into requirements. None of these was
+reasoned out in advance: each one is a bug that was fixed once the yardstick made the
+answer obvious, and they are listed with the case that produced them because the case is
+the argument.
+
+- **An error must name the SOURCE, not the compiler.** A source that filled the data
+  segment used to fail with `array index out of range at src/wantzel.wz:495`. Every word
+  of that is true and all of it points the wrong way: the reader goes looking in the
+  compiler, or — worse, if the reader is a generator — in its own code, for a fault that
+  is not there. It now says `<file>:<line>: data segment overflow: the source is too
+  large`. Naming the input is not politeness; it is the difference between a loop that
+  converges and one that thrashes.
+
+- **A limit must REFUSE — not truncate, not crash.** Three kinds of failure, and only one
+  of them is usable. A crash gives a caller nothing to act on. Silent truncation gives it
+  something worse: a result that looks complete. A clean refusal is a fact it can respond
+  to. The distinction is not academic — it decided the shape of two different repairs on
+  the same day. `io.push` may truncate, because its output is a *message* and a shortened
+  error string is still a readable error string. A generated `<Schema>.write` must refuse,
+  because its output is a *JSON object* that goes out as a protocol reply: truncating
+  hands the peer an unparseable envelope, which moves the failure from "this one call
+  failed cleanly" to "the session is broken and the reason is invisible". That is strictly
+  worse than the crash it replaced, because at least a crash is loud.
+
+- **Both halves of an operation must fail the same way.** When `io.push` was given a
+  truncating contract, three neighbouring writers were left overrunning their buffers. The
+  result was not two bugs but one worse property: a caller could form no model at all of
+  what happens when output does not fit, because it depended on which half of the append
+  it reached. Consistency here is not tidiness; an inconsistent contract cannot be
+  remembered, and what cannot be remembered gets written wrong.
+
+- **Silence must mean correct.** Exit 0 has to be trustworthy on its own, because
+  something machine-read acts on it without weighing tone or context. This is where the
+  no-warnings rule below comes from, and the yardstick is why it is not negotiable.
+
+- **A routine's docstring is part of its contract, and a wrong one is a bug.**
+  `kv.match` promised "subset match as used by entity searches" and delivered something
+  narrower: a stored list could not contain anything, not even itself. The trap survived
+  as long as it did because the repository *argued with itself* — one document called the
+  behaviour a deliberate choice while the docstring implied the opposite, so a reader
+  could find support for either belief and neither was tested. Prose about behaviour is
+  either checked or it is a liability.
+
+- **One way per concept, even where two would be convenient.** A second way is a second
+  thing to learn, a second thing to review, and a second chance to pick the wrong one.
+
+- **A behaviour change costs more here than elsewhere, and this is the rule most easily
+  underestimated.** Code a generator produced last week is not reread when the rules shift
+  underneath it; it simply starts being wrong, silently, in a place nobody is looking. So
+  a change that alters what existing working code does needs a stronger argument than one
+  that merely refuses something new — and when it is made anyway, both directions of the
+  change get written down, including the shape that used to work and now does not.
+
+- **Linux and Windows stay as identical as they can be made.** Floris, 14-09-2026: a
+  platform difference is one more thing the writer has to hold in their head, and that is
+  exactly what this language is trying to take off them. It weighs heavier here than in a
+  language people write by hand: a human learns "on Windows this one is different" once
+  and remembers it, while a generator has no such memory and will produce the Linux shape
+  every time. So the difference belongs in the runtime, not in the program -- one call,
+  one meaning, both targets. Where a platform genuinely cannot be hidden, it is named in
+  [language.md](language.md) rather than left for a reader to discover, because an
+  undocumented difference is the one that gets written wrong.
+
+What those have in common is worth stating on its own: none of them makes the language
+more powerful. Every one of them makes a failure easier to read correctly by something that
+cannot ask a follow-up question. That is the whole of *fit to be used in iterations* -- the
+yardstick does not ask what the language can express, it asks what a machine can conclude
+from the answer.
+
+Weigh a proposal against those, and a surprising number of questions answer themselves.
+Where it does not decide, say so in the ticket instead of guessing -- a yardstick used to
+justify a guess is worse than no yardstick, because the guess then arrives with a citation.
+
 ### So this compiler is built a little differently
 
 - **No warnings — only errors.** A warning and an error are two ways of saying the same

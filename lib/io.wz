@@ -41,28 +41,6 @@ var
   io.tmp:  array[0..255] of char;
   io.ts:   array[0..15] of char;
 
-// monotonic nanoseconds
-function io.now: int;
-var i, sec, ns: int;
-begin
-  sys2(SYS.clock, 1, addr(io.ts[0]));
-  sec := 0;
-  i := 7;
-  while i >= 0 do
-  begin
-    sec := bor(sec shl 8, ord(io.ts[i]));
-    i := i - 1;
-  end;
-  ns := 0;
-  i := 15;
-  while i >= 8 do
-  begin
-    ns := bor(ns shl 8, ord(io.ts[i]));
-    i := i - 1;
-  end;
-  return sec * 1000000000 + ns;
-end;
-
 function io.write(fd: int; a: int; n: int): int;
 begin
   return sys3(SYS.write, fd, a, n);
@@ -131,13 +109,17 @@ begin
   halt(1);
 end;
 
-// append the decimal form of v to b at position at; returns the new position
+// Append the decimal form of v to b at position at; returns the new position.
+// Stops at len(b): the position that comes back is then the end of the buffer, and
+// the number is truncated.  See io.push for why this truncates instead of signalling,
+// and for why a negative `at` travels through unchanged.
 function io.pushnum(b: array of char; at: int; v: int): int;
 var n, i: int;
 begin
+  if at < 0 then return at;
   n := io.digits(v);
   i := 0;
-  while i < n do
+  while (i < n) and (at < len(b)) do
   begin
     b[at] := io.nbuf[i];
     at := at + 1;
@@ -146,13 +128,26 @@ begin
   return at;
 end;
 
-// append a string literal to b at position at
+// Append a string literal to b at position at; returns the new position.
+//
+// Stops at len(b).  What does not fit is dropped and the position that comes back is
+// the end of the buffer, so a caller that cares can see it did not advance as far as
+// the literal is long.  It truncates rather than returning -1 because every caller
+// chains the result straight back in as the next position -- `n := io.push(b, n, ..)`
+// -- and a -1 flowing into the next call would index b[-1], which is worse than a
+// short buffer.  json.putslice does return -1, but it is called in places that test
+// for it; these are not.
+//
+// A negative `at` comes back unchanged rather than indexing b[-1], so a -1 from a
+// refusing routine (json.putslice, json.putb, a generated <Schema>.write) can travel
+// through a chain of these without damage and be tested once at the end.
 function io.push(b: array of char; at: int; s: str): int;
 var i, n: int;
 begin
+  if at < 0 then return at;
   n := slen(s);
   i := 0;
-  while i < n do
+  while (i < n) and (at < len(b)) do
   begin
     b[at] := schar(s, i);
     at := at + 1;
@@ -234,13 +229,55 @@ const
   SEEK_CUR = 1;
   SEEK_END = 2;
 
-  CLOCK_REALTIME = 0;
+  CLOCK_REALTIME  = 0;             // the clock id io.realtime asks for
+  CLOCK_MONOTONIC = 1;             // the clock id io.now asks for
 
-// wall-clock nanoseconds since the Unix epoch
-function io.realtime: int;
-var i, sec, ns: int;
+// Monotonic nanoseconds.
+//
+// A failed clock_gettime returns a negative -errno (an invalid clock id gives -22,
+// -EINVAL) AND LEAVES THE TIMESPEC UNTOUCHED, so the decode below would hand back
+// whatever io.ts held before -- the previous reading, or a zero timestamp on the first
+// call.  That is why the result is checked instead of decoded: a wrong time that is
+// stored is afterwards indistinguishable from a real one, so stopping beats carrying on.
+// On Windows the call is served by GetSystemTimeAsFileTime, which cannot fail and
+// always reports success; the check is then simply never taken.
+function io.now: int;
+var i, sec, ns, r: int;
 begin
-  sys2(SYS.clock, CLOCK_REALTIME, addr(io.ts[0]));
+  r := sys2(SYS.clock, CLOCK_MONOTONIC, addr(io.ts[0]));
+  if r < 0 then io.fatal("io.now: the monotonic clock is unavailable (clock_gettime failed)");
+  sec := 0;
+  i := 7;
+  while i >= 0 do
+  begin
+    sec := bor(sec shl 8, ord(io.ts[i]));
+    i := i - 1;
+  end;
+  ns := 0;
+  i := 15;
+  while i >= 8 do
+  begin
+    ns := bor(ns shl 8, ord(io.ts[i]));
+    i := i - 1;
+  end;
+  return sec * 1000000000 + ns;
+end;
+
+// Wall-clock nanoseconds since the Unix epoch.
+//
+// A failed clock_gettime returns a negative -errno (an invalid clock id gives -22,
+// -EINVAL) AND LEAVES THE TIMESPEC UNTOUCHED, so the decode below would hand back
+// whatever io.ts held before -- the previous reading, or a zero timestamp on the first
+// call, which is 1 January 1970.  This result feeds dates (time.nowsec, and the log
+// timestamps of lib/log.wz and lib/http.wz), and a wrong date that is stored is
+// afterwards indistinguishable from a real one: that is unrecoverable, so stopping
+// beats carrying on.  On Windows the call is served by GetSystemTimeAsFileTime, which
+// cannot fail and always reports success; the check is then simply never taken.
+function io.realtime: int;
+var i, sec, ns, r: int;
+begin
+  r := sys2(SYS.clock, CLOCK_REALTIME, addr(io.ts[0]));
+  if r < 0 then io.fatal("io.realtime: the system clock is unavailable (clock_gettime failed)");
   sec := 0;
   i := 7;
   while i >= 0 do

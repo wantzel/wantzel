@@ -48,9 +48,14 @@ begin
   sys5(SYS.setsockopt, fd, SOL_SOCKET, opt, addr(net.one[0]), 4);
 end;
 
-procedure net.nonblock(fd: int);
+// Put the socket in non-blocking mode.  True when it worked.
+//
+// The result must be tested: a failed F_SETFL leaves a BLOCKING socket in an epoll
+// loop, and then one slow client stops the whole server -- a hang, not an error.
+// Measured: on a closed fd the call returns -9 (EBADF) and changes nothing.
+function net.nonblock(fd: int): bool;
 begin
-  sys3(SYS.fcntl, fd, F_SETFL, O_NONBLOCK);
+  return sys3(SYS.fcntl, fd, F_SETFL, O_NONBLOCK) = 0;
 end;
 
 // bind to 0.0.0.0:port and start listening; returns the socket or a negative errno
@@ -82,7 +87,14 @@ begin
     net.close(fd);
     return r;
   end;
-  net.nonblock(fd);
+  // A blocking listening socket in an epoll loop makes accept() wait, so this is
+  // part of the contract of "a socket you can poll", not a detail.  Report it the
+  // way bind and listen above report: a negative errno, with the fd closed.
+  if not net.nonblock(fd) then
+  begin
+    net.close(fd);
+    return -9;                           // EBADF: the fd did not take O_NONBLOCK
+  end;
   return fd;
 end;
 
@@ -107,12 +119,22 @@ begin
   return sys1(SYS.epcreate, 0);
 end;
 
-procedure net.watch(ep: int; op: int; fd: int; events: int);
+// Add, change or remove an fd in the epoll set.  True when it worked.
+//
+// The result must be tested, and what a failure MEANS depends on the operation.
+// Measured with an invalid fd (-9, EBADF) and with a valid but unregistered one
+// (-2, ENOENT):
+//   EPOLL_ADD  a connection that is never watched, so it is never served: a hang.
+//   EPOLL_MOD  the fd keeps its OLD event mask, so the loop waits for the wrong
+//              readiness -- also a stall, and not one the caller notices.
+//   EPOLL_DEL  ENOENT only says the fd is already out of the set, which is exactly
+//              the state the caller wanted.
+function net.watch(ep: int; op: int; fd: int; events: int): bool;
 begin
   io.put32(net.ev, 0, events);
   io.put32(net.ev, 4, fd);
   io.put32(net.ev, 8, 0);
-  sys4(SYS.epctl, ep, op, fd, addr(net.ev[0]));
+  return sys4(SYS.epctl, ep, op, fd, addr(net.ev[0])) = 0;
 end;
 
 function net.wait(ep: int; a: int; maxev: int; timeout: int): int;

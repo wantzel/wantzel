@@ -26,37 +26,25 @@ done
 
 echo "language behaviour"
 ./bin/wantzel tests/compiler/feat.wz "$T/feat" 2>/dev/null
-same "feature suite" "$(cd "$T" && ./feat XYZ)" "sum of squares 1..10 = 385
-fib(20) = 6765
-multiples of 3 below 101 sum to 1683
-logic ok
-bits: 48 7 6 -1 1024 -16
-ord/chr: 65 B
-argc = 2, argv[1][0] = X
-len(a) = 10, negative div: -3 -1"
+same "feature suite" "$(cd "$T" && ./feat XYZ)" "$(cat tests/compiler/feat.out)"
 ./bin/wantzel examples/hello.wz "$T/hello" 2>/dev/null
 same "hello" "$("$T/hello")" "hello, world"
 ./bin/wantzel examples/primes.wz "$T/primes" 2>/dev/null
 same "sieve" "$("$T/primes" | head -1)" "primes below 200000: 17984"
 ./bin/wantzel tests/compiler/incl.wz "$T/incl" 2>/dev/null
-same "includes and array parameters" "$("$T/incl")" "nested include ok
-array parameter writes 32 bytes
-########
-array parameter reads ok"
+same "includes and array parameters" "$("$T/incl")" "$(cat tests/compiler/incl.out)"
 ./bin/wantzel examples/cat.wz "$T/cat" 2>/dev/null
 same "cat via stdin" "$(echo piped | "$T/cat")" "piped"
 same "cat a file" "$("$T/cat" examples/hello.wz | head -1)" "{ hello.wz -- the smallest useful Wantzel program }"
 
 echo "schemas and MCP"
 ./bin/wantzel tests/compiler/schema.wz "$T/schema" 2>/dev/null
-same "compiled schema parser" "$("$T/schema")" "method=2 id=7 loud=- params={\"a\":1}
-method=3 id=-3 loud=yes params=-
-method=0 id=- loud=- params=-
-method=-1 id=1 loud=- params=-
-rejected
-rejected
-rejected
-constants: 0123 fields=5"
+# READ THE GOLDEN FILE; do not write the expectation out a second time.
+# These lines stood here word for word beside tests/compiler/schema.out, and the same
+# expectation maintained in two places drifts: extending schema.wz broke this script and
+# tests/toolchain/freeze.sh while a plain ./wztest stayed GREEN -- only --toolchain saw
+# the difference, so whoever does not run it notices nothing.
+same "compiled schema parser" "$("$T/schema")" "$(cat tests/compiler/schema.out)"
 
 ./bin/wantzel examples/mcpserver.wz "$T/mcp" 2>/dev/null
 mcpsend() { printf '%s\n' "$1" | "$T/mcp" | head -1; }

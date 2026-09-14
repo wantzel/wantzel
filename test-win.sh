@@ -12,7 +12,40 @@
 set -e
 cd "$(dirname "$0")"
 T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT
+
+# CLEAN UP WITHOUT FAILING THE TEST.
+#
+# The WINEPREFIX lives in $T, and wineserver stays alive for seconds after the last call
+# with files in that prefix open -- the httpd case below even starts a server under Wine.
+# A bare 'rm -rf "$T"' then reported
+#
+#     rm: cannot remove '/tmp/tmp.XXXX/wp': Directory not empty
+#
+# and because this script runs under 'set -e' that one failed rm turned the WHOLE run
+# red, right after '18 passed, 0 failed'.  A test that reports its own success and then
+# trips over its cleanup is the kind of failure nobody reads correctly.
+#
+# So: shut wineserver down first and wait for it, and the rm afterwards must never decide
+# the outcome -- that is already fixed in $fail.
+cleanup_win() {
+  if [ -n "$WINEPREFIX" ] && [ -d "$WINEPREFIX" ]; then
+    # ONLY OUR OWN wineserver.  'wineserver -k' knows exactly one prefix -- the one in
+    # the environment -- and WINEPREFIX still points at $T/wp here, so this never touches
+    # the Wine of another worktree or a parallel suite.  That distinction is not
+    # theoretical: a broad kill across every wineserver is the mistake this repository
+    # already made once with a too-wide pgrep.
+    "${WINESERVER:-wineserver}" -k 2>/dev/null || true
+    _n=0
+    while [ $_n -lt 50 ]; do
+      # wait for OUR prefix: as long as a process holds a file in $WINEPREFIX open,
+      # the rm below fails.
+      pgrep -f "wineserver.*$WINEPREFIX" >/dev/null 2>&1 || break
+      _n=$((_n + 1)); sleep 0.1
+    done
+  fi
+  rm -rf "$T" 2>/dev/null || true
+}
+trap cleanup_win EXIT
 pass=0; fail=0
 ok()  { echo "  ok    $1"; pass=$((pass+1)); }
 bad() { echo "  FAIL  $1"; fail=$((fail+1)); }

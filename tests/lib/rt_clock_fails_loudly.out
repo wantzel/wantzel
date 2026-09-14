@@ -1,0 +1,4 @@
+invalid clock id: return = -22
+timespec untouched = yes, all 16 poison bytes intact
+valid clock id: return = 0
+io.realtime: the system clock is unavailable (clock_gettime failed)

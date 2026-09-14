@@ -393,7 +393,7 @@ if p.kind = Path.kind.closed then ...
 p.pts[i].x                                      // ordinary field access
 p.name[0..p.name_n - 1]                         // the text copy as a slice
 p.keys[i * 32..i * 32 + p.keys_len[i] - 1]      // element i of a text array
-n := Path.write(out, 0, p, buf);                // JSON back from out[0]; gives the position after the object; buf supplies the views
+n := Path.write(out, 0, p, buf);                // JSON back from out[0]; the position after the object, or -1 when it does not fit; buf supplies the views
 io.puts(STDOUT, Path.jsonschema);               // {"type":"object","properties":{...},"required":[...]}
 ```
 
@@ -414,7 +414,14 @@ unknown keys are skipped; `null` sets `f_null` and `f_ok`;
 a text that does not fit in `text[N]` or an array with more than `N`
 elements gives `-1`; an enum value outside the list gives `-1` in the
 field but no error. `write` always writes required fields and optional ones
-only if `f_ok` is true; `f_null` writes `null`. A nested schema
+only if `f_ok` is true; `f_null` writes `null`. `write` returns `-1` when the object
+does not fit in `dst` (or when the starting position is negative or past the end) and
+writes nothing usable in that case: a short buffer is a **refusal**, not a truncation,
+because half a JSON object is not a shorter object but a syntax error. This differs
+deliberately from the appenders in `lib/` (`io.push`, `json.putraw`, `json.putstr`),
+which truncate at `len(dst)` and hand back a position that is still usable — a
+shortened message is still a message. **Test the result of `write`**; a generated
+`tool.run` does, and reports the failure to the peer instead of dying on it. A nested schema
 must have been declared earlier; a schema name is a type name (so no
 variable with the same name). A `json` field in an output record can also
 be filled by `Other.write` of another schema in the view buffer:
@@ -447,7 +454,10 @@ The compiler generates: the constant `tool.list` (the complete
 `tool.out_<name>`, `tool.fail(s)`, `tool.byname(b, at, upto)` and
 `tool.run(idx, b, at, upto, dst)` (parses the arguments, calls
 `tool.<name>` and writes the result JSON; `-1` on arguments that
-do not satisfy the schema, `-2` if the handler failed with `tool.err`).
+do not satisfy the schema, `-2` if the handler failed with `tool.err`,
+`-3` when the result JSON does not fit in `dst` — the writer refuses instead of
+truncating, and `-3` keeps that apart from `-1`, which would blame the caller's
+arguments for a limit on our side).
 For `text` and `json` fields (views) in the output schema the compiler
 generates the buffer `tool.vbuf` (1 MB) and the fill position `tool.vn`, which is
 0 at every call: the handler writes the text into `tool.vbuf` from

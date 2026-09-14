@@ -58,6 +58,26 @@ compiler does the same in reverse.
 See [`examples/`](examples/) for a file-explorer MCP server, an HTTP server, and the
 smaller programs.
 
+## Numbers, all measured on one laptop
+
+A six-core machine, 14 September 2026. Reproduce them with `./build.sh` and `./wztest`.
+
+| | |
+|---|---|
+| the compiler compiling itself | **27 ms** for 6,380 lines, about **236,000 lines/second** |
+| full bootstrap from C to a fixed point | **1 second** (`boot.c` → stage1 = stage2 = stage3) |
+| the whole test suite | **9.7 seconds**, 106 tests |
+| peak memory to compile the compiler | **1.9 MB** |
+| the compiler binary | **499 kB**, statically linked, no libc, no dynamic dependencies |
+| **50 compilers at once** | **352 ms** wall clock, all 50 succeeded, all 50 byte-identical |
+
+That last row is the one that matters for generated code. Fifty parallel agents, each
+compiling the whole compiler, finish in about a third of a second and together peak below
+**100 MB** — so the machine you already have is not the constraint on how many agents you
+run, and a compile is cheap enough to put inside the loop rather than at the end of it.
+Byte-identical output under that load is the other half: when fifty agents build the same
+source, any difference between their binaries is a real difference, never a race.
+
 ## Why it is built this way
 
 A growing number of programmers rarely type their own code and read only some of it. When

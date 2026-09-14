@@ -1,0 +1,106 @@
+// Must stop at run time: "the system clock is unavailable", with exit status 1.
+//
+// io.now and io.realtime read the clock with sys2(SYS.clock, id, addr(io.ts[0])) and
+// then decode io.ts. A FAILED clock_gettime does two things at once:
+//
+//   1. it returns a negative -errno (an invalid clock id gives -22, -EINVAL), and
+//   2. it LEAVES THE TIMESPEC UNTOUCHED.
+//
+// Together those are worse than either alone. Because the buffer is not written, the
+// decode still succeeds -- it just decodes whatever io.ts happened to hold: the previous
+// reading, or a zero timestamp on the first call, which as a date is 1 January 1970.
+// Nothing about the returned value says it is not a time. That reading feeds
+// time.nowsec, the log timestamps of lib/log.wz and the request timestamps of
+// lib/http.wz, so a wrong date can be stored -- and a stored wrong date is afterwards
+// indistinguishable from a real one. That is unrecoverable, which is why these two
+// routines stop instead of carrying on.
+//
+// This test pins both halves:
+//
+//   PART 1 measures the premise rather than assuming it. It poisons a timespec with 0xFF
+//   bytes, asks for clock id 99, and prints the return value and the buffer. If the
+//   kernel ever started writing the buffer on failure, or stopped returning a negative,
+//   the premise this repair rests on would be gone and this part would change.
+//
+//   PART 2 runs the guard that io.now and io.realtime now carry, over that same failing
+//   clock, and the program must STOP. Take the `if r < 0 then io.fatal(...)` line out and
+//   the program decodes the poison instead, prints a nonsense timestamp and exits 0 --
+//   so the expected output below cannot be produced without the check.
+//
+// The clock ids the library actually asks for (CLOCK_MONOTONIC, CLOCK_REALTIME) are
+// always available on Linux, so the guard cannot be provoked through io.now itself; the
+// failing id is the only way to exercise the path at all.
+//
+// On Windows there is no clock_gettime: the compiler serves syscall 228 from
+// GetSystemTimeAsFileTime, which returns void and cannot fail, so __wsys reports 0 for
+// every clock id -- including 99. The check is correct there but never taken, and this
+// test is a Linux test for that reason.
+program t;
+include "io.wz";
+
+var
+  ts: array[0..15] of char;
+  i, r, sec, ns: int;
+
+procedure poison;
+begin
+  i := 0;
+  while i < 16 do
+  begin
+    ts[i] := chr(255);
+    i := i + 1;
+  end;
+end;
+
+begin
+  // ---- PART 1: what a failing clock really does ----
+  poison;
+  r := sys2(SYS.clock, 99, addr(ts[0]));
+  io.puts(STDOUT, "invalid clock id: return = ");
+  io.putn(STDOUT, r);
+  io.puts(STDOUT, "\n");
+
+  io.puts(STDOUT, "timespec untouched = ");
+  i := 0;
+  sec := 0;
+  while i < 16 do
+  begin
+    if ts[i] = chr(255) then sec := sec + 1;
+    i := i + 1;
+  end;
+  if sec = 16 then io.puts(STDOUT, "yes, all 16 poison bytes intact\n")
+  else io.puts(STDOUT, "no, the kernel wrote into it\n");
+
+  // A valid clock id, by contrast, succeeds and does fill the buffer.
+  poison;
+  r := sys2(SYS.clock, CLOCK_REALTIME, addr(ts[0]));
+  io.puts(STDOUT, "valid clock id: return = ");
+  io.putn(STDOUT, r);
+  io.puts(STDOUT, "\n");
+
+  // ---- PART 2: the guard io.now and io.realtime carry ----
+  // Same shape as the library: read, check the result, only then decode.
+  poison;
+  r := sys2(SYS.clock, 99, addr(ts[0]));
+  if r < 0 then io.fatal("io.realtime: the system clock is unavailable (clock_gettime failed)");
+
+  // Unreachable. Without the check above this is what runs, and it prints a timestamp
+  // decoded from the poison bytes and exits 0 -- the silent wrong time this guards.
+  sec := 0;
+  i := 7;
+  while i >= 0 do
+  begin
+    sec := bor(sec shl 8, ord(ts[i]));
+    i := i - 1;
+  end;
+  ns := 0;
+  i := 15;
+  while i >= 8 do
+  begin
+    ns := bor(ns shl 8, ord(ts[i]));
+    i := i - 1;
+  end;
+  io.puts(STDOUT, "decoded a time from an untouched buffer: ");
+  io.putn(STDOUT, sec * 1000000000 + ns);
+  io.puts(STDOUT, "\n");
+end.

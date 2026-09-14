@@ -16,7 +16,12 @@ program gen;
 include "io.wz";
 
 const
-  BUFSZ = 4194304;
+  // Room for the largest generated source. The data-segment case alone needs more
+  // than 32 MB of literals, and a static array costs nothing until it is touched.
+  BUFSZ = 50331648;
+  // The length of one literal in the datseg case. limits.sh works out from this how
+  // many of them just fit into the data segment and how many just do not.
+  DATLIT = 4000;
 
 var
   buf: array[0..BUFSZ - 1] of char;
@@ -239,6 +244,23 @@ begin
     i := 0;
     while i < n do begin put("t"); putn(i); put("(S): S \"d\";\n"); i := i + 1; end;
     put("end;\nbegin end.\n");
+  end
+
+  // n string literals of DATLIT bytes each, to fill the data segment. Every literal
+  // costs its bytes plus an eight-byte length and a nul, rounded up to eight, so the
+  // count limits.sh passes is what decides whether the segment still has room.
+  else if iskind("datseg") then
+  begin
+    put("program t;\nvar s: str;\nbegin\n");
+    i := 0;
+    while i < n do
+    begin
+      put("  s := \"");
+      putrep('x', DATLIT);
+      put("\";\n");
+      i := i + 1;
+    end;
+    put("end.\n");
   end
 
   // A static array of n bytes, with the last element touched.

@@ -6,13 +6,22 @@
 #   ./wztest tests/lang/hello.wz   one test
 #   ./wztest --time                show how long each test took
 #   ./wztest --toolchain           also the bootstrap fixed point and test.sh
+#   ./wztest --toolchain --windows also the Windows tests, through Wine (slower)
 #   ./wztest --bench               also tests/bench/ (skipped by default); see below
 #
 # This suite tests THE LANGUAGE AND THE COMPILER: does the language do what the
 # specification says, and does the compiler translate that correctly?  The tests live in
 # tests/lang, tests/compiler and tests/lib, and take a little over a second together.
-# tests/toolchain runs only with --toolchain (the bootstrap fixed point, test.sh and the
-# Windows tests through Wine).
+# tests/toolchain runs only with --toolchain (the bootstrap fixed point and test.sh).
+#
+# THE WINDOWS TESTS SIT BEHIND --windows, AND THAT IS A DELIBERATE SPLIT.  Everything the
+# language itself does is tested natively; Wine is there for two narrower questions --
+# does the compiler still cross-compile to a working .exe, and do the two backends reach
+# the same fixed point.  Those cannot regress from an ordinary change to lib/ or to a
+# test, but they are the slowest thing here: measured 14-09-2026, the Windows tests were
+# 19 of the 40 seconds of a full --toolchain run, and Wine starts a server of its own.
+# Keeping them out of the everyday loop is what makes that loop worth running on every
+# change; a release runs them, because release.py passes --windows.
 #
 # The conventions are all decided by files sitting next to each other:
 #   foo.wz + foo.out    compile, run, compare stdout+stderr
@@ -36,7 +45,7 @@ export WANTZEL WANTZEL0 ROOT
 
 [ -x "$WANTZEL" ] || { echo "wztest: $WANTZEL is missing; run ./build.sh" >&2; exit 2; }
 
-verbose=0; update=0; listonly=0; timing=0; toolchain=0; bench=0; filter=""; targets=""
+verbose=0; update=0; listonly=0; timing=0; toolchain=0; bench=0; windows=0; filter=""; targets=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -v) verbose=1 ;;
@@ -44,6 +53,7 @@ while [ $# -gt 0 ]; do
     --list) listonly=1 ;;
     --time) timing=1 ;;
     --toolchain) toolchain=1 ;;
+    --windows) windows=1 ;;
     --bench) bench=1 ;;
     -k) shift; filter="$1" ;;
     -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
@@ -55,7 +65,7 @@ done
 [ -n "$targets" ] || targets="tests"
 
 have_timeout=0; command -v timeout >/dev/null 2>&1 && have_timeout=1
-pass=0; fail=0; skip=0; updated=0; toolskipped=0
+pass=0; fail=0; skip=0; updated=0; toolskipped=0; winskipped=0
 failed=""
 now_ms() { date +%s%3N 2>/dev/null || echo 0; }
 elapsed() { if [ $timing -eq 1 ]; then printf ' (%s ms)' $(( $(now_ms) - t0 )); fi; }
@@ -74,6 +84,13 @@ done)
 for f in $list; do
   case "$f" in tests/helpers.sh) continue ;; esac      # shared functions, not a test
   case "$f" in tests/toolchain/*) [ $toolchain -eq 1 ] || { toolskipped=$((toolskipped+1)); continue; } ;; esac
+  # The Windows tests need Wine and are the slowest thing in the suite; --windows asks
+  # for them.  win_syscalls.sh runs .exe files under Wine, and freeze.sh calls
+  # test-win.sh, so both belong to this group.
+  case "$f" in
+    tests/toolchain/win_syscalls.sh|tests/toolchain/freeze.sh)
+      [ $windows -eq 1 ] || { winskipped=$((winskipped+1)); continue; } ;;
+  esac
   case "$f" in tests/bench/*) [ $bench -eq 1 ] || continue ;; esac
   case "$f" in *"$filter"*) ;; *) continue ;; esac
   case "$f" in */progs/*) continue ;; esac
@@ -122,10 +139,20 @@ got: $(limit <"$T/cerr")"; fi
       else
         args=""; [ -f "$base.args" ] && args=$(cat "$base.args")
         wantrc=0; [ -f "$base.exit" ] && wantrc=$(cat "$base.exit")
+        # The program RUNS in its own temporary directory, not in the test's source
+        # directory.  Compiling still happens in the source directory above, because a
+        # compile error has to name the bare file -- but a test that creates a scratch
+        # file would otherwise put it in tests/<dir>/ under a fixed name, where a second
+        # run of the suite writes exactly the same name.  That is not hypothetical: it
+        # made memory_patterns.wz read another run's mmap through the same file and
+        # syscalls_storage.wz open a file a second run had just renamed away.  Both
+        # passed on their own and failed in a full run, which is the hardest kind of
+        # failure to read.  A private directory per test removes the whole class.
+        mkdir -p "$T/work"
         if [ -f "$base.stdin" ]; then
-          ( cd "$dir" && run "$secs" "$T/prog" $args <"$base.stdin" >"$T/out" 2>&1 ); rc=$?
+          ( cd "$T/work" && run "$secs" "$T/prog" $args <"$base.stdin" >"$T/out" 2>&1 ); rc=$?
         else
-          ( cd "$dir" && run "$secs" "$T/prog" $args >"$T/out" 2>&1 ); rc=$?
+          ( cd "$T/work" && run "$secs" "$T/prog" $args >"$T/out" 2>&1 ); rc=$?
         fi
         if [ $rc -eq 124 ] && [ "$wantrc" != "124" ]; then bad "$f" "timed out after ${secs}s"
         elif [ $update -eq 1 ]; then cp "$T/out" "$base.out"; updated=$((updated+1)); printf '  upd   %s\n' "$f"
@@ -142,6 +169,7 @@ $(limit <"$T/out")"
 done
 
 [ $toolskipped -gt 0 ] && echo "($toolskipped toolchain tests not run; use --toolchain)"
+[ $winskipped -gt 0 ] && echo "($winskipped Windows tests not run; use --windows)"
 if [ $toolchain -eq 1 ]; then
   echo "toolchain"
   t0=$(now_ms)

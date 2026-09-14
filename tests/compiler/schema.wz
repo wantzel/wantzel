@@ -53,6 +53,33 @@ begin
   io.puts(STDOUT, "\n");
 end;
 
+// Same parse, but reporting _ok and _null per field: the distinction between
+// "the key was absent" and "the key was present with the value null".
+procedure shownull;
+var r: int;
+begin
+  r := Msg.parse(doc, 0, n, m);
+  if r < 0 then
+  begin
+    io.puts(STDOUT, "rejected\n");
+    return;
+  end;
+  io.puts(STDOUT, "accepted");
+  io.puts(STDOUT, " id_ok=");
+  if m.id_ok then io.puts(STDOUT, "yes") else io.puts(STDOUT, "no");
+  io.puts(STDOUT, " id_null=");
+  if m.id_null then io.puts(STDOUT, "yes") else io.puts(STDOUT, "no");
+  io.puts(STDOUT, " loud_ok=");
+  if m.loud_ok then io.puts(STDOUT, "yes") else io.puts(STDOUT, "no");
+  io.puts(STDOUT, " loud_null=");
+  if m.loud_null then io.puts(STDOUT, "yes") else io.puts(STDOUT, "no");
+  io.puts(STDOUT, " params_ok=");
+  if m.params_ok then io.puts(STDOUT, "yes") else io.puts(STDOUT, "no");
+  io.puts(STDOUT, " params_null=");
+  if m.params_null then io.puts(STDOUT, "yes") else io.puts(STDOUT, "no");
+  io.puts(STDOUT, "\n");
+end;
+
 begin
   load("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"a\":1}}");
   show;
@@ -68,6 +95,19 @@ begin
   show;
   load("[1,2,3]");
   show;
+  // A required field given as JSON null is not a value: it must be rejected,
+  // exactly as an absent key is.  _ok alone only says the key was present.
+  load("{\"jsonrpc\":null,\"method\":\"ping\"}");
+  show;
+  load("{\"jsonrpc\":\"2.0\",\"method\":null}");
+  show;
+  // An OPTIONAL field given as null still parses and sets both _ok and _null.
+  // The `_ok and not _null` idiom rests on this; it must not change.
+  load("{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":null,\"loud\":null,\"params\":null}");
+  shownull;
+  // And with those optional keys absent, _ok and _null are both false.
+  load("{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}");
+  shownull;
   io.puts(STDOUT, "constants: ");
   io.putn(STDOUT, Msg.method.initialize);
   io.putn(STDOUT, Msg.method.tools_list);

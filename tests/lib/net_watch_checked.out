@@ -1,0 +1,9 @@
+watch ADD on an unopened fd: false
+watch MOD on an unopened fd: false
+watch DEL on an unopened fd: false
+watch MOD before ADD: false
+watch ADD: true
+watch MOD after ADD: true
+watch DEL after ADD: true
+nonblock on a socket: true
+nonblock on a closed fd: false

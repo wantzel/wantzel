@@ -101,6 +101,7 @@ Found a new pitfall? Add it under the heading it belongs to.
 - Working out a record size in bytes by hand (`ISIZE = 16 + 8 + ...`) is error-prone; measure it with `addr(items[1]) - addr(items[0])` or `addr(last_field) - addr(first_field) + size`.
 - The `curve.*` constants are called `CURVE.NDAYS`, `CURVE.NHOURS`, `CURVE.DAYLEN` (not `CURVE.DAYS`, which collides with `curve.days`).
 - A `text` view (`f_at`/`f_end`) in an output schema is placed between quotes **raw** by `Out.write`: the bytes must already be JSON-escaped. So fill `tool.vbuf` with `json.escslice` (text) or `json.putraw` (only for a `json` field that is already valid JSON).
+- **Two different contracts for "it does not fit", and which one you get depends on what you are building.** The appenders in `lib/` — `io.push`, `io.pushnum`, `json.putraw`, `json.putstr`, `json.escslice`, `json.putreal` — **truncate** at `len(dst)` and hand back a position that is still usable, because a shortened message is still a message. A generated `<Schema>.write` and `json.putslice`/`json.putb` **refuse** with `-1`, because a shortened JSON object is not a shorter object but a syntax error. So: **always test the result of `Out.write`** (`if n < 0 then ...`); never assume a chain of `io.push` wrote everything (compare the position that comes back with the one you passed in). Neither one writes past the end any more, so getting it wrong no longer kills the process — it silently drops bytes or refuses, which is a great deal easier to find. (14-09-2026)
 - `lib/tools.wz` includes `http.wz`, so even a stdio-only program with a `tools` block must define `procedure app.request` (otherwise `forward declared routine is never defined` on the last line). A `forward` error always points at `end.`; look for the missing `app.*` hook in the library headers.
 - `http.serve(port, workers)`: `SO_REUSEPORT` only when `workers > 1`; in tests always use 1 worker.
 - A `json?` argument that may be a list **or a single string**: after `arg.take(at, upto)` a lone JSON string already sits in `arg.buf` without its quotes, and `arg.strings(arg.buf, 0, arg.n)` then returns `-1`. **Right:** `arg.strings(arg.raw, 0, upto - at)` on the raw copy (which understands a list, a string containing a list, and a bare string). `arg.buf` is for a string that contains an object (`arg.object`).
@@ -245,11 +246,25 @@ recognise `"abc"` as a single item. Inside an object that has already been copie
 `ctx.pbuf`) the value is still raw, and you can use `arg.strings(ctx.pbuf, kv.vat, kv.vend)`
 directly.
 
-## info filters (lib/kv.wz) are not JSONB containment
+## info filters (lib/kv.wz): which side decides
 
-`kv.match(obj, .., filter, ..)`: every filter key must exist; a **filter value** that is a list
-means "any one of these values"; a **stored** list is compared as a whole. So `{"tags":"a"}`
-does not match a stored `["a","b"]` (Postgres `@>` did). A deliberate choice.
+`kv.match(obj, .., filter, ..)`: every filter key must exist in `obj`, and per key the
+**stored** side decides which of two rules applies.
+
+| stored value | filter value | rule |
+|---|---|---|
+| not a list | a list | membership: the stored value equals one of the elements |
+| a list | anything | containment: the stored list holds the filter value, or all of a filter list's elements |
+| not a list | not a list | equality (`kv.same`), which is what containment means there |
+
+So `{"tags":"a"}` matches a stored `["a","b"]`, and a stored list **contains itself**:
+`{"tags":["a","b"]}` matches `["a","b"]`. The two empty-list cases pull apart, and that is
+deliberate: an empty **filter** list on a non-list stored value matches nothing (there is
+nothing to be a member of), while an empty filter list against a stored list matches
+everything (containment of nothing is vacuously true).
+
+`kv.contains` and `kv.haselem` are the containment half on their own, if you need it
+without the surrounding object walk.
 
 ## Ten argument slots: an array counts double
 

@@ -9,8 +9,18 @@ set -e
 cd "$(dirname "$0")"
 mkdir -p bin
 
+# Every file this script installs is written under a temporary name and RENAMED into
+# place.  A rename within one filesystem is atomic: a reader sees either the old file or
+# the new one, never half of one.  That matters because the suite rebuilds while the
+# rest of it is running -- tests/toolchain/freeze.sh calls this script, and test.sh,
+# test-win.sh and embedded_lib_current.sh read bin/wantzel0 and src/embedded.wz.  Writing
+# in place gave those readers a truncated file: `cc -o bin/wantzel0` empties the target
+# first, so a concurrent ./bin/wantzel0 got "Permission denied" (measured: 2 failures in
+# 176 attempts during one build), and a half-written src/embedded.wz fails
+# embedded_lib_current.sh and tests/compiler/schema.wz without either naming the cause.
 echo "1. cc bootstrap/boot.c -> bin/wantzel0    (the one and only external step)"
-cc -w -o bin/wantzel0 bootstrap/boot.c
+cc -w -o bin/wantzel0.new bootstrap/boot.c
+mv -f bin/wantzel0.new bin/wantzel0
 
 # The standard library goes INSIDE the compiler, so a binary that was downloaded rather
 # than built can still resolve include "io.wz". Regenerated every build: src/embedded.wz
@@ -20,8 +30,10 @@ cc -w -o bin/wantzel0 bootstrap/boot.c
 # The generator is itself written in Wantzel and compiled by wantzel0, which needs no
 # embedded copy: it reads lib/ from disk, and in this repository lib/ is right there.
 echo "1b. generating src/embedded.wz from lib/"
-./bin/wantzel0 tools/embedlib.wz bin/embedlib
-./bin/embedlib src/embedded.wz $(for f in lib/*.wz; do printf '%s %s ' "$(basename "$f")" "$f"; done)
+./bin/wantzel0 tools/embedlib.wz bin/embedlib.new
+mv -f bin/embedlib.new bin/embedlib
+./bin/embedlib src/embedded.wz.new $(for f in lib/*.wz; do printf '%s %s ' "$(basename "$f")" "$f"; done)
+mv -f src/embedded.wz.new src/embedded.wz
 
 echo "2. boot   src/wantzel.wz       -> bin/wantzel.stage1 (first self-hosted compiler)"
 ./bin/wantzel0 src/wantzel.wz bin/wantzel.stage1

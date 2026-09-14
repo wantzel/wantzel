@@ -241,12 +241,86 @@ begin
   return false;
 end;
 
+// is the value b[at..upto) a JSON array?
+function kv.isarray(b: array of char; at: int; upto: int): bool;
+begin
+  at := json.ws(b, at, upto);
+  if at >= upto then return false;
+  return b[at] = '[';
+end;
+
+// is the value v[vat..vend) an element of the array a[aat..aend)?  An empty
+// array holds nothing, and so does anything that is not an array.  This is
+// kv.anyof with the roles of the two sides swapped: there the ARRAY is the
+// filter, here it is the stored value -- including its treatment of a
+// malformed array, which is scanned only as far as the first match, so a
+// truncated "[1,2" still holds 1.  A caller that must reject malformed input
+// checks it with kv.isobject or json.skip first; kv.match does, through
+// kv.scanobj on the filter.
+function kv.haselem(a: array of char; aat: int; aend: int; v: array of char; vat: int; vend: int): bool;
+var at, e: int;
+begin
+  at := json.ws(a, aat, aend);
+  if at >= aend then return false;
+  if a[at] <> '[' then return false;
+  at := json.ws(a, at + 1, aend);
+  while at < aend do
+  begin
+    if a[at] = ']' then return false;
+    if not kv.vstart(a[at]) then return false;
+    e := json.skip(a, at, aend);
+    if e < 0 then return false;
+    if kv.same(a, at, e, v, vat, vend) then return true;
+    at := json.ws(a, e, aend);
+    if at >= aend then return false;
+    if a[at] = ']' then return false;
+    if a[at] <> ',' then return false;
+    at := json.ws(a, at + 1, aend);
+  end;
+  return false;
+end;
+
+// containment of a stored ARRAY o[oat..oend) against the value f[fat..fend):
+// when f is itself an array EVERY one of its elements must be in o, otherwise
+// f must be in o as an element.  An EMPTY filter list is contained in
+// everything -- which is the opposite of kv.anyof, where an empty list matches
+// nothing, and it is deliberate: containment of nothing is vacuously true.
+function kv.contains(o: array of char; oat: int; oend: int; f: array of char; fat: int; fend: int): bool;
+var at, e: int;
+begin
+  if not kv.isarray(f, fat, fend) then return kv.haselem(o, oat, oend, f, fat, fend);
+  at := json.ws(f, fat, fend);
+  at := json.ws(f, at + 1, fend);
+  while at < fend do
+  begin
+    if f[at] = ']' then return true;
+    if not kv.vstart(f[at]) then return false;
+    e := json.skip(f, at, fend);
+    if e < 0 then return false;
+    if not kv.haselem(o, oat, oend, f, at, e) then return false;
+    at := json.ws(f, e, fend);
+    if at >= fend then return false;
+    if f[at] = ']' then return true;
+    if f[at] <> ',' then return false;
+    at := json.ws(f, at + 1, fend);
+  end;
+  return false;
+end;
+
 // subset match as used by entity searches: every key of the filter object f
-// must exist in obj and its value must kv.same the filter value, or, when
-// the filter value is an array, equal any of its elements.  An empty filter
-// matches everything; a malformed filter matches nothing.
+// must exist in obj, and its value must match.  Per key, two branches:
+//
+//   the filter value is an ARRAY and the stored value is NOT an array
+//     -> membership: the stored value equals one of the filter elements
+//   in every other case
+//     -> containment: a stored array holds the filter value (or, for a filter
+//        array, all of its elements); a stored scalar must kv.same the filter
+//        value, which is what containment amounts to there
+//
+// So a stored list contains itself.  An empty filter matches everything; a
+// malformed filter matches nothing.
 function kv.match(obj: array of char; oat: int; oend: int; f: array of char; fat: int; fend: int): bool;
-var cur, fkat, fkend, fvat, fvend: int;
+var cur, fkat, fkend, fvat, fvend, ovat, ovend: int;
     ok: bool;
 begin
   if kv.scanobj(f, fat, fend) < 0 then return false;
@@ -255,8 +329,12 @@ begin
   begin
     fkat := kv.kat; fkend := kv.kend; fvat := kv.vat; fvend := kv.vend;
     if not kv.find(obj, oat, oend, f[fkat..fkend - 1]) then return false;
-    if f[fvat] = '[' then ok := kv.anyof(obj, kv.vat, kv.vend, f, fvat, fvend)
-    else ok := kv.same(obj, kv.vat, kv.vend, f, fvat, fvend);
+    // kv.find left the cursor on the stored value; save it before a nested
+    // call moves it (see the cursor note at the top of this file)
+    ovat := kv.vat; ovend := kv.vend;
+    if kv.isarray(obj, ovat, ovend) then ok := kv.contains(obj, ovat, ovend, f, fvat, fvend)
+    else if f[fvat] = '[' then ok := kv.anyof(obj, ovat, ovend, f, fvat, fvend)
+    else ok := kv.same(obj, ovat, ovend, f, fvat, fvend);
     if not ok then return false;
     cur := kv.next(f, cur, fend);
   end;

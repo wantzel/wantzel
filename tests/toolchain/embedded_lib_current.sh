@@ -23,10 +23,19 @@ if cmp -s src/embedded.wz "$T/fresh.wz"; then
   exit 0
 fi
 
-echo "src/embedded.wz no longer matches lib/:"
+echo "src/embedded.wz is out of date: it no longer matches lib/."
+echo
+echo "    Run ./build.sh. That regenerates it; there is nothing to commit, because"
+echo "    src/embedded.wz is generated and .gitignore keeps it out of the repository."
+echo
 cmp src/embedded.wz "$T/fresh.wz" | sed 's/^/    /'
 echo
-echo "Run ./build.sh and commit the regenerated src/embedded.wz in the same commit as"
-echo "the change to lib/ -- otherwise a downloaded compiler ships a different library"
-echo "than the repository shows."
+# WHY THIS MESSAGE SAYS SO MUCH: a stale copy makes this test fail AND
+# tests/compiler/schema.wz fail, and neither failure mentions lib/ or embedded.wz. That
+# once cost a full investigation: two tests red, both green in isolation, and a second
+# full run green once build.sh had run for another reason. The pattern "fails in
+# the suite, passes alone, passes on a re-run" is also the signature of a real flake, so
+# the cause has to be in the message or it will be mistaken for one.
+echo "    A stale copy also fails tests/compiler/schema.wz, and that failure names"
+echo "    neither lib/ nor embedded.wz. If you see both red, run ./build.sh first."
 exit 1

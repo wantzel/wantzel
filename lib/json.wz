@@ -288,17 +288,31 @@ end;
 
 // ------------------------------------------------------------- writing
 
-// append s to dst as a quoted, escaped JSON string
+// Append s to dst as a quoted, escaped JSON string; returns the new position.
+//
+// Stops at len(dst), the same truncating contract as io.push: the callers here chain
+// the result straight back in (lib/log.wz, lib/mcp.wz, lib/router.wz, lib/oauth.wz)
+// without testing it.  Truncated output loses the closing quote, so a caller that must
+// produce well-formed JSON compares the returned position with the one it passed in.
+// Without room for even the opening quote nothing is written and `at` comes back
+// unchanged.
+//
+// One character can become SIX bytes (\u00XX for a control character), so the check at
+// the top of the loop tests the heaviest case plus the closing quote; if that fits, the
+// shorter paths fit too, and no write path can be forgotten when one is added.
 function json.putstr(dst: array of char; at: int; s: str): int;
 var i, n: int;
     c: char;
 begin
+  if (at < 0) or (at + 1 > len(dst)) then return at;
   n := slen(s);
   dst[at] := '"';
   at := at + 1;
   i := 0;
   while i < n do
   begin
+    { six is the heaviest path (\u00XX); plus one for the closing quote }
+    if at + 7 > len(dst) then return at;
     c := schar(s, i);
     if c = '"' then
     begin
@@ -339,13 +353,20 @@ begin
   return at + 1;
 end;
 
-// append a slice of src, escaped but without the surrounding quotes, for
-// building a larger JSON string piece by piece
+// Append a slice of src, escaped but without the surrounding quotes, for building a
+// larger JSON string piece by piece; returns the new position.
+//
+// Stops at len(dst), the same truncating contract as io.push: its caller (lib/mcp.wz)
+// chains the result back in without testing it.  A caller that must know whether
+// everything fit compares the returned position with the one it passed in.
 function json.escslice(dst: array of char; at: int; src: array of char; from: int; upto: int): int;
 var c: char;
 begin
+  if at < 0 then return at;
   while from < upto do
   begin
+    { six is the heaviest path (\u00XX) }
+    if at + 6 > len(dst) then return at;
     c := src[from];
     if (c = '"') or (c = '\\') then
     begin
@@ -396,7 +417,7 @@ end;
 function json.putslice(dst: array of char; at: int; src: array of char; from: int; upto: int): int;
 var c: char;
 begin
-  if at + 1 > len(dst) then return -1;
+  if (at < 0) or (at + 1 > len(dst)) then return -1;
   dst[at] := '"';
   at := at + 1;
   while from < upto do
@@ -532,13 +553,21 @@ end;
 var
   json.rdig: array[0..31] of char;
 
-// append v to dst at position at as a JSON number with up to 15 significant
-// digits (trailing zeros trimmed); NaN and infinities become null
+// Append v to dst at position at as a JSON number with up to 15 significant digits
+// (trailing zeros trimmed); NaN and infinities become null.  Returns the new position.
+//
+// Needs room for the longest form it can produce: a sign, 16 digits, a point and an
+// exponent (-1.23456789012346e-279) is 22 characters at its longest, measured across
+// the whole representable range, so 32 is the bound with margin.
+// Without that room nothing is written and `at` comes back unchanged -- the same
+// truncating contract as io.push, so a chained position stays usable.  The loops below
+// write dst[at] directly and this single check up front is what keeps them in bounds.
 function json.putreal(dst: array of char; at: int; v: real): int;
 var e, i, n, m, k, ip, fp: int;
     a, ten, lim: real;
     neg: bool;
 begin
+  if (at < 0) or (at + 32 > len(dst)) then return at;
   if not (v = v) then return io.push(dst, at, "null");
   lim := real(1);
   i := 0;
@@ -697,10 +726,34 @@ begin
   return n;
 end;
 
-// append src[from..upto) verbatim (already valid JSON text) to dst
+// Write one byte of JSON structure at `at`; returns at + 1, or -1 when there is no
+// room (and -1 straight through when `at` is already -1, so a chain of these collapses
+// to one test at the end).
+//
+// This is the refusing counterpart of the truncating appenders above, and it exists for
+// the generated <Schema>.write: a truncated JSON object is not a shorter object, it is
+// a syntax error, so the structural bytes ({ } [ ] , ") must refuse rather than drop.
+function json.putb(dst: array of char; at: int; c: char): int;
+begin
+  if (at < 0) or (at >= len(dst)) then return -1;
+  dst[at] := c;
+  return at + 1;
+end;
+
+// Append src[from..upto) verbatim (already valid JSON text) to dst; returns the new
+// position.
+//
+// Stops at len(dst): what does not fit is dropped and the position that comes back is
+// the end of the buffer.  The same truncating contract as io.push, and for the same
+// reason -- every caller here chains the result straight back in as the next position
+// (lib/oauth.wz builds a WWW-Authenticate header that way) without testing it, so a -1
+// would become the next write index.  A caller that must know whether everything fit
+// compares the returned position with the one it passed in, or checks the room up
+// front as kv.put does.
 function json.putraw(dst: array of char; at: int; src: array of char; from: int; upto: int): int;
 begin
-  while from < upto do
+  if at < 0 then return at;
+  while (from < upto) and (at < len(dst)) do
   begin
     dst[at] := src[from];
     at := at + 1;

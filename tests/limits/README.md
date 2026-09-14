@@ -1,8 +1,9 @@
 # Limits of the language and the toolchain (measured)
 
 `limits.sh` proves every limit with a case that just fits and one that just does not.
-Measured on 10 September 2026; this table is the source, and the constants live in
-`bootstrap/boot.c`/`src/wantzel.wz` (the compiler) and `lib/*.wz` (the library).
+Measured on 10 September 2026; the capacity limits were raised on 14 September 2026.
+This table is the source, and the constants live in `bootstrap/boot.c`/`src/wantzel.wz`
+(the compiler) and `lib/*.wz` (the library).
 
 | limit | value | what happens above it |
 |---|---|---|
@@ -11,9 +12,11 @@ Measured on 10 September 2026; this table is the source, and the constants live 
 | string literal | 4095 bytes | compile error |
 | include depth (`schema`/`tools` count as an include too) | 16 | compile error |
 | source files including generated ones | 1024 | compile error |
-| source in total (`SRCMAX`, including generated code) | 16 MB | compile error |
-| machine code (`CODEMAX`) | 16 MB | compile error |
-| data: literals, JSON schemas, tool list (`DATMAX`) | 8 MB | compile error |
+| source in total (`SRCMAX`, including generated code) | 64 MB | compile error |
+| machine code (`CODEMAX`) | 64 MB | compile error |
+| data: literals, JSON schemas, tool list (`DATMAX`) | 32 MB | compile error: `data segment overflow: the source is too large` |
+| name pool: every identifier, nul-separated (`NAMEMAX`) | 8 MB | compile error |
+| source file names together (`FNPMAX`) | 524000 bytes | compile error |
 | global names (var + const, including schema constants) | 16384 | compile error |
 | local names per routine (var + const) | 2048 | compile error |
 | routines | 8192 | compile error |
@@ -23,7 +26,7 @@ Measured on 10 September 2026; this table is the source, and the constants live 
 | schemas | 512 | compile error |
 | fields per schema | 128 | compile error |
 | enum values per schema in total | 1024 | compile error |
-| JSON Schema text per schema, and the whole tool list | 1 MB | compile error |
+| JSON Schema text per schema, and the whole tool list | 4 MB | compile error |
 | tools | 1024 | compile error |
 | `break`/`continue` per loop nest | 256 | compile error |
 | static arrays (bss) | effectively unbounded up to RAM + swap; measured: 8 GB runs, 32 GB segfaults on first touch (Linux, overcommit heuristic) | SIGSEGV, no message |

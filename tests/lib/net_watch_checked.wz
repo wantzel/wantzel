@@ -1,0 +1,36 @@
+// lib/net.wz: net.watch and net.nonblock report failure instead of losing it silently.
+// An unwatched fd is a connection that is never served, so the result must be testable.
+program net_watch_checked;
+include "io.wz";
+include "net.wz";
+var ep, s, closed: int;
+procedure yes(s2: str; b: bool);
+begin
+  io.puts(STDOUT, s2);
+  if b then io.puts(STDOUT, "true\n") else io.puts(STDOUT, "false\n");
+end;
+begin
+  ep := net.epoll;
+  s  := net.socket;
+
+  // A fd that was never opened cannot be watched: EBADF.
+  yes("watch ADD on an unopened fd: ", net.watch(ep, EPOLL_ADD, 9999, EPOLLIN));
+  // Nor changed, nor removed.
+  yes("watch MOD on an unopened fd: ", net.watch(ep, EPOLL_MOD, 9999, EPOLLIN));
+  yes("watch DEL on an unopened fd: ", net.watch(ep, EPOLL_DEL, 9999, 0));
+
+  // A valid socket that is not in the set yet: MOD and DEL say ENOENT, ADD works.
+  yes("watch MOD before ADD: ", net.watch(ep, EPOLL_MOD, s, EPOLLIN));
+  yes("watch ADD: ", net.watch(ep, EPOLL_ADD, s, EPOLLIN));
+  yes("watch MOD after ADD: ", net.watch(ep, EPOLL_MOD, s, bor(EPOLLIN, EPOLLOUT)));
+  yes("watch DEL after ADD: ", net.watch(ep, EPOLL_DEL, s, 0));
+
+  // net.nonblock on a real socket, then on a closed one.
+  yes("nonblock on a socket: ", net.nonblock(s));
+  closed := net.socket;
+  net.close(closed);
+  yes("nonblock on a closed fd: ", net.nonblock(closed));
+
+  net.close(s);
+  net.close(ep);
+end.

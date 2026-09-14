@@ -79,6 +79,14 @@ expect_compile "512 schemas" "$T/sc512.wz"; expect_fail "513 schemas" "$T/sc513.
 gen tools 1024 t1024.wz
 gen toolsonly 1025 t1025.wz
 expect_compile "1024 tools" "$T/t1024.wz"; expect_fail "1025 tools" "$T/t1025.wz" "too many tools"
+# data segment: DATMAX = 32 MB of literals, JSON schemas and the tool list.  A literal of
+# 4000 bytes costs 4016 (the bytes, a nul, an eight-byte length, rounded up to eight), so
+# 8355 of them fit and 8356 do not.  The point of this pair is not the number but the
+# SHAPE of the refusal: the room must be checked BEFORE the byte is written, otherwise the
+# compiler stops on its own bounds check and reports itself instead of the source.
+gen datseg 8355 d8355.wz
+gen datseg 8356 d8356.wz
+expect_compile "32 MB of string literals" "$T/d8355.wz"; expect_fail "just over 32 MB of string literals" "$T/d8356.wz" "data segment overflow: the source is too large"
 
 echo "limits of a running program"
 # static memory: bss grows for free until it is touched; the kernel refuses more than RAM+swap (heuristic overcommit) with a segfault at the first touch

@@ -12,7 +12,17 @@ cd "$ROOT"
 #
 # "dat" is deliberately not in the list: it is the name of the data segment array in
 # both compilers (dat[datlen]), and it would match on every line that touches it.
-NL='\b(de|het|een|van|niet|wordt|worden|moet|moeten|zijn|naar|met|voor|die|deze|geen|alleen|ook|nog|maar|als|dan|bij|uit|over|onder|tussen|draait|bestand|bestanden|regel|regels|fout|fouten|melding|gebruik|zie|wegwerp|hernoeming)\b'
+#
+# The list is the weak point, not the threshold: on 14-09-2026 a comment reading
+# "past precies: vier tekens in vier" slipped through, because not one of its four
+# Dutch words was in it. Words that carry MEANING in a comment -- a count, a unit, a
+# verb about fitting or measuring -- are worth more here than function words, because
+# that is what a comment is made of. Added below: numbers, sizes, and the verbs that
+# turn up in a test comment. Left OUT on purpose: byte, bytes, alle, past, vol, lang,
+# acht, weer, zelf -- each is also an ordinary English word (or a substring of one), and
+# adding them made this test fail on its own English prose. A word only earns a place
+# here if it cannot appear in an English sentence.
+NL='\b(de|het|een|van|niet|wordt|worden|moet|moeten|zijn|naar|met|voor|die|deze|geen|alleen|ook|nog|maar|als|dan|bij|uit|over|onder|tussen|draait|bestand|bestanden|regel|regels|fout|fouten|melding|gebruik|zie|wegwerp|hernoeming|precies|teken|tekens|twee|drie|vier|vijf|zes|zeven|negen|tien|elke|dus|omdat|terwijl|zodat|waarde|waarden|lengte|grens|grenzen|leeg|kort|eerste|laatste|nieuwe|oude|klopt|geeft|staat|gaat|komt|hoort|blijft|vangt|telt|leest|schrijft)\b'
 
 hits=$(git ls-files | while read -r f; do
   case "$f" in tests/toolchain/english_only.sh) continue ;; esac

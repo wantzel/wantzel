@@ -14,7 +14,8 @@ in the root.
 | `tests/toolchain/` | the bootstrap fixed point, `test.sh`, the Windows side through Wine, and that the editor grammar still knows every keyword |
 | `tests/bench/` | speed, with a hard bound beside it |
 
-`tests/toolchain/` runs **only** with `--toolchain` (slow, needs Wine); `tests/bench/`
+`tests/toolchain/` runs **only** with `--toolchain`; the Windows tests inside it need
+Wine and run **only** with `--windows` on top of that; `tests/bench/`
 only with `--bench`.
 
 ## Running
@@ -27,9 +28,20 @@ only with `--bench`.
 ./wztest -t W-hhhh-llll           # the tests of one ticket
 ./wztest -v tests/lang/x.wz       # full diff on failure
 ./wztest --time                   # duration per test
-./wztest --toolchain              # plus the bootstrap fixed point, test.sh and Wine
+./wztest --toolchain              # plus the bootstrap fixed point and test.sh
+./wztest --toolchain --windows    # and the Windows side, through Wine (twice as slow)
 ./wztest --bench                  # plus tests/bench/
 ```
+
+**The Windows tests sit behind `--windows`, and knowing why tells you when to use it.**
+Everything the language itself does is checked natively; Wine answers two narrower
+questions -- does the compiler still cross-compile to a working `.exe`, and do both
+backends reach the same fixed point. Neither can regress from an ordinary change to
+`lib/` or to a test, and they are the slowest thing here: measured 14-09-2026, they were
+19 of the 40 seconds of a full run, so leaving them out halves it (32s to 16s). Use
+`--windows` when you touch the Windows side of the runtime, a syscall shim, or the code
+generator -- and when you release, where `release.py` passes it for you, because a
+release publishes an `.exe`.
 
 **Always use `--toolchain` when working on the compiler or the bootstrap.** It is the only
 way to notice that `src/wantzel.wz` and `bootstrap/boot.c` have drifted apart, and

@@ -23,7 +23,7 @@ begin
   sn := io.push(src, 0, "abcdefgh");
   { does not fit: eight characters into a buffer of four }
   show("unescape too small = ", json.unescape(src, 0, sn, small, 0));
-  { past precies: vier tekens in vier }
+  { fits exactly: four characters in four }
   show("unescape exact fit = ", json.unescape(src, 0, 4, small, 0));
   { fits in the large buffer }
   show("unescape roomy = ", json.unescape(src, 0, sn, big, 0));

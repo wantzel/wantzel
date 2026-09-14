@@ -5,4 +5,8 @@ method=-1 id=1 loud=- params=-
 rejected
 rejected
 rejected
+rejected
+rejected
+accepted id_ok=yes id_null=yes loud_ok=yes loud_null=yes params_ok=yes params_null=yes
+accepted id_ok=no id_null=no loud_ok=no loud_null=no params_ok=no params_null=no
 constants: 0123 fields=5

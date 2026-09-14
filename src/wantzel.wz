@@ -18,11 +18,12 @@ const
     tests/toolchain/release_assets.sh checks it against the git tag: a binary that
     cannot say which version it is cannot be matched to a published checksum.
     bootstrap/boot.c carries the same string. }
-  VERSION = "0.1.1";
-  SRCMAX  = 16777216;
-  CODEMAX = 16777216;
-  DATMAX  = 8388608;
-  NAMEMAX = 2097152;
+  VERSION = "0.1.2";
+  SRCMAX  = 67108864;
+  CODEMAX = 67108864;
+  DATMAX  = 33554432;
+  NAMEMAX = 8388608;
+  FNPMAX  = 524000;   { the pool of source file names; fnpool holds 524288 }
   MAXG    = 16384;
   MAXF    = 8192;
   MAXL    = 2048;
@@ -31,7 +32,7 @@ const
   MAXFLD  = 128;
   MAXENUM = 1024;
   MAXS    = 512;
-  JSMAX   = 1048576;
+  JSMAX   = 4194304;
   SF_INT   = 1;
   SF_BOOL  = 2;
   SF_TEXT  = 3;     { a view into the parsed buffer }
@@ -149,7 +150,7 @@ var
   nbuf:    array[0..31] of char;
   hdr:     array[0..HDRMAX-1] of char;   hlen:    int;
   outname: array[0..255] of char;        outnamelen: int;
-  fnpool:  array[0..131071] of char;     fnplen: int;
+  fnpool:  array[0..524287] of char;     fnplen: int;
   filenam, filelen: array[0..1023] of int;
   nfiles, curfile: int;
   incpos, incend, incline, incfile: array[0..15] of int;
@@ -472,33 +473,38 @@ begin
   return 0;
 end;
 
+{ One byte into the data segment, with the room checked BEFORE the write.
+
+  The order matters: checking afterwards means the byte that does not fit has
+  already been stored, so a source that fills the segment stops with a bounds
+  trap naming this compiler instead of a compile error naming the source.  Every
+  write into dat goes through here for that reason. }
+procedure dput(b: int);
+begin
+  if datlen >= DATMAX then fail("data segment overflow: the source is too large");
+  dat[datlen] := chr(band(b, 255));
+  datlen := datlen + 1;
+end;
+
 function datstr(usem: int; n: int): int;
 var o, i: int;
 begin
   datmark := datlen;
-  while (datlen mod 8) <> 0 do
-  begin
-    dat[datlen] := chr(0);
-    datlen := datlen + 1;
-  end;
+  while (datlen mod 8) <> 0 do dput(0);
   i := 0;
   while i < 8 do
   begin
-    dat[datlen] := chr(band(n shr (i * 8), 255));
-    datlen := datlen + 1;
+    dput(band(n shr (i * 8), 255));
     i := i + 1;
   end;
   o := datlen;
   i := 0;
   while i < n do
   begin
-    if usem <> 0 then dat[datlen] := mbuf[i] else dat[datlen] := tbuf[i];
-    datlen := datlen + 1;
+    if usem <> 0 then dput(ord(mbuf[i])) else dput(ord(tbuf[i]));
     i := i + 1;
   end;
-  dat[datlen] := chr(0);
-  datlen := datlen + 1;
-  if datlen >= DATMAX then fail("data segment overflow");
+  dput(0);
   return o;
 end;
 
@@ -795,6 +801,7 @@ begin
   i := 0;
   while pathbuf[i] <> chr(0) do
   begin
+    if fnplen >= FNPMAX then fail("source file name pool overflow: too many or too long source paths");
     fnpool[fnplen] := pathbuf[i];
     fnplen := fnplen + 1;
     i := i + 1;
@@ -808,9 +815,9 @@ begin
     fdev[nfiles] := stfield(0);
     fino[nfiles] := stfield(8);
   end;
+  if fnplen >= FNPMAX then fail("source file name pool overflow: too many or too long source paths");
   fnpool[fnplen] := chr(0);
   fnplen := fnplen + 1;
-  if fnplen >= 130000 then fail("source file name pool overflow");
   nfiles := nfiles + 1;
   return nfiles - 1;
 end;
@@ -1019,10 +1026,10 @@ begin
   start := srclen;
   while true do
   begin
+    if srclen + 65536 > SRCMAX then begin cls(fd); fail("source is too large"); end;
     n := rdbuf(fd, addr(src[srclen]), 65536);
     if n <= 0 then break;
     srclen := srclen + n;
-    if srclen + 65536 > SRCMAX then fail("source is too large");
   end;
   cls(fd);
   return srclen - start;
@@ -1237,13 +1244,14 @@ begin
   i := 0;
   while tbufb(i) <> 0 do
   begin
+    if namelen >= NAMEMAX then fail("name pool overflow: the source is too large");
     names[namelen] := tbuf[i];
     namelen := namelen + 1;
     i := i + 1;
   end;
+  if namelen >= NAMEMAX then fail("name pool overflow: the source is too large");
   names[namelen] := chr(0);
   namelen := namelen + 1;
-  if namelen >= NAMEMAX then fail("name pool overflow");
   return o;
 end;
 
@@ -3759,6 +3767,16 @@ end;
   entered through the same mechanism as an include, so it is compiled like
   any other code. }
 
+{ One byte of generated source, with the room checked BEFORE the write -- the same
+  reason as dput above: a check afterwards has already stored the byte that does not
+  fit, which turns "the source is too large" into a bounds trap inside this compiler. }
+procedure sput(c: char);
+begin
+  if srclen >= SRCMAX then fail("generated source is too large");
+  src[srclen] := c;
+  srclen := srclen + 1;
+end;
+
 procedure gen(t: str);
 var i, n: int;
 begin
@@ -3766,9 +3784,7 @@ begin
   i := 0;
   while i < n do
   begin
-    if srclen >= SRCMAX then fail("generated source is too large");
-    src[srclen] := schar(t, i);
-    srclen := srclen + 1;
+    sput(schar(t, i));
     i := i + 1;
   end;
 end;
@@ -3780,8 +3796,7 @@ begin
   i := 0;
   while i < n do
   begin
-    src[srclen] := nbuf[i];
-    srclen := srclen + 1;
+    sput(nbuf[i]);
     i := i + 1;
   end;
 end;
@@ -3792,8 +3807,7 @@ begin
   i := 0;
   while schname[i] <> chr(0) do
   begin
-    src[srclen] := schname[i];
-    srclen := srclen + 1;
+    sput(schname[i]);
     i := i + 1;
   end;
 end;
@@ -3804,8 +3818,7 @@ begin
   i := 0;
   while sfld[f * 64 + i] <> chr(0) do
   begin
-    src[srclen] := sfld[f * 64 + i];
-    srclen := srclen + 1;
+    sput(sfld[f * 64 + i]);
     i := i + 1;
   end;
 end;
@@ -3822,8 +3835,7 @@ begin
   i := 0;
   while scnam[sfsub[f] * 64 + i] <> chr(0) do
   begin
-    src[srclen] := scnam[sfsub[f] * 64 + i];
-    srclen := srclen + 1;
+    sput(scnam[sfsub[f] * 64 + i]);
     i := i + 1;
   end;
 end;
@@ -3834,8 +3846,7 @@ begin
   i := 0;
   while sfjson[f * 64 + i] <> chr(0) do
   begin
-    src[srclen] := sfjson[f * 64 + i];
-    srclen := srclen + 1;
+    sput(sfjson[f * 64 + i]);
     i := i + 1;
   end;
 end;
@@ -3843,17 +3854,14 @@ end;
 procedure genquoted(e: int);
 var i: int;
 begin
-  src[srclen] := '"';
-  srclen := srclen + 1;
+  sput('"');
   i := 0;
   while senum[e * 64 + i] <> chr(0) do
   begin
-    src[srclen] := senum[e * 64 + i];
-    srclen := srclen + 1;
+    sput(senum[e * 64 + i]);
     i := i + 1;
   end;
-  src[srclen] := '"';
-  srclen := srclen + 1;
+  sput('"');
 end;
 
 procedure genident(e: int);
@@ -3864,8 +3872,7 @@ begin
   begin
     c := ord(senum[e * 64 + i]);
     if not (isal(c) or isdg(c)) then c := 95;
-    src[srclen] := chr(c);
-    srclen := srclen + 1;
+    sput(chr(c));
     i := i + 1;
   end;
 end;
@@ -4006,6 +4013,17 @@ begin
   gen("      end;\n      "); genr(f); gen("_ok := true;\n    end\n    else ");
 end;
 
+{ The truncation test that follows every appending call in a generated writer.
+  json.putreal, json.putraw, json.putstr, io.push and io.pushnum truncate at len(dst)
+  instead of signalling, so after such a call `at = len(dst)` is the only
+  evidence that something was dropped.  For an error message truncation is harmless;
+  for a JSON object it is not -- what comes out is not a shorter object but a syntax
+  error -- so the writer turns it into the refusal -1 here. }
+procedure genfull;
+begin
+  gen("      if at >= len(dst) then return -1;\n");
+end;
+
 { write one value; the field (tgt 0) or element v1 (tgt 1) }
 procedure genput(f: int; tgt: int);
 var t, ei: int;
@@ -4014,24 +4032,35 @@ begin
   if t = SF_INT then
   begin
     gen("      at := io.pushnum(dst, at, "); genr(f); if tgt <> 0 then gen("[v1]"); gen(");\n");
+    genfull;
   end
   else if t = SF_REAL then
   begin
+    { json.putreal is the one appender that neither truncates nor signals: without room
+      for its longest form (32 bytes of headroom) it writes NOTHING and returns `at`
+      unchanged, which would leave a key with no value at all in the output -- invalid
+      JSON that the len(dst) test below cannot see, because `at` never reached the end.
+      So the room is tested here, before the call, and a refusal comes out instead. }
+    gen("      if (at < 0) or (at + 32 > len(dst)) then return -1;\n");
     gen("      at := json.putreal(dst, at, "); genr(f); if tgt <> 0 then gen("[v1]"); gen(");\n");
+    genfull;
   end
   else if t = SF_BOOL then
   begin
     gen("      if "); genr(f); if tgt <> 0 then gen("[v1]");
     gen(" then at := io.push(dst, at, \"true\") else at := io.push(dst, at, \"false\");\n");
+    genfull;
   end
   else if t = SF_TEXT then
   begin
-    gen("      dst[at] := '\"';\n      at := json.putraw(dst, at + 1, src, "); genr(f); gen("_at, "); genr(f); gen("_end);\n");
-    gen("      dst[at] := '\"';\n      at := at + 1;\n");
+    gen("      at := json.putb(dst, at, '\"');\n      at := json.putraw(dst, at, src, "); genr(f); gen("_at, "); genr(f); gen("_end);\n");
+    genfull;
+    gen("      at := json.putb(dst, at, '\"');\n");
   end
   else if t = SF_JSON then
   begin
     gen("      at := json.putraw(dst, at, src, "); genr(f); gen("_at, "); genr(f); gen("_end);\n");
+    genfull;
   end
   else if t = SF_ENUM then
   begin
@@ -4043,6 +4072,7 @@ begin
       ei := ei + 1;
     end;
     gen("      else\n        at := io.push(dst, at, \"null\");\n      end;\n");
+    genfull;
   end
   else if t = SF_TEXTN then
   begin
@@ -4130,7 +4160,7 @@ begin
   begin
     if sfopt[f] = 0 then
     begin
-      gen("      if not "); genr(f); gen("_ok then return -1;\n");
+      gen("      if (not "); genr(f); gen("_ok) or "); genr(f); gen("_null then return -1;\n");
     end;
     f := f + 1;
   end;
@@ -4152,9 +4182,13 @@ begin
   gen("\n    begin\n      at := json.skip(b, at, last);\n      if at < 0 then return -1;\n    end;\n");
   gen("  end;\n  return -1;\nend;\n");
   { --- write --- }
-  gen("\nfunction "); genname; gen(".write(dst: array of char; at: int; r: array of "); genname;
+  gen("\n{ Returns the position after the object, or -1 when it does not fit in dst.\n");
+  gen("  A short buffer is a refusal, not a truncation: half a JSON object is not a\n");
+  gen("  shorter object but a syntax error, and this text goes out as the\n");
+  gen("  structuredContent of a protocol reply. }\n");
+  gen("function "); genname; gen(".write(dst: array of char; at: int; r: array of "); genname;
   gen("; src: array of char): int;\nvar v1: int;\n    first: bool;\nbegin\n");
-  gen("  dst[at] := '{';\n  at := at + 1;\n  first := true;\n  v1 := 0;\n");
+  gen("  at := json.putb(dst, at, '{');\n  first := true;\n  v1 := 0;\n");
   f := 0;
   while f < nfld do
   begin
@@ -4162,22 +4196,22 @@ begin
     begin
       gen("  if "); genr(f); gen("_ok then\n");
     end;
-    gen("  begin\n    if not first then\n    begin\n      dst[at] := ',';\n      at := at + 1;\n    end;\n    first := false;\n");
-    gen("    at := io.push(dst, at, \"\\\""); genjs(f); gen("\\\":\");\n");
-    gen("    if "); genr(f); gen("_null then at := io.push(dst, at, \"null\")\n    else\n    begin\n");
+    gen("  begin\n    if not first then at := json.putb(dst, at, ',');\n    first := false;\n");
+    gen("    at := io.push(dst, at, \"\\\""); genjs(f); gen("\\\":\");\n    if at >= len(dst) then return -1;\n");
+    gen("    if "); genr(f); gen("_null then\n    begin\n      at := io.push(dst, at, \"null\");\n      if at >= len(dst) then return -1;\n    end\n    else\n    begin\n");
     if sfarr[f] <> 0 then
     begin
-      gen("      dst[at] := '[';\n      at := at + 1;\n");
+      gen("      at := json.putb(dst, at, '[');\n");
       gen("      for v1 := 0 to "); genr(f); gen("_n - 1 do\n      begin\n");
-      gen("      if v1 > 0 then\n      begin\n        dst[at] := ',';\n        at := at + 1;\n      end;\n");
+      gen("      if v1 > 0 then at := json.putb(dst, at, ',');\n");
       genput(f, 1);
-      gen("      end;\n      dst[at] := ']';\n      at := at + 1;\n");
+      gen("      end;\n      at := json.putb(dst, at, ']');\n");
     end
     else genput(f, 0);
     gen("    end;\n  end;\n");
     f := f + 1;
   end;
-  gen("  dst[at] := '}';\n  return at + 1;\nend;\n");
+  gen("  return json.putb(dst, at, '}');\nend;\n");
 end;
 
 { --- the JSON Schema text --- }
@@ -4330,27 +4364,20 @@ begin
   jss("]}");
   jsc(0);
   { into the data segment, as the value of the str constant Name.jsonschema }
-  while (datlen mod 8) <> 0 do
-  begin
-    dat[datlen] := chr(0);
-    datlen := datlen + 1;
-  end;
+  while (datlen mod 8) <> 0 do dput(0);
   i := 0;
   while i < 8 do
   begin
-    dat[datlen] := chr(band((jslen - 1) shr (i * 8), 255));
-    datlen := datlen + 1;
+    dput(band((jslen - 1) shr (i * 8), 255));
     i := i + 1;
   end;
   scjs[nsc] := datlen;
   i := 0;
   while i < jslen do
   begin
-    dat[datlen] := jsbuf[i];
-    datlen := datlen + 1;
+    dput(ord(jsbuf[i]));
     i := i + 1;
   end;
-  if datlen >= DATMAX then fail("data segment overflow");
 end;
 
 { the schema whose name is in tbuf, or -1 }
@@ -4570,8 +4597,7 @@ begin
   j := 0;
   while tlnam[i * 64 + j] <> chr(0) do
   begin
-    src[srclen] := tlnam[i * 64 + j];
-    srclen := srclen + 1;
+    sput(tlnam[i * 64 + j]);
     j := j + 1;
   end;
 end;
@@ -4582,8 +4608,7 @@ begin
   j := 0;
   while scnam[k * 64 + j] <> chr(0) do
   begin
-    src[srclen] := scnam[k * 64 + j];
-    srclen := srclen + 1;
+    sput(scnam[k * 64 + j]);
     j := j + 1;
   end;
 end;
@@ -4618,27 +4643,20 @@ begin
     i := i + 1;
   end;
   jsc(0);
-  while (datlen mod 8) <> 0 do
-  begin
-    dat[datlen] := chr(0);
-    datlen := datlen + 1;
-  end;
+  while (datlen mod 8) <> 0 do dput(0);
   i := 0;
   while i < 8 do
   begin
-    dat[datlen] := chr(band((jslen - 1) shr (i * 8), 255));
-    datlen := datlen + 1;
+    dput(band((jslen - 1) shr (i * 8), 255));
     i := i + 1;
   end;
   tlseen := datlen;
   i := 0;
   while i < jslen do
   begin
-    dat[datlen] := jsbuf[i];
-    datlen := datlen + 1;
+    dput(ord(jsbuf[i]));
     i := i + 1;
   end;
-  if datlen >= DATMAX then fail("data segment overflow");
   i := 0;
   while i < slen("tool.list") do
   begin
@@ -4684,7 +4702,10 @@ begin
   end;
   gen("  return -1;\nend;\n");
   { --- run: parse arguments, call the handler, write the result JSON into dst --- }
-  gen("\n{ returns the length written, -1 for bad arguments, -2 when the handler failed (see tool.err) }\n");
+  gen("\n{ returns the length written, -1 for bad arguments, -2 when the handler failed\n");
+  gen("  (see tool.err), -3 when the result JSON does not fit in dst.  The writer\n");
+  gen("  refuses rather than truncating -- half an object is a syntax error -- and -3\n");
+  gen("  keeps that apart from -1, which would blame the caller's arguments for it. }\n");
   gen("function tool.run(idx: int; b: array of char; at: int; upto: int; dst: array of char): int;\nvar rc: int;\nbegin\n  rc := 0;\n  tool.errn := 0;\n  case idx of\n");
   i := 0;
   while i < ntl do
@@ -4693,7 +4714,8 @@ begin
     gen("      "); gensc(tlout[i]); gen(".clear(tool.out_"); gentl(i); gen(");\n");
     gen("      tool.vn := 0;\n      rc := tool."); gentl(i); gen("(tool.in_"); gentl(i); gen(", tool.out_"); gentl(i); gen(");\n");
     gen("      if rc <> 0 then return -2;\n");
-    gen("      return "); gensc(tlout[i]); gen(".write(dst, 0, tool.out_"); gentl(i); gen(", tool.vbuf);\n    end;\n");
+    gen("      rc := "); gensc(tlout[i]); gen(".write(dst, 0, tool.out_"); gentl(i); gen(", tool.vbuf);\n");
+    gen("      if rc < 0 then return -3;\n      return rc;\n    end;\n");
     i := i + 1;
   end;
   gen("  end;\n  return -1;\nend;\n");
@@ -5987,9 +6009,7 @@ end;
 
 procedure pd(b: int);
 begin
-  dat[datlen] := chr(band(b, 255));
-  datlen := datlen + 1;
-  if datlen >= DATMAX then fail("data segment overflow");
+  dput(b);
 end;
 
 procedure pd16(v: int);

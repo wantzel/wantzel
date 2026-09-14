@@ -1,0 +1,149 @@
+// io.push, io.pushnum, json.putreal, json.putstr and json.escslice do not write past
+// the end of their buffer, and a negative position travels through all of them.
+//
+// All three take an `array of char`, so len(b) is available to them, but none of them
+// used to consult it: io.push copied until the literal ran out. Writing one byte too far
+// is a runtime `array index out of range` -- the program stops.
+//
+// This matters more than an ordinary overflow because tool.fail is compiler-generated:
+// a `tools` block emits `tool.errn := io.push(tool.err, 0, s)` into a fixed
+// array[0..255], so every program with such a block inherits the shape whether its
+// author knows the limit or not. The failure lands on an error path, which is the least
+// travelled one, so a server starts, serves traffic and dies only on the call that
+// happens to build the long message.
+//
+// They TRUNCATE rather than returning -1. Every caller chains the result straight back
+// in as the next position (`n := io.push(b, n, ..)`) without testing it, so a -1 would
+// become the next write index and b[-1] is worse than a short buffer. json.putslice does
+// return -1, but it is called in the few places that check for it.
+//
+// The contract pinned here: the position that comes back never exceeds len(b), and it
+// stays usable, so a chain of pushes on a full buffer keeps returning len(b) instead of
+// running off the end.
+program io_push_bounds_t;
+include "json.wz";
+var small: array[0..7] of char;      // deliberately too small
+    big:    array[0..63] of char;
+    tiny:   array[0..3] of char;
+    n: int;
+procedure show(s: str; v: int); begin io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n"); end;
+procedure showb(s: str; b: array of char; upto: int);
+begin
+  io.puts(STDOUT, s);
+  if upto > 0 then io.out(STDOUT, addr(b[0]), upto);
+  io.puts(STDOUT, "\n");
+end;
+begin
+  { --- io.push --- }
+  { a literal longer than the buffer stops at len(b) instead of crashing }
+  n := io.push(small, 0, "abcdefghijklmnop");
+  show("push 16 into 8 = ", n);
+  showb("  content = ", small, n);
+
+  { exactly full is not an overflow }
+  n := io.push(small, 0, "abcdefgh");
+  show("push 8 into 8 = ", n);
+
+  { the offset counts: from position 6 there is room for two more }
+  n := io.push(small, 6, "xyz");
+  show("push 3 at 6 = ", n);
+  showb("  content = ", small, n);
+
+  { chaining on a full buffer keeps returning len(b), so the position stays usable }
+  n := io.push(small, 0, "abcdefgh");
+  n := io.push(small, n, "more");
+  n := io.push(small, n, "and more");
+  show("chained past the end = ", n);
+
+  { starting exactly at the end writes nothing and does not move }
+  n := io.push(small, 8, "z");
+  show("push at len(b) = ", n);
+
+  { --- io.pushnum --- }
+  { a number that does not fit is truncated at len(b) }
+  n := io.pushnum(tiny, 0, 1234567);
+  show("pushnum 7 digits into 4 = ", n);
+  showb("  content = ", tiny, n);
+
+  { a negative number: the sign is part of the digits }
+  n := io.pushnum(tiny, 0, -1234567);
+  show("pushnum -1234567 into 4 = ", n);
+  showb("  content = ", tiny, n);
+
+  { room enough leaves it untouched }
+  n := io.pushnum(big, 0, -1234567);
+  show("pushnum roomy = ", n);
+  showb("  content = ", big, n);
+
+  { at the very end nothing is written }
+  n := io.pushnum(tiny, 4, 9);
+  show("pushnum at len(b) = ", n);
+
+  { --- json.putreal --- }
+  { it needs room for its longest form; without it nothing is written and at stands still }
+  n := json.putreal(tiny, 0, 1.5);
+  show("putreal into 4 = ", n);
+
+  n := json.putreal(small, 0, 1.5);
+  show("putreal into 8 = ", n);
+
+  { with room it writes as before }
+  n := json.putreal(big, 0, 1.5);
+  show("putreal roomy = ", n);
+  showb("  content = ", big, n);
+
+  { near the end of a large buffer there is no room either }
+  n := json.putreal(big, 60, 1.5);
+  show("putreal at 60 of 64 = ", n);
+
+  { and just far enough back there is }
+  n := json.putreal(big, 32, 1.5);
+  show("putreal at 32 of 64 = ", n);
+
+  { --- json.putstr --- }
+  { a string longer than the buffer is truncated at len(dst); note that the closing
+    quote is then missing, which is why a caller building JSON must test the position }
+  n := json.putstr(small, 0, "abcdefghijklmnop");
+  show("putstr 16 into 8 = ", n);
+  showb("  content = ", small, n);
+
+  { one character can become six bytes, so an escape near the end is dropped whole
+    rather than written half }
+  n := json.putstr(small, 0, "ab\ncdef");
+  show("putstr with an escape into 8 = ", n);
+  showb("  content = ", small, n);
+
+  { without room for even the opening quote nothing is written and at stands still }
+  n := json.putstr(small, 8, "z");
+  show("putstr at len(b) = ", n);
+
+  { room enough leaves it untouched, quotes and all }
+  n := json.putstr(big, 0, "abc");
+  show("putstr roomy = ", n);
+  showb("  content = ", big, n);
+
+  { --- json.escslice --- }
+  { no quotes of its own; truncated at len(dst) }
+  n := io.push(big, 0, "abcdefghij");
+  n := json.escslice(small, 0, big, 0, 10);
+  show("escslice 10 into 8 = ", n);
+  showb("  content = ", small, n);
+
+  { a control byte needs six bytes, so it is dropped whole when it does not fit }
+  big[0] := chr(1);
+  n := json.escslice(tiny, 0, big, 0, 1);
+  show("escslice a control byte into 4 = ", n);
+
+  { --- a negative position travels through unchanged, it does not index b[-1] --- }
+  show("push at -1 = ", io.push(small, -1, "z"));
+  show("pushnum at -1 = ", io.pushnum(small, -1, 9));
+  show("putreal at -1 = ", json.putreal(big, -1, 1.5));
+  show("putstr at -1 = ", json.putstr(small, -1, "z"));
+  show("escslice at -1 = ", json.escslice(small, -1, big, 0, 1));
+  show("putslice at -1 = ", json.putslice(small, -1, big, 0, 1));
+
+  { --- json.putb refuses instead of truncating: one byte of structure or nothing --- }
+  show("putb into 8 at 0 = ", json.putb(small, 0, 'x'));
+  show("putb at len(b) = ", json.putb(small, 8, 'x'));
+  show("putb at -1 = ", json.putb(small, -1, 'x'));
+end.

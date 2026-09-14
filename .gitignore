@@ -14,3 +14,10 @@
 # Never a token in a repository. This is a safety net: nothing here reads a .env, but
 # if a copy ever drifts in, it must not be committed.
 .env
+
+# Worktrees for parallel work. They belong OUTSIDE the repository, in wstack/ itself,
+# where no repository sees them. This is the safety net in case one is ever created
+# inside: a worktree in a commit would carry the whole tree twice, and this repository
+# is public.
+/wt-*/
+/worktrees/

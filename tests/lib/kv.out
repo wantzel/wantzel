@@ -47,6 +47,27 @@ same [1,2] ~ [1, 2] -> 0
 same {"k":1} ~ {"k":1} -> 1
 same  ~  -> 1
 same - ~ - -> 0
+haselem [1,2] ? 1 -> 1
+haselem [1,2] ? 3 -> 0
+haselem [1,2] ? 2.0 -> 1
+haselem ["p","q"] ? "q" -> 1
+haselem [ 1 , 2 ] ? 2 -> 1
+haselem [[1,2],3] ? [1,2] -> 1
+haselem [] ? 1 -> 0
+haselem [1,2 ? 1 -> 1
+haselem 1 ? 1 -> 0
+haselem  ? 1 -> 0
+contains [1,2] > 1 -> 1
+contains [1,2] > 3 -> 0
+contains [1,2] > [1,2] -> 1
+contains [1,2] > [2,1] -> 1
+contains [1,2] > [1] -> 1
+contains [1,2] > [1,3] -> 0
+contains [1,2] > [] -> 1
+contains [] > [] -> 1
+contains [] > [1] -> 0
+contains [1,2] > [1,2 -> 0
+contains ["p","q"] > ["q","p"] -> 1
 match {"a":1} -> 1
 match {"a":1.0} -> 1
 match {"a":2} -> 0
@@ -58,8 +79,19 @@ match {"zz":1} -> 0
 match {"zz":[1]} -> 0
 match {"d":{"k":1}} -> 1
 match {"d":{"k":2}} -> 0
-match {"c":[1,2]} -> 0
-match {"c":[[1,2]]} -> 1
+match {"c":[1,2]} -> 1
+match {"c":[[1,2]]} -> 0
+match {"c":1} -> 1
+match {"c":2} -> 1
+match {"c":3} -> 0
+match {"c":[2,1]} -> 1
+match {"c":[1]} -> 1
+match {"c":[1,3]} -> 0
+match {"c":[]} -> 1
+match {"c":1.0} -> 1
+match {"c":"1"} -> 0
+match {"c":1,"a":1} -> 1
+match {"c":3,"a":1} -> 0
 match {"e":null} -> 1
 match {"a":1,"b":"x"} -> 1
 match {"a":1,"b":"q"} -> 0
@@ -69,6 +101,21 @@ match {"a":1 -> 0
 match {"a":[1,2} -> 0
 match [] -> 0
 match  -> 0
+match {"tags":["p","q"]} -> 1
+match {"tags":["q","p"]} -> 1
+match {"tags":"p"} -> 1
+match {"tags":"r"} -> 0
+match {"tags":["p"]} -> 1
+match {"tags":["p","r"]} -> 0
+match {"one":["p"]} -> 1
+match {"none":[]} -> 1
+match {"none":["p"]} -> 0
+match {"none":"p"} -> 0
+match {"s":[2,1]} -> 1
+match {"s":2} -> 1
+match {"o":{"k":1}} -> 1
+match {"o":{"k":3}} -> 0
+match {"o":[{"k":2}]} -> 1
 merge {"a":1,"b":"x","c":true} + {"b":"y","d":[1, 2],"c":null,"zz":null} -> {"a":1,"b":"y","d":[1, 2]}
 merge {"a":1} + {} -> {"a":1}
 merge {} + {"a":{"k":[1]}} -> {"a":{"k":[1]}}

@@ -53,6 +53,16 @@ begin
     mcp.text("the arguments do not match the tool's input schema");
     return;
   end;
+  { -3: the generated writer refused because the result does not fit in tool.out.  It
+    refuses rather than truncating, since half an object would leave the peer with an
+    unparseable envelope instead of one failed call.  Reported separately because -1
+    would blame the caller's arguments for a limit on our side. }
+  if n = -3 then
+  begin
+    mcp.failed := true;
+    mcp.text("the result does not fit in the tool output buffer");
+    return;
+  end;
   if n < 0 then
   begin
     mcp.failed := true;
@@ -235,6 +245,14 @@ begin
   begin
     http.add("{\"detail\":\"the body does not match the tool's input schema\"}");
     http.finish(422, "application/json");
+    return true;
+  end;
+  { -3: the result does not fit in tool.out; see app.call for why that is not a -1.
+    500, because the limit is ours and the request was valid. }
+  if n = -3 then
+  begin
+    http.add("{\"detail\":\"the result does not fit in the tool output buffer\"}");
+    http.finish(500, "application/json");
     return true;
   end;
   if n < 0 then

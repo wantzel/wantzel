@@ -37,6 +37,7 @@ var
   http.hdrat, http.hdrend: int;                // the header lines (after the request line)
   http.bodyat, http.bodylen: int;
   http.keep: bool;
+  http.ignored: bool;                          // a result that is deliberately not acted on
   http.wpos: int;                              // write cursor for the reply body
   http.requests: int;
   http.xhdr: array[0..HDRROOM - 1] of char;    // extra response headers for the current reply
@@ -448,7 +449,12 @@ end;
 
 procedure http.drop(fd: int);
 begin
-  net.watch(http.ep, EPOLL_DEL, fd, 0);
+  // A failing DEL is deliberately ignored: it means the fd is already out of the
+  // set (ENOENT), which is the state this routine is trying to reach.  Closing the
+  // fd removes it from the set anyway.  The result goes into http.ignored because
+  // the language refuses a discarded function result -- so "I am ignoring this on
+  // purpose" has to be written down rather than left to the reader.
+  http.ignored := net.watch(http.ep, EPOLL_DEL, fd, 0);
   net.close(fd);
   http.open[fd] := false;
 end;
@@ -464,7 +470,10 @@ begin
     if r > 0 then http.osend[fd] := http.osend[fd] + r
     else if r = EAGAIN then
     begin
-      net.watch(http.ep, EPOLL_MOD, fd, bor(EPOLLIN, EPOLLOUT));
+      // Without EPOLLOUT this connection is never woken to finish writing, so a
+      // failed MOD is a stall.  It costs this one client, not the server: drop it.
+      if not net.watch(http.ep, EPOLL_MOD, fd, bor(EPOLLIN, EPOLLOUT)) then
+        http.drop(fd);
       return;
     end
     else if r <> EINTR then
@@ -473,7 +482,13 @@ begin
       return;
     end;
   end;
-  net.watch(http.ep, EPOLL_MOD, fd, EPOLLIN);
+  // Back to read-only.  A failed MOD would leave EPOLLOUT armed on an idle socket,
+  // spinning the loop on a writable fd with nothing to write: drop it instead.
+  if not net.watch(http.ep, EPOLL_MOD, fd, EPOLLIN) then
+  begin
+    http.drop(fd);
+    return;
+  end;
   if not http.keep then http.drop(fd);
 end;
 
@@ -538,7 +553,10 @@ begin
     http.osend[fd] := 0;
     http.oend[fd] := 0;
     http.open[fd] := true;
-    net.watch(http.ep, EPOLL_ADD, fd, EPOLLIN);
+    // A missed ADD means this connection is never served: the client waits forever
+    // and the fd leaks.  That is one client, not the server, so close it here
+    // rather than stopping a process that is serving others.
+    if not net.watch(http.ep, EPOLL_ADD, fd, EPOLLIN) then http.drop(fd);
   end;
 end;
 
@@ -560,7 +578,11 @@ begin
   if http.lfd < 0 then io.fatal("cannot bind the port");
   http.ep := net.epoll;
   if http.ep < 0 then io.fatal("cannot create the epoll set");
-  net.watch(http.ep, EPOLL_ADD, http.lfd, EPOLLIN);
+  // The listening socket is the one the whole loop depends on: without it in the set
+  // the server accepts nothing at all and would sit silently in epoll_wait forever.
+  // Same treatment as net.listen and net.epoll above.
+  if not net.watch(http.ep, EPOLL_ADD, http.lfd, EPOLLIN) then
+    io.fatal("cannot watch the listening socket");
   while true do
   begin
     n := net.wait(http.ep, addr(http.evs[0]), MAXEV, -1);
