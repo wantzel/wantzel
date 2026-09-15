@@ -295,7 +295,7 @@ justify a guess is worse than no yardstick, because the guess then arrives with 
   generated code stop corresponding to the source you are reviewing. Straightforward code
   generation keeps what runs recognisable as what you read, and it is a large part of why
   compiling takes milliseconds.
-- **The language stays frozen.** A moving target is one more thing you would have to keep
+- **The language changes rarely, and only on evidence.** A moving target is one more thing you would have to keep
   in your head, and one more way for code written last month to mean something else today.
 
 ### And it makes writing it by hand pleasant again
@@ -370,7 +370,7 @@ wrong, and the expressiveness given up comes back as predictability — which is
 both a reader and a generator need.
 
 The rule is not only about types. Wherever two mechanisms would overlap, there is one:
-`bool` and no `boolean`, `include` and no module system, one comment form, and — as the
+`bool` and no `boolean`, `include` and no module system, and — as the
 section above works out — errors and no warnings, because "valid" and "valid but I have
 remarks" are two answers to a question that should have one. The deviations from Pascal are
 the same rule applied case by case:
@@ -381,7 +381,40 @@ the same rule applied case by case:
 | pointers, `new`/`dispose` | absent | no heap means no memory leak and no use-after-free |
 | `string`, `ansistring`, `pchar` | `str` (literal) + `array of char` | no hidden allocation |
 | units, `uses` | `include` | one mechanism |
-| `(* *)` and `{ }` | `{ }` and `//` | (and `{ }` ends at the first `}` — a pitfall we hit twice) |
+| `(* *)` and `{ }` | only `//` | `{ }` ended at the first `}`, so a brace in the comment text turned the rest of the sentence into code |
+
+### The test that decides a syntax question
+
+The rule above is easy to state and easy to misapply, because "one way per concept" sounds
+like an argument for removing anything that has a neighbour. Every row in that table has
+one thing in common, and it is the actual test:
+
+> **Each deviation removes a *choice* between alternatives that meant the same thing.
+> None of them removes a *distinction*.**
+
+Six integer types collapse to one because they were six spellings of the same idea. `units`
+and `include` were two mechanisms for one job. But `procedure` and `function` are not two
+ways to say one thing — one returns a value the caller must use, the other does not, and the
+rule that a result may not be discarded depends on telling them apart. Removing that would
+cost something; removing `longint` cost nothing.
+
+Two more things follow from it, and they settle most cases before an argument starts:
+
+- **A familiar spelling is kept where it costs nothing — and "nothing" is a measurement,
+  not an assumption.** The `{ }` comment looked free by this test: familiar to a Pascal
+  reader, one branch in the lexer, arguably a second concept rather than a second spelling.
+  The error log said otherwise — six of seven recorded syntax errors came from it, because
+  it ended at the first `}` and a brace in the comment text turned prose into code. It was
+  removed. Where a count exists, it outranks the argument.
+- **Compatibility is not a goal; familiarity is.** Wantzel is not an ISO-7185 dialect and
+  does not try to be. But "if you have written Pascal you will read Wantzel without
+  explanation" is a promise worth keeping, and a change that *creates* a deviation where
+  none existed — `end;` instead of `end.` — pays that price for nothing.
+
+Where the two genuinely pull against each other, the yardstick above decides: a familiar
+spelling that makes a *generator* likelier to be wrong loses, however comfortable it is for
+a person. Case-insensitive identifiers with a merely cosmetic dot are the live example —
+faithful to Pascal, and the largest single source of errors we have measured.
 
 ---
 

@@ -24,7 +24,7 @@ begin
   show("  exitcode = ", proc.exitcode(proc.status[0]));
   if proc.exited(proc.status[0]) then io.puts(STDOUT, "  exited = yes\n") else io.puts(STDOUT, "  exited = no\n");
   show("  signal = ", proc.signal(proc.status[0]));
-  { proc.ok is false: the child exited cleanly but with code 7, and that is not success }
+  // proc.ok is false: the child exited cleanly but with code 7, and that is not success
   if proc.ok(proc.status[0]) then io.puts(STDOUT, "  ok = yes\n") else io.puts(STDOUT, "  ok = no (code 7)\n");
 
   // a child killed by a signal: the exit code is then 0, and without checking the

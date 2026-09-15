@@ -13,7 +13,7 @@ function total(a: array of real): real;
 var i: int; t: real;
 begin
   i := 0;
-  while i < len(a) do begin t := t + a[i]; i := i + 1; end;   { t starts at 0.0 }
+  while i < len(a) do begin t := t + a[i]; i := i + 1; end;   // t starts at 0.0
   return t;
 end;
 procedure scale(a: array of real; k: real);
@@ -28,11 +28,11 @@ begin
 end;
 begin
   i := 1;
-  while i <= 5 do begin xs[i] := real(i) * 0.5; i := i + 1; end;   { 0.5 1.0 1.5 2.0 2.5 }
-  s := total(xs);                 show("total x10 = ", trunc(s * 10.0));            { 75 }
+  while i <= 5 do begin xs[i] := real(i) * 0.5; i := i + 1; end;   // 0.5 1.0 1.5 2.0 2.5
+  s := total(xs);                 show("total x10 = ", trunc(s * 10.0));            // 75
   scale(xs, 4.0);
-  s := total(xs);                 show("after scale x10 = ", trunc(s * 10.0));      { 300 }
-  s := mean(xs);                  show("mean x10 = ", trunc(s * 10.0));             { 60 }
-  show("xs[5] x10 = ", trunc(xs[5] * 10.0));                                        { 100 }
-  xs[3] := xs[1] + xs[2];         show("xs[3] x10 = ", trunc(xs[3] * 10.0));        { 60 }
+  s := total(xs);                 show("after scale x10 = ", trunc(s * 10.0));      // 300
+  s := mean(xs);                  show("mean x10 = ", trunc(s * 10.0));             // 60
+  show("xs[5] x10 = ", trunc(xs[5] * 10.0));                                        // 100
+  xs[3] := xs[1] + xs[2];         show("xs[3] x10 = ", trunc(xs[3] * 10.0));        // 60
 end.

@@ -21,7 +21,7 @@
 /* limits                                                              */
 /* ------------------------------------------------------------------ */
 /* The release this compiler was built from; src/wantzel.wz has the same string. */
-#define VERSION "0.1.2"
+#define VERSION "0.2.0"
 #define SRCMAX  67108864
 #define CODEMAX 67108864
 #define DATMAX  33554432
@@ -29,6 +29,12 @@
 #define FNPMAX    524000   /* the pool of source file names; fnpool holds 524288 */
 #define MAXG       16384
 #define MAXF        8192
+/* Buckets for the name index over globals and routines.  A power of two so the
+   modulo is a mask, and four times MAXG so a full table still averages well under
+   one name per bucket.  The index is what keeps a lookup from walking every name:
+   without it, compiling 16,384 globals costs four times what 8,192 cost. */
+#define NHASH      65536
+#define HMASK      65535
 #define MAXL        2048
 #define MAXP          10
 #define MAXFIX   4194304
@@ -142,6 +148,13 @@ char nbuf[32];
 /* globals */
 long gnam[MAXG], gkind[MAXG], gtyp[MAXG], gval[MAXG];
 long garr[MAXG], glo[MAXG], ghi[MAXG];
+/* The name index: for each bucket the newest entry in it, and for each entry the
+   one before it in the same bucket.  -1 ends a chain.  Globals and routines have
+   their own index because they are looked up separately.  Entries are only ever
+   added -- ngl and nfn never shrink -- so a chain never has to be unlinked. */
+long ghead[NHASH], gnext[MAXG];
+long fhead[NHASH], fnext[MAXF];
+long hashed = 0;
 long ngl, bsslen;
 
 /* functions */
@@ -264,49 +277,89 @@ long eqt(char *s){
 }
 
 long keyword(){
-    if(eqt("program")){ return KW_PROGRAM; }
-    if(eqt("const")){ return KW_CONST; }
-    if(eqt("var")){ return KW_VAR; }
-    if(eqt("array")){ return KW_ARRAY; }
-    if(eqt("of")){ return KW_OF; }
-    if(eqt("function")){ return KW_FUNCTION; }
-    if(eqt("procedure")){ return KW_PROCEDURE; }
-    if(eqt("forward")){ return KW_FORWARD; }
-    if(eqt("begin")){ return KW_BEGIN; }
-    if(eqt("end")){ return KW_END; }
-    if(eqt("if")){ return KW_IF; }
-    if(eqt("then")){ return KW_THEN; }
-    if(eqt("else")){ return KW_ELSE; }
-    if(eqt("while")){ return KW_WHILE; }
-    if(eqt("do")){ return KW_DO; }
-    if(eqt("repeat")){ return KW_REPEAT; }
-    if(eqt("until")){ return KW_UNTIL; }
-    if(eqt("return")){ return KW_RETURN; }
-    if(eqt("break")){ return KW_BREAK; }
-    if(eqt("continue")){ return KW_CONTINUE; }
-    if(eqt("div")){ return KW_DIV; }
-    if(eqt("mod")){ return KW_MOD; }
-    if(eqt("and")){ return KW_AND; }
-    if(eqt("or")){ return KW_OR; }
-    if(eqt("not")){ return KW_NOT; }
-    if(eqt("shl")){ return KW_SHL; }
-    if(eqt("shr")){ return KW_SHR; }
-    if(eqt("true")){ return KW_TRUE; }
-    if(eqt("false")){ return KW_FALSE; }
-    if(eqt("int")){ return KW_INT; }
-    if(eqt("char")){ return KW_CHAR; }
-    if(eqt("bool")){ return KW_BOOL; }
-    if(eqt("str")){ return KW_STR; }
-    if(eqt("include")){ return KW_INCLUDE; }
-    if(eqt("schema")){ return KW_SCHEMA; }
-    if(eqt("record")){ return KW_RECORD; }
-    if(eqt("real")){ return KW_REAL; }
-    if(eqt("type")){ return KW_TYPE; }
-    if(eqt("for")){ return KW_FOR; }
-    if(eqt("to")){ return KW_TO; }
-    if(eqt("downto")){ return KW_DOWNTO; }
-    if(eqt("case")){ return KW_CASE; }
-    if(eqt("tools")){ return KW_TOOLS; }
+    long c;
+    /* Dispatch on the first character before comparing.  Every identifier used to be
+       compared against all 43 keywords in turn, so a name that is not a keyword -- which
+       is nearly all of them -- paid for the whole list.  One comparison on the first byte
+       cuts that to the handful of keywords that can still match. */
+    c = tbufb(0);
+    if(c == 97){
+        if(eqt("array")){ return KW_ARRAY; }
+        if(eqt("and")){ return KW_AND; }
+    }
+    if(c == 98){
+        if(eqt("begin")){ return KW_BEGIN; }
+        if(eqt("break")){ return KW_BREAK; }
+        if(eqt("bool")){ return KW_BOOL; }
+    }
+    if(c == 99){
+        if(eqt("const")){ return KW_CONST; }
+        if(eqt("continue")){ return KW_CONTINUE; }
+        if(eqt("char")){ return KW_CHAR; }
+        if(eqt("case")){ return KW_CASE; }
+    }
+    if(c == 100){
+        if(eqt("do")){ return KW_DO; }
+        if(eqt("div")){ return KW_DIV; }
+        if(eqt("downto")){ return KW_DOWNTO; }
+    }
+    if(c == 101){
+        if(eqt("end")){ return KW_END; }
+        if(eqt("else")){ return KW_ELSE; }
+    }
+    if(c == 102){
+        if(eqt("function")){ return KW_FUNCTION; }
+        if(eqt("forward")){ return KW_FORWARD; }
+        if(eqt("false")){ return KW_FALSE; }
+        if(eqt("for")){ return KW_FOR; }
+    }
+    if(c == 105){
+        if(eqt("if")){ return KW_IF; }
+        if(eqt("int")){ return KW_INT; }
+        if(eqt("include")){ return KW_INCLUDE; }
+    }
+    if(c == 109){
+        if(eqt("mod")){ return KW_MOD; }
+    }
+    if(c == 110){
+        if(eqt("not")){ return KW_NOT; }
+    }
+    if(c == 111){
+        if(eqt("of")){ return KW_OF; }
+        if(eqt("or")){ return KW_OR; }
+    }
+    if(c == 112){
+        if(eqt("program")){ return KW_PROGRAM; }
+        if(eqt("procedure")){ return KW_PROCEDURE; }
+    }
+    if(c == 114){
+        if(eqt("repeat")){ return KW_REPEAT; }
+        if(eqt("return")){ return KW_RETURN; }
+        if(eqt("record")){ return KW_RECORD; }
+        if(eqt("real")){ return KW_REAL; }
+    }
+    if(c == 115){
+        if(eqt("shl")){ return KW_SHL; }
+        if(eqt("shr")){ return KW_SHR; }
+        if(eqt("str")){ return KW_STR; }
+        if(eqt("schema")){ return KW_SCHEMA; }
+    }
+    if(c == 116){
+        if(eqt("then")){ return KW_THEN; }
+        if(eqt("true")){ return KW_TRUE; }
+        if(eqt("type")){ return KW_TYPE; }
+        if(eqt("to")){ return KW_TO; }
+        if(eqt("tools")){ return KW_TOOLS; }
+    }
+    if(c == 117){
+        if(eqt("until")){ return KW_UNTIL; }
+    }
+    if(c == 118){
+        if(eqt("var")){ return KW_VAR; }
+    }
+    if(c == 119){
+        if(eqt("while")){ return KW_WHILE; }
+    }
     return TK_ID;
 }
 
@@ -378,15 +431,12 @@ long next(){
         c = srcb(pos);
         if(c == 10){ line = line + 1; pos = pos + 1; }
         else if(c==32 || c==9 || c==13){ pos = pos + 1; }
-        else if(c == 123){                     /* { comment } */
-            pos = pos + 1;
-            while(1){
-                if(pos >= srcend){ fail("unterminated comment"); }
-                if(srcb(pos) == 125){ pos = pos + 1; break; }
-                if(srcb(pos) == 10){ line = line + 1; }
-                pos = pos + 1;
-            }
-        }
+        /* A brace is not a comment.  { } used to open one and it ended at the FIRST
+           closing brace, so a brace inside the text -- a JSON example, an f-string,
+           the words "default {}" -- ended the comment early and the rest of the
+           sentence was read as code.  The error then landed far from its cause, on a
+           line that looked correct. */
+        else if(c == 123){ fail("{ } is not a comment; use // to the end of the line"); }
         else if(c==47 && pos+1<srcend && srcb(pos+1)==47){   /* // */
             while(pos < srcend && srcb(pos) != 10){ pos = pos + 1; }
         }
@@ -776,22 +826,100 @@ long findloc(){
     return -1;
 }
 
+/* The hash of the identifier now in tbuf.  Identifiers are lowercased on the way into
+   tbuf (see the lexer), so this hashes the same bytes nameq compares and the index
+   inherits the case-insensitivity instead of having to repeat it.
+
+   FNV-1a, which is a multiply and an xor per byte and needs no table.  The result is
+   masked into a bucket, never used as an identity: every hit is still confirmed with
+   nameq, so a collision costs a comparison and never a wrong answer. */
+long tokhash(){
+    long h; long i; long c;
+    h = 2166136261L;
+    i = 0;
+    while(1){
+        c = tbufb(i);
+        if(c == 0){ return h & HMASK; }
+        h = h ^ c;
+        h = (h * 16777619L) & 4294967295L;
+        i = i + 1;
+    }
+    return h & HMASK;
+}
+
+/* The same hash, over a name already in the pool rather than the token in tbuf.  Two
+   entry points because a name is sometimes added straight from the token and sometimes
+   from an offset interned earlier; they must agree byte for byte or a name would be
+   filed in one bucket and sought in another. */
+long namehash(long off){
+    long h; long i; long c;
+    h = 2166136261L;
+    i = 0;
+    while(1){
+        c = namesb(off + i);
+        if(c == 0){ return h & HMASK; }
+        h = h ^ c;
+        h = (h * 16777619L) & 4294967295L;
+        i = i + 1;
+    }
+    return h & HMASK;
+}
+
+/* Fill the buckets with -1 the first time anything is looked up or added.  Doing it
+   here rather than in an init routine keeps the change to the lookup path only. */
+void hashinit(){
+    long i;
+    if(hashed){ return; }
+    i = 0;
+    while(i < NHASH){
+        ghead[i] = -1;
+        fhead[i] = -1;
+        i = i + 1;
+    }
+    hashed = 1;
+}
+
+/* File global g, whose name is already in gnam[g], in its bucket.  Called right after
+   the entry is filled in and before ngl moves on. */
+void gindex(long g){
+    long b;
+    hashinit();
+    b = namehash(gnam[g]);
+    gnext[g] = ghead[b];
+    ghead[b] = g;
+}
+
+/* The same for routine f. */
+void findex(long f){
+    long b;
+    hashinit();
+    b = namehash(fnam[f]);
+    fnext[f] = fhead[b];
+    fhead[b] = f;
+}
+
+/* Walk only the names that hash to the same bucket, newest first.  That order is the
+   one the old linear scan had (it counted down from ngl - 1), and it is kept although
+   nothing depends on it any more: a duplicate global is refused at declaration, so a
+   name is in here at most once. */
 long findglob(){
     long i;
-    i = ngl - 1;
+    hashinit();
+    i = ghead[tokhash()];
     while(i >= 0){
         if(nameq(gnam[i])){ return i; }
-        i = i - 1;
+        i = gnext[i];
     }
     return -1;
 }
 
 long findfn(){
     long i;
-    i = nfn - 1;
+    hashinit();
+    i = fhead[tokhash()];
     while(i >= 0){
         if(nameq(fnam[i])){ return i; }
-        i = i - 1;
+        i = fnext[i];
     }
     return -1;
 }
@@ -2422,6 +2550,7 @@ long declvars(long islocal){
                 garr[ngl] = ptarr; glo[ngl] = ptlo; ghi[ngl] = pthi;
                 gval[ngl] = bsslen;
                 bsslen = bsslen + sz;
+                gindex(ngl);
                 ngl = ngl + 1;
             }
             i = i + 1;
@@ -2527,6 +2656,7 @@ long declconsts(long islocal){
             if(ngl >= MAXG){ fail("too many globals"); }
             gnam[ngl] = o; gkind[ngl] = SK_CONST; gval[ngl] = v; gtyp[ngl] = t;
             garr[ngl] = 0; glo[ngl] = 0; ghi[ngl] = 0;
+            gindex(ngl);
             ngl = ngl + 1;
         }
         if(tok != 59){ fail("missing ; after constant declaration"); }
@@ -2847,10 +2977,10 @@ long genschema(){
     gen("\n    begin\n      at := json.skip(b, at, last);\n      if at < 0 then return -1;\n    end;\n");
     gen("  end;\n  return -1;\nend;\n");
     /* --- write --- */
-    gen("\n{ Returns the position after the object, or -1 when it does not fit in dst.\n");
-    gen("  A short buffer is a refusal, not a truncation: half a JSON object is not a\n");
-    gen("  shorter object but a syntax error, and this text goes out as the\n");
-    gen("  structuredContent of a protocol reply. }\n");
+    gen("\n// Returns the position after the object, or -1 when it does not fit in dst.\n");
+    gen("  // A short buffer is a refusal, not a truncation: half a JSON object is not a\n");
+    gen("  // shorter object but a syntax error, and this text goes out as the\n");
+    gen("  // structuredContent of a protocol reply.\n");
     gen("function "); genname(); gen(".write(dst: array of char; at: int; r: array of "); genname();
     gen("; src: array of char): int;\nvar v1: int;\n    first: bool;\nbegin\n");
     gen("  at := json.putb(dst, at, '{');\n  first := true;\n  v1 := 0;\n");
@@ -3092,6 +3222,7 @@ long declschema(){
     if(ngl >= MAXG){ fail("too many globals"); }
     gnam[ngl] = intern(); gkind[ngl] = SK_CONST; gtyp[ngl] = T_STR; gval[ngl] = scjs[nsc];
     garr[ngl] = 0; glo[ngl] = 0; ghi[ngl] = 0;
+    gindex(ngl);
     ngl = ngl + 1;
     nsc = nsc + 1;
     /* generate, then compile the generated text like an include */
@@ -3153,6 +3284,7 @@ long gentools(){
     if(ngl >= MAXG){ fail("too many globals"); }
     gnam[ngl] = intern(); gkind[ngl] = SK_CONST; gtyp[ngl] = T_STR; gval[ngl] = tlseen;
     garr[ngl] = 0; glo[ngl] = 0; ghi[ngl] = 0;
+    gindex(ngl);
     ngl = ngl + 1;
     /* --- constants, argument/result records, handler declarations --- */
     gen("\nconst\n  tool.count = "); gennum(ntl); gen(";\n");
@@ -3165,7 +3297,7 @@ long gentools(){
         gen("  tool.out_"); gentl(i); gen(": "); gensc(tlout[i]); gen(";\n");
         i = i + 1;
     }
-    gen("\n{ a handler returns 0, or calls tool.fail with a message and returns its result }\n");
+    gen("\n// a handler returns 0, or calls tool.fail with a message and returns its result\n");
     gen("function tool.fail(s: str): int;\nbegin\n  tool.errn := io.push(tool.err, 0, s);\n  return 1;\nend;\n");
     i = 0;
     while(i < ntl){
@@ -3181,10 +3313,10 @@ long gentools(){
     }
     gen("  return -1;\nend;\n");
     /* --- run: parse arguments, call the handler, write the result JSON into dst --- */
-    gen("\n{ returns the length written, -1 for bad arguments, -2 when the handler failed\n");
-    gen("  (see tool.err), -3 when the result JSON does not fit in dst.  The writer\n");
-    gen("  refuses rather than truncating -- half an object is a syntax error -- and -3\n");
-    gen("  keeps that apart from -1, which would blame the caller's arguments for it. }\n");
+    gen("\n// returns the length written, -1 for bad arguments, -2 when the handler failed\n");
+    gen("  // (see tool.err), -3 when the result JSON does not fit in dst.  The writer\n");
+    gen("  // refuses rather than truncating -- half an object is a syntax error -- and -3\n");
+    gen("  // keeps that apart from -1, which would blame the caller's arguments for it.\n");
     gen("function tool.run(idx: int; b: array of char; at: int; upto: int; dst: array of char): int;\nvar rc: int;\nbegin\n  rc := 0;\n  tool.errn := 0;\n  case idx of\n");
     i = 0;
     while(i < ntl){
@@ -3288,6 +3420,7 @@ long declroutine(long isproc){
         if(nfn >= MAXF){ fail("too many routines"); }
         fi = nfn; nfn = nfn + 1;
         fnam[fi] = intern(); fdef[fi] = 0; fadr[fi] = 0;
+        findex(fi);
     }
     next();
     nloc = 0; frame = 0;
@@ -3431,12 +3564,12 @@ long declroutine(long isproc){
 /* the Windows runtime, compiled into every .exe before the program     */
 /* ------------------------------------------------------------------ */
 long genwin(){
-    gen("{ Windows runtime: the Linux system calls a Wantzel program uses, mapped onto\n");
-    gen("  kernel32 and ws2_32.  __wsys receives the Linux syscall number and its\n");
-    gen("  arguments and does the Windows equivalent; __winit turns the command line\n");
-    gen("  into an argc/argv block.  All of this is ordinary Wantzel, compiled into every\n");
-    gen("  .exe ahead of the program, so the code generator needs no Windows knowledge.\n");
-    gen("  epoll is emulated over WSAPoll, with a small interest table kept here. }\n");
+    gen("// Windows runtime: the Linux system calls a Wantzel program uses, mapped onto\n");
+    gen("  // kernel32 and ws2_32.  __wsys receives the Linux syscall number and its\n");
+    gen("  // arguments and does the Windows equivalent; __winit turns the command line\n");
+    gen("  // into an argc/argv block.  All of this is ordinary Wantzel, compiled into every\n");
+    gen("  // .exe ahead of the program, so the code generator needs no Windows knowledge.\n");
+    gen("  // epoll is emulated over WSAPoll, with a small interest table kept here.\n");
     gen("const\n");
     gen("  __K_GETSTDHANDLE = 0;\n");
     gen("  __K_WRITEFILE = 1;\n");
@@ -3483,18 +3616,18 @@ long genwin(){
     gen("  __wargs: array[0..4095] of char;\n");
     gen("  __wdig: array[0..31] of char;\n");
     gen("  __wcount, __wdummy, __wstarted: int;\n");
-    gen("  __wsh: array[0..__WMAXFD - 1] of int;      { socket handle for small fd, or 0 }\n");
-    gen("  __wev: array[0..__WMAXFD - 1] of int;      { epoll events requested for fd }\n");
-    gen("  __wpoll: array[0..__WMAXFD * 16 - 1] of char;   { WSAPOLLFD array }\n");
-    gen("  __wrow: array[0..__WMAXFD - 1] of int;     { poll row -> fd }\n");
-    gen("  __wsa: array[0..15] of char;               { a working sockaddr }\n");
+    gen("  __wsh: array[0..__WMAXFD - 1] of int;   // socket handle for small fd, or 0\n");
+    gen("  __wev: array[0..__WMAXFD - 1] of int;   // epoll events requested for fd\n");
+    gen("  __wpoll: array[0..__WMAXFD * 16 - 1] of char;   // WSAPOLLFD array\n");
+    gen("  __wrow: array[0..__WMAXFD - 1] of int;   // poll row -> fd\n");
+    gen("  __wsa: array[0..15] of char;   // a working sockaddr\n");
     gen("  __wtime: array[0..7] of char;\n");
-    gen("  __wdh: array[0..__WMAXFD - 1] of int;   { FindFirst handle per dir fd, or 0 }\n");
-    gen("  __wdfirst: array[0..__WMAXFD - 1] of int; { 1 = first entry already in __wfd32 }\n");
-    gen("  __wfind: array[0..319] of char;          { WIN32_FIND_DATAA }\n");
-    gen("  __wpath: array[0..1039] of char;         { path + backslash-star }\n");
-    gen("  __wovl: array[0..31] of char;            { a zeroed OVERLAPPED for LockFileEx }\n");
-    gen("  __wpos: array[0..7] of char;             { SetFilePointerEx result }\n");
+    gen("  __wdh: array[0..__WMAXFD - 1] of int;   // FindFirst handle per dir fd, or 0\n");
+    gen("  __wdfirst: array[0..__WMAXFD - 1] of int;   // 1 = first entry already in __wfd32\n");
+    gen("  __wfind: array[0..319] of char;   // WIN32_FIND_DATAA\n");
+    gen("  __wpath: array[0..1039] of char;   // path + backslash-star\n");
+    gen("  __wovl: array[0..31] of char;   // a zeroed OVERLAPPED for LockFileEx\n");
+    gen("  __wpos: array[0..7] of char;   // SetFilePointerEx result\n");
     gen("\n");
     gen("procedure __wp32(b: array of char; at: int; v: int);\n");
     gen("begin\n");
@@ -3539,7 +3672,7 @@ long genwin(){
     gen("  if __wissock(fd) then\n");
     gen("  begin\n");
     gen("    r := winapi(__W_SEND, __wsh[fd], a, n, 0);\n");
-    gen("    if r < 0 then return 0 - 11;             { treat as EAGAIN-ish }\n");
+    gen("    if r < 0 then return 0 - 11;   // treat as EAGAIN-ish\n");
     gen("    return r;\n");
     gen("  end;\n");
     gen("  __wcount := 0;\n");
@@ -3575,18 +3708,18 @@ long genwin(){
     gen("  if band(flags, 576) = 576 then disp := 2;\n");
     gen("  h := winapi(__K_CREATEFILEA, path, access, 3, 0, disp, 0x80, 0);\n");
     gen("  if h = 0 - 1 then return 0 - 1;\n");
-    gen("  if band(flags, 1024) <> 0 then __wdummy := winapi(__K_SETPTR, h, 0, 0, 2);   { O_APPEND: seek to the end }\n");
+    gen("  if band(flags, 1024) <> 0 then __wdummy := winapi(__K_SETPTR, h, 0, 0, 2);   // O_APPEND: seek to the end\n");
     gen("  return h;\n");
     gen("end;\n");
     gen("\n");
-    gen("{ mmap over CreateFileMapping/MapViewOfFile; fd < 0 maps the page file }\n");
+    gen("// mmap over CreateFileMapping/MapViewOfFile; fd < 0 maps the page file\n");
     gen("function __wmmap(n: int; prot: int; fd: int; off: int): int;\n");
     gen("var h, m, a, p, acc: int;\n");
     gen("begin\n");
-    gen("  p := 2; acc := 4;                          { PAGE_READONLY, FILE_MAP_READ }\n");
+    gen("  p := 2; acc := 4;   // PAGE_READONLY, FILE_MAP_READ\n");
     gen("  if band(prot, 2) <> 0 then\n");
     gen("  begin\n");
-    gen("    p := 4; acc := 0x0F001F;                 { PAGE_READWRITE, FILE_MAP_ALL_ACCESS }\n");
+    gen("    p := 4; acc := 0x0F001F;   // PAGE_READWRITE, FILE_MAP_ALL_ACCESS\n");
     gen("  end;\n");
     gen("  if fd < 0 then\n");
     gen("  begin\n");
@@ -3625,7 +3758,7 @@ long genwin(){
     gen("  return 0;\n");
     gen("end;\n");
     gen("\n");
-    gen("{ flock: LOCK_SH 1, LOCK_EX 2, LOCK_NB 4, LOCK_UN 8 over the whole file }\n");
+    gen("// flock: LOCK_SH 1, LOCK_EX 2, LOCK_NB 4, LOCK_UN 8 over the whole file\n");
     gen("function __wflock(fd: int; op: int): int;\n");
     gen("var h, flags, ok, i: int;\n");
     gen("begin\n");
@@ -3709,9 +3842,9 @@ long genwin(){
     gen("  return fd;\n");
     gen("end;\n");
     gen("\n");
-    gen("{ Winsock's sockaddr_in matches Linux's byte for byte for AF_INET: family at\n");
-    gen("  0 (2), port big-endian at 2, address at 4.  So the caller's 16-byte buffer\n");
-    gen("  passes straight through. }\n");
+    gen("// Winsock's sockaddr_in matches Linux's byte for byte for AF_INET: family at\n");
+    gen("  // 0 (2), port big-endian at 2, address at 4.  So the caller's 16-byte buffer\n");
+    gen("  // passes straight through.\n");
     gen("function __wbind(fd: int; sa: int; sln: int): int;\n");
     gen("var r: int;\n");
     gen("begin\n");
@@ -3735,7 +3868,7 @@ long genwin(){
     gen("begin\n");
     gen("  if not __wissock(fd) then return 0 - 9;\n");
     gen("  h := winapi(__W_ACCEPT, __wsh[fd], 0, 0);\n");
-    gen("  if h = 0 - 1 then return 0 - 11;           { WSAEWOULDBLOCK -> EAGAIN }\n");
+    gen("  if h = 0 - 1 then return 0 - 11;   // WSAEWOULDBLOCK -> EAGAIN\n");
     gen("  nfd := __wslot;\n");
     gen("  if nfd < 0 then\n");
     gen("  begin\n");
@@ -3746,14 +3879,14 @@ long genwin(){
     gen("  __wev[nfd] := 0;\n");
     gen("  nb := 1;\n");
     gen("  __wp32(__wsa, 0, nb);\n");
-    gen("  __wdummy := winapi(__W_IOCTL, h, 0x8004667E, addr(__wsa[0]));   { FIONBIO }\n");
+    gen("  __wdummy := winapi(__W_IOCTL, h, 0x8004667E, addr(__wsa[0]));   // FIONBIO\n");
     gen("  return nfd;\n");
     gen("end;\n");
     gen("\n");
     gen("function __wsetopt(fd: int; opt: int; a: int; sln: int): int;\n");
     gen("begin\n");
     gen("  if not __wissock(fd) then return 0 - 9;\n");
-    gen("  { SO_REUSEADDR is 4 on Windows; SO_REUSEPORT does not exist, ignore it }\n");
+    gen("  // SO_REUSEADDR is 4 on Windows; SO_REUSEPORT does not exist, ignore it\n");
     gen("  if opt = 15 then return 0;\n");
     gen("  __wdummy := winapi(__W_SETSOCKOPT, __wsh[fd], 0xFFFF, 4, a, sln);\n");
     gen("  return 0;\n");
@@ -3777,7 +3910,7 @@ long genwin(){
     gen("  poke(a + 3, band(v shr 24, 255));\n");
     gen("end;\n");
     gen("\n");
-    gen("{ epoll_ctl: op 1=ADD, 2=DEL, 3=MOD.  The event mask sits at [ev+0]. }\n");
+    gen("// epoll_ctl: op 1=ADD, 2=DEL, 3=MOD.  The event mask sits at [ev+0].\n");
     gen("function __wepctl(op: int; fd: int; ev: int): int;\n");
     gen("var mask: int;\n");
     gen("begin\n");
@@ -3794,8 +3927,8 @@ long genwin(){
     gen("  return 0;\n");
     gen("end;\n");
     gen("\n");
-    gen("{ epoll_wait: build a WSAPOLLFD array from the interest table, poll it, then\n");
-    gen("  write ready events into the caller's array (12 bytes each: events, fd). }\n");
+    gen("// epoll_wait: build a WSAPOLLFD array from the interest table, poll it, then\n");
+    gen("  // write ready events into the caller's array (12 bytes each: events, fd).\n");
     gen("function __wepwait(a: int; maxev: int; timeout: int): int;\n");
     gen("var i, np, r, k, out, revents, ev, base, pe: int;\n");
     gen("begin\n");
@@ -3809,8 +3942,8 @@ long genwin(){
     gen("      __wp32(__wpoll, base, band(__wsh[i], 0xFFFFFFFF));\n");
     gen("      __wp32(__wpoll, base + 4, __wsh[i] shr 32);\n");
     gen("      ev := 0;\n");
-    gen("      if band(__wev[i], 1) <> 0 then ev := bor(ev, 0x0300);   { IN -> RDNORM|RDBAND }\n");
-    gen("      if band(__wev[i], 4) <> 0 then ev := bor(ev, 0x0010);   { OUT -> WRNORM }\n");
+    gen("      if band(__wev[i], 1) <> 0 then ev := bor(ev, 0x0300);   // IN -> RDNORM|RDBAND\n");
+    gen("      if band(__wev[i], 4) <> 0 then ev := bor(ev, 0x0010);   // OUT -> WRNORM\n");
     gen("      __wpoll[base + 8] := chr(band(ev, 255));\n");
     gen("      __wpoll[base + 9] := chr(band(ev shr 8, 255));\n");
     gen("      __wpoll[base + 10] := chr(0);\n");
@@ -3841,10 +3974,10 @@ long genwin(){
     gen("    if revents <> 0 then\n");
     gen("    begin\n");
     gen("      ev := 0;\n");
-    gen("      if band(revents, 0x0300) <> 0 then ev := bor(ev, 1);   { IN }\n");
-    gen("      if band(revents, 0x0010) <> 0 then ev := bor(ev, 4);   { OUT }\n");
-    gen("      if band(revents, 0x0001) <> 0 then ev := bor(ev, 8);   { ERR }\n");
-    gen("      if band(revents, 0x0002) <> 0 then ev := bor(ev, 16);  { HUP }\n");
+    gen("      if band(revents, 0x0300) <> 0 then ev := bor(ev, 1);   // IN\n");
+    gen("      if band(revents, 0x0010) <> 0 then ev := bor(ev, 4);   // OUT\n");
+    gen("      if band(revents, 0x0001) <> 0 then ev := bor(ev, 8);   // ERR\n");
+    gen("      if band(revents, 0x0002) <> 0 then ev := bor(ev, 16);   // HUP\n");
     gen("      pe := a + out * 12;\n");
     gen("      __wput32abs(pe, ev);\n");
     gen("      __wput32abs(pe + 4, __wrow[k]);\n");
@@ -3857,8 +3990,8 @@ long genwin(){
     gen("  return out;\n");
     gen("end;\n");
     gen("\n");
-    gen("{ clock_gettime-ish: return nanoseconds since the Unix epoch, good enough for\n");
-    gen("  the io.now() the library exposes.  FILETIME is 100ns ticks since 1601. }\n");
+    gen("// clock_gettime-ish: return nanoseconds since the Unix epoch, good enough for\n");
+    gen("  // the io.now() the library exposes.  FILETIME is 100ns ticks since 1601.\n");
     gen("function __wnow: int;\n");
     gen("var lo, hi, t: int;\n");
     gen("begin\n");
@@ -3866,28 +3999,28 @@ long genwin(){
     gen("  lo := __wg32(__wtime, 0);\n");
     gen("  hi := __wg32(__wtime, 4);\n");
     gen("  t := bor(lo, hi shl 32);\n");
-    gen("  t := t - 116444736000000000;           { 1601 -> 1970 in 100ns ticks }\n");
-    gen("  return t * 100;                         { 100ns -> ns }\n");
+    gen("  t := t - 116444736000000000;   // 1601 -> 1970 in 100ns ticks\n");
+    gen("  return t * 100;   // 100ns -> ns\n");
     gen("end;\n");
     gen("\n");
-    gen("{ WIN32_FIND_DATAA: dwFileAttributes at 0, ftLastWriteTime at 20 (8 bytes),\n");
-    gen("  nFileSizeHigh at 28, nFileSizeLow at 32, cFileName at 44 (260 bytes). }\n");
+    gen("// WIN32_FIND_DATAA: dwFileAttributes at 0, ftLastWriteTime at 20 (8 bytes),\n");
+    gen("  // nFileSizeHigh at 28, nFileSizeLow at 32, cFileName at 44 (260 bytes).\n");
     gen("function __wattr_isdir(attr: int): bool;\n");
     gen("begin\n");
-    gen("  return band(attr, 16) <> 0;      { FILE_ATTRIBUTE_DIRECTORY }\n");
+    gen("  return band(attr, 16) <> 0;   // FILE_ATTRIBUTE_DIRECTORY\n");
     gen("end;\n");
     gen("\n");
-    gen("{ GetFileAttributesExA fills a WIN32_FILE_ATTRIBUTE_DATA (36 bytes):\n");
-    gen("  attributes at 0, ftLastWriteTime at 20, sizeHigh at 28, sizeLow at 32. }\n");
+    gen("// GetFileAttributesExA fills a WIN32_FILE_ATTRIBUTE_DATA (36 bytes):\n");
+    gen("  // attributes at 0, ftLastWriteTime at 20, sizeHigh at 28, sizeLow at 32.\n");
     gen("function __wstatinto(path: int; stbuf: int): int;\n");
     gen("var ok, attr, mode, sz, lo, hi, mt, mlo, mhi: int;\n");
     gen("begin\n");
-    gen("  ok := winapi(__K_GETATTREX, path, 0, addr(__wfind[0]));   { GetFileAttributesExA }\n");
+    gen("  ok := winapi(__K_GETATTREX, path, 0, addr(__wfind[0]));   // GetFileAttributesExA\n");
     gen("  if band(ok, 0xFFFFFFFF) = 0 then return 0 - 2;\n");
     gen("  attr := __wg32(__wfind, 0);\n");
-    gen("  mode := 0x8000;                                            { S_IFREG }\n");
-    gen("  if __wattr_isdir(attr) then mode := 0x4000;               { S_IFDIR }\n");
-    gen("  mode := bor(mode, 0x1FF);                                  { rwxrwxrwx bits }\n");
+    gen("  mode := 0x8000;   // S_IFREG\n");
+    gen("  if __wattr_isdir(attr) then mode := 0x4000;   // S_IFDIR\n");
+    gen("  mode := bor(mode, 0x1FF);   // rwxrwxrwx bits\n");
     gen("  lo := __wg32(__wfind, 32);\n");
     gen("  hi := __wg32(__wfind, 28);\n");
     gen("  sz := bor(band(lo, 0xFFFFFFFF), hi shl 32);\n");
@@ -3895,8 +4028,8 @@ long genwin(){
     gen("  mhi := __wg32(__wfind, 24);\n");
     gen("  mt := bor(band(mlo, 0xFFFFFFFF), mhi shl 32);\n");
     gen("  mt := mt - 116444736000000000;\n");
-    gen("  mt := mt div 10000000;                                     { 100ns ticks -> seconds }\n");
-    gen("  { mode at offset 24, size at 48, mtime at 88 (see lib/fs.wz) }\n");
+    gen("  mt := mt div 10000000;   // 100ns ticks -> seconds\n");
+    gen("  // mode at offset 24, size at 48, mtime at 88 (see lib/fs.wz)\n");
     gen("  __wput32abs(stbuf + 24, mode);\n");
     gen("  __wput32abs(stbuf + 48, band(sz, 0xFFFFFFFF));\n");
     gen("  __wput32abs(stbuf + 52, sz shr 32);\n");
@@ -3905,7 +4038,7 @@ long genwin(){
     gen("  return 0;\n");
     gen("end;\n");
     gen("\n");
-    gen("{ opendir(path): start a FindFirstFileA over path\\* and return a dir fd }\n");
+    gen("// opendir(path): start a FindFirstFileA over path\\* and return a dir fd\n");
     gen("function __wopendir(path: int): int;\n");
     gen("var i, o, h, fd: int;\n");
     gen("    c: char;\n");
@@ -3933,15 +4066,15 @@ long genwin(){
     gen("    __wdummy := winapi(__K_FINDCLOSE, h);\n");
     gen("    return 0 - 24;\n");
     gen("  end;\n");
-    gen("  __wsh[fd] := 0 - 2;              { mark the slot busy but not a socket }\n");
+    gen("  __wsh[fd] := 0 - 2;   // mark the slot busy but not a socket\n");
     gen("  __wdh[fd] := h;\n");
-    gen("  __wdfirst[fd] := 1;             { the first entry is already in __wfind }\n");
+    gen("  __wdfirst[fd] := 1;   // the first entry is already in __wfind\n");
     gen("  return fd;\n");
     gen("end;\n");
     gen("\n");
-    gen("{ getdents into the caller's buffer at address a, capacity cap.  Emits Linux\n");
-    gen("  dirent64-ish records: reclen (2 bytes) at +16, type (1 byte) at +18, the\n");
-    gen("  NUL-terminated name from +19.  Returns bytes written, or 0 at the end. }\n");
+    gen("// getdents into the caller's buffer at address a, capacity cap.  Emits Linux\n");
+    gen("  // dirent64-ish records: reclen (2 bytes) at +16, type (1 byte) at +18, the\n");
+    gen("  // NUL-terminated name from +19.  Returns bytes written, or 0 at the end.\n");
     gen("function __wgetdents(fd: int; a: int; cap: int): int;\n");
     gen("var used, attr, i, nl, reclen, base, more, t: int;\n");
     gen("    c: char;\n");
@@ -3956,7 +4089,7 @@ long genwin(){
     gen("      if band(more, 0xFFFFFFFF) = 0 then break;\n");
     gen("    end;\n");
     gen("    __wdfirst[fd] := 0;\n");
-    gen("    { name length }\n");
+    gen("    // name length\n");
     gen("    nl := 0;\n");
     gen("    while nl < 259 do\n");
     gen("    begin\n");
@@ -3967,20 +4100,20 @@ long genwin(){
     gen("    reclen := (reclen + 7) div 8 * 8;\n");
     gen("    if used + reclen > cap then\n");
     gen("    begin\n");
-    gen("      { no room: reprocess this entry next call by pretending it is first }\n");
+    gen("      // no room: reprocess this entry next call by pretending it is first\n");
     gen("      __wdfirst[fd] := 1;\n");
     gen("      break;\n");
     gen("    end;\n");
     gen("    base := a + used;\n");
-    gen("    __wput32abs(base, 0);            { d_ino low }\n");
+    gen("    __wput32abs(base, 0);   // d_ino low\n");
     gen("    __wput32abs(base + 4, 0);\n");
-    gen("    __wput32abs(base + 8, 0);        { d_off }\n");
+    gen("    __wput32abs(base + 8, 0);   // d_off\n");
     gen("    __wput32abs(base + 12, 0);\n");
     gen("    poke(base + 16, band(reclen, 255));\n");
     gen("    poke(base + 17, band(reclen shr 8, 255));\n");
     gen("    attr := __wg32(__wfind, 0);\n");
-    gen("    t := 8;                          { DT_REG }\n");
-    gen("    if __wattr_isdir(attr) then t := 4;   { DT_DIR }\n");
+    gen("    t := 8;   // DT_REG\n");
+    gen("    if __wattr_isdir(attr) then t := 4;   // DT_DIR\n");
     gen("    poke(base + 18, t);\n");
     gen("    i := 0;\n");
     gen("    while i < nl do\n");
@@ -4002,29 +4135,29 @@ long genwin(){
     gen("  if nr = 0 then return __wread(a, b, c);\n");
     gen("  if nr = 2 then\n");
     gen("  begin\n");
-    gen("    if band(b, 65536) <> 0 then return __wopendir(a);   { O_DIRECTORY }\n");
+    gen("    if band(b, 65536) <> 0 then return __wopendir(a);   // O_DIRECTORY\n");
     gen("    return __wopen(a, b);\n");
     gen("  end;\n");
-    gen("  if (nr = 4) or (nr = 6) then return __wstatinto(a, b);  { stat / lstat }\n");
-    gen("  if nr = 217 then return __wgetdents(a, b, c);           { getdents }\n");
+    gen("  if (nr = 4) or (nr = 6) then return __wstatinto(a, b);   // stat / lstat\n");
+    gen("  if nr = 217 then return __wgetdents(a, b, c);   // getdents\n");
     gen("  if nr = 3 then\n");
     gen("  begin\n");
     gen("    __wclose(a);\n");
     gen("    return 0;\n");
     gen("  end;\n");
-    gen("  if nr = 41 then return __wsock;                         { socket }\n");
-    gen("  if nr = 49 then return __wbind(a, b, c);                { bind }\n");
-    gen("  if nr = 50 then return __wlisten(a, b);                 { listen }\n");
-    gen("  if nr = 43 then return __waccept(a);                    { accept }\n");
-    gen("  if nr = 288 then return __waccept(a);                   { accept4 }\n");
-    gen("  if nr = 54 then return __wsetopt(a, c, d, e);           { setsockopt }\n");
-    gen("  if nr = 72 then return __wnonblock(a);                  { fcntl F_SETFL }\n");
-    gen("  if nr = 44 then return __wwrite(a, b, c);               { sendto -> send }\n");
-    gen("  if nr = 48 then return 0;                               { shutdown: no-op }\n");
-    gen("  if nr = 291 then return 1000000;                        { epoll_create -> token }\n");
-    gen("  if nr = 233 then return __wepctl(b, c, d);              { epoll_ctl }\n");
-    gen("  if nr = 232 then return __wepwait(b, c, d);             { epoll_wait }\n");
-    gen("  if nr = 228 then                                        { clock_gettime: fill the timespec }\n");
+    gen("  if nr = 41 then return __wsock;   // socket\n");
+    gen("  if nr = 49 then return __wbind(a, b, c);   // bind\n");
+    gen("  if nr = 50 then return __wlisten(a, b);   // listen\n");
+    gen("  if nr = 43 then return __waccept(a);   // accept\n");
+    gen("  if nr = 288 then return __waccept(a);   // accept4\n");
+    gen("  if nr = 54 then return __wsetopt(a, c, d, e);   // setsockopt\n");
+    gen("  if nr = 72 then return __wnonblock(a);   // fcntl F_SETFL\n");
+    gen("  if nr = 44 then return __wwrite(a, b, c);   // sendto -> send\n");
+    gen("  if nr = 48 then return 0;   // shutdown: no-op\n");
+    gen("  if nr = 291 then return 1000000;   // epoll_create -> token\n");
+    gen("  if nr = 233 then return __wepctl(b, c, d);   // epoll_ctl\n");
+    gen("  if nr = 232 then return __wepwait(b, c, d);   // epoll_wait\n");
+    gen("  if nr = 228 then   // clock_gettime: fill the timespec\n");
     gen("  begin\n");
     gen("    t := __wnow;\n");
     gen("    __wput32abs(b, band(t div 1000000000, 0xFFFFFFFF));\n");
@@ -4033,63 +4166,63 @@ long genwin(){
     gen("    __wput32abs(b + 12, 0);\n");
     gen("    return 0;\n");
     gen("  end;\n");
-    gen("  if nr = 9 then return __wmmap(b, c, e, f);               { mmap }\n");
-    gen("  if nr = 11 then                                         { munmap }\n");
+    gen("  if nr = 9 then return __wmmap(b, c, e, f);   // mmap\n");
+    gen("  if nr = 11 then   // munmap\n");
     gen("  begin\n");
     gen("    __wdummy := winapi(__K_UNMAPVIEW, a);\n");
     gen("    return 0;\n");
     gen("  end;\n");
-    gen("  if nr = 26 then                                         { msync }\n");
+    gen("  if nr = 26 then   // msync\n");
     gen("  begin\n");
     gen("    __wdummy := winapi(__K_FLUSHVIEW, a, b);\n");
     gen("    return 0;\n");
     gen("  end;\n");
-    gen("  if nr = 74 then                                         { fsync }\n");
+    gen("  if nr = 74 then   // fsync\n");
     gen("  begin\n");
     gen("    __wdummy := winapi(__K_FLUSHFILE, __whandle(a));\n");
     gen("    return 0;\n");
     gen("  end;\n");
-    gen("  if nr = 82 then                                         { rename }\n");
+    gen("  if nr = 82 then   // rename\n");
     gen("  begin\n");
-    gen("    t := winapi(__K_MOVEFILE, a, b, 9);                  { REPLACE_EXISTING | WRITE_THROUGH }\n");
+    gen("    t := winapi(__K_MOVEFILE, a, b, 9);   // REPLACE_EXISTING | WRITE_THROUGH\n");
     gen("    if band(t, 0xFFFFFFFF) = 0 then return 0 - 2;\n");
     gen("    return 0;\n");
     gen("  end;\n");
-    gen("  if nr = 8 then return __wlseek(a, b, c);                { lseek }\n");
-    gen("  if nr = 77 then return __wftruncate(a, b);              { ftruncate }\n");
-    gen("  if nr = 87 then                                         { unlink }\n");
+    gen("  if nr = 8 then return __wlseek(a, b, c);   // lseek\n");
+    gen("  if nr = 77 then return __wftruncate(a, b);   // ftruncate\n");
+    gen("  if nr = 87 then   // unlink\n");
     gen("  begin\n");
     gen("    t := winapi(__K_DELETEFILE, a);\n");
     gen("    if band(t, 0xFFFFFFFF) = 0 then return 0 - 2;\n");
     gen("    return 0;\n");
     gen("  end;\n");
-    gen("  if nr = 83 then                                         { mkdir }\n");
+    gen("  if nr = 83 then   // mkdir\n");
     gen("  begin\n");
     gen("    t := winapi(__K_CREATEDIR, a, 0);\n");
     gen("    if band(t, 0xFFFFFFFF) = 0 then return 0 - 17;\n");
     gen("    return 0;\n");
     gen("  end;\n");
-    gen("  if nr = 84 then                                         { rmdir }\n");
+    gen("  if nr = 84 then   // rmdir\n");
     gen("  begin\n");
     gen("    t := winapi(__K_REMOVEDIR, a);\n");
     gen("    if band(t, 0xFFFFFFFF) = 0 then return 0 - 2;\n");
     gen("    return 0;\n");
     gen("  end;\n");
-    gen("  if nr = 73 then return __wflock(a, b);                  { flock }\n");
-    gen("  if nr = 318 then                                        { getrandom }\n");
+    gen("  if nr = 73 then return __wflock(a, b);   // flock\n");
+    gen("  if nr = 318 then   // getrandom\n");
     gen("  begin\n");
     gen("    t := winapi(__A_RANDOM, a, b);\n");
     gen("    if band(t, 0xFF) = 0 then return 0 - 1;\n");
     gen("    return b;\n");
     gen("  end;\n");
-    gen("  if nr = 35 then                                         { nanosleep }\n");
+    gen("  if nr = 35 then   // nanosleep\n");
     gen("  begin\n");
     gen("    __wdummy := winapi(__K_SLEEP, 1);\n");
     gen("    return 0;\n");
     gen("  end;\n");
-    gen("  if nr = 90 then return 0;                               { chmod: no-op }\n");
-    gen("  if nr = 57 then return 0;   { fork: no worker processes, run single-process }\n");
-    gen("  if nr = 61 then return 0;   { wait4: nothing to wait for }\n");
+    gen("  if nr = 90 then return 0;   // chmod: no-op\n");
+    gen("  if nr = 57 then return 0;   // fork: no worker processes, run single-process\n");
+    gen("  if nr = 61 then return 0;   // wait4: nothing to wait for\n");
     gen("  if (nr = 60) or (nr = 231) then winapi(__K_EXITPROCESS, band(a, 0xFFFFFFFF));\n");
     gen("  __wputs(\"runtime error: an unsupported system call was made on Windows\\n\");\n");
     gen("  winapi(__K_EXITPROCESS, 70);\n");

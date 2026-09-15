@@ -12,7 +12,7 @@ mkdir -p bin
 # Every file this script installs is written under a temporary name and RENAMED into
 # place.  A rename within one filesystem is atomic: a reader sees either the old file or
 # the new one, never half of one.  That matters because the suite rebuilds while the
-# rest of it is running -- tests/toolchain/freeze.sh calls this script, and test.sh,
+# rest of it is running -- tests/toolchain/all_suites_green.sh calls this script, and test.sh,
 # test-win.sh and embedded_lib_current.sh read bin/wantzel0 and src/embedded.wz.  Writing
 # in place gave those readers a truncated file: `cc -o bin/wantzel0` empties the target
 # first, so a concurrent ./bin/wantzel0 got "Permission denied" (measured: 2 failures in

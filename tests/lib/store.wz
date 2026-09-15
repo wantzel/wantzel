@@ -105,13 +105,13 @@ begin
   if fs.stat(addr(path[0])) then show(suffix, fs.size) else show(suffix, -1);
 end;
 begin
-  { The working directory carries the PROCESS ID: with a fixed name two concurrent runs
-    collided on the same files, and this test also removes them midway to imitate an
-    unclean stop.  SYS.getpid lives in lib/io.wz. }
+  // The working directory carries the PROCESS ID: with a fixed name two concurrent runs
+  // collided on the same files, and this test also removes them midway to imitate an
+  // unclean stop.  SYS.getpid lives in lib/io.wz.
   dirn := io.push(dir, 0, "st_test_");
   dirn := io.pushnum(dir, dirn, sys1(SYS.getpid, 0));
   dirn := io.push(dir, dirn, ".d");
-  { a clean start: remove leftovers of an earlier run }
+  // a clean start: remove leftovers of an earlier run
   n := inwork("store.log"); sys1(SYS.unlink, addr(path[0]));
   n := inwork("store.snap"); sys1(SYS.unlink, addr(path[0]));
   show("record size = ", addr(it.name_n) - addr(it.id[0]) + 8);
@@ -126,14 +126,14 @@ begin
   show("high = ", store.high(tab));
   if store.del(tab, 3) then show("del row 3 ", 1) else show("del row 3 ", 0);
   show("count after del = ", store.count(tab));
-  show("alloc reuses = ", store.alloc(tab));               { 3 }
+  show("alloc reuses = ", store.alloc(tab));               // 3
   rebuildindex;
   show("find item 5 -> row ", find(5));
   show("find item 4 (deleted) -> ", find(4));
   copyfrom(view(store.rowaddr(tab, find(7)), 1));
   show("item 7 value x10 = ", trunc(it.value * 10.0));
   io.out(STDOUT, addr(it.name[0]), it.name_n); io.puts(STDOUT, "\n");
-  { an unclean stop: close without a snapshot, reopen, replay the log }
+  // an unclean stop: close without a snapshot, reopen, replay the log
   store.close;
   openstore;
   show("replayed count = ", store.count(tab));
@@ -142,7 +142,7 @@ begin
   rebuildindex;
   copyfrom(view(store.rowaddr(tab, find(10)), 1));
   show("replayed item 10 kind = ", it.kind);
-  { snapshot, add more, reopen: snapshot + log tail }
+  // snapshot, add more, reopen: snapshot + log tail
   if store.snapshot then show("snapshot ", 1) else show("snapshot ", 0);
   n := inwork("store.log"); filesize("store.log");
   row := put(11, 9, 11.0);
@@ -151,7 +151,7 @@ begin
   show("after snapshot+tail count = ", store.count(tab));
   rebuildindex;
   show("find item 11 -> row ", find(11));
-  { a torn tail: append garbage bytes to the log, reopen: the good records survive }
+  // a torn tail: append garbage bytes to the log, reopen: the good records survive
   store.close;
   n := inwork("store.log");
   fd := sys3(SYS.open, addr(path[0]), bor(O_WRONLY, O_APPEND), 0);
@@ -164,11 +164,11 @@ begin
   store.close;
   openstore;
   show("count after repair = ", store.count(tab));
-  { capacity }
+  // capacity
   n := 0;
   while put(100 + n, 0, 0.0) >= 0 do n := n + 1;
   show("filled up to = ", store.count(tab));
-  { hash table details }
+  // hash table details
   hash.clear(idx.rows);
   for i := 1 to 170 do
   begin
@@ -183,7 +183,7 @@ begin
   store.close;
   n := inwork("store.log"); sys1(SYS.unlink, addr(path[0]));
   n := inwork("store.snap"); sys1(SYS.unlink, addr(path[0]));
-  { the directory itself, not a file in it: so dir and not inwork }
+  // the directory itself, not a file in it: so dir and not inwork
   for n := 0 to dirn - 1 do path[n] := dir[n];
   path[dirn] := chr(0); show("rmdir = ", sys1(SYS.rmdir, addr(path[0])));
 end.

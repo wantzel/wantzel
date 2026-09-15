@@ -1,5 +1,10 @@
-# The language freeze: the toolchain suite, the Windows suite and this suite with
-# boot/wantzel byte comparison all pass, and the spec has no open "planned" items.
+# The release gate: the toolchain suite, the Windows suite and the byte comparison
+# between boot.c and the self-hosted compiler all pass, and the spec has no open
+# "planned" items left in section 9.
+#
+# It used to be called freeze.sh, from when the language was described as frozen. The
+# checks are the same and they are what matters: the two compilers agree down to the
+# byte, on both targets, and nothing in the spec is promised but not delivered.
 . "$ROOT/tests/helpers.sh"
 cd "$ROOT"
 ./build.sh >"$T/build.log" 2>&1 || { tail -5 "$T/build.log"; exit 1; }

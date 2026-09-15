@@ -43,11 +43,6 @@
         {
           "name": "comment.line.double-slash.wantzel",
           "match": "//.*$"
-        },
-        {
-          "name": "comment.block.wantzel",
-          "begin": "\\{",
-          "end": "\\}"
         }
       ]
     },

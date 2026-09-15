@@ -38,8 +38,8 @@ var
   src: array[0..63] of char;
   n: int;
   u: Unit;
-  tight: array[0..63] of char;      { room for some records and not others }
-  one: array[0..0] of char;         { not even room for the opening brace }
+  tight: array[0..63] of char;      // room for some records and not others
+  one: array[0..0] of char;         // not even room for the opening brace
   raw: array[0..3] of char;
 procedure show(s: str; v: int);
 begin io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n"); end;
@@ -54,7 +54,7 @@ begin
   r.total := 1234.5;
   r.ok := true;
   r.kind := Reply.kind.probe;
-  emit;                                            { required only; empty units array }
+  emit;                                            // required only; empty units array
   r.label_n := io.push(r.label, 0, "a \"quoted\" label");
   r.label_ok := true;
   r.units_n := 2;
@@ -64,31 +64,31 @@ begin
   r.values_n := 3;
   r.values[0] := -1; r.values[1] := 0; r.values[2] := 70000000000;
   emit;
-  r.label_ok := true; r.label_null := true;        { an explicit null }
+  r.label_ok := true; r.label_null := true;        // an explicit null
   n := io.push(src, 0, "raw \\u00e9 text");
-  r.note_at := 4; r.note_end := n;                 { a view into src is copied raw, escapes and all }
+  r.note_at := 4; r.note_end := n;                 // a view into src is copied raw, escapes and all
   r.note_ok := true;
-  r.kind := 7;                                     { outside the enum: written as null }
+  r.kind := 7;                                     // outside the enum: written as null
   r.total := 0.000001;
   emit;
   io.puts(STDOUT, Reply.jsonschema); io.puts(STDOUT, "\n");
 
-  { --- a buffer that is too small is refused, not overrun --- }
+  // --- a buffer that is too small is refused, not overrun ---
 
-  { the full record from above needs far more than 64 bytes }
+  // the full record from above needs far more than 64 bytes
   show("write into 64 = ", Reply.write(tight, 0, r, src));
 
-  { not even the opening brace fits }
+  // not even the opening brace fits
   show("write into 1 = ", Reply.write(one, 0, r, src));
 
-  { a position past the end of a roomy buffer is refused too }
+  // a position past the end of a roomy buffer is refused too
   show("write at 1024 of 1024 = ", Reply.write(out, 1024, r, src));
 
-  { a negative start position is refused rather than writing out[-1] }
+  // a negative start position is refused rather than writing out[-1]
   show("write at -1 = ", Reply.write(out, -1, r, src));
 
-  { a small record DOES fit in 64, so the guard does not refuse what is writable:
-    a nested schema is written by its own generated writer, on the same contract }
+  // a small record DOES fit in 64, so the guard does not refuse what is writable:
+  // a nested schema is written by its own generated writer, on the same contract
   Unit.clear(u);
   u.key_n := io.push(u.key, 0, "kwh");
   u.factor := 1.0;
@@ -96,28 +96,28 @@ begin
   show("Unit.write into 64 = ", n);
   if n > 0 then begin io.out(STDOUT, addr(tight[0]), n); io.puts(STDOUT, "\n"); end;
 
-  { The discriminating pair.  A `real` field needs 32 bytes of headroom (json.putreal
-    writes nothing at all without it, so the writer tests the room before the call),
-    which is what decides the boundary here rather than the 23 bytes the object
-    occupies.  One byte less than the boundary must be refused and the boundary itself
-    must succeed -- with the guard removed the first of these dies with `array index out
-    of range` instead of printing -1. }
+  // The discriminating pair.  A `real` field needs 32 bytes of headroom (json.putreal
+  // writes nothing at all without it, so the writer tests the room before the call),
+  // which is what decides the boundary here rather than the 23 bytes the object
+  // occupies.  One byte less than the boundary must be refused and the boundary itself
+  // must succeed -- with the guard removed the first of these dies with `array index out
+  // of range` instead of printing -1.
   show("Unit.write one byte too few = ", Unit.write(tight[0..52], 0, u, src));
   show("Unit.write exactly enough   = ", Unit.write(tight[0..53], 0, u, src));
 
-  { --- json.putraw stops at len(dst) instead of running off the end --- }
+  // --- json.putraw stops at len(dst) instead of running off the end ---
 
-  { more bytes than the buffer holds: truncated at len(dst), no crash }
+  // more bytes than the buffer holds: truncated at len(dst), no crash
   n := io.push(src, 0, "[1,2,3,4,5]");
   show("putraw 11 into 4 = ", json.putraw(raw, 0, src, 0, n));
 
-  { starting at the end writes nothing and does not move }
+  // starting at the end writes nothing and does not move
   show("putraw at len(dst) = ", json.putraw(raw, 4, src, 0, n));
 
-  { a negative position travels through unchanged instead of writing dst[-1] }
+  // a negative position travels through unchanged instead of writing dst[-1]
   show("putraw at -1 = ", json.putraw(raw, -1, src, 0, n));
 
-  { with room it copies verbatim, as before }
+  // with room it copies verbatim, as before
   n := io.push(src, 0, "[1,2]");
   n := json.putraw(out, 0, src, 0, n);
   show("putraw roomy = ", n);

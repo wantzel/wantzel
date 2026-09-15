@@ -9,10 +9,10 @@ procedure show(s: str; v: int);
 begin
   io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
 end;
-procedure app.hook(x: int); forward;              { a library-style callback }
+procedure app.hook(x: int); forward;              // a library-style callback
 procedure byvalue(x: int);
 begin
-  x := x + 100;                                   { does not reach the caller }
+  x := x + 100;                                   // does not reach the caller
 end;
 procedure fillarr(a: array of int; v: int);
 var i: int;
@@ -31,7 +31,7 @@ end;
 function zeroed: int;
 var k: int; a: array[0..3] of int;
 begin
-  k := k + a[3];                                  { both start at zero on every call }
+  k := k + a[3];                                  // both start at zero on every call
   a[3] := 9; 
   return k;
 end;

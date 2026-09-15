@@ -14,25 +14,25 @@ begin
   io.puts(STDOUT, "\n");
 end;
 begin
-  { the epoch and a known moment }
+  // the epoch and a known moment
   show("1970-01-01T00:00:00Z");
   show("2026-09-11T12:34:56Z");
-  { without a zone: read as UTC, so the same number }
+  // without a zone: read as UTC, so the same number
   show("2026-09-11T12:34:56");
-  { a bare date is midnight UTC }
+  // a bare date is midnight UTC
   show("2026-09-11");
   show("1970-01-02");
-  { a fraction is dropped }
+  // a fraction is dropped
   show("2026-09-11T12:34:56.123456");
   show("2026-09-11T12:34:56.5Z");
-  { offsets: east of UTC is earlier in UTC }
+  // offsets: east of UTC is earlier in UTC
   show("2026-09-11T12:34:56+02:00");
   show("2026-09-11T12:34:56-05:00");
   show("2026-09-11T12:34:56+0200");
   show("2026-09-11T12:34:56+00:00");
-  { a space instead of T, as Postgres writes it }
+  // a space instead of T, as Postgres writes it
   show("2026-09-11 12:34:56Z");
-  { refusals }
+  // refusals
   show("2026-09-11T12:34");
   show("2026-13-01T00:00:00Z");
   show("2026-02-30T00:00:00Z");

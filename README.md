@@ -10,6 +10,9 @@ standard library, so the download is the whole toolchain.
 > **Early days.** Anything may change before 1.0 — the language, the library, the
 > command-line interface.
 
+[**wantzel.com**](https://wantzel.com) — what the language is for, and why it is built this
+way.
+
 ## Start here
 
 Download a binary from [Releases](https://github.com/wantzel/wantzel/releases), or build
@@ -60,16 +63,16 @@ smaller programs.
 
 ## Numbers, all measured on one laptop
 
-A six-core machine, 14 September 2026. Reproduce them with `./build.sh` and `./wztest`.
+A six-core machine, 15 September 2026. Reproduce them with `./build.sh` and `./wztest`.
 
 | | |
 |---|---|
-| the compiler compiling itself | **27 ms** for 6,380 lines, about **236,000 lines/second** |
-| full bootstrap from C to a fixed point | **1 second** (`boot.c` → stage1 = stage2 = stage3) |
-| the whole test suite | **9.7 seconds**, 106 tests |
-| peak memory to compile the compiler | **1.9 MB** |
-| the compiler binary | **499 kB**, statically linked, no libc, no dynamic dependencies |
-| **50 compilers at once** | **352 ms** wall clock, all 50 succeeded, all 50 byte-identical |
+| the compiler compiling itself | **11 ms** for 6,487 lines, about **590,000 lines/second** |
+| full bootstrap from C to a fixed point | **270 ms** (`boot.c` → stage1 = stage2 = stage3) |
+| the whole test suite | **2.3 seconds**, 98 tests |
+| peak memory to compile the compiler | **2.9 MB** |
+| the compiler binary | **514 kB**, statically linked, no libc, no dynamic dependencies |
+| **50 compilers at once** | **130 ms** wall clock, all 50 succeeded, all 50 byte-identical |
 
 That last row is the one that matters for generated code. Fifty parallel agents, each
 compiling the whole compiler, finish in about a third of a second and together peak below
@@ -77,6 +80,18 @@ compiling the whole compiler, finish in about a third of a second and together p
 run, and a compile is cheap enough to put inside the loop rather than at the end of it.
 Byte-identical output under that load is the other half: when fifty agents build the same
 source, any difference between their binaries is a real difference, never a race.
+
+**And it holds as the source grows**, which is the part a single number cannot tell you.
+Name lookup goes through a hash index, so compile time grows in step with the program
+rather than with the square of it: 2,048 globals take 3 ms, 4,096 take 5 ms, 8,192 take
+8 ms and 16,384 take 16 ms. Doubling the names doubles the time. That is what keeps a
+compile inside the loop on a large generated source instead of only on a small one.
+
+The rate does depend on what the source is made of, so treat one number as one shape of
+code. The compiler's own source — dense procedural code — compiles at about 590,000 lines
+a second; a program built largely from `schema` and `tools` declarations, which generate a
+great deal of code per line written, runs at roughly a third of that. Both are the same
+compiler on the same machine.
 
 ## Why it is built this way
 
@@ -162,3 +177,6 @@ compiler is checked against it — but nothing here carries a compatibility prom
 
 MIT; see [LICENSE](LICENSE). Contributions are welcome: [CONTRIBUTING.md](CONTRIBUTING.md)
 says what is useful and how to report a bug.
+
+Questions, or something you built with it: <floris@wantzel.com>. Larger example
+applications are being built at [wantzel/demos](https://github.com/wantzel/demos).

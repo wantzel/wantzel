@@ -23,7 +23,7 @@ begin
   loc.weight := real(k) * 0.5;
   loc.active := true;
   loc.name[0] := 'L';
-  q := loc;                         { whole-record copy }
+  q := loc;                         // whole-record copy
 end;
 begin
   p.x := 3; p.y := 4;

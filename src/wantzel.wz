@@ -14,18 +14,24 @@
 program wantzel;
 
 const
-  { The release this compiler was built from.  It is reported by --version, and
-    tests/toolchain/release_assets.sh checks it against the git tag: a binary that
-    cannot say which version it is cannot be matched to a published checksum.
-    bootstrap/boot.c carries the same string. }
-  VERSION = "0.1.2";
+  // The release this compiler was built from.  It is reported by --version, and
+  // tests/toolchain/release_assets.sh checks it against the git tag: a binary that
+  // cannot say which version it is cannot be matched to a published checksum.
+  // bootstrap/boot.c carries the same string.
+  VERSION = "0.2.0";
   SRCMAX  = 67108864;
   CODEMAX = 67108864;
   DATMAX  = 33554432;
   NAMEMAX = 8388608;
-  FNPMAX  = 524000;   { the pool of source file names; fnpool holds 524288 }
+  FNPMAX  = 524000;   // the pool of source file names; fnpool holds 524288
   MAXG    = 16384;
   MAXF    = 8192;
+  // Buckets for the name index over globals and routines.  A power of two so the
+  // modulo is a mask, and four times MAXG so a full table still averages well under
+  // one name per bucket.  The index is what keeps a lookup from walking every name:
+  // without it, compiling 16,384 globals costs four times what 8,192 cost.
+  NHASH   = 65536;
+  HMASK   = 65535;
   MAXL    = 2048;
   MAXP    = 10;
   MAXFIX  = 4194304;
@@ -35,31 +41,31 @@ const
   JSMAX   = 4194304;
   SF_INT   = 1;
   SF_BOOL  = 2;
-  SF_TEXT  = 3;     { a view into the parsed buffer }
-  SF_JSON  = 4;     { any value, as a view }
-  SF_ENUM  = 5;     { text of (...) -> int }
+  SF_TEXT  = 3;     // a view into the parsed buffer
+  SF_JSON  = 4;     // any value, as a view
+  SF_ENUM  = 5;     // text of (...) -> int
   SF_REAL  = 6;
-  SF_TEXTN = 7;     { text[N]: an unescaped copy }
-  SF_SUB   = 8;     { a nested schema }
+  SF_TEXTN = 7;     // text[N]: an unescaped copy
+  SF_SUB   = 8;     // a nested schema
   TBMAX   = 4096;
-  { The standard library carried inside the compiler.  EMBMAX is the room for all of
-    lib/ together; the generated file is checked against these by the build. }
+  // The standard library carried inside the compiler.  EMBMAX is the room for all of
+  // lib/ together; the generated file is checked against these by the build.
   EMBMAX  = 4194304;
   EMBFILES = 64;
   EMBNAMES = 2048;
 
-  { types }
+  // types
   T_VOID = 0;
   T_INT  = 1;
   T_CHAR = 2;
   T_BOOL = 3;
   T_STR  = 4;
   T_REAL = 5;
-  T_REC  = 16;        { record type k has type code T_REC + k }
+  T_REC  = 16;        // record type k has type code T_REC + k
   MAXR   = 1024;
   MAXRF  = 32768;
 
-  { tokens: printable ASCII stands for itself }
+  // tokens: printable ASCII stands for itself
   TK_EOF    = 0;
   TK_INT    = 1;
   TK_CHR    = 2;
@@ -124,20 +130,20 @@ const
   FX_CALL = 1;
   FX_BSS  = 2;
   FX_BSS32 = 3;
-  FX_WSYS  = 4;       { call __wsys, the Windows system call emulation }
-  FX_WINIT = 5;       { call __winit, builds argv from the command line }
-  FX_IAT   = 6;       { rip-relative reference to an import table slot }
+  FX_WSYS  = 4;       // call __wsys, the Windows system call emulation
+  FX_WINIT = 5;       // call __winit, builds argv from the command line
+  FX_IAT   = 6;       // rip-relative reference to an import table slot
 
-  VBASE  = 4194304;   { 0x400000 }
-  HDRLEN = 120;       { ELF header; a PE header uses the whole buffer }
+  VBASE  = 4194304;   // 0x400000
+  HDRLEN = 120;       // ELF header; a PE header uses the whole buffer
   HDRMAX = 512;
-  { imported DLL functions.  The IAT holds KCOUNT kernel32 thunks, a null,
-    then WCOUNT ws2_32 thunks, a null.  winapi(slot) indexes slot*8 into the
-    IAT, so ws2_32 slots start at KCOUNT+1: the runtime numbers them that way. }
-  KCOUNT = 27;        { kernel32 functions, IAT slots 0..26 }
-  WCOUNT = 11;        { ws2_32 functions, IAT slots 28..38 }
-  ACOUNT = 1;         { advapi32 functions, IAT slot 40 }
-  NIMP   = 39;        { KCOUNT + WCOUNT + ACOUNT, total names in impname }
+  // imported DLL functions.  The IAT holds KCOUNT kernel32 thunks, a null,
+  // then WCOUNT ws2_32 thunks, a null.  winapi(slot) indexes slot*8 into the
+  // IAT, so ws2_32 slots start at KCOUNT+1: the runtime numbers them that way.
+  KCOUNT = 27;        // kernel32 functions, IAT slots 0..26
+  WCOUNT = 11;        // ws2_32 functions, IAT slots 28..38
+  ACOUNT = 1;         // advapi32 functions, IAT slot 40
+  NIMP   = 39;        // KCOUNT + WCOUNT + ACOUNT, total names in impname
 
 var
   src:     array[0..SRCMAX-1] of char;   srclen:  int;
@@ -156,36 +162,36 @@ var
   incpos, incend, incline, incfile: array[0..15] of int;
   incdepth, srcend, datmark: int;
   pathbuf: array[0..1023] of char;
-  libdir:  array[0..1023] of char;      { where the compiler looks for its library }
+  libdir:  array[0..1023] of char;      // where the compiler looks for its library
   libdirlen: int;
 
-  { THE LIBRARY, CARRIED INSIDE THE COMPILER.
-
-    A compiler that was downloaded rather than built has no lib/ beside it, so
-    include "io.wz" had nowhere to read from and the binary was useless for anything
-    but a program that includes nothing.  The sources now travel with it.
-
-    A file on disk still wins.  That way someone working in the repository edits
-    lib/io.wz and sees the effect immediately, which is the behaviour that matters
-    while the language is young; the embedded copy only answers when the file is not
-    there.  Filled by emb.fill in the generated src/embedded.wz. }
-  emb.src: array[0..EMBMAX - 1] of char;   { every library file, end to end }
+  // THE LIBRARY, CARRIED INSIDE THE COMPILER.
+  //
+  // A compiler that was downloaded rather than built has no lib/ beside it, so
+  // include "io.wz" had nowhere to read from and the binary was useless for anything
+  // but a program that includes nothing.  The sources now travel with it.
+  //
+  // A file on disk still wins.  That way someone working in the repository edits
+  // lib/io.wz and sees the effect immediately, which is the behaviour that matters
+  // while the language is young; the embedded copy only answers when the file is not
+  // there.  Filled by emb.fill in the generated src/embedded.wz.
+  emb.src: array[0..EMBMAX - 1] of char;   // every library file, end to end
   emb.len: int;
-  emb.nm: array[0..EMBNAMES - 1] of char;  { the names, nul-separated }
+  emb.nm: array[0..EMBNAMES - 1] of char;  // the names, nul-separated
   emb.nmlen: int;
-  emb.nmat: array[0..EMBFILES - 1] of int; { where each name starts in emb.nm }
-  emb.off: array[0..EMBFILES - 1] of int;  { where each source starts in emb.src }
-  emb.fin: array[0..EMBFILES - 1] of int;  { and where it stops }
+  emb.nmat: array[0..EMBFILES - 1] of int; // where each name starts in emb.nm
+  emb.off: array[0..EMBFILES - 1] of int;  // where each source starts in emb.src
+  emb.fin: array[0..EMBFILES - 1] of int;  // and where it stops
   emb.n: int;
-  { The IDENTITY of every file read in: st_dev and st_ino from stat(2).  That makes
-    "lib/io.wz" the same file as "../../elsewhere/lib/io.wz" -- and makes a TEST called
-    kv.wz something DIFFERENT from the library kv.wz, because the inode differs.
-    Comparing on the path string could do neither. }
+  // The IDENTITY of every file read in: st_dev and st_ino from stat(2).  That makes
+  // "lib/io.wz" the same file as "../../elsewhere/lib/io.wz" -- and makes a TEST called
+  // kv.wz something DIFFERENT from the library kv.wz, because the inode differs.
+  // Comparing on the path string could do neither.
   stbuf:  array[0..143] of char;
   fdev:   array[0..1023] of int;
-  { -1 for a real file, otherwise the index in the embedded table.  An embedded file has
-    no device and inode, so samefile cannot recognise it; this is how a second include of
-    the same library file is caught. }
+  // -1 for a real file, otherwise the index in the embedded table.  An embedded file has
+  // no device and inode, so samefile cannot recognise it; this is how a second include of
+  // the same library file is caught.
   filemb: array[0..1023] of int;
   fino:   array[0..1023] of int;
 
@@ -193,17 +199,27 @@ var
   garr, glo, ghi:          array[0..MAXG-1] of int;
   ngl, bsslen: int;
 
+  // The name index: for each bucket the newest entry in it, and for each entry the
+  // one before it in the same bucket.  -1 ends a chain.  Globals and routines have
+  // their own index because they are looked up separately.  Entries are only ever
+  // added -- ngl and nfn never shrink -- so a chain never has to be unlinked.
+  ghead: array[0..NHASH-1] of int;
+  gnext: array[0..MAXG-1] of int;
+  fhead: array[0..NHASH-1] of int;
+  fnext: array[0..MAXF-1] of int;
+  hashed: bool;                    // are the buckets initialised to -1 yet?
+
   fnam, frtyp, fnpar, fadr, fdef, fline, fnreg: array[0..MAXF-1] of int;
-  ffile: array[0..MAXF-1] of int;      { the file a forward declaration stood in }
+  ffile: array[0..MAXF-1] of int;      // the file a forward declaration stood in
   fptyp, fparr: array[0..MAXF*MAXP-1] of int;
   nfn: int;
 
-  { record types and their fields }
+  // record types and their fields
   rtnam, rtsize, rtf0, rtnf: array[0..MAXR-1] of int;
   nrt: int;
   fdnam, fdtyp, fdoff, fdarr, fdlo, fdhi: array[0..MAXRF-1] of int;
   nfd: int;
-  { the field path split off a dotted name, and what a designator resolved to }
+  // the field path split off a dotted name, and what a designator resolved to
   fpath: array[0..TBMAX-1] of char;
   fplen: int;
   refisarr, refet, reflo, refhi, refdyn, refidx, spli, spgi, allowslice: int;
@@ -225,8 +241,8 @@ var
   nfld: int;
   senum: array[0..MAXENUM * 64 - 1] of char;
   nenum: int;
-  scnam: array[0..MAXS * 64 - 1] of char;     { declared schemas, for nesting }
-  scjs:  array[0..MAXS - 1] of int;           { data offset of each schema's JSON Schema text }
+  scnam: array[0..MAXS * 64 - 1] of char;     // declared schemas, for nesting
+  scjs:  array[0..MAXS - 1] of int;           // data offset of each schema's JSON Schema text
   nsc: int;
   jsbuf: array[0..JSMAX - 1] of char;
   jslen: int;
@@ -243,11 +259,11 @@ var
   mi: int;
   lvkind, lvimm, lvoff, lvtype, lvpos, lvfx: int;
   elkind, eloff, eltype: int;
-  rlit: array[0..0] of real;            { scratch for the bits of a real literal }
+  rlit: array[0..0] of real;            // scratch for the bits of a real literal
 
-{ ------------------------------------------------------------------ }
-{ byte access and system calls                                        }
-{ ------------------------------------------------------------------ }
+// ------------------------------------------------------------------
+// byte access and system calls
+// ------------------------------------------------------------------
 
 function sch(s: str; i: int): int;
 begin
@@ -285,9 +301,9 @@ begin
   return sys3(0, fd, a, n);
 end;
 
-{ stat(2): fills stbuf.  Offset 0 is st_dev, offset 8 st_ino -- together they identify
-  a file UNIQUELY, whichever path you reach it by.  See lib/fs.wz, which reads the same
-  struct. }
+// stat(2): fills stbuf.  Offset 0 is st_dev, offset 8 st_ino -- together they identify
+// a file UNIQUELY, whichever path you reach it by.  See lib/fs.wz, which reads the same
+// struct.
 function stt(a: int): int;
 begin
   return sys2(4, a, addr(stbuf[0]));
@@ -313,13 +329,13 @@ begin
   wrbuf(fd, addr(fnpool[filenam[curfile]]), filelen[curfile]);
 end;
 
-{ the name of file fi, which is not necessarily the one being read now }
+// the name of file fi, which is not necessarily the one being read now
 procedure wrfile(fd: int; fi: int);
 begin
   wrbuf(fd, addr(fnpool[filenam[fi]]), filelen[fi]);
 end;
 
-{ an interned name, from the pool; they are NUL-terminated }
+// an interned name, from the pool; they are NUL-terminated
 procedure wrnam(fd: int; off: int);
 var n: int;
 begin
@@ -374,9 +390,9 @@ begin
   halt(1);
 end;
 
-{ ------------------------------------------------------------------ }
-{ lexer                                                               }
-{ ------------------------------------------------------------------ }
+// ------------------------------------------------------------------
+// lexer
+// ------------------------------------------------------------------
 
 function isal(c: int): bool;
 begin
@@ -413,50 +429,107 @@ begin
 end;
 
 function keyword: int;
+var c: int;
 begin
-  if eqt("program")   then return KW_PROGRAM;
-  if eqt("const")     then return KW_CONST;
-  if eqt("var")       then return KW_VAR;
-  if eqt("array")     then return KW_ARRAY;
-  if eqt("of")        then return KW_OF;
-  if eqt("function")  then return KW_FUNCTION;
-  if eqt("procedure") then return KW_PROCEDURE;
-  if eqt("forward")   then return KW_FORWARD;
-  if eqt("begin")     then return KW_BEGIN;
-  if eqt("end")       then return KW_END;
-  if eqt("if")        then return KW_IF;
-  if eqt("then")      then return KW_THEN;
-  if eqt("else")      then return KW_ELSE;
-  if eqt("while")     then return KW_WHILE;
-  if eqt("do")        then return KW_DO;
-  if eqt("repeat")    then return KW_REPEAT;
-  if eqt("until")     then return KW_UNTIL;
-  if eqt("return")    then return KW_RETURN;
-  if eqt("break")     then return KW_BREAK;
-  if eqt("continue")  then return KW_CONTINUE;
-  if eqt("div")       then return KW_DIV;
-  if eqt("mod")       then return KW_MOD;
-  if eqt("and")       then return KW_AND;
-  if eqt("or")        then return KW_OR;
-  if eqt("not")       then return KW_NOT;
-  if eqt("shl")       then return KW_SHL;
-  if eqt("shr")       then return KW_SHR;
-  if eqt("true")      then return KW_TRUE;
-  if eqt("false")     then return KW_FALSE;
-  if eqt("int")       then return KW_INT;
-  if eqt("char")      then return KW_CHAR;
-  if eqt("bool")      then return KW_BOOL;
-  if eqt("str")       then return KW_STR;
-  if eqt("include")   then return KW_INCLUDE;
-  if eqt("schema")    then return KW_SCHEMA;
-  if eqt("record")    then return KW_RECORD;
-  if eqt("real")      then return KW_REAL;
-  if eqt("type")      then return KW_TYPE;
-  if eqt("for")       then return KW_FOR;
-  if eqt("to")        then return KW_TO;
-  if eqt("downto")    then return KW_DOWNTO;
-  if eqt("case")      then return KW_CASE;
-  if eqt("tools")     then return KW_TOOLS;
+  // Dispatch on the first character before comparing.  Every identifier used to be
+  // compared against all 43 keywords in turn, so a name that is not a keyword -- which
+  // is nearly all of them -- paid for the whole list.  One comparison on the first byte
+  // cuts that to the handful of keywords that can still match.
+  c := tbufb(0);
+  if c = 97 then
+  begin
+    if eqt("array")     then return KW_ARRAY;
+    if eqt("and")       then return KW_AND;
+  end;
+  if c = 98 then
+  begin
+    if eqt("begin")     then return KW_BEGIN;
+    if eqt("break")     then return KW_BREAK;
+    if eqt("bool")      then return KW_BOOL;
+  end;
+  if c = 99 then
+  begin
+    if eqt("const")     then return KW_CONST;
+    if eqt("continue")  then return KW_CONTINUE;
+    if eqt("char")      then return KW_CHAR;
+    if eqt("case")      then return KW_CASE;
+  end;
+  if c = 100 then
+  begin
+    if eqt("do")        then return KW_DO;
+    if eqt("div")       then return KW_DIV;
+    if eqt("downto")    then return KW_DOWNTO;
+  end;
+  if c = 101 then
+  begin
+    if eqt("end")       then return KW_END;
+    if eqt("else")      then return KW_ELSE;
+  end;
+  if c = 102 then
+  begin
+    if eqt("function")  then return KW_FUNCTION;
+    if eqt("forward")   then return KW_FORWARD;
+    if eqt("false")     then return KW_FALSE;
+    if eqt("for")       then return KW_FOR;
+  end;
+  if c = 105 then
+  begin
+    if eqt("if")        then return KW_IF;
+    if eqt("int")       then return KW_INT;
+    if eqt("include")   then return KW_INCLUDE;
+  end;
+  if c = 109 then
+  begin
+    if eqt("mod")       then return KW_MOD;
+  end;
+  if c = 110 then
+  begin
+    if eqt("not")       then return KW_NOT;
+  end;
+  if c = 111 then
+  begin
+    if eqt("of")        then return KW_OF;
+    if eqt("or")        then return KW_OR;
+  end;
+  if c = 112 then
+  begin
+    if eqt("program")   then return KW_PROGRAM;
+    if eqt("procedure") then return KW_PROCEDURE;
+  end;
+  if c = 114 then
+  begin
+    if eqt("repeat")    then return KW_REPEAT;
+    if eqt("return")    then return KW_RETURN;
+    if eqt("record")    then return KW_RECORD;
+    if eqt("real")      then return KW_REAL;
+  end;
+  if c = 115 then
+  begin
+    if eqt("shl")       then return KW_SHL;
+    if eqt("shr")       then return KW_SHR;
+    if eqt("str")       then return KW_STR;
+    if eqt("schema")    then return KW_SCHEMA;
+  end;
+  if c = 116 then
+  begin
+    if eqt("then")      then return KW_THEN;
+    if eqt("true")      then return KW_TRUE;
+    if eqt("type")      then return KW_TYPE;
+    if eqt("to")        then return KW_TO;
+    if eqt("tools")     then return KW_TOOLS;
+  end;
+  if c = 117 then
+  begin
+    if eqt("until")     then return KW_UNTIL;
+  end;
+  if c = 118 then
+  begin
+    if eqt("var")       then return KW_VAR;
+  end;
+  if c = 119 then
+  begin
+    if eqt("while")     then return KW_WHILE;
+  end;
   return TK_ID;
 end;
 
@@ -473,12 +546,12 @@ begin
   return 0;
 end;
 
-{ One byte into the data segment, with the room checked BEFORE the write.
-
-  The order matters: checking afterwards means the byte that does not fit has
-  already been stored, so a source that fills the segment stops with a bounds
-  trap naming this compiler instead of a compile error naming the source.  Every
-  write into dat goes through here for that reason. }
+// One byte into the data segment, with the room checked BEFORE the write.
+//
+// The order matters: checking afterwards means the byte that does not fit has
+// already been stored, so a source that fills the segment stops with a bounds
+// trap naming this compiler instead of a compile error naming the source.  Every
+// write into dat goes through here for that reason.
 procedure dput(b: int);
 begin
   if datlen >= DATMAX then fail("data segment overflow: the source is too large");
@@ -508,8 +581,8 @@ begin
   return o;
 end;
 
-{ The IEEE-754 bits of m * 10^ex.  Powers of ten up to 1e22 are exact in a
-  double, so a literal with at most 18 significant digits rounds once. }
+// The IEEE-754 bits of m * 10^ex.  Powers of ten up to 1e22 are exact in a
+// double, so a literal with at most 18 significant digits rounds once.
 function realbits(m: int; ex: int): int;
 var p, ten, d: real;
     k, i, v: int;
@@ -560,21 +633,13 @@ begin
       pos := pos + 1;
     end
     else if (c = 32) or (c = 9) or (c = 13) then pos := pos + 1
-    else if c = 123 then
-    begin
-      pos := pos + 1;
-      while true do
-      begin
-        if pos >= srcend then fail("unterminated comment");
-        if srcb(pos) = 125 then
-        begin
-          pos := pos + 1;
-          break;
-        end;
-        if srcb(pos) = 10 then line := line + 1;
-        pos := pos + 1;
-      end;
-    end
+    // A brace is not a comment.  { } used to open one and it ended at the FIRST
+    // closing brace, so a brace inside the text -- a JSON example, an f-string,
+    // the words "default {}" -- ended the comment early and the rest of the
+    // sentence was read as code.  The error then landed far from its cause, on a
+    // line that looked correct.  The message says what to write instead, because
+    // the source that hits this is usually older than the change.
+    else if c = 123 then fail("{ } is not a comment; use // to the end of the line")
     else if (c = 47) and (pos + 1 < srcend) and (srcb(pos + 1) = 47) then
     begin
       while (pos < srcend) and (srcb(pos) <> 10) do pos := pos + 1;
@@ -596,7 +661,7 @@ begin
     tbuf[n] := chr(0);
     obuf[n] := chr(0);
     tok := keyword;
-    { a dotted name is one identifier: net.socket, Rpc.method }
+    // a dotted name is one identifier: net.socket, Rpc.method
     if tok = TK_ID then
     begin
       while (pos + 1 < srcend) and (srcb(pos) = 46) and isal(srcb(pos + 1)) do
@@ -775,11 +840,11 @@ begin
   next;
 end;
 
-{ ------------------------------------------------------------------ }
-{ source files and includes                                           }
-{ ------------------------------------------------------------------ }
+// ------------------------------------------------------------------
+// source files and includes
+// ------------------------------------------------------------------
 
-{ eight bytes little-endian from stbuf -- st_dev at 0, st_ino at 8 }
+// eight bytes little-endian from stbuf -- st_dev at 0, st_ino at 8
 function stfield(at: int): int;
 var i, v: int;
 begin
@@ -807,7 +872,7 @@ begin
     i := i + 1;
   end;
   filelen[nfiles] := i;
-  { keep this file's identity, so samefile can compare it }
+  // keep this file's identity, so samefile can compare it
   fdev[nfiles] := 0; fino[nfiles] := 0;
   filemb[nfiles] := -1;
   if stt(addr(pathbuf[0])) >= 0 then
@@ -822,14 +887,14 @@ begin
   return nfiles - 1;
 end;
 
-{ Clean up pathbuf: "a/./b" becomes "a/b" and "a/x/../b" becomes "a/b".
-
-  Why this is REQUIRED and not merely tidy: the de-duplication below compares PATH
-  STRINGS.  Without cleaning, "lib/io.wz" is a different file from
-  "tests/lib/../../lib/io.wz", and then io.wz comes in twice -- with "duplicate
-  declaration" on a line in a THIRD file, which leads nobody to the real cause.  Since
-  there is a search path this happens by itself: the same library comes in through a
-  bare name and through a relative path. }
+// Clean up pathbuf: "a/./b" becomes "a/b" and "a/x/../b" becomes "a/b".
+//
+// Why this is REQUIRED and not merely tidy: the de-duplication below compares PATH
+// STRINGS.  Without cleaning, "lib/io.wz" is a different file from
+// "tests/lib/../../lib/io.wz", and then io.wz comes in twice -- with "duplicate
+// declaration" on a line in a THIRD file, which leads nobody to the real cause.  Since
+// there is a search path this happens by itself: the same library comes in through a
+// bare name and through a relative path.
 procedure normpath;
 var i, n, w, seg: int;
 begin
@@ -839,7 +904,7 @@ begin
   i := 0;
   while i < n do
   begin
-    { skip "./" }
+    // skip "./"
     if (pathbuf[i] = '.') and (i + 1 < n) and (pathbuf[i + 1] = '/')
        and ((w = 0) or (pathbuf[w - 1] = '/')) then
     begin
@@ -848,7 +913,7 @@ begin
     else if (pathbuf[i] = '.') and (i + 2 < n) and (pathbuf[i + 1] = '.')
             and (pathbuf[i + 2] = '/') and ((w = 0) or (pathbuf[w - 1] = '/')) then
     begin
-      { "..": drop the previous segment, but only if there is one and it is not ".." }
+      // "..": drop the previous segment, but only if there is one and it is not ".."
       seg := 0;
       if w >= 2 then
       begin
@@ -870,17 +935,17 @@ begin
   pathbuf[w] := chr(0);
 end;
 
-{ The same FILE NAME as file fi, but through a different path?
-
-  This is not a correctness check but a BETTER ERROR MESSAGE.  If lib/io.wz comes in as
-  "lib/io.wz" and as "../../elsewhere/lib/io.wz", those are two files as far as the
-  de-duplication is concerned, and you get "duplicate declaration" on a line in io.wz
-  itself -- a place that has nothing to do with the cause and where nobody finds the real
-  error.  With this check the compiler says what is actually going on. }
+// The same FILE NAME as file fi, but through a different path?
+//
+// This is not a correctness check but a BETTER ERROR MESSAGE.  If lib/io.wz comes in as
+// "lib/io.wz" and as "../../elsewhere/lib/io.wz", those are two files as far as the
+// de-duplication is concerned, and you get "duplicate declaration" on a line in io.wz
+// itself -- a place that has nothing to do with the cause and where nobody finds the real
+// error.  With this check the compiler says what is actually going on.
 function samebase(fi: int): bool;
 var a, b, na, nb: int;
 begin
-  { find the last '/' in both names, and compare from there }
+  // find the last '/' in both names, and compare from there
   na := 0; a := 0;
   while fnpool[filenam[fi] + a] <> chr(0) do
   begin
@@ -903,16 +968,16 @@ begin
   return false;
 end;
 
-{ Is pathbuf THE SAME FILE as file fi?
-
-  On IDENTITY (st_dev + st_ino from stat(2)) and not on the path string.  That is the
-  whole difference: "lib/io.wz" and "../../elsewhere/lib/io.wz" are then the same file,
-  while a test called kv.wz is something DIFFERENT from the library kv.wz.  With a string
-  comparison the first was a double include ("duplicate declaration" in a third file) and
-  the second a file that includes itself -- both errors that point nowhere.
-
-  If the file cannot be stat'ed it falls back to the path string; the behaviour is then
-  the same as before and no worse. }
+// Is pathbuf THE SAME FILE as file fi?
+//
+// On IDENTITY (st_dev + st_ino from stat(2)) and not on the path string.  That is the
+// whole difference: "lib/io.wz" and "../../elsewhere/lib/io.wz" are then the same file,
+// while a test called kv.wz is something DIFFERENT from the library kv.wz.  With a string
+// comparison the first was a double include ("duplicate declaration" in a third file) and
+// the second a file that includes itself -- both errors that point nowhere.
+//
+// If the file cannot be stat'ed it falls back to the path string; the behaviour is then
+// the same as before and no worse.
 function samefile(fi: int): bool;
 var i: int;
 begin
@@ -929,9 +994,9 @@ begin
   return false;
 end;
 
-{ does pathbuf exist? -- for the choice between relative and the search path }
-{ Filling the table.  The three below are called only by emb.fill in the generated
-  file, which is why they are so plain: a name, then the bytes in chunks, then done. }
+// does pathbuf exist? -- for the choice between relative and the search path
+// Filling the table.  The three below are called only by emb.fill in the generated
+// file, which is why they are so plain: a name, then the bytes in chunks, then done.
 procedure emb.begin(nm: str);
 var i, n: int;
 begin
@@ -971,8 +1036,8 @@ begin
   emb.n := emb.n + 1;
 end;
 
-{ Which embedded file is called <name>, or -1.  The name comes from the include as a
-  nul-terminated string in dat. }
+// Which embedded file is called <name>, or -1.  The name comes from the include as a
+// nul-terminated string in dat.
 function emb.find(doff: int): int;
 var i, j, at: int;
 begin
@@ -989,7 +1054,7 @@ begin
   return -1;
 end;
 
-{ Copy embedded file i into the source buffer, the way readfile would have. }
+// Copy embedded file i into the source buffer, the way readfile would have.
 function emb.read(i: int): int;
 var j, n: int;
 begin
@@ -1005,8 +1070,8 @@ begin
   return n;
 end;
 
-{ emb.fill, generated from lib/ by tools/embedlib.wz.  It is a separate file because it
-  is generated: nothing in it is written by hand, and build.sh remakes it. }
+// emb.fill, generated from lib/ by tools/embedlib.wz.  It is a separate file because it
+// is generated: nothing in it is written by hand, and build.sh remakes it.
 include "embedded.wz";
 
 function fileexists: bool;
@@ -1035,19 +1100,19 @@ begin
   return srclen - start;
 end;
 
-{ The DIRECTORY THE COMPILER ITSELF IS IN, plus "/lib/" -- the search path for includes
-  that are not found relatively.
-
-  Why this exists: without a search path every source has to spell out the exact relative
-  path to the library ("../../lib/io.wz"), and that breaks as soon as a file moves or the
-  library sits somewhere else.  Worse: the de-duplication below works on the PATH STRING,
-  so the same file along two spellings comes in TWICE and gives "duplicate declaration"
-  in a third file.  C solves this with -I plus a system path; this is the same solution,
-  with the compiler itself as the anchor.
-
-  The anchor is argch(0, ..): the path the compiler was invoked with.  If wantzel sits in
-  /x/y/wantzel, the search path is /x/y/lib/.  That works for a compiler built next to
-  its lib, and just as well for an installed binary. }
+// The DIRECTORY THE COMPILER ITSELF IS IN, plus "/lib/" -- the search path for includes
+// that are not found relatively.
+//
+// Why this exists: without a search path every source has to spell out the exact relative
+// path to the library ("../../lib/io.wz"), and that breaks as soon as a file moves or the
+// library sits somewhere else.  Worse: the de-duplication below works on the PATH STRING,
+// so the same file along two spellings comes in TWICE and gives "duplicate declaration"
+// in a third file.  C solves this with -I plus a system path; this is the same solution,
+// with the compiler itself as the anchor.
+//
+// The anchor is argch(0, ..): the path the compiler was invoked with.  If wantzel sits in
+// /x/y/wantzel, the search path is /x/y/lib/.  That works for a compiler built next to
+// its lib, and just as well for an installed binary.
 procedure setlibdir;
 var i, cut: int;
 begin
@@ -1066,10 +1131,10 @@ begin
     i := i + 1;
   end;
   libdirlen := cut;
-  { If the compiler sits in .../bin/, its library belongs in .../lib/ beside it and not
-    in .../bin/lib/.  That is the usual layout (prefix/bin next to prefix/lib), and it is
-    also what happens here now that build.sh writes to bin/.  Recognised by the last
-    directory name: if the path ends in "bin/", take that off. }
+  // If the compiler sits in .../bin/, its library belongs in .../lib/ beside it and not
+  // in .../bin/lib/.  That is the usual layout (prefix/bin next to prefix/lib), and it is
+  // also what happens here now that build.sh writes to bin/.  Recognised by the last
+  // directory name: if the path ends in "bin/", take that off.
   if libdirlen >= 4 then
     if (libdir[libdirlen - 4] = 'b') and (libdir[libdirlen - 3] = 'i')
        and (libdir[libdirlen - 2] = 'n') and (libdir[libdirlen - 1] = '/') then
@@ -1079,8 +1144,8 @@ begin
   libdirlen := libdirlen + 4;
 end;
 
-{ pathbuf := <search path>/<name from the include>, for the second attempt }
-{ does the name from the include contain a '/'? then it is a path, not a library name }
+// pathbuf := <search path>/<name from the include>, for the second attempt
+// does the name from the include contain a '/'? then it is a path, not a library name
 function haspath(doff: int): bool;
 var i: int;
 begin
@@ -1125,7 +1190,7 @@ begin
     if fnpool[base + i] = '/' then cut := i + 1;
     i := i + 1;
   end;
-  if dat[doff] = '/' then cut := 0;      { an absolute path stands alone }
+  if dat[doff] = '/' then cut := 0;      // an absolute path stands alone
   i := 0;
   while i < cut do
   begin
@@ -1152,23 +1217,23 @@ begin
   doff := tval;
   next;
   if tok <> 59 then fail("missing ; after include");
-  { RELATIVE FIRST (next to the including file), THEN THE SEARCH PATH -- like C with
-    "mine.h" and <stdio.h>, but without two spellings: if the file exists next to the
-    includer, that wins; otherwise it is looked for in the compiler's library.  That way
-    a source can write "io.wz" and not "../../lib/io.wz". }
-  { A BARE NAME IS A LIBRARY NAME, a name with a '/' is a path.
-
-    That distinction replaces three rules a newcomer would otherwise have to learn by
-    heart.  include "io.wz" always means THE library -- even in a test file that is
-    itself called io.wz, because that is not a path.  include "../src/foo.wz" always
-    means a file next to the includer.  No precedence rule to remember, no file that
-    finds itself, and no two spellings like C's <> against "".
-
-    If the library name does not exist it falls back to relative: that way files lying
-    next to each other and naming each other by name keep working. }
-  { A bare library name that is on NEITHER path comes from the embedded copy, if the
-    compiler carries one.  Disk first, always: someone editing lib/io.wz in a checkout
-    must see the effect without rebuilding. }
+  // RELATIVE FIRST (next to the including file), THEN THE SEARCH PATH -- like C with
+  // "mine.h" and <stdio.h>, but without two spellings: if the file exists next to the
+  // includer, that wins; otherwise it is looked for in the compiler's library.  That way
+  // a source can write "io.wz" and not "../../lib/io.wz".
+  // A BARE NAME IS A LIBRARY NAME, a name with a '/' is a path.
+  //
+  // That distinction replaces three rules a newcomer would otherwise have to learn by
+  // heart.  include "io.wz" always means THE library -- even in a test file that is
+  // itself called io.wz, because that is not a path.  include "../src/foo.wz" always
+  // means a file next to the includer.  No precedence rule to remember, no file that
+  // finds itself, and no two spellings like C's <> against "".
+  //
+  // If the library name does not exist it falls back to relative: that way files lying
+  // next to each other and naming each other by name keep working.
+  // A bare library name that is on NEITHER path comes from the embedded copy, if the
+  // compiler carries one.  Disk first, always: someone editing lib/io.wz in a checkout
+  // must see the effect without rebuilding.
   embi := -1;
   if haspath(doff) then makepath(doff)
   else
@@ -1182,8 +1247,8 @@ begin
   end;
   if embi >= 0 then
   begin
-    { An embedded file is not a file, so the same-file check below cannot apply to it;
-      guard against including one twice by its position in the table. }
+    // An embedded file is not a file, so the same-file check below cannot apply to it;
+    // guard against including one twice by its position in the table.
     i := 0;
     while i < nfiles do
     begin
@@ -1192,9 +1257,9 @@ begin
     end;
     if i < nfiles then begin next; return; end;
     if incdepth >= 16 then fail("includes nested too deeply");
-    { The name an error message will carry.  makelibpath already put <libdir>/<name>
-      there, which is the path this file WOULD have had -- the most useful thing to
-      show, since it is where a reader would look for it. }
+    // The name an error message will carry.  makelibpath already put <libdir>/<name>
+    // there, which is the path this file WOULD have had -- the most useful thing to
+    // show, since it is where a reader would look for it.
     makelibpath(doff);
     fi := addfile;
     filemb[fi] := embi;
@@ -1233,9 +1298,9 @@ begin
   next;
 end;
 
-{ ------------------------------------------------------------------ }
-{ symbol tables                                                       }
-{ ------------------------------------------------------------------ }
+// ------------------------------------------------------------------
+// symbol tables
+// ------------------------------------------------------------------
 
 function intern: int;
 var o, i: int;
@@ -1268,6 +1333,86 @@ begin
   return false;
 end;
 
+// The hash of the identifier now in tbuf.  Identifiers are lowercased on the way into
+// tbuf (see the lexer), so this hashes the same bytes nameq compares and the index
+// inherits the case-insensitivity instead of having to repeat it.
+//
+// FNV-1a, which is a multiply and an xor per byte and needs no table.  The result is
+// masked into a bucket, never used as an identity: every hit is still confirmed with
+// nameq, so a collision costs a comparison and never a wrong answer.
+function tokhash: int;
+var h, i, c: int;
+begin
+  h := 2166136261;
+  i := 0;
+  while true do
+  begin
+    c := tbufb(i);
+    if c = 0 then return band(h, HMASK);
+    h := bxor(h, c);
+    h := band(h * 16777619, 4294967295);
+    i := i + 1;
+  end;
+  return band(h, HMASK);
+end;
+
+// The same hash, over a name already in the pool rather than the token in tbuf.  Two
+// entry points because a name is sometimes added straight from the token and sometimes
+// from an offset interned earlier; they must agree byte for byte or a name would be
+// filed in one bucket and sought in another.
+function namehash(off: int): int;
+var h, i, c: int;
+begin
+  h := 2166136261;
+  i := 0;
+  while true do
+  begin
+    c := namesb(off + i);
+    if c = 0 then return band(h, HMASK);
+    h := bxor(h, c);
+    h := band(h * 16777619, 4294967295);
+    i := i + 1;
+  end;
+  return band(h, HMASK);
+end;
+
+// Fill the buckets with -1 the first time anything is looked up or added.  Doing it
+// here rather than in an init routine keeps the change to the lookup path only.
+procedure hashinit;
+var i: int;
+begin
+  if hashed then return;
+  i := 0;
+  while i < NHASH do
+  begin
+    ghead[i] := -1;
+    fhead[i] := -1;
+    i := i + 1;
+  end;
+  hashed := true;
+end;
+
+// File global g, whose name is already in gnam[g], in its bucket.  Called right after
+// the entry is filled in and before ngl moves on.
+procedure gindex(g: int);
+var b: int;
+begin
+  hashinit;
+  b := namehash(gnam[g]);
+  gnext[g] := ghead[b];
+  ghead[b] := g;
+end;
+
+// The same for routine f.
+procedure findex(f: int);
+var b: int;
+begin
+  hashinit;
+  b := namehash(fnam[f]);
+  fnext[f] := fhead[b];
+  fhead[b] := f;
+end;
+
 function findloc: int;
 var i: int;
 begin
@@ -1280,14 +1425,19 @@ begin
   return -1;
 end;
 
+// Walk only the names that hash to the same bucket, newest first.  That order is the
+// one the old linear scan had (it counted down from ngl - 1), and it is kept although
+// nothing depends on it any more: a duplicate global is refused at declaration, so a
+// name is in here at most once.
 function findglob: int;
 var i: int;
 begin
-  i := ngl - 1;
+  hashinit;
+  i := ghead[tokhash];
   while i >= 0 do
   begin
     if nameq(gnam[i]) then return i;
-    i := i - 1;
+    i := gnext[i];
   end;
   return -1;
 end;
@@ -1295,11 +1445,12 @@ end;
 function findfn: int;
 var i: int;
 begin
-  i := nfn - 1;
+  hashinit;
+  i := fhead[tokhash];
   while i >= 0 do
   begin
     if nameq(fnam[i]) then return i;
-    i := i - 1;
+    i := fnext[i];
   end;
   return -1;
 end;
@@ -1341,8 +1492,8 @@ begin
   return -1;
 end;
 
-{ Split the dotted identifier in tbuf into the longest prefix that names a
-  variable and a residual field path, which lands in fpath.  Sets spli/spgi. }
+// Split the dotted identifier in tbuf into the longest prefix that names a
+// variable and a residual field path, which lands in fpath.  Sets spli/spgi.
 function splitname: bool;
 var k, i: int;
 begin
@@ -1377,7 +1528,7 @@ begin
   return false;
 end;
 
-{ the field of record type t whose name is fpath[a..b) }
+// the field of record type t whose name is fpath[a..b)
 function findfield(t: int; a: int; b: int): int;
 var r, f, i: int;
     ok: bool;
@@ -1427,9 +1578,9 @@ begin
   end;
 end;
 
-{ ------------------------------------------------------------------ }
-{ code emission                                                       }
-{ ------------------------------------------------------------------ }
+// ------------------------------------------------------------------
+// code emission
+// ------------------------------------------------------------------
 
 procedure e(b: int);
 begin
@@ -1613,10 +1764,10 @@ begin
   end;
 end;
 
-{ --- real arithmetic ------------------------------------------------
-  A real travels in rax as its 64-bit pattern, so every path that moves
-  an int (stack, registers, memory, calls) moves a real unchanged.  Only
-  the operations themselves go through xmm0/xmm1. }
+// --- real arithmetic ------------------------------------------------
+// A real travels in rax as its 64-bit pattern, so every path that moves
+// an int (stack, registers, memory, calls) moves a real unchanged.  Only
+// the operations themselves go through xmm0/xmm1.
 procedure xmm0rax;
 begin
   e(0x66); e(0x48); e(0x0F); e(0x6E); e(0xC0);
@@ -1639,9 +1790,9 @@ begin
   raxxmm0;
 end;
 
-{ A system call: rax holds the Linux number, rdi..r9 the arguments.  A Linux
-  executable executes the instruction; a Windows executable calls the shim
-  that hands the same registers to __wsys, the emulation in Wantzel. }
+// A system call: rax holds the Linux number, rdi..r9 the arguments.  A Linux
+// executable executes the instruction; a Windows executable calls the shim
+// that hands the same registers to __wsys, the emulation in Wantzel.
 procedure syscallinsn;
 begin
   if winmode <> 0 then
@@ -1703,16 +1854,16 @@ begin
   e(0xE8); e32(trapaddr - (codelen + 4));
 end;
 
-{ ------------------------------------------------------------------ }
-{ expressions                                                         }
-{ ------------------------------------------------------------------ }
+// ------------------------------------------------------------------
+// expressions
+// ------------------------------------------------------------------
 
 function expr: int; forward;
 function factor: int; forward;
 
-{ The pending simple operand: factor() records whether the value it just
-  produced was a constant or a scalar variable, so that the next operator can
-  roll that code back and use an immediate or memory operand instead. }
+// The pending simple operand: factor() records whether the value it just
+// produced was a constant or a scalar variable, so that the next operator can
+// roll that code back and use an immediate or memory operand instead.
 
 procedure memop(opc: int);
 begin
@@ -1829,8 +1980,8 @@ begin
   return false;
 end;
 
-{ Element access: the checked, zero-based index is left in rax and the
-  element is then reached with a single instruction. }
+// Element access: the checked, zero-based index is left in rax and the
+// element is then reached with a single instruction.
 
 function elemsetup(li: int; gi: int): int;
 var isarr, lo, hi, ok, t, k, o, et: int;
@@ -1956,8 +2107,8 @@ begin
   end;
 end;
 
-{ The first six argument registers follow the System V order, which the
-  syscall builtins share; r12..r15 extend it for our own calls. }
+// The first six argument registers follow the System V order, which the
+// syscall builtins share; r12..r15 extend it for our own calls.
 procedure popreg(i: int);
 begin
   if i = 0 then e(0x5F)
@@ -1982,8 +2133,8 @@ begin
   else begin e(0x41); e(0x59); end;
 end;
 
-{ The Windows x64 convention: rcx, rdx, r8, r9, then the stack.  Arguments
-  five to seven wait in r10, r11 and rdi until the call frame exists. }
+// The Windows x64 convention: rcx, rdx, r8, r9, then the stack.  Arguments
+// five to seven wait in r10, r11 and rdi until the call frame exists.
 procedure popwin(i: int);
 begin
   if i = 0 then e(0x59)
@@ -2030,12 +2181,12 @@ begin
   return 0;
 end;
 
-{ Emit in rax the address a designator denotes.  The head variable is
-  li/gi (already scanned, with the token after it read); fpath holds the
-  field path that was split off its dotted name.  Consumes any further
-  "[index]" and ".field" steps.  Returns the type reached; refisarr, refet,
-  reflo, refhi and refdyn describe it (an array is 1 = static, 2 = an
-  array parameter whose length lives at [rbp+refdyn]). }
+// Emit in rax the address a designator denotes.  The head variable is
+// li/gi (already scanned, with the token after it read); fpath holds the
+// field path that was split off its dotted name.  Consumes any further
+// "[index]" and ".field" steps.  Returns the type reached; refisarr, refet,
+// reflo, refhi and refdyn describe it (an array is 1 = static, 2 = an
+// array parameter whose length lives at [rbp+refdyn]).
 function pathaddr(li: int; gi: int): int;
 var isarr, lo, hi, et, dyn, pend, t, ok, sz, a, b, f, b1, b2, b3: int;
 begin
@@ -2100,7 +2251,7 @@ begin
       want(t, T_INT, "array index");
       if tok = TK_RANGE then
       begin
-        { a slice: [lo..hi], inclusive like a declaration }
+        // a slice: [lo..hi], inclusive like a declaration
         if allowslice = 0 then fail("a slice can only be passed as an array argument");
         next;
         push;
@@ -2200,7 +2351,7 @@ begin
   return et;
 end;
 
-{ Scan the name in tbuf as a designator head: sets spli/spgi and fpath. }
+// Scan the name in tbuf as a designator head: sets spli/spgi and fpath.
 function resolvevar: bool;
 begin
   fplen := 0;
@@ -2210,7 +2361,7 @@ begin
   return splitname;
 end;
 
-{ rax := the element count of the array a designator reached }
+// rax := the element count of the array a designator reached
 procedure reflen;
 begin
   if refisarr = 2 then
@@ -2230,7 +2381,7 @@ var t, n, i: int;
 begin
   if tok = TK_STR then
   begin
-    { a literal is an array of char }
+    // a literal is an array of char
     if et <> T_CHAR then fail("a string literal can only be passed as an array of char");
     immdata(tval); push;
     n := 0; i := 7;
@@ -2246,7 +2397,7 @@ begin
   if tok <> TK_ID then fail("this parameter needs an array");
   if eqt("view") then
   begin
-    { view(addr, count): any memory as an array }
+    // view(addr, count): any memory as an array
     next; lparen; argint; push; comma; argint; push; rparen;
     return;
   end;
@@ -2257,7 +2408,7 @@ begin
   allowslice := 0;
   if (refisarr = 0) and (t >= T_REC) and (t = et) then
   begin
-    { a record passes as a one-element view }
+    // a record passes as a one-element view
     push; imm(1); push;
     return;
   end;
@@ -2343,10 +2494,10 @@ begin
   next;
 end;
 
-{ winapi(slot, args...): call an imported Windows function through the
-  import address table.  The stack is aligned to sixteen bytes and given
-  the 32-byte shadow space the convention demands; rsi keeps the old rsp,
-  which every Windows function preserves. }
+// winapi(slot, args...): call an imported Windows function through the
+// import address table.  The stack is aligned to sixteen bytes and given
+// the 32-byte shadow space the convention demands; rsi keeps the old rsp,
+// which every Windows function preserves.
 function dowinapi: int;
 var n, i: int;
 begin
@@ -2469,7 +2620,7 @@ begin
   if b = 16 then return dowinapi;
   if b = 17 then
   begin
-    { poke(addr, byte): store one byte at an absolute address }
+    // poke(addr, byte): store one byte at an absolute address
     lparen; argint; push; comma; argint; rparen;
     popc;
     e(0x88); e(0x01);
@@ -2477,7 +2628,7 @@ begin
   end;
   if b = 18 then
   begin
-    { peek(addr): read one byte from an absolute address }
+    // peek(addr): read one byte from an absolute address
     lparen; argint; rparen;
     e(0x48); e(0x0F); e(0xB6); e(0x00);
     return T_INT;
@@ -2526,7 +2677,7 @@ begin
   end;
   if (b = 28) or (b = 29) then
   begin
-    { trunc(real): int, round(real): int }
+    // trunc(real): int, round(real): int
     lparen; t := expr; want(t, T_REAL, "trunc/round"); rparen;
     xmm0rax;
     e(0xF2); e(0x48); e(0x0F);
@@ -2536,7 +2687,7 @@ begin
   end;
   if b = 30 then
   begin
-    { sqrt(real): real }
+    // sqrt(real): real
     lparen; t := expr; want(t, T_REAL, "sqrt"); rparen;
     xmm0rax;
     e(0xF2); e(0x0F); e(0x51); e(0xC0);
@@ -2545,7 +2696,7 @@ begin
   end;
   if b = 31 then
   begin
-    { pack32(real): int -- the IEEE single bits }
+    // pack32(real): int -- the IEEE single bits
     lparen; t := expr; want(t, T_REAL, "pack32"); rparen;
     xmm0rax;
     e(0xF2); e(0x0F); e(0x5A); e(0xC0);
@@ -2555,7 +2706,7 @@ begin
   if b = 33 then fail("view(addr, count) can only be passed where an array parameter is expected");
   if b = 32 then
   begin
-    { unpack32(int): real }
+    // unpack32(int): real
     lparen; argint; rparen;
     e(0x66); e(0x0F); e(0x6E); e(0xC0);
     e(0xF3); e(0x0F); e(0x5A); e(0xC0);
@@ -2606,7 +2757,7 @@ begin
   end;
   if tok = KW_REAL then
   begin
-    { real(int): real }
+    // real(int): real
     next; lparen; argint; rparen;
     xmm0rax;
     e(0xF2); e(0x48); e(0x0F); e(0x2A); e(0xC0);
@@ -2963,9 +3114,9 @@ begin
   return lt;
 end;
 
-{ ------------------------------------------------------------------ }
-{ statements                                                          }
-{ ------------------------------------------------------------------ }
+// ------------------------------------------------------------------
+// statements
+// ------------------------------------------------------------------
 
 procedure stmt; forward;
 
@@ -2988,14 +3139,14 @@ end;
 procedure stmtlist; forward;
 function cexpr: int; forward;
 
-{ a hidden 8-byte slot in the current frame }
+// a hidden 8-byte slot in the current frame
 function hidden: int;
 begin
   frame := frame + 8;
   return 0 - frame;
 end;
 
-{ jump chains: each pending rel32 holds the offset of the previous one }
+// jump chains: each pending rel32 holds the offset of the previous one
 function read32(o: int): int;
 var v: int;
 begin
@@ -3017,7 +3168,7 @@ begin
   end;
 end;
 
-{ for v := a to b do s   |   for v := b downto a do s }
+// for v := a to b do s   |   for v := b downto a do s
 procedure dofor;
 var li, gi, t, slot, down, top, lab, ob, oc, i: int;
 begin
@@ -3081,7 +3232,7 @@ begin
   nbrk := brkbase; ncnt := cntbase; brkbase := ob; cntbase := oc;
 end;
 
-{ one case label: an int constant expression, or a char }
+// one case label: an int constant expression, or a char
 function caselabel(t: int): int;
 var v, gi, li: int;
 begin
@@ -3122,7 +3273,7 @@ begin
   return cexpr;
 end;
 
-{ case e of  l1, l2: s;  l3: s;  else s; s  end }
+// case e of  l1, l2: s;  l3: s;  else s; s  end
 procedure docase;
 var t, slot, v, hit, nxt, endh: int;
 begin
@@ -3386,7 +3537,7 @@ begin
     push;
     if t >= T_REC then
     begin
-      { whole-record copy }
+      // whole-record copy
       if tok <> TK_ID then fail("a record can only be assigned from another record");
       if not resolvevar then fail("undeclared identifier");
       next;
@@ -3406,9 +3557,9 @@ begin
   end;
 end;
 
-{ ------------------------------------------------------------------ }
-{ declarations                                                        }
-{ ------------------------------------------------------------------ }
+// ------------------------------------------------------------------
+// declarations
+// ------------------------------------------------------------------
 
 function cfactor: int;
 var v, gi: int;
@@ -3467,7 +3618,7 @@ begin
   return v;
 end;
 
-{ continue a constant expression whose first term is already known }
+// continue a constant expression whose first term is already known
 function cexprfrom(v: int): int;
 var op: int;
 begin
@@ -3587,6 +3738,7 @@ begin
         garr[ngl] := ptarr; glo[ngl] := ptlo; ghi[ngl] := pthi;
         gval[ngl] := bsslen;
         bsslen := bsslen + sz;
+        gindex(ngl);
         ngl := ngl + 1;
       end;
       i := i + 1;
@@ -3596,7 +3748,7 @@ begin
   end;
 end;
 
-{ type NAME = record <names: type;>... end; }
+// type NAME = record <names: type;>... end;
 procedure decltypes;
 var r, n, i, t, nb, sz, off, al: int;
 begin
@@ -3751,6 +3903,7 @@ begin
       if ngl >= MAXG then fail("too many globals");
       gnam[ngl] := o; gkind[ngl] := SK_CONST; gval[ngl] := v; gtyp[ngl] := t;
       garr[ngl] := 0; glo[ngl] := 0; ghi[ngl] := 0;
+      gindex(ngl);
       ngl := ngl + 1;
     end;
     if tok <> 59 then fail("missing ; after constant declaration");
@@ -3759,17 +3912,17 @@ begin
 end;
 
 
-{ ------------------------------------------------------------------ }
-{ schema: parse the declaration, then generate Wantzel source for it      }
-{ ------------------------------------------------------------------ }
-{ A schema is a record type plus a generated parser, writer and JSON
-  Schema text.  The generated text is appended to the source buffer and
-  entered through the same mechanism as an include, so it is compiled like
-  any other code. }
+// ------------------------------------------------------------------
+// schema: parse the declaration, then generate Wantzel source for it
+// ------------------------------------------------------------------
+// A schema is a record type plus a generated parser, writer and JSON
+// Schema text.  The generated text is appended to the source buffer and
+// entered through the same mechanism as an include, so it is compiled like
+// any other code.
 
-{ One byte of generated source, with the room checked BEFORE the write -- the same
-  reason as dput above: a check afterwards has already stored the byte that does not
-  fit, which turns "the source is too large" into a bounds trap inside this compiler. }
+// One byte of generated source, with the room checked BEFORE the write -- the same
+// reason as dput above: a check afterwards has already stored the byte that does not
+// fit, which turns "the source is too large" into a bounds trap inside this compiler.
 procedure sput(c: char);
 begin
   if srclen >= SRCMAX then fail("generated source is too large");
@@ -3877,7 +4030,7 @@ begin
   end;
 end;
 
-{ the Wantzel type of a field's element }
+// the Wantzel type of a field's element
 procedure genelemtype(f: int);
 var t: int;
 begin
@@ -3888,7 +4041,7 @@ begin
   else if t = SF_SUB then gensub(f);
 end;
 
-{ the record fields of one schema field }
+// the record fields of one schema field
 procedure gendecl(f: int);
 var t: int;
 begin
@@ -3923,7 +4076,7 @@ begin
   genfld(f); gen("_ok: bool;\n  "); genfld(f); gen("_null: bool;\n");
 end;
 
-{ read one value at `at` into target tgt (0: the field, 1: element v1) }
+// read one value at `at` into target tgt (0: the field, 1: element v1)
 procedure genread(f: int; tgt: int);
 var t, ei: int;
 begin
@@ -3991,7 +4144,7 @@ begin
   end;
 end;
 
-{ one "if json.eq(...) then <read the value> end else" arm }
+// one "if json.eq(...) then <read the value> end else" arm
 procedure genarm(f: int);
 begin
   gen("    if json.eq(b, k0, k1, \""); genjs(f); gen("\") then\n    begin\n");
@@ -4013,18 +4166,18 @@ begin
   gen("      end;\n      "); genr(f); gen("_ok := true;\n    end\n    else ");
 end;
 
-{ The truncation test that follows every appending call in a generated writer.
-  json.putreal, json.putraw, json.putstr, io.push and io.pushnum truncate at len(dst)
-  instead of signalling, so after such a call `at = len(dst)` is the only
-  evidence that something was dropped.  For an error message truncation is harmless;
-  for a JSON object it is not -- what comes out is not a shorter object but a syntax
-  error -- so the writer turns it into the refusal -1 here. }
+// The truncation test that follows every appending call in a generated writer.
+// json.putreal, json.putraw, json.putstr, io.push and io.pushnum truncate at len(dst)
+// instead of signalling, so after such a call `at = len(dst)` is the only
+// evidence that something was dropped.  For an error message truncation is harmless;
+// for a JSON object it is not -- what comes out is not a shorter object but a syntax
+// error -- so the writer turns it into the refusal -1 here.
 procedure genfull;
 begin
   gen("      if at >= len(dst) then return -1;\n");
 end;
 
-{ write one value; the field (tgt 0) or element v1 (tgt 1) }
+// write one value; the field (tgt 0) or element v1 (tgt 1)
 procedure genput(f: int; tgt: int);
 var t, ei: int;
 begin
@@ -4036,11 +4189,11 @@ begin
   end
   else if t = SF_REAL then
   begin
-    { json.putreal is the one appender that neither truncates nor signals: without room
-      for its longest form (32 bytes of headroom) it writes NOTHING and returns `at`
-      unchanged, which would leave a key with no value at all in the output -- invalid
-      JSON that the len(dst) test below cannot see, because `at` never reached the end.
-      So the room is tested here, before the call, and a refusal comes out instead. }
+    // json.putreal is the one appender that neither truncates nor signals: without room
+    // for its longest form (32 bytes of headroom) it writes NOTHING and returns `at`
+    // unchanged, which would leave a key with no value at all in the output -- invalid
+    // JSON that the len(dst) test below cannot see, because `at` never reached the end.
+    // So the room is tested here, before the call, and a refusal comes out instead.
     gen("      if (at < 0) or (at + 32 > len(dst)) then return -1;\n");
     gen("      at := json.putreal(dst, at, "); genr(f); if tgt <> 0 then gen("[v1]"); gen(");\n");
     genfull;
@@ -4095,7 +4248,7 @@ end;
 procedure genschema;
 var f, ei: int;
 begin
-  { --- the record type --- }
+  // --- the record type ---
   gen("\ntype\n  "); genname; gen(" = record\n");
   f := 0;
   while f < nfld do
@@ -4104,7 +4257,7 @@ begin
     f := f + 1;
   end;
   gen("  end;\n");
-  { --- enum constants and the field count --- }
+  // --- enum constants and the field count ---
   gen("const\n");
   f := 0;
   while f < nfld do
@@ -4123,7 +4276,7 @@ begin
     f := f + 1;
   end;
   gen("  "); genname; gen(".fields = "); gennum(nfld); gen(";\n");
-  { --- clear --- }
+  // --- clear ---
   gen("\nprocedure "); genname; gen(".clear(r: array of "); genname; gen(");\nbegin\n");
   f := 0;
   while f < nfld do
@@ -4143,7 +4296,7 @@ begin
     f := f + 1;
   end;
   gen("end;\n");
-  { --- parse --- }
+  // --- parse ---
   gen("\nfunction "); genname; gen(".parse(b: array of char; at: int; last: int; r: array of "); genname;
   gen("): int;\nvar k0, k1, v0, v1, n: int;\nbegin\n  "); genname; gen(".clear(r);\n");
   gen("  k0 := 0; k1 := 0; v0 := 0; v1 := 0; n := 0;\n");
@@ -4181,11 +4334,11 @@ begin
   end;
   gen("\n    begin\n      at := json.skip(b, at, last);\n      if at < 0 then return -1;\n    end;\n");
   gen("  end;\n  return -1;\nend;\n");
-  { --- write --- }
-  gen("\n{ Returns the position after the object, or -1 when it does not fit in dst.\n");
-  gen("  A short buffer is a refusal, not a truncation: half a JSON object is not a\n");
-  gen("  shorter object but a syntax error, and this text goes out as the\n");
-  gen("  structuredContent of a protocol reply. }\n");
+  // --- write ---
+  gen("\n// Returns the position after the object, or -1 when it does not fit in dst.\n");
+  gen("  // A short buffer is a refusal, not a truncation: half a JSON object is not a\n");
+  gen("  // shorter object but a syntax error, and this text goes out as the\n");
+  gen("  // structuredContent of a protocol reply.\n");
   gen("function "); genname; gen(".write(dst: array of char; at: int; r: array of "); genname;
   gen("; src: array of char): int;\nvar v1: int;\n    first: bool;\nbegin\n");
   gen("  at := json.putb(dst, at, '{');\n  first := true;\n  v1 := 0;\n");
@@ -4214,7 +4367,7 @@ begin
   gen("  return json.putb(dst, at, '}');\nend;\n");
 end;
 
-{ --- the JSON Schema text --- }
+// --- the JSON Schema text ---
 procedure jsc(c: int);
 begin
   if jslen >= JSMAX - 1 then fail("the JSON Schema of this schema is too large");
@@ -4245,7 +4398,7 @@ begin
   end;
 end;
 
-{ a NUL-terminated text from the data segment, escaped }
+// a NUL-terminated text from the data segment, escaped
 procedure jsdat(o: int);
 var c: int;
 begin
@@ -4269,7 +4422,7 @@ begin
   end;
 end;
 
-{ the schema of one element }
+// the schema of one element
 procedure jselem(f: int);
 var t, ei, i: int;
 begin
@@ -4340,7 +4493,7 @@ begin
     else if sfdesc[f] >= 0 then
     begin
       jselem(f);
-      jslen := jslen - 1;                     { reopen the element object }
+      jslen := jslen - 1;                     // reopen the element object
       if sftype[f] = SF_JSON then jss("\"description\":\"")
       else jss(",\"description\":\"");
       jsdat(sfdesc[f]); jsc(34); jsc(125);
@@ -4363,7 +4516,7 @@ begin
   end;
   jss("]}");
   jsc(0);
-  { into the data segment, as the value of the str constant Name.jsonschema }
+  // into the data segment, as the value of the str constant Name.jsonschema
   while (datlen mod 8) <> 0 do dput(0);
   i := 0;
   while i < 8 do
@@ -4380,7 +4533,7 @@ begin
   end;
 end;
 
-{ the schema whose name is in tbuf, or -1 }
+// the schema whose name is in tbuf, or -1
 function findschema: int;
 var i, j: int;
 begin
@@ -4398,7 +4551,7 @@ begin
   return -1;
 end;
 
-{ schema NAME = record <field: type[?] ["description"];>... end; }
+// schema NAME = record <field: type[?] ["description"];>... end;
 procedure declschema;
 var i, f, fi, lo, hi: int;
 begin
@@ -4477,7 +4630,7 @@ begin
       sftype[nfld] := SF_TEXT;
       if tok = 91 then
       begin
-        { text[N]: a copy }
+        // text[N]: a copy
         next;
         sftype[nfld] := SF_TEXTN;
         sftlen[nfld] := cexpr;
@@ -4539,7 +4692,7 @@ begin
     end;
     if tok = TK_STR then
     begin
-      sfdesc[nfld] := tval;            { the description stays in the data segment }
+      sfdesc[nfld] := tval;            // the description stays in the data segment
       next;
     end;
     if tok <> 59 then fail("missing ; after a schema field");
@@ -4549,7 +4702,7 @@ begin
   if tok <> KW_END then fail("missing end of the schema");
   next;
   if tok <> 59 then fail("missing ; after the schema");
-  { the JSON Schema text and its str constant }
+  // the JSON Schema text and its str constant
   genjsonschema;
   i := 0;
   while schname[i] <> chr(0) do
@@ -4562,9 +4715,10 @@ begin
   if ngl >= MAXG then fail("too many globals");
   gnam[ngl] := intern; gkind[ngl] := SK_CONST; gtyp[ngl] := T_STR; gval[ngl] := scjs[nsc];
   garr[ngl] := 0; glo[ngl] := 0; ghi[ngl] := 0;
+  gindex(ngl);
   ngl := ngl + 1;
   nsc := nsc + 1;
-  { generate, then compile the generated text like an include }
+  // generate, then compile the generated text like an include
   if incdepth >= 16 then fail("includes nested too deeply");
   pathbuf[0] := '<';
   f := 1;
@@ -4587,9 +4741,9 @@ begin
   next;
 end;
 
-{ ------------------------------------------------------------------ }
-{ tools: a declared tool table becomes tools/list text and a dispatcher }
-{ ------------------------------------------------------------------ }
+// ------------------------------------------------------------------
+// tools: a declared tool table becomes tools/list text and a dispatcher
+// ------------------------------------------------------------------
 
 procedure gentl(i: int);
 var j: int;
@@ -4627,7 +4781,7 @@ end;
 procedure gentools;
 var i: int;
 begin
-  { --- the tools/list text, as the str constant tool.list --- }
+  // --- the tools/list text, as the str constant tool.list ---
   jslen := 0;
   i := 0;
   while i < ntl do
@@ -4667,8 +4821,9 @@ begin
   if ngl >= MAXG then fail("too many globals");
   gnam[ngl] := intern; gkind[ngl] := SK_CONST; gtyp[ngl] := T_STR; gval[ngl] := tlseen;
   garr[ngl] := 0; glo[ngl] := 0; ghi[ngl] := 0;
+  gindex(ngl);
   ngl := ngl + 1;
-  { --- constants, argument/result records, handler declarations --- }
+  // --- constants, argument/result records, handler declarations ---
   gen("\nconst\n  tool.count = "); gennum(ntl); gen(";\n");
   i := 0;
   while i < ntl do
@@ -4684,7 +4839,7 @@ begin
     gen("  tool.out_"); gentl(i); gen(": "); gensc(tlout[i]); gen(";\n");
     i := i + 1;
   end;
-  gen("\n{ a handler returns 0, or calls tool.fail with a message and returns its result }\n");
+  gen("\n// a handler returns 0, or calls tool.fail with a message and returns its result\n");
   gen("function tool.fail(s: str): int;\nbegin\n  tool.errn := io.push(tool.err, 0, s);\n  return 1;\nend;\n");
   i := 0;
   while i < ntl do
@@ -4692,7 +4847,7 @@ begin
     gen("function tool."); gentl(i); gen("(a: array of "); gensc(tlin[i]); gen("; r: array of "); gensc(tlout[i]); gen("): int; forward;\n");
     i := i + 1;
   end;
-  { --- byname --- }
+  // --- byname ---
   gen("\nfunction tool.byname(b: array of char; at: int; upto: int): int;\nbegin\n");
   i := 0;
   while i < ntl do
@@ -4701,11 +4856,11 @@ begin
     i := i + 1;
   end;
   gen("  return -1;\nend;\n");
-  { --- run: parse arguments, call the handler, write the result JSON into dst --- }
-  gen("\n{ returns the length written, -1 for bad arguments, -2 when the handler failed\n");
-  gen("  (see tool.err), -3 when the result JSON does not fit in dst.  The writer\n");
-  gen("  refuses rather than truncating -- half an object is a syntax error -- and -3\n");
-  gen("  keeps that apart from -1, which would blame the caller's arguments for it. }\n");
+  // --- run: parse arguments, call the handler, write the result JSON into dst ---
+  gen("\n// returns the length written, -1 for bad arguments, -2 when the handler failed\n");
+  gen("  // (see tool.err), -3 when the result JSON does not fit in dst.  The writer\n");
+  gen("  // refuses rather than truncating -- half an object is a syntax error -- and -3\n");
+  gen("  // keeps that apart from -1, which would blame the caller's arguments for it.\n");
   gen("function tool.run(idx: int; b: array of char; at: int; upto: int; dst: array of char): int;\nvar rc: int;\nbegin\n  rc := 0;\n  tool.errn := 0;\n  case idx of\n");
   i := 0;
   while i < ntl do
@@ -4721,7 +4876,7 @@ begin
   gen("  end;\n  return -1;\nend;\n");
 end;
 
-{ tools  <name>(<InSchema>): <OutSchema> "<description>" [readonly] [idempotent] [destructive]; ... end; }
+// tools  <name>(<InSchema>): <OutSchema> "<description>" [readonly] [idempotent] [destructive]; ... end;
 procedure decltools;
 var i, f, fi: int;
 begin
@@ -4789,9 +4944,9 @@ begin
   next;
 end;
 
-{ ------------------------------------------------------------------ }
-{ routines                                                            }
-{ ------------------------------------------------------------------ }
+// ------------------------------------------------------------------
+// routines
+// ------------------------------------------------------------------
 
 procedure storeparam(i: int; off: int);
 begin
@@ -4829,6 +4984,7 @@ begin
     fi := nfn;
     nfn := nfn + 1;
     fnam[fi] := intern; fdef[fi] := 0; fadr[fi] := 0;
+    findex(fi);
   end;
   next;
   nloc := 0;
@@ -4928,8 +5084,8 @@ begin
   next;
   if tok = KW_FORWARD then
   begin
-    { the line of the DECLARATION, before next() walks past the ';' onto the following
-      line -- otherwise an unresolved forward is reported one line too far down. }
+    // the line of the DECLARATION, before next() walks past the ';' onto the following
+    // line -- otherwise an unresolved forward is reported one line too far down.
     fline[fi] := line;
     ffile[fi] := curfile;
     next;
@@ -4997,24 +5153,24 @@ begin
   i := (frame - parmbytes) div 8;
   e32at(zcnt, i);
   e32at(zcnt + 4, i shr 32);
-  nloc := 0;                                      { locals do not outlive the routine }
+  nloc := 0;                                      // locals do not outlive the routine
 end;
 
-{ ------------------------------------------------------------------ }
-{ the Windows runtime, compiled into every .exe before the program     }
-{ ------------------------------------------------------------------ }
-{ System calls are emulated in Wantzel on top of kernel32: __wsys receives the
-  Linux number and arguments, __winit turns the command line into an
-  argc/argv block.  The text is entered like an include named <windows>. }
+// ------------------------------------------------------------------
+// the Windows runtime, compiled into every .exe before the program
+// ------------------------------------------------------------------
+// System calls are emulated in Wantzel on top of kernel32: __wsys receives the
+// Linux number and arguments, __winit turns the command line into an
+// argc/argv block.  The text is entered like an include named <windows>.
 
 procedure genwin;
 begin
-  gen("{ Windows runtime: the Linux system calls a Wantzel program uses, mapped onto\n");
-  gen("  kernel32 and ws2_32.  __wsys receives the Linux syscall number and its\n");
-  gen("  arguments and does the Windows equivalent; __winit turns the command line\n");
-  gen("  into an argc/argv block.  All of this is ordinary Wantzel, compiled into every\n");
-  gen("  .exe ahead of the program, so the code generator needs no Windows knowledge.\n");
-  gen("  epoll is emulated over WSAPoll, with a small interest table kept here. }\n");
+  gen("// Windows runtime: the Linux system calls a Wantzel program uses, mapped onto\n");
+  gen("  // kernel32 and ws2_32.  __wsys receives the Linux syscall number and its\n");
+  gen("  // arguments and does the Windows equivalent; __winit turns the command line\n");
+  gen("  // into an argc/argv block.  All of this is ordinary Wantzel, compiled into every\n");
+  gen("  // .exe ahead of the program, so the code generator needs no Windows knowledge.\n");
+  gen("  // epoll is emulated over WSAPoll, with a small interest table kept here.\n");
   gen("const\n");
   gen("  __K_GETSTDHANDLE = 0;\n");
   gen("  __K_WRITEFILE = 1;\n");
@@ -5061,18 +5217,18 @@ begin
   gen("  __wargs: array[0..4095] of char;\n");
   gen("  __wdig: array[0..31] of char;\n");
   gen("  __wcount, __wdummy, __wstarted: int;\n");
-  gen("  __wsh: array[0..__WMAXFD - 1] of int;      { socket handle for small fd, or 0 }\n");
-  gen("  __wev: array[0..__WMAXFD - 1] of int;      { epoll events requested for fd }\n");
-  gen("  __wpoll: array[0..__WMAXFD * 16 - 1] of char;   { WSAPOLLFD array }\n");
-  gen("  __wrow: array[0..__WMAXFD - 1] of int;     { poll row -> fd }\n");
-  gen("  __wsa: array[0..15] of char;               { a working sockaddr }\n");
+  gen("  __wsh: array[0..__WMAXFD - 1] of int;   // socket handle for small fd, or 0\n");
+  gen("  __wev: array[0..__WMAXFD - 1] of int;   // epoll events requested for fd\n");
+  gen("  __wpoll: array[0..__WMAXFD * 16 - 1] of char;   // WSAPOLLFD array\n");
+  gen("  __wrow: array[0..__WMAXFD - 1] of int;   // poll row -> fd\n");
+  gen("  __wsa: array[0..15] of char;   // a working sockaddr\n");
   gen("  __wtime: array[0..7] of char;\n");
-  gen("  __wdh: array[0..__WMAXFD - 1] of int;   { FindFirst handle per dir fd, or 0 }\n");
-  gen("  __wdfirst: array[0..__WMAXFD - 1] of int; { 1 = first entry already in __wfd32 }\n");
-  gen("  __wfind: array[0..319] of char;          { WIN32_FIND_DATAA }\n");
-  gen("  __wpath: array[0..1039] of char;         { path + backslash-star }\n");
-  gen("  __wovl: array[0..31] of char;            { a zeroed OVERLAPPED for LockFileEx }\n");
-  gen("  __wpos: array[0..7] of char;             { SetFilePointerEx result }\n");
+  gen("  __wdh: array[0..__WMAXFD - 1] of int;   // FindFirst handle per dir fd, or 0\n");
+  gen("  __wdfirst: array[0..__WMAXFD - 1] of int;   // 1 = first entry already in __wfd32\n");
+  gen("  __wfind: array[0..319] of char;   // WIN32_FIND_DATAA\n");
+  gen("  __wpath: array[0..1039] of char;   // path + backslash-star\n");
+  gen("  __wovl: array[0..31] of char;   // a zeroed OVERLAPPED for LockFileEx\n");
+  gen("  __wpos: array[0..7] of char;   // SetFilePointerEx result\n");
   gen("\n");
   gen("procedure __wp32(b: array of char; at: int; v: int);\n");
   gen("begin\n");
@@ -5117,7 +5273,7 @@ begin
   gen("  if __wissock(fd) then\n");
   gen("  begin\n");
   gen("    r := winapi(__W_SEND, __wsh[fd], a, n, 0);\n");
-  gen("    if r < 0 then return 0 - 11;             { treat as EAGAIN-ish }\n");
+  gen("    if r < 0 then return 0 - 11;   // treat as EAGAIN-ish\n");
   gen("    return r;\n");
   gen("  end;\n");
   gen("  __wcount := 0;\n");
@@ -5153,18 +5309,18 @@ begin
   gen("  if band(flags, 576) = 576 then disp := 2;\n");
   gen("  h := winapi(__K_CREATEFILEA, path, access, 3, 0, disp, 0x80, 0);\n");
   gen("  if h = 0 - 1 then return 0 - 1;\n");
-  gen("  if band(flags, 1024) <> 0 then __wdummy := winapi(__K_SETPTR, h, 0, 0, 2);   { O_APPEND: seek to the end }\n");
+  gen("  if band(flags, 1024) <> 0 then __wdummy := winapi(__K_SETPTR, h, 0, 0, 2);   // O_APPEND: seek to the end\n");
   gen("  return h;\n");
   gen("end;\n");
   gen("\n");
-  gen("{ mmap over CreateFileMapping/MapViewOfFile; fd < 0 maps the page file }\n");
+  gen("// mmap over CreateFileMapping/MapViewOfFile; fd < 0 maps the page file\n");
   gen("function __wmmap(n: int; prot: int; fd: int; off: int): int;\n");
   gen("var h, m, a, p, acc: int;\n");
   gen("begin\n");
-  gen("  p := 2; acc := 4;                          { PAGE_READONLY, FILE_MAP_READ }\n");
+  gen("  p := 2; acc := 4;   // PAGE_READONLY, FILE_MAP_READ\n");
   gen("  if band(prot, 2) <> 0 then\n");
   gen("  begin\n");
-  gen("    p := 4; acc := 0x0F001F;                 { PAGE_READWRITE, FILE_MAP_ALL_ACCESS }\n");
+  gen("    p := 4; acc := 0x0F001F;   // PAGE_READWRITE, FILE_MAP_ALL_ACCESS\n");
   gen("  end;\n");
   gen("  if fd < 0 then\n");
   gen("  begin\n");
@@ -5203,7 +5359,7 @@ begin
   gen("  return 0;\n");
   gen("end;\n");
   gen("\n");
-  gen("{ flock: LOCK_SH 1, LOCK_EX 2, LOCK_NB 4, LOCK_UN 8 over the whole file }\n");
+  gen("// flock: LOCK_SH 1, LOCK_EX 2, LOCK_NB 4, LOCK_UN 8 over the whole file\n");
   gen("function __wflock(fd: int; op: int): int;\n");
   gen("var h, flags, ok, i: int;\n");
   gen("begin\n");
@@ -5287,9 +5443,9 @@ begin
   gen("  return fd;\n");
   gen("end;\n");
   gen("\n");
-  gen("{ Winsock's sockaddr_in matches Linux's byte for byte for AF_INET: family at\n");
-  gen("  0 (2), port big-endian at 2, address at 4.  So the caller's 16-byte buffer\n");
-  gen("  passes straight through. }\n");
+  gen("// Winsock's sockaddr_in matches Linux's byte for byte for AF_INET: family at\n");
+  gen("  // 0 (2), port big-endian at 2, address at 4.  So the caller's 16-byte buffer\n");
+  gen("  // passes straight through.\n");
   gen("function __wbind(fd: int; sa: int; sln: int): int;\n");
   gen("var r: int;\n");
   gen("begin\n");
@@ -5313,7 +5469,7 @@ begin
   gen("begin\n");
   gen("  if not __wissock(fd) then return 0 - 9;\n");
   gen("  h := winapi(__W_ACCEPT, __wsh[fd], 0, 0);\n");
-  gen("  if h = 0 - 1 then return 0 - 11;           { WSAEWOULDBLOCK -> EAGAIN }\n");
+  gen("  if h = 0 - 1 then return 0 - 11;   // WSAEWOULDBLOCK -> EAGAIN\n");
   gen("  nfd := __wslot;\n");
   gen("  if nfd < 0 then\n");
   gen("  begin\n");
@@ -5324,14 +5480,14 @@ begin
   gen("  __wev[nfd] := 0;\n");
   gen("  nb := 1;\n");
   gen("  __wp32(__wsa, 0, nb);\n");
-  gen("  __wdummy := winapi(__W_IOCTL, h, 0x8004667E, addr(__wsa[0]));   { FIONBIO }\n");
+  gen("  __wdummy := winapi(__W_IOCTL, h, 0x8004667E, addr(__wsa[0]));   // FIONBIO\n");
   gen("  return nfd;\n");
   gen("end;\n");
   gen("\n");
   gen("function __wsetopt(fd: int; opt: int; a: int; sln: int): int;\n");
   gen("begin\n");
   gen("  if not __wissock(fd) then return 0 - 9;\n");
-  gen("  { SO_REUSEADDR is 4 on Windows; SO_REUSEPORT does not exist, ignore it }\n");
+  gen("  // SO_REUSEADDR is 4 on Windows; SO_REUSEPORT does not exist, ignore it\n");
   gen("  if opt = 15 then return 0;\n");
   gen("  __wdummy := winapi(__W_SETSOCKOPT, __wsh[fd], 0xFFFF, 4, a, sln);\n");
   gen("  return 0;\n");
@@ -5355,7 +5511,7 @@ begin
   gen("  poke(a + 3, band(v shr 24, 255));\n");
   gen("end;\n");
   gen("\n");
-  gen("{ epoll_ctl: op 1=ADD, 2=DEL, 3=MOD.  The event mask sits at [ev+0]. }\n");
+  gen("// epoll_ctl: op 1=ADD, 2=DEL, 3=MOD.  The event mask sits at [ev+0].\n");
   gen("function __wepctl(op: int; fd: int; ev: int): int;\n");
   gen("var mask: int;\n");
   gen("begin\n");
@@ -5372,8 +5528,8 @@ begin
   gen("  return 0;\n");
   gen("end;\n");
   gen("\n");
-  gen("{ epoll_wait: build a WSAPOLLFD array from the interest table, poll it, then\n");
-  gen("  write ready events into the caller's array (12 bytes each: events, fd). }\n");
+  gen("// epoll_wait: build a WSAPOLLFD array from the interest table, poll it, then\n");
+  gen("  // write ready events into the caller's array (12 bytes each: events, fd).\n");
   gen("function __wepwait(a: int; maxev: int; timeout: int): int;\n");
   gen("var i, np, r, k, out, revents, ev, base, pe: int;\n");
   gen("begin\n");
@@ -5387,8 +5543,8 @@ begin
   gen("      __wp32(__wpoll, base, band(__wsh[i], 0xFFFFFFFF));\n");
   gen("      __wp32(__wpoll, base + 4, __wsh[i] shr 32);\n");
   gen("      ev := 0;\n");
-  gen("      if band(__wev[i], 1) <> 0 then ev := bor(ev, 0x0300);   { IN -> RDNORM|RDBAND }\n");
-  gen("      if band(__wev[i], 4) <> 0 then ev := bor(ev, 0x0010);   { OUT -> WRNORM }\n");
+  gen("      if band(__wev[i], 1) <> 0 then ev := bor(ev, 0x0300);   // IN -> RDNORM|RDBAND\n");
+  gen("      if band(__wev[i], 4) <> 0 then ev := bor(ev, 0x0010);   // OUT -> WRNORM\n");
   gen("      __wpoll[base + 8] := chr(band(ev, 255));\n");
   gen("      __wpoll[base + 9] := chr(band(ev shr 8, 255));\n");
   gen("      __wpoll[base + 10] := chr(0);\n");
@@ -5419,10 +5575,10 @@ begin
   gen("    if revents <> 0 then\n");
   gen("    begin\n");
   gen("      ev := 0;\n");
-  gen("      if band(revents, 0x0300) <> 0 then ev := bor(ev, 1);   { IN }\n");
-  gen("      if band(revents, 0x0010) <> 0 then ev := bor(ev, 4);   { OUT }\n");
-  gen("      if band(revents, 0x0001) <> 0 then ev := bor(ev, 8);   { ERR }\n");
-  gen("      if band(revents, 0x0002) <> 0 then ev := bor(ev, 16);  { HUP }\n");
+  gen("      if band(revents, 0x0300) <> 0 then ev := bor(ev, 1);   // IN\n");
+  gen("      if band(revents, 0x0010) <> 0 then ev := bor(ev, 4);   // OUT\n");
+  gen("      if band(revents, 0x0001) <> 0 then ev := bor(ev, 8);   // ERR\n");
+  gen("      if band(revents, 0x0002) <> 0 then ev := bor(ev, 16);   // HUP\n");
   gen("      pe := a + out * 12;\n");
   gen("      __wput32abs(pe, ev);\n");
   gen("      __wput32abs(pe + 4, __wrow[k]);\n");
@@ -5435,8 +5591,8 @@ begin
   gen("  return out;\n");
   gen("end;\n");
   gen("\n");
-  gen("{ clock_gettime-ish: return nanoseconds since the Unix epoch, good enough for\n");
-  gen("  the io.now() the library exposes.  FILETIME is 100ns ticks since 1601. }\n");
+  gen("// clock_gettime-ish: return nanoseconds since the Unix epoch, good enough for\n");
+  gen("  // the io.now() the library exposes.  FILETIME is 100ns ticks since 1601.\n");
   gen("function __wnow: int;\n");
   gen("var lo, hi, t: int;\n");
   gen("begin\n");
@@ -5444,28 +5600,28 @@ begin
   gen("  lo := __wg32(__wtime, 0);\n");
   gen("  hi := __wg32(__wtime, 4);\n");
   gen("  t := bor(lo, hi shl 32);\n");
-  gen("  t := t - 116444736000000000;           { 1601 -> 1970 in 100ns ticks }\n");
-  gen("  return t * 100;                         { 100ns -> ns }\n");
+  gen("  t := t - 116444736000000000;   // 1601 -> 1970 in 100ns ticks\n");
+  gen("  return t * 100;   // 100ns -> ns\n");
   gen("end;\n");
   gen("\n");
-  gen("{ WIN32_FIND_DATAA: dwFileAttributes at 0, ftLastWriteTime at 20 (8 bytes),\n");
-  gen("  nFileSizeHigh at 28, nFileSizeLow at 32, cFileName at 44 (260 bytes). }\n");
+  gen("// WIN32_FIND_DATAA: dwFileAttributes at 0, ftLastWriteTime at 20 (8 bytes),\n");
+  gen("  // nFileSizeHigh at 28, nFileSizeLow at 32, cFileName at 44 (260 bytes).\n");
   gen("function __wattr_isdir(attr: int): bool;\n");
   gen("begin\n");
-  gen("  return band(attr, 16) <> 0;      { FILE_ATTRIBUTE_DIRECTORY }\n");
+  gen("  return band(attr, 16) <> 0;   // FILE_ATTRIBUTE_DIRECTORY\n");
   gen("end;\n");
   gen("\n");
-  gen("{ GetFileAttributesExA fills a WIN32_FILE_ATTRIBUTE_DATA (36 bytes):\n");
-  gen("  attributes at 0, ftLastWriteTime at 20, sizeHigh at 28, sizeLow at 32. }\n");
+  gen("// GetFileAttributesExA fills a WIN32_FILE_ATTRIBUTE_DATA (36 bytes):\n");
+  gen("  // attributes at 0, ftLastWriteTime at 20, sizeHigh at 28, sizeLow at 32.\n");
   gen("function __wstatinto(path: int; stbuf: int): int;\n");
   gen("var ok, attr, mode, sz, lo, hi, mt, mlo, mhi: int;\n");
   gen("begin\n");
-  gen("  ok := winapi(__K_GETATTREX, path, 0, addr(__wfind[0]));   { GetFileAttributesExA }\n");
+  gen("  ok := winapi(__K_GETATTREX, path, 0, addr(__wfind[0]));   // GetFileAttributesExA\n");
   gen("  if band(ok, 0xFFFFFFFF) = 0 then return 0 - 2;\n");
   gen("  attr := __wg32(__wfind, 0);\n");
-  gen("  mode := 0x8000;                                            { S_IFREG }\n");
-  gen("  if __wattr_isdir(attr) then mode := 0x4000;               { S_IFDIR }\n");
-  gen("  mode := bor(mode, 0x1FF);                                  { rwxrwxrwx bits }\n");
+  gen("  mode := 0x8000;   // S_IFREG\n");
+  gen("  if __wattr_isdir(attr) then mode := 0x4000;   // S_IFDIR\n");
+  gen("  mode := bor(mode, 0x1FF);   // rwxrwxrwx bits\n");
   gen("  lo := __wg32(__wfind, 32);\n");
   gen("  hi := __wg32(__wfind, 28);\n");
   gen("  sz := bor(band(lo, 0xFFFFFFFF), hi shl 32);\n");
@@ -5473,8 +5629,8 @@ begin
   gen("  mhi := __wg32(__wfind, 24);\n");
   gen("  mt := bor(band(mlo, 0xFFFFFFFF), mhi shl 32);\n");
   gen("  mt := mt - 116444736000000000;\n");
-  gen("  mt := mt div 10000000;                                     { 100ns ticks -> seconds }\n");
-  gen("  { mode at offset 24, size at 48, mtime at 88 (see lib/fs.wz) }\n");
+  gen("  mt := mt div 10000000;   // 100ns ticks -> seconds\n");
+  gen("  // mode at offset 24, size at 48, mtime at 88 (see lib/fs.wz)\n");
   gen("  __wput32abs(stbuf + 24, mode);\n");
   gen("  __wput32abs(stbuf + 48, band(sz, 0xFFFFFFFF));\n");
   gen("  __wput32abs(stbuf + 52, sz shr 32);\n");
@@ -5483,7 +5639,7 @@ begin
   gen("  return 0;\n");
   gen("end;\n");
   gen("\n");
-  gen("{ opendir(path): start a FindFirstFileA over path\\* and return a dir fd }\n");
+  gen("// opendir(path): start a FindFirstFileA over path\\* and return a dir fd\n");
   gen("function __wopendir(path: int): int;\n");
   gen("var i, o, h, fd: int;\n");
   gen("    c: char;\n");
@@ -5511,15 +5667,15 @@ begin
   gen("    __wdummy := winapi(__K_FINDCLOSE, h);\n");
   gen("    return 0 - 24;\n");
   gen("  end;\n");
-  gen("  __wsh[fd] := 0 - 2;              { mark the slot busy but not a socket }\n");
+  gen("  __wsh[fd] := 0 - 2;   // mark the slot busy but not a socket\n");
   gen("  __wdh[fd] := h;\n");
-  gen("  __wdfirst[fd] := 1;             { the first entry is already in __wfind }\n");
+  gen("  __wdfirst[fd] := 1;   // the first entry is already in __wfind\n");
   gen("  return fd;\n");
   gen("end;\n");
   gen("\n");
-  gen("{ getdents into the caller's buffer at address a, capacity cap.  Emits Linux\n");
-  gen("  dirent64-ish records: reclen (2 bytes) at +16, type (1 byte) at +18, the\n");
-  gen("  NUL-terminated name from +19.  Returns bytes written, or 0 at the end. }\n");
+  gen("// getdents into the caller's buffer at address a, capacity cap.  Emits Linux\n");
+  gen("  // dirent64-ish records: reclen (2 bytes) at +16, type (1 byte) at +18, the\n");
+  gen("  // NUL-terminated name from +19.  Returns bytes written, or 0 at the end.\n");
   gen("function __wgetdents(fd: int; a: int; cap: int): int;\n");
   gen("var used, attr, i, nl, reclen, base, more, t: int;\n");
   gen("    c: char;\n");
@@ -5534,7 +5690,7 @@ begin
   gen("      if band(more, 0xFFFFFFFF) = 0 then break;\n");
   gen("    end;\n");
   gen("    __wdfirst[fd] := 0;\n");
-  gen("    { name length }\n");
+  gen("    // name length\n");
   gen("    nl := 0;\n");
   gen("    while nl < 259 do\n");
   gen("    begin\n");
@@ -5545,20 +5701,20 @@ begin
   gen("    reclen := (reclen + 7) div 8 * 8;\n");
   gen("    if used + reclen > cap then\n");
   gen("    begin\n");
-  gen("      { no room: reprocess this entry next call by pretending it is first }\n");
+  gen("      // no room: reprocess this entry next call by pretending it is first\n");
   gen("      __wdfirst[fd] := 1;\n");
   gen("      break;\n");
   gen("    end;\n");
   gen("    base := a + used;\n");
-  gen("    __wput32abs(base, 0);            { d_ino low }\n");
+  gen("    __wput32abs(base, 0);   // d_ino low\n");
   gen("    __wput32abs(base + 4, 0);\n");
-  gen("    __wput32abs(base + 8, 0);        { d_off }\n");
+  gen("    __wput32abs(base + 8, 0);   // d_off\n");
   gen("    __wput32abs(base + 12, 0);\n");
   gen("    poke(base + 16, band(reclen, 255));\n");
   gen("    poke(base + 17, band(reclen shr 8, 255));\n");
   gen("    attr := __wg32(__wfind, 0);\n");
-  gen("    t := 8;                          { DT_REG }\n");
-  gen("    if __wattr_isdir(attr) then t := 4;   { DT_DIR }\n");
+  gen("    t := 8;   // DT_REG\n");
+  gen("    if __wattr_isdir(attr) then t := 4;   // DT_DIR\n");
   gen("    poke(base + 18, t);\n");
   gen("    i := 0;\n");
   gen("    while i < nl do\n");
@@ -5580,29 +5736,29 @@ begin
   gen("  if nr = 0 then return __wread(a, b, c);\n");
   gen("  if nr = 2 then\n");
   gen("  begin\n");
-  gen("    if band(b, 65536) <> 0 then return __wopendir(a);   { O_DIRECTORY }\n");
+  gen("    if band(b, 65536) <> 0 then return __wopendir(a);   // O_DIRECTORY\n");
   gen("    return __wopen(a, b);\n");
   gen("  end;\n");
-  gen("  if (nr = 4) or (nr = 6) then return __wstatinto(a, b);  { stat / lstat }\n");
-  gen("  if nr = 217 then return __wgetdents(a, b, c);           { getdents }\n");
+  gen("  if (nr = 4) or (nr = 6) then return __wstatinto(a, b);   // stat / lstat\n");
+  gen("  if nr = 217 then return __wgetdents(a, b, c);   // getdents\n");
   gen("  if nr = 3 then\n");
   gen("  begin\n");
   gen("    __wclose(a);\n");
   gen("    return 0;\n");
   gen("  end;\n");
-  gen("  if nr = 41 then return __wsock;                         { socket }\n");
-  gen("  if nr = 49 then return __wbind(a, b, c);                { bind }\n");
-  gen("  if nr = 50 then return __wlisten(a, b);                 { listen }\n");
-  gen("  if nr = 43 then return __waccept(a);                    { accept }\n");
-  gen("  if nr = 288 then return __waccept(a);                   { accept4 }\n");
-  gen("  if nr = 54 then return __wsetopt(a, c, d, e);           { setsockopt }\n");
-  gen("  if nr = 72 then return __wnonblock(a);                  { fcntl F_SETFL }\n");
-  gen("  if nr = 44 then return __wwrite(a, b, c);               { sendto -> send }\n");
-  gen("  if nr = 48 then return 0;                               { shutdown: no-op }\n");
-  gen("  if nr = 291 then return 1000000;                        { epoll_create -> token }\n");
-  gen("  if nr = 233 then return __wepctl(b, c, d);              { epoll_ctl }\n");
-  gen("  if nr = 232 then return __wepwait(b, c, d);             { epoll_wait }\n");
-  gen("  if nr = 228 then                                        { clock_gettime: fill the timespec }\n");
+  gen("  if nr = 41 then return __wsock;   // socket\n");
+  gen("  if nr = 49 then return __wbind(a, b, c);   // bind\n");
+  gen("  if nr = 50 then return __wlisten(a, b);   // listen\n");
+  gen("  if nr = 43 then return __waccept(a);   // accept\n");
+  gen("  if nr = 288 then return __waccept(a);   // accept4\n");
+  gen("  if nr = 54 then return __wsetopt(a, c, d, e);   // setsockopt\n");
+  gen("  if nr = 72 then return __wnonblock(a);   // fcntl F_SETFL\n");
+  gen("  if nr = 44 then return __wwrite(a, b, c);   // sendto -> send\n");
+  gen("  if nr = 48 then return 0;   // shutdown: no-op\n");
+  gen("  if nr = 291 then return 1000000;   // epoll_create -> token\n");
+  gen("  if nr = 233 then return __wepctl(b, c, d);   // epoll_ctl\n");
+  gen("  if nr = 232 then return __wepwait(b, c, d);   // epoll_wait\n");
+  gen("  if nr = 228 then   // clock_gettime: fill the timespec\n");
   gen("  begin\n");
   gen("    t := __wnow;\n");
   gen("    __wput32abs(b, band(t div 1000000000, 0xFFFFFFFF));\n");
@@ -5611,63 +5767,63 @@ begin
   gen("    __wput32abs(b + 12, 0);\n");
   gen("    return 0;\n");
   gen("  end;\n");
-  gen("  if nr = 9 then return __wmmap(b, c, e, f);               { mmap }\n");
-  gen("  if nr = 11 then                                         { munmap }\n");
+  gen("  if nr = 9 then return __wmmap(b, c, e, f);   // mmap\n");
+  gen("  if nr = 11 then   // munmap\n");
   gen("  begin\n");
   gen("    __wdummy := winapi(__K_UNMAPVIEW, a);\n");
   gen("    return 0;\n");
   gen("  end;\n");
-  gen("  if nr = 26 then                                         { msync }\n");
+  gen("  if nr = 26 then   // msync\n");
   gen("  begin\n");
   gen("    __wdummy := winapi(__K_FLUSHVIEW, a, b);\n");
   gen("    return 0;\n");
   gen("  end;\n");
-  gen("  if nr = 74 then                                         { fsync }\n");
+  gen("  if nr = 74 then   // fsync\n");
   gen("  begin\n");
   gen("    __wdummy := winapi(__K_FLUSHFILE, __whandle(a));\n");
   gen("    return 0;\n");
   gen("  end;\n");
-  gen("  if nr = 82 then                                         { rename }\n");
+  gen("  if nr = 82 then   // rename\n");
   gen("  begin\n");
-  gen("    t := winapi(__K_MOVEFILE, a, b, 9);                  { REPLACE_EXISTING | WRITE_THROUGH }\n");
+  gen("    t := winapi(__K_MOVEFILE, a, b, 9);   // REPLACE_EXISTING | WRITE_THROUGH\n");
   gen("    if band(t, 0xFFFFFFFF) = 0 then return 0 - 2;\n");
   gen("    return 0;\n");
   gen("  end;\n");
-  gen("  if nr = 8 then return __wlseek(a, b, c);                { lseek }\n");
-  gen("  if nr = 77 then return __wftruncate(a, b);              { ftruncate }\n");
-  gen("  if nr = 87 then                                         { unlink }\n");
+  gen("  if nr = 8 then return __wlseek(a, b, c);   // lseek\n");
+  gen("  if nr = 77 then return __wftruncate(a, b);   // ftruncate\n");
+  gen("  if nr = 87 then   // unlink\n");
   gen("  begin\n");
   gen("    t := winapi(__K_DELETEFILE, a);\n");
   gen("    if band(t, 0xFFFFFFFF) = 0 then return 0 - 2;\n");
   gen("    return 0;\n");
   gen("  end;\n");
-  gen("  if nr = 83 then                                         { mkdir }\n");
+  gen("  if nr = 83 then   // mkdir\n");
   gen("  begin\n");
   gen("    t := winapi(__K_CREATEDIR, a, 0);\n");
   gen("    if band(t, 0xFFFFFFFF) = 0 then return 0 - 17;\n");
   gen("    return 0;\n");
   gen("  end;\n");
-  gen("  if nr = 84 then                                         { rmdir }\n");
+  gen("  if nr = 84 then   // rmdir\n");
   gen("  begin\n");
   gen("    t := winapi(__K_REMOVEDIR, a);\n");
   gen("    if band(t, 0xFFFFFFFF) = 0 then return 0 - 2;\n");
   gen("    return 0;\n");
   gen("  end;\n");
-  gen("  if nr = 73 then return __wflock(a, b);                  { flock }\n");
-  gen("  if nr = 318 then                                        { getrandom }\n");
+  gen("  if nr = 73 then return __wflock(a, b);   // flock\n");
+  gen("  if nr = 318 then   // getrandom\n");
   gen("  begin\n");
   gen("    t := winapi(__A_RANDOM, a, b);\n");
   gen("    if band(t, 0xFF) = 0 then return 0 - 1;\n");
   gen("    return b;\n");
   gen("  end;\n");
-  gen("  if nr = 35 then                                         { nanosleep }\n");
+  gen("  if nr = 35 then   // nanosleep\n");
   gen("  begin\n");
   gen("    __wdummy := winapi(__K_SLEEP, 1);\n");
   gen("    return 0;\n");
   gen("  end;\n");
-  gen("  if nr = 90 then return 0;                               { chmod: no-op }\n");
-  gen("  if nr = 57 then return 0;   { fork: no worker processes, run single-process }\n");
-  gen("  if nr = 61 then return 0;   { wait4: nothing to wait for }\n");
+  gen("  if nr = 90 then return 0;   // chmod: no-op\n");
+  gen("  if nr = 57 then return 0;   // fork: no worker processes, run single-process\n");
+  gen("  if nr = 61 then return 0;   // wait4: nothing to wait for\n");
   gen("  if (nr = 60) or (nr = 231) then winapi(__K_EXITPROCESS, band(a, 0xFFFFFFFF));\n");
   gen("  __wputs(\"runtime error: an unsupported system call was made on Windows\\n\");\n");
   gen("  winapi(__K_EXITPROCESS, 70);\n");
@@ -5776,9 +5932,9 @@ begin
   next;
 end;
 
-{ ------------------------------------------------------------------ }
-{ program                                                             }
-{ ------------------------------------------------------------------ }
+// ------------------------------------------------------------------
+// program
+// ------------------------------------------------------------------
 
 procedure emitprelude;
 var i, j, k: int;
@@ -5786,7 +5942,7 @@ begin
   entryoff := 0;
   if winmode <> 0 then
   begin
-    { __sysraw: hand the Linux register set to __wsys(nr, a, b, c, d, e, f) }
+    // __sysraw: hand the Linux register set to __wsys(nr, a, b, c, d, e, f)
     sysrawaddr := codelen;
     e(0x41); e(0x54);
     e(0x4D); e(0x89); e(0xCC);
@@ -5799,8 +5955,8 @@ begin
     e(0xE8); fixup(FX_WSYS, 0); e32(0);
     e(0x41); e(0x5C);
     e(0xC3);
-    { entry: __winit builds an argc/argv block; its address goes where a
-      Linux executable keeps its initial stack pointer }
+    // entry: __winit builds an argc/argv block; its address goes where a
+    // Linux executable keeps its initial stack pointer
     entryoff := codelen;
     e(0xE8); fixup(FX_WINIT, 0); e32(0);
     e(0x49); e(0xBA); fixup(FX_BSS, 0); e64(0);
@@ -5833,8 +5989,8 @@ begin
   e(0xC3);
   e(0x31); e(0xC0);
   e(0xC3);
-  { __scan(rdi=base, rsi=len, rdx=from, rcx=to, r8b=byte) -> rax
-    sixteen bytes per step, with a byte loop for the tail }
+  // __scan(rdi=base, rsi=len, rdx=from, rcx=to, r8b=byte) -> rax
+  // sixteen bytes per step, with a byte loop for the tail
   scanaddr := codelen;
   e(0x66); e(0x41); e(0x0F); e(0x6E); e(0xC8);
   e(0x66); e(0x0F); e(0x60); e(0xC9);
@@ -5892,9 +6048,9 @@ begin
     else if tok = KW_PROCEDURE then declroutine(1)
     else break;
   end;
-  { Report EVERY unresolved forward, not just the first: a program that serves HTTP
-    defines several hooks from more than one library, and fixing them one compile at a
-    time is the slow path.  Each is named, at the file and line of its declaration. }
+  // Report EVERY unresolved forward, not just the first: a program that serves HTTP
+  // defines several hooks from more than one library, and fixing them one compile at a
+  // time is the slow path.  Each is named, at the file and line of its declaration.
   i := 0;
   nunres := 0;
   while i < nfn do
@@ -5929,9 +6085,9 @@ begin
   e32at(mainpatch, mainaddr - (mainpatch + 4));
 end;
 
-{ ------------------------------------------------------------------ }
-{ ELF output                                                          }
-{ ------------------------------------------------------------------ }
+// ------------------------------------------------------------------
+// ELF output
+// ------------------------------------------------------------------
 
 procedure ph(b: int);
 begin
@@ -6000,12 +6156,12 @@ begin
   chm(addr(outname[0]), 493);
 end;
 
-{ ------------------------------------------------------------------ }
-{ PE output: a 64-bit Windows executable                              }
-{ ------------------------------------------------------------------ }
-{ Three sections: .text, .rdata (the string data followed by the import
-  tables for kernel32) and .bss.  No relocations, so the image is fixed at
-  VBASE, exactly like the ELF; no section is both writable and executable. }
+// ------------------------------------------------------------------
+// PE output: a 64-bit Windows executable
+// ------------------------------------------------------------------
+// Three sections: .text, .rdata (the string data followed by the import
+// tables for kernel32) and .bss.  No relocations, so the image is fixed at
+// VBASE, exactly like the ELF; no section is both writable and executable.
 
 procedure pd(b: int);
 begin
@@ -6045,11 +6201,11 @@ begin
   end;
 end;
 
-{ The import address table, in slot order; winapi() indexes it. }
-{ Imported functions, in IAT slot order.  winapi(slot) calls slot*8 into the
-  IAT.  The first WSBASE slots live in kernel32, the rest in ws2_32; the two
-  DLLs get their own null-terminated thunk arrays, which is why the slot after
-  the last kernel32 entry is reserved as a gap (see the IAT layout below). }
+// The import address table, in slot order; winapi() indexes it.
+// Imported functions, in IAT slot order.  winapi(slot) calls slot*8 into the
+// IAT.  The first WSBASE slots live in kernel32, the rest in ws2_32; the two
+// DLLs get their own null-terminated thunk arrays, which is why the slot after
+// the last kernel32 entry is reserved as a gap (see the IAT layout below).
 function impname(i: int): str;
 begin
   if i = 0 then return "GetStdHandle";
@@ -6079,7 +6235,7 @@ begin
   if i = 24 then return "RemoveDirectoryA";
   if i = 25 then return "LockFileEx";
   if i = 26 then return "UnlockFileEx";
-  { ws2_32, from name 27 }
+  // ws2_32, from name 27
   if i = 27 then return "WSAStartup";
   if i = 28 then return "socket";
   if i = 29 then return "closesocket";
@@ -6091,11 +6247,11 @@ begin
   if i = 35 then return "send";
   if i = 36 then return "recv";
   if i = 37 then return "WSAPoll";
-  { advapi32 }
+  // advapi32
   return "SystemFunction036";
 end;
 
-{ offset of hint/name entry i within the name block */ }
+// offset of hint/name entry i within the name block */
 function impoff(i: int): int;
 var o, k, n: int;
 begin
@@ -6122,34 +6278,34 @@ var textrva, textraw, rdatarva, rdataraw, bssrva, imgsize: int;
     codeva, datava, bssva, iatva, idt, iat, names, i, k, v, fd, wsys, winit: int;
     iatlen, w2name, a3name: int;
 begin
-  { The IAT (and an identical ILT) each hold KCOUNT kernel32 thunks, a null,
-    WCOUNT ws2_32 thunks, a null, ACOUNT advapi32 thunks, and a null:
-    NIMP + 3 eight-byte entries. }
+  // The IAT (and an identical ILT) each hold KCOUNT kernel32 thunks, a null,
+  // WCOUNT ws2_32 thunks, a null, ACOUNT advapi32 thunks, and a null:
+  // NIMP + 3 eight-byte entries.
   iatlen := 8 * (NIMP + 3);
   while (codelen mod 8) <> 0 do e(0x90);
   while (datlen mod 8) <> 0 do pd(0);
   textrva := 0x1000;
   rdatarva := align(textrva + codelen, 0x1000);
   idt := datlen;
-  iat := idt + 80;                       { three entries + a null one, 4 * 20 }
-  names := iat + iatlen + iatlen;        { IAT, then ILT, then the names }
+  iat := idt + 80;                       // three entries + a null one, 4 * 20
+  names := iat + iatlen + iatlen;        // IAT, then ILT, then the names
   w2name := impoff(NIMP) + slen("KERNEL32.dll") + 1;
   a3name := w2name + slen("WS2_32.dll") + 1;
-  { --- import directory table: kernel32, ws2_32, advapi32, then null --- }
-  pd32(rdatarva + iat + iatlen);                        { kernel32 ILT }
+  // --- import directory table: kernel32, ws2_32, advapi32, then null ---
+  pd32(rdatarva + iat + iatlen);                        // kernel32 ILT
   pd32(0); pd32(0);
-  pd32(rdatarva + names + impoff(NIMP));                { "KERNEL32.dll" }
-  pd32(rdatarva + iat);                                 { kernel32 IAT }
-  pd32(rdatarva + iat + iatlen + 8 * (KCOUNT + 1));     { ws2_32 ILT }
+  pd32(rdatarva + names + impoff(NIMP));                // "KERNEL32.dll"
+  pd32(rdatarva + iat);                                 // kernel32 IAT
+  pd32(rdatarva + iat + iatlen + 8 * (KCOUNT + 1));     // ws2_32 ILT
   pd32(0); pd32(0);
-  pd32(rdatarva + names + w2name);                      { "WS2_32.dll" }
-  pd32(rdatarva + iat + 8 * (KCOUNT + 1));              { ws2_32 IAT }
-  pd32(rdatarva + iat + iatlen + 8 * (KCOUNT + WCOUNT + 2));   { advapi32 ILT }
+  pd32(rdatarva + names + w2name);                      // "WS2_32.dll"
+  pd32(rdatarva + iat + 8 * (KCOUNT + 1));              // ws2_32 IAT
+  pd32(rdatarva + iat + iatlen + 8 * (KCOUNT + WCOUNT + 2));   // advapi32 ILT
   pd32(0); pd32(0);
-  pd32(rdatarva + names + a3name);                      { "ADVAPI32.dll" }
-  pd32(rdatarva + iat + 8 * (KCOUNT + WCOUNT + 2));     { advapi32 IAT }
-  pd32(0); pd32(0); pd32(0); pd32(0); pd32(0);          { null directory entry }
-  { --- the IAT, then an identical ILT --- }
+  pd32(rdatarva + names + a3name);                      // "ADVAPI32.dll"
+  pd32(rdatarva + iat + 8 * (KCOUNT + WCOUNT + 2));     // advapi32 IAT
+  pd32(0); pd32(0); pd32(0); pd32(0); pd32(0);          // null directory entry
+  // --- the IAT, then an identical ILT ---
   k := 0;
   while k < 2 do
   begin
@@ -6159,22 +6315,22 @@ begin
       pd32(rdatarva + names + impoff(i)); pd32(0);
       i := i + 1;
     end;
-    pd32(0); pd32(0);                             { kernel32 terminator }
+    pd32(0); pd32(0);                             // kernel32 terminator
     while i < KCOUNT + WCOUNT do
     begin
       pd32(rdatarva + names + impoff(i)); pd32(0);
       i := i + 1;
     end;
-    pd32(0); pd32(0);                             { ws2_32 terminator }
+    pd32(0); pd32(0);                             // ws2_32 terminator
     while i < NIMP do
     begin
       pd32(rdatarva + names + impoff(i)); pd32(0);
       i := i + 1;
     end;
-    pd32(0); pd32(0);                             { advapi32 terminator }
+    pd32(0); pd32(0);                             // advapi32 terminator
     k := k + 1;
   end;
-  { --- hint/name table --- }
+  // --- hint/name table ---
   i := 0;
   while i < NIMP do
   begin
@@ -6215,7 +6371,7 @@ begin
   end;
 
   hlen := 0;
-  { DOS header and stub }
+  // DOS header and stub
   ph(77); ph(90); ph16(0x90); ph16(3); ph16(0); ph16(4);
   ph16(0); ph16(0xFFFF); ph16(0); ph16(0xB8);
   ph16(0); ph16(0); ph16(0); ph16(0x40);
@@ -6226,10 +6382,10 @@ begin
   phs("This program cannot be run in DOS mode.");
   ph(13); ph(13); ph(10); ph(36);
   while hlen < 128 do ph(0);
-  { PE signature and COFF header }
+  // PE signature and COFF header
   ph(80); ph(69); ph(0); ph(0);
   ph16(0x8664); ph16(3); ph32(0); ph32(0); ph32(0); ph16(240); ph16(0x23);
-  { optional header }
+  // optional header
   ph16(0x20B); ph(1); ph(0);
   ph32(textraw); ph32(rdataraw); ph32(align(bsslen, 512));
   ph32(textrva + entryoff); ph32(textrva);
@@ -6251,7 +6407,7 @@ begin
   end;
   ph32(rdatarva + iat); ph32(iatlen);
   ph32(0); ph32(0); ph32(0); ph32(0); ph32(0); ph32(0);
-  { section table }
+  // section table
   phs(".text"); ph(0); ph(0); ph(0);
   ph32(codelen); ph32(textrva); ph32(textraw); ph32(HDRMAX);
   ph32(0); ph32(0); ph16(0); ph16(0); ph32(0x60000020);
@@ -6278,7 +6434,7 @@ function compile: int;
 var n: int;
 begin
   line := 1;
-  emb.fill;                              { the library carried inside this binary }
+  emb.fill;                              // the library carried inside this binary
   srclen := 0; fnplen := 0; nfiles := 0; incdepth := 0;
   curfile := addfile;
   n := readfile;
@@ -6309,8 +6465,8 @@ begin
 end;
 
 begin
-  { --version before the argument count check: asking a compiler what it is should not
-    require giving it a source file and an output name. }
+  // --version before the argument count check: asking a compiler what it is should not
+  // require giving it a source file and an output name.
   if argc() = 2 then
   begin
     if argeq(1, "--version") or argeq(1, "-v") then
@@ -6321,10 +6477,10 @@ begin
       halt(0);
     end;
   end;
-  { Run with no arguments at all, say what this program IS.  Someone who finds the
-    binary without the repository around it has no other way to tell.  This is the
-    only place it prints: a successful compile stays silent, so the text cannot end
-    up in a build log or in a shell substitution. }
+  // Run with no arguments at all, say what this program IS.  Someone who finds the
+  // binary without the repository around it has no other way to tell.  This is the
+  // only place it prints: a successful compile stays silent, so the text cannot end
+  // up in a build log or in a shell substitution.
   if argc() < 3 then
   begin
     wrs(2, "wantzel ");
@@ -6357,8 +6513,8 @@ begin
   end;
   outname[mi] := chr(0);
   outnamelen := mi;
-  { the target defaults to the host convention read off the output name: a
-    name ending in .exe means Windows.  An explicit --target= overrides it. }
+  // the target defaults to the host convention read off the output name: a
+  // name ending in .exe means Windows.  An explicit --target= overrides it.
   winmode := 0;
   if mi >= 4 then
   begin

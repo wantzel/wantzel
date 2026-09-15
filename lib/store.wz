@@ -245,7 +245,7 @@ begin
     begin
       sys1(SYS.close, fd); store.err := "snapshot record size or capacity differs"; return -1;
     end;
-    cnt := io.get64(store.sh, STORE.NAMELEN + 16);        { rows written = high-water mark }
+    cnt := io.get64(store.sh, STORE.NAMELEN + 16);        // rows written = high-water mark
     if (cnt < 0) or (cnt > store.cap[t]) then begin sys1(SYS.close, fd); store.err := "snapshot row count invalid"; return -1; end;
     if cnt > 0 then
     begin
@@ -273,7 +273,7 @@ begin
   store.dirn := len(dir);
   store.mkpath("");
   store.path[store.dirn] := chr(0);
-  sys2(SYS.mkdir, addr(store.path[0]), 493);             { harmless when it exists }
+  sys2(SYS.mkdir, addr(store.path[0]), 493);             // harmless when it exists
   for t := 0 to store.nt - 1 do
   begin
     store.base[t] := store.mapzero(store.rs[t] * store.cap[t]);
@@ -287,7 +287,7 @@ begin
   store.mkpath("store.log");
   store.logfd := sys3(SYS.open, addr(store.path[0]), bor(bor(O_WRONLY, O_CREAT), O_APPEND), 420);
   if store.logfd < 0 then begin store.err := "cannot open the log"; return false; end;
-  { a torn tail is cut off so the next record lands right after the last good one }
+  // a torn tail is cut off so the next record lands right after the last good one
   if sys2(SYS.ftruncate, store.logfd, store.logsize) < 0 then begin store.err := "cannot truncate the log"; return false; end;
   store.open := true;
   return true;
@@ -344,7 +344,7 @@ begin
   if fd < 0 then begin store.err := "cannot create the snapshot"; return false; end;
   io.put32(store.sh, 0, STORE.SNAPMAGIC);
   io.put32(store.sh, 4, store.nt);
-  for i := 0 to 7 do store.sh[8 + i] := chr(0);      { the log is truncated after the snapshot: replay from 0 }
+  for i := 0 to 7 do store.sh[8 + i] := chr(0);      // the log is truncated after the snapshot: replay from 0
   if sys3(SYS.write, fd, addr(store.sh[0]), 16) <> 16 then begin sys1(SYS.close, fd); return false; end;
   for t := 0 to store.nt - 1 do
   begin
@@ -364,10 +364,10 @@ begin
   if sys1(SYS.fsync, fd) < 0 then begin sys1(SYS.close, fd); return false; end;
   sys1(SYS.close, fd);
   store.mkpath("store.snap");
-  for i := 0 to 1099 do store.rd[i] := store.path[i];          { the final name, NUL-terminated }
+  for i := 0 to 1099 do store.rd[i] := store.path[i];          // the final name, NUL-terminated
   store.mkpath("store.snap.tmp");
   if sys2(SYS.rename, addr(store.path[0]), addr(store.rd[0])) < 0 then begin store.err := "rename failed"; return false; end;
-  { the log is now fully covered by the snapshot: start it afresh }
+  // the log is now fully covered by the snapshot: start it afresh
   if sys2(SYS.ftruncate, store.logfd, 0) < 0 then return false;
   store.logsize := 0;
   return true;

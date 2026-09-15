@@ -106,8 +106,8 @@ begin
     n := io.push(http.logbuf, n, "?");
   end;
   n := io.push(http.logbuf, n, "\",\"path\":");
-  { json.putslice returns -1 when it does not fit.  A log line is not an answer:
-    better an empty path value than a truncated line or a negative position. }
+  // json.putslice returns -1 when it does not fit.  A log line is not an answer:
+  // better an empty path value than a truncated line or a negative position.
   if http.pathlen > 200 then at := json.putslice(http.logbuf, n, http.inbuf, http.pathat, http.pathat + 200)
   else at := json.putslice(http.logbuf, n, http.inbuf, http.pathat, http.pathat + http.pathlen);
   if at < 0 then n := io.push(http.logbuf, n, "\"\"") else n := at;

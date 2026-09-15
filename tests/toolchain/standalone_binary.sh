@@ -20,8 +20,8 @@ include "json.wz";
 include "math.wz";
 var n: int;
 begin
-  { json.wz and math.wz are included to prove more than one embedded file resolves,
-    and that a library file including another one works from the table too. }
+  // json.wz and math.wz are included to prove more than one embedded file resolves,
+  // and that a library file including another one works from the table too.
   n := math.floor(3.7);
   io.puts(STDOUT, "alone ");
   io.putn(STDOUT, n);

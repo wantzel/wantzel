@@ -79,7 +79,7 @@ begin
   uid := oauth.verify;
   if uid < 0 then begin oauth.challenge; return; end;
   if tool.rest("/api/") then return;
-  if http.pathis("/mcp") or http.pathis("/") then begin mcp.http; return; end;   { connectors may be given the bare host }
+  if http.pathis("/mcp") or http.pathis("/") then begin mcp.http; return; end;   // connectors may be given the bare host
   router.notfound;
 end;
 

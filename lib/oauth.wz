@@ -337,12 +337,12 @@ begin
   row := store.alloc(oauth.tc);
   if row < 0 then begin router.error(503, "no room for more clients"); return; end;
   oauth.newsecret;
-  oauth.hex16(oauth.raw, oauth.cl.id);                 { the client id: 32 hex chars of 16 random bytes }
+  oauth.hex16(oauth.raw, oauth.cl.id);                 // the client id: 32 hex chars of 16 random bytes
   oauth.cl.hassecret := not public;
   for i := 0 to 31 do oauth.cl.secret[i] := chr(0);
   if not public then
   begin
-    oauth.newsecret;                                     { a second secret: the client secret }
+    oauth.newsecret;                                     // a second secret: the client secret
     oauth.hashtext(oauth.txt[0..oauth.txtn - 1]);
     for i := 0 to 31 do oauth.cl.secret[i] := oauth.dig[i];
   end;
@@ -372,8 +372,8 @@ begin
   for i := 0 to oauth.cl.nuris - 1 do
   begin
     if i > 0 then http.add(",");
-    { -1: the uri no longer fits in the answer; skip it rather than destroying the
-      position }
+    // -1: the uri no longer fits in the answer; skip it rather than destroying the
+    // position
     at := json.putslice(http.outbuf, http.wpos, oauth.cl.uris, i * OAUTH.URILEN, i * OAUTH.URILEN + oauth.cl.urilen[i]);
     if at >= 0 then http.wpos := at;
   end;
@@ -445,7 +445,7 @@ end;
 procedure oauth.hidden(name: str; v: array of char; n: int);
 begin
   http.add("<input type=\"hidden\" name=\""); http.add(name); http.add("\" value=\"");
-  http.addb(v, 0, n);                       { values are our own or already validated; quotes are not allowed in them }
+  http.addb(v, 0, n);                       // values are our own or already validated; quotes are not allowed in them
   http.add("\">\n");
 end;
 
@@ -497,7 +497,7 @@ begin
   end;
   row := store.alloc(oauth.tcode);
   if row < 0 then begin router.error(503, "no room for more codes"); return; end;
-  oauth.newsecret;                                     { the code: oauth.txt }
+  oauth.newsecret;                                     // the code: oauth.txt
   oauth.hashtext(oauth.txt[0..oauth.txtn - 1]);
   for i := 0 to 31 do oauth.cd.hash[i] := oauth.dig[i];
   for i := 0 to 31 do oauth.cd.client[i] := oauth.q.client[i];
@@ -631,7 +631,7 @@ begin
       oauth.tokenerror(400, "invalid_grant", "PKCE verification failed");
       return;
     end;
-    oauth.cd.used := true;                             { single use: mark before issuing }
+    oauth.cd.used := true;                             // single use: mark before issuing
     oauth.ok := oauth.savecode(row);
     uid := oauth.cd.user;
     oauth.issue(uid, oauth.q.client);
@@ -650,7 +650,7 @@ begin
     if oauth.tk.expires < time.nowsec then begin oauth.tokenerror(400, "invalid_grant", "refresh token expired"); return; end;
     if not oauth.sameid(oauth.tk.client, oauth.q.client) then begin oauth.tokenerror(400, "invalid_grant", "token belongs to another client"); return; end;
     uid := oauth.tk.user;
-    oauth.ok := store.del(oauth.ttok, row);                        { rotation: the old refresh token dies }
+    oauth.ok := store.del(oauth.ttok, row);                        // rotation: the old refresh token dies
     oauth.ok := hash.del(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.tk.hash);
     oauth.issue(uid, oauth.q.client);
     return;
@@ -813,7 +813,7 @@ var row, i: int;
 begin
   row := store.alloc(oauth.ttok);
   if row < 0 then return false;
-  oauth.newsecret;                                     { the session id: oauth.txt }
+  oauth.newsecret;                                     // the session id: oauth.txt
   oauth.hashtext(oauth.txt[0..oauth.txtn - 1]);
   for i := 0 to 31 do oauth.tk.hash[i] := oauth.dig[i];
   oauth.tk.kind := OAUTH.KIND_SESSION;
@@ -862,8 +862,8 @@ begin
   if http.param("next") then
   begin
     n := http.pvlen;
-    { only a path on this server: "/x" yes, "//evil.example" and "https://..." no,
-      or the form turns into an open redirect }
+    // only a path on this server: "/x" yes, "//evil.example" and "https://..." no,
+    // or the form turns into an open redirect
     if oauth.safenext(n) then
     begin
       http.add("<input type=\"hidden\" name=\"next\" value=\"");
@@ -932,7 +932,7 @@ end;
 
 function oauth.route: bool;
 begin
-  if http.method = HTTP.OPTIONS then                   { CORS preflight for browser-based clients }
+  if http.method = HTTP.OPTIONS then                   // CORS preflight for browser-based clients
   begin
     router.cors;
     http.finish(204, "text/plain");

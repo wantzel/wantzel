@@ -142,41 +142,41 @@ begin
   for i := 0 to len(a) - 1 do a[i].key := a[i].key + 100;
 end;
 begin
-  { §2 }
+  // §2
   for i := 1 to 10 do n := items.add(i, real(i) * 0.5);
   show("nitems = ", nitems);
-  show("total x10 = ", trunc(total(items[0..nitems - 1]) * 10.0));   { 27.5 -> 275 }
+  show("total x10 = ", trunc(total(items[0..nitems - 1]) * 10.0));   // 27.5 -> 275
   i := 0;
   while items.add(0, 0.0) >= 0 do i := i + 1;
-  show("added until full = ", i);                                     { 990 }
-  { §3 }
+  show("added until full = ", i);                                     // 990
+  // §3
   at := text.store("hello");
   n := text.store(", world");
   put(arena[at..at + 11]);
   show("used = ", used);
-  { §4 }
+  // §4
   nodes.init;
   for i := 1 to 5 do nodes.push(i * 10);
-  show("nodes sum = ", nodes.sum);                                    { 150 }
-  i := head; head := nodes[i].next; nodes.release(i);                 { drop the top one (50) }
-  show("nodes sum after release = ", nodes.sum);                      { 100 }
+  show("nodes sum = ", nodes.sum);                                    // 150
+  i := head; head := nodes[i].next; nodes.release(i);                 // drop the top one (50)
+  show("nodes sum after release = ", nodes.sum);                      // 100
   n := 0;
   while nodes.alloc <> NIL do n := n + 1;
-  show("free nodes were = ", n);                                      { 252 }
-  { §5 }
+  show("free nodes were = ", n);                                      // 252
+  // §5
   for i := 1 to 400 do if not hash.put(i * 7919, i) then show("put failed at ", i);
-  show("hash get 7919*200 = ", hash.get(7919 * 200));                 { 200 }
-  show("hash get missing = ", hash.get(12345));                       { -1 }
+  show("hash get 7919*200 = ", hash.get(7919 * 200));                 // 200
+  show("hash get missing = ", hash.get(12345));                       // -1
   show("hash count = ", hcount);
-  if hash.put(99, 1) then show("hash full ", 0) else show("hash full ", 1);   { 400*2 < 1024, so it fits: 0 }
-  { §6 }
+  if hash.put(99, 1) then show("hash full ", 0) else show("hash full ", 1);   // 400*2 < 1024, so it fits: 0
+  // §6
   fill(view(addr(arena[8]), 8), 'x');
   show("arena[7] = ", ord(arena[7])); show("arena[8] = ", ord(arena[8]));
-  { §7 anonymous }
+  // §7 anonymous
   p := sys6(SYS.mmap, 0, 1048576, bor(PROT_READ, PROT_WRITE), bor(MAP_PRIVATE, MAP_ANONYMOUS), -1, 0);
   if p > 0 then begin fill(view(p, 1048576), chr(3)); show("anon sum = ", sumb(view(p, 1048576))); end;
   show("munmap = ", sys2(SYS.munmap, p, 1048576));
-  { §8 a record table as a file, read back through mmap }
+  // §8 a record table as a file, read back through mmap
   n := io.push(path, 0, "mp_items.tmp"); path[n] := chr(0);
   fd := sys3(SYS.open, addr(path[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
   n := 10 * (addr(items[1]) - addr(items[0]));
@@ -188,8 +188,8 @@ begin
   show("mapped total x10 = ", trunc(total(view(p, 10)) * 10.0));
   show("msync = ", sys3(SYS.msync, p, n, 4));
   sys2(SYS.munmap, p, n);
-  n := sys3(SYS.read, fd, addr(arena[0]), n);                        { the file itself changed }
+  n := sys3(SYS.read, fd, addr(arena[0]), n);                        // the file itself changed
   sys1(SYS.close, fd);
-  show("key of item 3 in file = ", io.get64(arena, 3 * 16));         { 4 + 100 }
+  show("key of item 3 in file = ", io.get64(arena, 3 * 16));         // 4 + 100
   sys1(SYS.unlink, addr(path[0]));
 end.

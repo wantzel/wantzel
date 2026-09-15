@@ -9,18 +9,18 @@ begin
   io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
 end;
 begin
-  r := real(7);                    show("real(7) x2 = ", trunc(r * 2.0));           { 14 }
-  r := real(-3) / 2.0;             show("trunc(-1.5) = ", trunc(r));                { -1 }
-  show("round(-1.5) = ", round(r));                                                 { -2 (to even) }
-  show("round(2.5) = ", round(2.5));                                                { 2 (to even) }
-  show("round(3.5) = ", round(3.5));                                                { 4 }
-  show("trunc(2.999) = ", trunc(2.999));                                            { 2 }
-  r := sqrt(2.0);                  show("sqrt2 x1e6 = ", trunc(r * 1000000.0));     { 1414213 }
-  r := sqrt(144.0);                show("sqrt144 = ", trunc(r));                    { 12 }
-  bits := pack32(1.0);             show("pack32(1.0) = ", bits);                    { 1065353216 = 0x3F800000 }
-  bits := pack32(-2.5);            show("pack32(-2.5) = ", bits);                   { 0xC0200000 = 3223322624 }
-  r := unpack32(1065353216);       show("unpack32(0x3F800000) = ", trunc(r));       { 1 }
-  r := unpack32(pack32(0.1));      show("0.1 via single, x1e9 = ", round(r * 1000000000.0));  { 100000001 }
+  r := real(7);                    show("real(7) x2 = ", trunc(r * 2.0));           // 14
+  r := real(-3) / 2.0;             show("trunc(-1.5) = ", trunc(r));                // -1
+  show("round(-1.5) = ", round(r));                                                 // -2 (to even)
+  show("round(2.5) = ", round(2.5));                                                // 2 (to even)
+  show("round(3.5) = ", round(3.5));                                                // 4
+  show("trunc(2.999) = ", trunc(2.999));                                            // 2
+  r := sqrt(2.0);                  show("sqrt2 x1e6 = ", trunc(r * 1000000.0));     // 1414213
+  r := sqrt(144.0);                show("sqrt144 = ", trunc(r));                    // 12
+  bits := pack32(1.0);             show("pack32(1.0) = ", bits);                    // 1065353216 = 0x3F800000
+  bits := pack32(-2.5);            show("pack32(-2.5) = ", bits);                   // 0xC0200000 = 3223322624
+  r := unpack32(1065353216);       show("unpack32(0x3F800000) = ", trunc(r));       // 1
+  r := unpack32(pack32(0.1));      show("0.1 via single, x1e9 = ", round(r * 1000000000.0));  // 100000001
   i := 1000000000;
-  r := real(i) * real(i);          show("1e18 div 1e9 = ", trunc(r / 1000000000.0)); { 1000000000 }
+  r := real(i) * real(i);          show("1e18 div 1e9 = ", trunc(r / 1000000000.0)); // 1000000000
 end.

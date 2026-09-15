@@ -53,17 +53,17 @@ begin
   end;
   step(bodies, 0.5);
   step(bodies, 0.5);
-  show("b1.pos.x x10 = ", trunc(bodies[1].pos.x * 10.0));     { 1+1 = 2 -> 20 }
-  show("b3.pos.y x10 = ", trunc(bodies[3].pos.y * 10.0));     { 6 -> 60 }
-  show("b2.tags[0] = ", bodies[2].tags[0]);                    { 2 }
-  show("b2.tags[3] = ", bodies[2].tags[3]);                    { 200 }
-  show("b3.label[0] = ", ord(bodies[3].label[0]));             { 67 }
+  show("b1.pos.x x10 = ", trunc(bodies[1].pos.x * 10.0));     // 1+1 = 2 -> 20
+  show("b3.pos.y x10 = ", trunc(bodies[3].pos.y * 10.0));     // 6 -> 60
+  show("b2.tags[0] = ", bodies[2].tags[0]);                    // 2
+  show("b2.tags[3] = ", bodies[2].tags[3]);                    // 200
+  show("b3.label[0] = ", ord(bodies[3].label[0]));             // 67
   s := sumx(bodies);
-  show("sumx x10 = ", trunc(s * 10.0));                        { (2+3+4)*10 = 90 }
+  show("sumx x10 = ", trunc(s * 10.0));                        // (2+3+4)*10 = 90
   show("len(tags) = ", len(bodies[2].tags));
-  show("size = ", addr(bodies[2]) - addr(bodies[1]));          { 8 + 16 + 16 + 32 + 8 = 80 }
+  show("size = ", addr(bodies[2]) - addr(bodies[1]));          // 8 + 16 + 16 + 32 + 8 = 80
   bodies[1] := bodies[3];
-  show("b1.id after copy = ", bodies[1].id);                   { 3 }
+  show("b1.id after copy = ", bodies[1].id);                   // 3
   i := 4;
-  bodies[i].id := 0;                                           { runtime error }
+  bodies[i].id := 0;                                           // runtime error
 end.

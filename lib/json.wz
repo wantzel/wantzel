@@ -201,12 +201,12 @@ begin
   n := 0;
   while from < upto do
   begin
-    { DOES IT STILL FIT?  One check at the top of the loop instead of eleven at the
-      separate assignments: that way none can be forgotten when a write path is added.
-      Here ONE byte is tested (the ordinary case); the paths that write two or three --
-      only \uXXXX above 127 -- test for that themselves.  Without this line the routine
-      wrote outside dst and every caller had to guard it; now -1 is the answer, just as
-      for an invalid escape. }
+    // DOES IT STILL FIT?  One check at the top of the loop instead of eleven at the
+    // separate assignments: that way none can be forgotten when a write path is added.
+    // Here ONE byte is tested (the ordinary case); the paths that write two or three --
+    // only \uXXXX above 127 -- test for that themselves.  Without this line the routine
+    // wrote outside dst and every caller had to guard it; now -1 is the answer, just as
+    // for an invalid escape.
     if at + n >= len(dst) then return -1;
     c := src[from];
     if c <> '\\' then
@@ -311,7 +311,7 @@ begin
   i := 0;
   while i < n do
   begin
-    { six is the heaviest path (\u00XX); plus one for the closing quote }
+    // six is the heaviest path (\u00XX); plus one for the closing quote
     if at + 7 > len(dst) then return at;
     c := schar(s, i);
     if c = '"' then
@@ -365,7 +365,7 @@ begin
   if at < 0 then return at;
   while from < upto do
   begin
-    { six is the heaviest path (\u00XX) }
+    // six is the heaviest path (\u00XX)
     if at + 6 > len(dst) then return at;
     c := src[from];
     if (c = '"') or (c = '\\') then
@@ -422,7 +422,7 @@ begin
   at := at + 1;
   while from < upto do
   begin
-    { six is the heaviest path (\u00XX); plus one for the closing quote }
+    // six is the heaviest path (\u00XX); plus one for the closing quote
     if at + 7 > len(dst) then return -1;
     c := src[from];
     if (c = '"') or (c = '\\') then
@@ -571,7 +571,7 @@ begin
   if not (v = v) then return io.push(dst, at, "null");
   lim := real(1);
   i := 0;
-  while i < 40 do begin lim := lim * real(10000000); i := i + 1; end;   { ~1e280 as an "infinite" bound }
+  while i < 40 do begin lim := lim * real(10000000); i := i + 1; end;   // ~1e280 as an "infinite" bound
   if (v > lim) or (v < -lim) then return io.push(dst, at, "null");
   neg := v < real(0);
   a := v;
@@ -580,13 +580,13 @@ begin
   if a = real(0) then
   begin
     if neg then begin dst[at] := '-'; at := at + 1; end;
-    return io.push(dst, at, "0.0");       { a real always carries a point, as JSON floats do }
+    return io.push(dst, at, "0.0");       // a real always carries a point, as JSON floats do
   end;
-  { scale a into [1, 10) and count the decimal exponent }
+  // scale a into [1, 10) and count the decimal exponent
   e := 0;
   while a >= ten do begin a := a / ten; e := e + 1; end;
   while a < real(1) do begin a := a * ten; e := e - 1; end;
-  { 15 significant digits as an integer }
+  // 15 significant digits as an integer
   m := round(a * real(100000000000000));
   if m >= 1000000000000000 then begin m := m div 10; e := e + 1; end;
   n := 15;
@@ -594,12 +594,12 @@ begin
   i := 0;
   k := m;
   while k > 0 do begin json.rdig[i] := chr(48 + (k mod 10)); k := k div 10; i := i + 1; end;
-  { json.rdig holds the digits reversed; i = n }
+  // json.rdig holds the digits reversed; i = n
   if neg then begin dst[at] := '-'; at := at + 1; end;
-  { The threshold at which a number is written exponentially.  Python's repr switches
-    at 1e16 and not at 1e15, and at 1e-5 on the other side.  That threshold is adopted
-    here because JSON is often read or written by a Python side, and then a comparison
-    on TEXT has to match.  Measured 11-09-2026. }
+  // The threshold at which a number is written exponentially.  Python's repr switches
+  // at 1e16 and not at 1e15, and at 1e-5 on the other side.  That threshold is adopted
+  // here because JSON is often read or written by a Python side, and then a comparison
+  // on TEXT has to match.  Measured 11-09-2026.
   if (e >= 16) or (e <= -5) then
   begin
     dst[at] := json.rdig[n - 1]; at := at + 1;
@@ -610,8 +610,8 @@ begin
       while k >= 0 do begin dst[at] := json.rdig[k]; at := at + 1; k := k - 1; end;
     end;
     dst[at] := 'e'; at := at + 1;
-    { Python ALWAYS writes the sign and pads the exponent to two digits: 1e+16,
-      1e-05.  That is not taste but what a text comparison expects. }
+    // Python ALWAYS writes the sign and pads the exponent to two digits: 1e+16,
+    // 1e-05.  That is not taste but what a text comparison expects.
     if e < 0 then begin dst[at] := '-'; at := at + 1; e := 0 - e; end
     else begin dst[at] := '+'; at := at + 1; end;
     if e < 10 then begin dst[at] := '0'; at := at + 1; end;
@@ -626,7 +626,7 @@ begin
     while k >= 0 do begin dst[at] := json.rdig[k]; at := at + 1; k := k - 1; end;
     return at;
   end;
-  ip := e + 1;                   { digits before the point }
+  ip := e + 1;                   // digits before the point
   k := n - 1;
   fp := 0;
   while fp < ip do
@@ -641,7 +641,7 @@ begin
   end
   else
   begin
-    dst[at] := '.'; at := at + 1;    { a whole value keeps its .0 so it stays a JSON float }
+    dst[at] := '.'; at := at + 1;    // a whole value keeps its .0 so it stays a JSON float
     dst[at] := '0'; at := at + 1;
   end;
   return at;

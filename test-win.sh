@@ -87,7 +87,7 @@ we=$(printf 'piped\n' | W "$T/cat.exe")
 [ "$we" = "piped" ] && ok "cat reads stdin" || bad "cat stdin: got '$we'"
 # cat: a named file (CreateFileA + ReadFile)
 we=$(W "$T/cat.exe" examples/hello.wz | head -1)
-[ "$we" = "{ hello.wz -- the smallest useful Wantzel program }" ] && ok "cat reads a file" || bad "cat file: got '$we'"
+[ "$we" = "// hello.wz -- the smallest useful Wantzel program" ] && ok "cat reads a file" || bad "cat file: got '$we'"
 
 echo "wantzel.exe compiles Wantzel source, under Wine (self-hosting on Windows)"
 ABS="$(pwd)/examples/hello.wz"

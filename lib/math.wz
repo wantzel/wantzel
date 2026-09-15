@@ -83,7 +83,7 @@ var k, i: int;
     r, term, sum: real;
 begin
   if math.isnan(x) then return x;
-  if x > 709.7 then return 1.0e308 * 10.0;       { +inf }
+  if x > 709.7 then return 1.0e308 * 10.0;       // +inf
   if x < -745.0 then return 0.0;
   k := round(x / MATH.LN2);
   r := x - real(k) * MATH.LN2;
@@ -111,7 +111,7 @@ begin
   e := 0;
   while m >= 2.0 do begin m := m * 0.5; e := e + 1; end;
   while m < 1.0 do begin m := m * 2.0; e := e - 1; end;
-  if m > 1.4142135623730951 then begin m := m * 0.5; e := e + 1; end;   { m in [0.707, 1.414) }
+  if m > 1.4142135623730951 then begin m := m * 0.5; e := e + 1; end;   // m in [0.707, 1.414)
   s := (m - 1.0) / (m + 1.0);
   s2 := s * s;
   term := s;
@@ -338,7 +338,7 @@ begin
   if a >= 9.0e15 then return json.putreal(dst, at, x);
   scale := 1;
   for i := 1 to decimals do scale := scale * 10;
-  n := math.floor(a * real(scale) + 0.5 + 1.0e-9);  { half away from zero; the epsilon lets 2.675 -> 2.68 }
+  n := math.floor(a * real(scale) + 0.5 + 1.0e-9);  // half away from zero; the epsilon lets 2.675 -> 2.68
   if n = 0 then neg := false;
   ip := n div scale;
   fp := n mod scale;

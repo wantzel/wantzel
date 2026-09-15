@@ -177,8 +177,8 @@ begin
     if c = 'Z' then i := i + 1
     else if (c = '+') or (c = '-') then
     begin
-      { an offset of the form +HH:MM or +HHMM }
-      if c = '-' then sign := 1 else sign := -1;    { east of UTC means subtracting }
+      // an offset of the form +HH:MM or +HHMM
+      if c = '-' then sign := 1 else sign := -1;    // east of UTC means subtracting
       if i + 5 > n then return -1;
       oh := time.num(s, i + 1, 2);
       if s[i + 3] = ':' then

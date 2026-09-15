@@ -27,7 +27,7 @@ begin
   show("bxor = ", bxor(5, 3));
   show("bnot 0 = ", bnot(0));
   show("1 shl 10 = ", 1 shl 10);
-  show("-64 shr 2 = ", -64 shr 2);        { arithmetic shift }
+  show("-64 shr 2 = ", -64 shr 2);        // arithmetic shift
   show("1 shl 62 shr 62 = ", (1 shl 62) shr 62);
   if 'a' < 'b' then show("char order ", 1) else show("char order ", 0);
   if 3 <> 4 then show("ne ", 1) else show("ne ", 0);

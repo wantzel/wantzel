@@ -35,14 +35,14 @@ same "sieve" "$("$T/primes" | head -1)" "primes below 200000: 17984"
 same "includes and array parameters" "$("$T/incl")" "$(cat tests/compiler/incl.out)"
 ./bin/wantzel examples/cat.wz "$T/cat" 2>/dev/null
 same "cat via stdin" "$(echo piped | "$T/cat")" "piped"
-same "cat a file" "$("$T/cat" examples/hello.wz | head -1)" "{ hello.wz -- the smallest useful Wantzel program }"
+same "cat a file" "$("$T/cat" examples/hello.wz | head -1)" "// hello.wz -- the smallest useful Wantzel program"
 
 echo "schemas and MCP"
 ./bin/wantzel tests/compiler/schema.wz "$T/schema" 2>/dev/null
 # READ THE GOLDEN FILE; do not write the expectation out a second time.
 # These lines stood here word for word beside tests/compiler/schema.out, and the same
 # expectation maintained in two places drifts: extending schema.wz broke this script and
-# tests/toolchain/freeze.sh while a plain ./wztest stayed GREEN -- only --toolchain saw
+# tests/toolchain/all_suites_green.sh while a plain ./wztest stayed GREEN -- only --toolchain saw
 # the difference, so whoever does not run it notices nothing.
 same "compiled schema parser" "$("$T/schema")" "$(cat tests/compiler/schema.out)"
 
@@ -290,7 +290,7 @@ PX
 
 ce "schema needs record" "wantzel: SRC:2: a schema body starts with 'record'" <<'PX'
 program t;
-schema S = { a: int; };
+schema S = int;
 begin end.
 PX
 

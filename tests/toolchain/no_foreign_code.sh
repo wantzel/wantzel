@@ -22,7 +22,12 @@ report "a name from a project this compiler was split out of" '\bddop|duurzame|n
 # /home/you/ and /path/to/ are placeholders in documentation; a real account name is not.
 hits=$(git ls-files | xargs grep -niE '/home/[a-z]+/' 2>/dev/null | grep -vE '/home/(you|user)/' | grep -v '^tests/toolchain/no_foreign_code.sh:')
 if [ -n "$hits" ]; then printf '  a personal home directory:\n'; printf '%s\n' "$hits" | sed 's/^/    /'; fails=$((fails+1)); fi
-report "an e-mail address" '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}'
+# floris@wantzel.com is the project's OWN contact address and belongs in the open: it is
+# what the README and the site tell a reader to write to.  Every other address is still
+# refused -- the one this check exists for is a personal address from another project,
+# which is a leak that cannot be taken back once it is in the history.
+hits=$(git ls-files | xargs grep -niE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}' 2>/dev/null | grep -viE 'floris@wantzel\.com' | grep -v '^tests/toolchain/no_foreign_code.sh:')
+if [ -n "$hits" ]; then printf '  an e-mail address:\n'; printf '%s\n' "$hits" | sed 's/^/    /'; fails=$((fails+1)); fi
 
 [ $fails -eq 0 ] || { echo "$fails kind(s) of foreign reference found; see above"; exit 1; }
 echo "no foreign names, personal paths or e-mail addresses"

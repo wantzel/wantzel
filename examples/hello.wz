@@ -1,4 +1,4 @@
-{ hello.wz -- the smallest useful Wantzel program }
+// hello.wz -- the smallest useful Wantzel program
 
 program hello;
 

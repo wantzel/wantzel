@@ -33,7 +33,7 @@ begin
   n := io.push(name1, 0, "sc_test1.tmp"); name1[n] := chr(0);
   n := io.push(name2, 0, "sc_test2.tmp"); name2[n] := chr(0);
   n := io.push(dirn, 0, "sc_dir.tmp"); dirn[n] := chr(0);
-  { create, write, append }
+  // create, write, append
   fd := sys3(SYS.open, addr(name1[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
   if fd > 0 then show("create fd ok ", 1) else show("create fd ok ", 0);
   show("write ", sys3(SYS.write, fd, sadr("hello"), 5));
@@ -44,7 +44,7 @@ begin
   sys1(SYS.close, fd);
   n := readall(name1);
   io.out(STDOUT, addr(buf[0]), n); io.puts(STDOUT, "\n");
-  { lseek and truncate }
+  // lseek and truncate
   fd := sys3(SYS.open, addr(name1[0]), O_RDWR, 0);
   show("lseek end = ", sys3(SYS.lseek, fd, 0, SEEK_END));
   show("lseek 6 = ", sys3(SYS.lseek, fd, 6, SEEK_SET));
@@ -56,27 +56,27 @@ begin
   sys1(SYS.close, fd);
   n := readall(name1);
   io.out(STDOUT, addr(buf[0]), n); io.puts(STDOUT, "\n");
-  { rename }
+  // rename
   show("rename ", sys2(SYS.rename, addr(name1[0]), addr(name2[0])));
   show("old gone ", readall(name1));
   n := readall(name2);
   io.out(STDOUT, addr(buf[0]), n); io.puts(STDOUT, "\n");
-  { file-backed mmap, read-only }
+  // file-backed mmap, read-only
   fd := sys3(SYS.open, addr(name2[0]), O_RDONLY, 0);
   p := sys6(SYS.mmap, 0, 5, PROT_READ, MAP_SHARED, fd, 0);
   if p > 0 then show("file mmap byte 1 = ", peek(p + 1)) else show("file mmap failed ", p);
   show("munmap ", sys2(SYS.munmap, p, 5));
   sys1(SYS.close, fd);
-  { anonymous mmap of 1 MB, filled through a view }
+  // anonymous mmap of 1 MB, filled through a view
   p := sys6(SYS.mmap, 0, 1048576, bor(PROT_READ, PROT_WRITE), bor(MAP_PRIVATE, MAP_ANONYMOUS), -1, 0);
   if p > 0 then show("anon mmap sum = ", fill(view(p, 1048576))) else show("anon mmap failed ", p);
   show("munmap ", sys2(SYS.munmap, p, 1048576));
-  { directories and deletion }
+  // directories and deletion
   show("mkdir ", sys2(SYS.mkdir, addr(dirn[0]), 493));
   show("rmdir ", sys1(SYS.rmdir, addr(dirn[0])));
   show("unlink ", sys1(SYS.unlink, addr(name2[0])));
   show("gone ", readall(name2));
-  { randomness and the clock }
+  // randomness and the clock
   show("getrandom ", sys3(SYS.getrandom, addr(rnd1[0]), 16, 0));
   show("getrandom ", sys3(SYS.getrandom, addr(rnd2[0]), 16, 0));
   same := 0;

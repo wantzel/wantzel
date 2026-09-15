@@ -31,29 +31,29 @@ begin
   r := Sample.parse(doc, 0, n, s);
   show("parse = ", r);
   show("name_n = ", s.name_n);
-  show("name[5] = ", ord(s.name[5]));                 { newline decoded }
+  show("name[5] = ", ord(s.name[5]));                 // newline decoded
   show("value x100 = ", trunc(s.value * 100.0));
   show("points_n = ", s.points_n);
   show("points[2] = ", trunc(s.points[2]));
   show("points[3] x1000 = ", trunc(s.points[3] * 1000.0));
   show("keys_n = ", s.keys_n);
-  show("keys_len[2] = ", s.keys_len[2]);              { d, e-acute (2 bytes), f = 4 }
-  show("keys[1] first = ", ord(s.keys[8]));           { 'b' at slot 1 }
+  show("keys_len[2] = ", s.keys_len[2]);              // d, e-acute (2 bytes), f = 4
+  show("keys[1] first = ", ord(s.keys[8]));           // 'b' at slot 1
   show("flags_n = ", s.flags_n);
   if s.flags[0] and not s.flags[1] then show("flags ", 1) else show("flags ", 0);
   if s.count_ok and s.count_null then show("count null ", 1) else show("count null ", 0);
   if s.note_ok then show("note present ", 1) else show("note present ", 0);
   r := Sample.write(out, 0, s, doc);
   io.out(STDOUT, addr(out[0]), r); io.puts(STDOUT, "\n");
-  { round trip }
+  // round trip
   n := r;
   i := 0;
   while i < n do begin doc[i] := out[i]; i := i + 1; end;
   r := Sample.parse(doc, 0, n, s);
   show("reparse = ", r);
   show("value x100 = ", trunc(s.value * 100.0));
-  { rejections }
-  load("{\"value\":1.0,\"points\":[],\"keys\":[]}");            { name missing }
+  // rejections
+  load("{\"value\":1.0,\"points\":[],\"keys\":[]}");            // name missing
   show("missing required = ", Sample.parse(doc, 0, n, s));
   load("{\"name\":\"x\",\"value\":1.0,\"points\":[1,2,3,4,5,6,7,8,9,10,11],\"keys\":[]}");
   show("too many points = ", Sample.parse(doc, 0, n, s));

@@ -29,7 +29,7 @@ begin
   roundtrip(0.0); roundtrip(1.0); roundtrip(-1.0); roundtrip(0.5); roundtrip(0.1);
   roundtrip(123456.789); roundtrip(1.0e21); roundtrip(1.5e-7); roundtrip(-273.15);
   roundtrip(8760.0); roundtrip(0.000123); roundtrip(1.0e15); roundtrip(9.769);
-  { parsing forms }
+  // parsing forms
   n := io.push(buf, 0, "  -12.5e2 ,");
   r := json.real(buf, 0, n); show("pos after -12.5e2 = ", r); show("value = ", trunc(json.rval));
   n := io.push(buf, 0, "1E3");  r := json.real(buf, 0, n); show("1E3 = ", trunc(json.rval));
@@ -38,22 +38,22 @@ begin
   n := io.push(buf, 0, "true"); r := json.boolean(buf, 0, n); if json.bval then show("bool true ", 1) else show("bool true ", 0);
   n := io.push(buf, 0, "{\"a\":[1,{\"b\":\"}\"}],\"c\":null} tail");
   r := json.skip(buf, 0, n); show("skip nested = ", r);
-  { isnull }
+  // isnull
   n := io.push(buf, 0, "  null,"); if json.isnull(buf, 0, n) then show("isnull ", 1) else show("isnull ", 0);
   n := io.push(buf, 0, "nul"); if json.isnull(buf, 0, n) then show("isnull short ", 1) else show("isnull short ", 0);
-  { escaping out }
+  // escaping out
   n := json.putstr(dst, 0, "a\"b\\c\nd\te"); line(dst, n);
   n := io.push(buf, 0, "x\"y"); n := json.putslice(dst, 0, buf, 0, n); line(dst, n);
-  buf[0] := chr(1); n := json.escslice(dst, 0, buf, 0, 1); line(dst, n);        { a control byte becomes  }
-  { copystr: bounded, decodes escapes and \u sequences }
+  buf[0] := chr(1); n := json.escslice(dst, 0, buf, 0, 1); line(dst, n);        // a control byte becomes 
+  // copystr: bounded, decodes escapes and \u sequences
   n := io.push(buf, 0, "h\\u00e9\\n\\\"");
   r := json.copystr(buf, 0, n, dst); show("copystr len = ", r); show("byte 1 = ", ord(dst[1])); show("byte 2 = ", ord(dst[2]));
   r := json.copystr(buf, 0, n, small); show("copystr overflow = ", r);
   n := io.push(buf, 0, "bad\\q"); r := json.copystr(buf, 0, n, dst); show("copystr bad escape len = ", r);
   n := io.push(buf, 0, "\\u12"); r := json.copystr(buf, 0, n, dst); show("copystr short unicode = ", r);
-  { putraw }
+  // putraw
   n := io.push(buf, 0, "[1,2]"); r := json.putraw(dst, 0, buf, 0, n); line(dst, r);
-  { eq and ws }
+  // eq and ws
   n := io.push(buf, 0, "  key"); show("ws = ", json.ws(buf, 0, n));
   if json.eq(buf, 2, 5, "key") then show("eq ", 1) else show("eq ", 0);
   if json.eq(buf, 2, 5, "keys") then show("eq len ", 1) else show("eq len ", 0);

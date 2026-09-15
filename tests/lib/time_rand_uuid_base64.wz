@@ -38,7 +38,7 @@ begin
   for i := 0 to len(a) - 1 do if a[i] <> b[i] then return false;
   return true;
 end;
-{ encode s, print it, decode the result and check the round trip }
+// encode s, print it, decode the result and check the round trip
 procedure b64(s: array of char);
 var n, m: int;
 begin
@@ -47,11 +47,11 @@ begin
   outv(enc[0..n - 1]);
   m := base64.decode(enc[0..n - 1], dec);
   if (m = len(s)) and same(dec[0..m - 1], s) then io.puts(STDOUT, " roundtrip ok") else io.puts(STDOUT, " roundtrip FAIL");
-  { the same without padding }
+  // the same without padding
   while (n > 0) and (enc[n - 1] = '=') do n := n - 1;
   m := base64.decode(enc[0..n - 1], dec);
   if (m = len(s)) and same(dec[0..m - 1], s) then io.puts(STDOUT, ", unpadded ok") else io.puts(STDOUT, ", unpadded FAIL");
-  { and through the URL alphabet }
+  // and through the URL alphabet
   n := base64.urlencode(enc, 0, s);
   m := base64.decode(enc[0..n - 1], dec);
   if (m = len(s)) and same(dec[0..m - 1], s) then io.puts(STDOUT, ", url ok") else io.puts(STDOUT, ", url FAIL");
@@ -84,7 +84,7 @@ begin
   show("iso length ", n);
 end;
 begin
-  { base64: the RFC 4648 test vectors }
+  // base64: the RFC 4648 test vectors
   b64("");
   b64("f");
   b64("fo");
@@ -107,7 +107,7 @@ begin
   show("decode overflow = ", base64.decode("Zm9vYmFy", dec[0..3]));
   show("decode empty = ", base64.decode("", dec));
 
-  { time.split }
+  // time.split
   date(0);
   date(951782400);
   date(1700000000);
@@ -133,7 +133,7 @@ begin
   show("daysin 2024 2 = ", time.daysin(2024, 2));
   showb("nowsec after 2023 ", time.nowsec > 1700000000);
 
-  { uuid }
+  // uuid
   uuid.v4(u1);
   uuid.v4(u2);
   showb("uuids differ ", not same(u1, u2));
@@ -155,7 +155,7 @@ begin
   showb("parse bad ", uuid.parse("123e4567-e89b-12d3-a456-42661417400g", u3));
   showb("parse short ", uuid.parse("123e4567", u3));
 
-  { rand.below }
+  // rand.below
   for i := 0 to 9 do hits[i] := 0;
   ok := true;
   for i := 1 to 1000 do

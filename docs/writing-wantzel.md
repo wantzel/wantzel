@@ -70,7 +70,7 @@ Found a new pitfall? Add it under the heading it belongs to.
 - `for i := a to b do` counts in steps of 1, `downto` counts back; `i` is an ordinary `int` variable (not a `real`, not a field).
 - A program ends with `end.` (a period); a routine with `end;`. Anything after `end.` → `text after the end of the program`.
 - `type` and `schema` may appear only at program level, before the routines that use them; `tools ... end;` once, after the schemas.
-- Comments: `//` and `{ }`; `(* *)` does not exist. A `{ ... }` comment ends at the **first** `}`: a JSON example like `{"a":1}` inside one breaks the code that follows (`undeclared identifier` on some later line). Use `//` for comments containing braces. (Hit by two different agents; `wantzellog.py check` catches it now.)
+- Comments: `//` only. Neither `{ }` nor `(* *)` exists, and a `{` outside a string is refused. The block comment was removed on 15 September 2026 because it ended at the **first** `}`: a JSON example like `{"a":1}` inside one turned the rest of the sentence into code, and the error surfaced far away on a line that looked correct. Write a multi-line comment as several `//` lines.
 - Character escapes: `'\n' '\t' '\r' '\\' '\''` and `"\""`; any other `\x` → `unknown escape sequence`. No `\xNN`; use `chr(0x1B)`.
 - Hex literals: `0xFF`. No `$FF` (Pascal), no `1_000`.
 

@@ -32,7 +32,7 @@ begin
   io.putn(STDOUT, tool.count); io.puts(STDOUT, "\n");
   io.putn(STDOUT, tool.id_double); io.putn(STDOUT, tool.id_shout); io.puts(STDOUT, "\n");
   n := io.push(doc, 0, "{\"n\":21}");
-  i := tool.byname(doc, 2, 3);                   { the key "n" is not a tool }
+  i := tool.byname(doc, 2, 3);                   // the key "n" is not a tool
   io.putn(STDOUT, i); io.puts(STDOUT, "\n");
   n := tool.run(tool.id_double, doc, 0, n, buf);
   io.out(STDOUT, addr(buf[0]), n); io.puts(STDOUT, "\n");

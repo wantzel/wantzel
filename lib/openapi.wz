@@ -114,7 +114,7 @@ begin
     end;
     return n;
   end;
-  { a bare word: true, false, null, a number }
+  // a bare word: true, false, null, a number
   i := at;
   while i < n do
   begin
@@ -151,7 +151,7 @@ begin
     end
     else if c = '"' then
     begin
-      { a key at depth 1 of this object? }
+      // a key at depth 1 of this object?
       if depth = 1 then
       begin
         atkey := true;
@@ -178,7 +178,7 @@ begin
     else if c = '}' then
     begin
       depth := depth - 1;
-      if depth = 0 then return false;          { past this tool object }
+      if depth = 0 then return false;          // past this tool object
     end;
     i := i + 1;
   end;
@@ -348,7 +348,7 @@ end;
 // what belongs there, and a list-shaped name wants a list, not null.
 procedure oapi.exuntyped(nat: int; nend: int);
 begin
-  { the domain first (the application knows its own lists), then the shape }
+  // the domain first (the application knows its own lists), then the shape
   if app.exarray(nat, nend) then return;
   if oapi.nameends(nat, nend, "_keys") or oapi.nameends(nat, nend, "_ids") then http.add("[]")
   else if oapi.nameis(nat, nend, "info") then http.add("{}")
@@ -392,18 +392,18 @@ function app.exstring(nat: int; nend: int): bool; forward;
 
 procedure oapi.exstring(nat: int; nend: int);
 begin
-  { Generic and name-driven: this holds for every application, so it stays here. }
+  // Generic and name-driven: this holds for every application, so it stays here.
   if oapi.nameends(nat, nend, "_id") or oapi.nameis(nat, nend, "id") then
   begin
-    { a WELL-FORMED placeholder and not a random one: a call with it gives a clean
-      400 that names the id, and then the example is doing its work }
+    // a WELL-FORMED placeholder and not a random one: a call with it gives a clean
+    // 400 that names the id, and then the example is doing its work
     http.add("\"9c1f8f0e-2c47-4a4e-9a5e-000000000000\""); return;
   end;
   if oapi.nameends(nat, nend, "_at") or oapi.nameends(nat, nend, "_date") then
   begin
     http.add("\"2026-01-01T00:00:00Z\""); return;
   end;
-  { Then the domain: the application knows that and this library does not. }
+  // Then the domain: the application knows that and this library does not.
   if app.exstring(nat, nend) then return;
   http.add("\"\"");
 end;
@@ -472,7 +472,7 @@ begin
   end;
   if not oapi.sub(sat, send, "properties") then begin http.addc('}'); return; end;
   pat := oapi.vat; pend := oapi.vend;
-  { walk the property names at depth 1 of the properties object }
+  // walk the property names at depth 1 of the properties object
   depth := 0; instr := false; esc := false;
   i := pat;
   while i < pend do
@@ -491,7 +491,7 @@ begin
         nat := i + 1;
         nend := nat;
         while (nend < pend) and (schar(tool.list, nend) <> '"') do nend := nend + 1;
-        { its schema follows the colon }
+        // its schema follows the colon
         vend := nend + 1;
         while (vend < pend) and ((schar(tool.list, vend) = ':') or (schar(tool.list, vend) = ' ')) do vend := vend + 1;
         // Required fields are always in.  Beyond that we take a few optional ones a
@@ -558,7 +558,7 @@ begin
     http.add("\",\"description\":");
     if oapi.field(oapi.at[t], "description") then oapi.addslice(oapi.vat, oapi.vend)
     else http.add("\"\"");
-    { readonly tools get their own tag, so the page separates reading from writing }
+    // readonly tools get their own tag, so the page separates reading from writing
     ro := false;
     if oapi.field(oapi.at[t], "annotations") then
       if oapi.sub(oapi.vat, oapi.vend, "readOnlyHint") then
@@ -594,7 +594,7 @@ begin
   http.add("<style>body{margin:0}.topbar{display:none}</style></head><body><div id=\"ui\"></div>");
   http.add("<script src=\"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js\"></script>");
   http.add("<script>window.ui=SwaggerUIBundle({url:'/openapi.json',dom_id:'#ui',");
-  { the browser already has the session cookie; send it with every try-it-out call }
+  // the browser already has the session cookie; send it with every try-it-out call
   http.add("requestInterceptor:function(r){r.credentials='same-origin';return r},");
   http.add("docExpansion:'none',filter:true,tryItOutEnabled:true,persistAuthorization:true});</script>");
   http.add("</body></html>");

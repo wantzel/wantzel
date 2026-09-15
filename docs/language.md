@@ -6,7 +6,7 @@ are kept separately in §9 and are only valid once they move here. Whoever imple
 something reads this file first; whoever changes the language updates this file in the same
 commit.
 
-Last updated: 2026-09-10 (phase 1 complete: real, record, slices, view, case, for, local const, schema v2, tools; language frozen).
+Last updated: 2026-09-15 (phase 1 complete: real, record, slices, view, case, for, local const, schema v2, tools).
 
 ## The language in brief
 
@@ -147,7 +147,7 @@ begin                       // main program
 end.                        // the dot is required
 ```
 
-Comments: `// to end of line` and `{ ... }`. Identifiers are
+Comments: `// to end of line`, and that is the only form. Identifiers are
 **case-insensitive** (`Point` and `point` are the same name, as in
 Pascal); keywords too. Identifiers: letters, digits, `_`, and a **dot**
 as a namespace separator (`io.puts`, `mcp.buf`): the dot is cosmetic, there
@@ -352,8 +352,8 @@ instead; that is the only place the two platforms differ.
 The number itself is an ordinary constant — `SYS.fork = 57` and `SYS.wait4 = 61` live in
 `lib/io.wz`, and the compiler knows no syscall by name. **Everything the operating system
 offers is therefore reachable without touching the language**, which is why a new
-capability is a constant plus a call rather than a compiler change, and does not break the
-freeze. `fork`, shared memory and `flock` were each called impossible here before someone
+capability is a constant plus a call rather than a compiler change, and needs no language
+change at all. `fork`, shared memory and `flock` were each called impossible here before someone
 looked.
 
 The other side of that: nothing is checked. A wrong number or a wrong argument gives a
@@ -480,7 +480,7 @@ a compile error. Annotations: `readonly`, `idempotent`, `destructive`
 | `string`, `shortstring`, `ansistring`, `pchar` | `str` (literal) + `array of char` | no hidden allocation |
 | `real`, `single`, `double`, `extended` | only `real` (64) | idem |
 | `var` parameters | array view or global | no aliasing of scalars |
-| `(* *)`, `{ }` | `{ }` and `//` | |
+| `(* *)`, `{ }` | only `//` | a brace inside the comment text ended it early, and the error landed far from its cause |
 | `shl`/`shr`/`and`/`or` on ints | `shl`/`shr`, `band`/`bor`/`bxor`/`bnot`; `and`/`or` only on bool | logical and bitwise never confused |
 | `exit`, `halt` | `return`, `halt(code)` | |
 | units, `uses` | `include` | one mechanism |
@@ -491,10 +491,26 @@ a compile error. Annotations: `readonly`, `idempotent`, `destructive`
 
 ## 9. Planned (not yet valid)
 
-The language was **frozen** on 10 September 2026: there are no open language extensions left.
-What an application still needs is library (`lib/`). Ideas for after the freeze become
-tickets with priority P3 and only return here once Floris lifts the
-freeze.
+**Before 1.0, anything here can still change.** This is a young language: if a construct
+turns out to cost more than it gives, it goes, and code that used it will need editing. The
+`{ }` block comment was removed on 15 September 2026 for exactly that reason. Plan for it,
+and read this section on each release.
+
+That is not licence to churn. **The bar is evidence, not taste** — a proposal resting on
+symmetry or familiarity does not clear it, one that can show what a construct costs in
+practice does. It is then weighed against the test in [`design.md`](design.md): a change
+should remove a *choice* between things that meant the same, never a *distinction*.
+
+After 1.0 this reverses: compatibility is the default and a break needs the stronger case.
+What an application still needs meanwhile is library (`lib/`), not language.
+
+One thing has been **removed** since: the `{ }` block comment, on 15 September 2026. It
+ended at the first `}`, so a brace inside the comment text — a JSON example, the words
+"default {}" — closed it early and the rest of the sentence was compiled as code, with the
+error appearing far from its cause on a line that looked correct. Six of seven recorded
+syntax errors came from it, including several written after the pitfall was documented.
+`//` has no such failure mode. A source that still uses `{ }` is refused with a message
+naming the replacement.
 
 What is **not** coming: heap/`new`/`dispose`, pointers, strings with content as a
 language type, sets, `with`, `goto`, variants, classes, generics, exceptions,

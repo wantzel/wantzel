@@ -7,8 +7,8 @@ program t;
 include "oauth.wz";
 var
   i: int;
-{ oauth.wz forward-declares these two: the library does not know how an
-  application authenticates.  The pages under test never call them. }
+// oauth.wz forward-declares these two: the library does not know how an
+// application authenticates.  The pages under test never call them.
 function app.authenticate(user: array of char; secret: array of char): int;
 begin
   return -1;
@@ -17,7 +17,7 @@ function app.machinetoken(token: array of char): int;
 begin
   return -1;
 end;
-{ http.wz forward-declares this one; no request is served here. }
+// http.wz forward-declares this one; no request is served here.
 procedure app.request;
 begin
 end;
@@ -34,7 +34,7 @@ begin
   http.wpos := http.obase + HDRROOM;
   http.xlen := 0;
 end;
-{ true when needle occurs in the reply body }
+// true when needle occurs in the reply body
 function has(needle: str): bool;
 var i, j, n: int;
     hit: bool;
@@ -57,22 +57,22 @@ begin
   io.puts(STDOUT, "\n");
 end;
 begin
-  { the cookie name: one source, and it says nothing about the language }
+  // the cookie name: one source, and it says nothing about the language
   io.puts(STDOUT, "cookie = "); io.puts(STDOUT, OAUTH.CNAME); io.puts(STDOUT, "\n");
 
-  { the login page, in full, so the wording is pinned }
+  // the login page, in full, so the wording is pinned
   reset;
   oauth.loginpage(false);
   io.puts(STDOUT, "--- loginpage ---\n");
   body;
 
-  { and the same page after a failed attempt }
+  // and the same page after a failed attempt
   reset;
   oauth.loginpage(true);
   io.puts(STDOUT, "--- loginpage failed ---\n");
   yn("says unknown user ", has("Unknown user or wrong code."));
 
-  { no Dutch left in either }
+  // no Dutch left in either
   yn("no Inloggen ", not has("Inloggen"));
   yn("no Gebruiker ", not has("Gebruiker"));
   yn("no Onbekende ", not has("Onbekende"));

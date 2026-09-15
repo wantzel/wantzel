@@ -43,7 +43,7 @@ begin
   show("meta length = ", p.meta_end - p.meta_at);
   r := Path.write(out, 0, p, doc);
   io.out(STDOUT, addr(out[0]), r); io.puts(STDOUT, "\n");
-  { two records side by side in an array, parsed through slices }
+  // two records side by side in an array, parsed through slices
   r := Path.parse(doc, 0, n, paths[1..1]);
   paths[1].id := 8;
   paths[0] := paths[1];
@@ -51,7 +51,7 @@ begin
   show("paths[0].id = ", paths[0].id);
   show("paths[1].id = ", paths[1].id);
   show("paths[1].pts[1].x = ", trunc(paths[1].pts[1].x));
-  n := io.push(doc, 0, "{\"id\":1,\"kind\":\"open\",\"origin\":{\"x\":1}}");   { origin.y missing }
+  n := io.push(doc, 0, "{\"id\":1,\"kind\":\"open\",\"origin\":{\"x\":1}}");   // origin.y missing
   show("nested required = ", Path.parse(doc, 0, n, p));
   n := io.push(doc, 0, "{\"id\":1,\"kind\":\"round\",\"origin\":{\"x\":1,\"y\":2},\"pts\":[]}");
   r := Path.parse(doc, 0, n, p);
