@@ -85,10 +85,16 @@ for f in $list; do
   case "$f" in tests/helpers.sh) continue ;; esac      # shared functions, not a test
   case "$f" in tests/toolchain/*) [ $toolchain -eq 1 ] || { toolskipped=$((toolskipped+1)); continue; } ;; esac
   # The Windows tests need Wine and are the slowest thing in the suite; --windows asks
-  # for them.  win_syscalls.sh runs .exe files under Wine, and freeze.sh calls
-  # test-win.sh, so both belong to this group.
+  # for them.  Only tests that actually START Wine belong here: win_backend_bytes.sh
+  # compares .exe bytes and runs in every --toolchain run.
+  #
+  # This list named freeze.sh until 15-09-2026, and freeze.sh had been renamed to
+  # all_suites_green.sh -- so the entry matched nothing and that script, which called
+  # test-win.sh unconditionally, ran Wine on every --toolchain run. Twenty-nine orphan
+  # wine processes later, the call is gone from it. A name in this list is
+  # only as good as the file it names: check it after a rename.
   case "$f" in
-    tests/toolchain/win_syscalls.sh|tests/toolchain/freeze.sh)
+    tests/toolchain/win_syscalls.sh|tests/toolchain/win_exe_runs.sh|tests/toolchain/win_same_output.sh|tests/toolchain/win_getprocaddress.sh|tests/toolchain/win_winproc.sh)
       [ $windows -eq 1 ] || { winskipped=$((winskipped+1)); continue; } ;;
   esac
   case "$f" in tests/bench/*) [ $bench -eq 1 ] || continue ;; esac

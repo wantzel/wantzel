@@ -1,6 +1,5 @@
 // primes.wz -- sieve of Eratosthenes, with the runtime bounds checks left on.
 
-program primes;
 
 const
   N = 200000;

@@ -1,2 +1,2 @@
 // Must not compile: "the value of this function call is not used".
-program t; function f: int; begin return 1; end; begin f; end.
+function f: int; begin return 1; end; begin f; end.

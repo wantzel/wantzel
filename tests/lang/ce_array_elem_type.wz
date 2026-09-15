@@ -1,2 +1,2 @@
 // Must not compile: "type error in array argument: expected char, found int".
-program t; var b: array[0..3] of int; procedure p(a: array of char); begin end; begin p(b); end.
+var b: array[0..3] of int; procedure p(a: array of char); begin end; begin p(b); end.

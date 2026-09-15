@@ -1,0 +1,10 @@
+// Must not compile: "undeclared identifier: io.puts is declared in io.wz; add: include
+// "io.wz";" -- forgetting the include is the first mistake a newcomer makes, and the bare
+// message says nothing about where io.puts lives while the compiler is carrying the
+// library that declares it.
+//
+// tests/compiler/missing_include_quiet.sh is the other half: a name that is in no library
+// must NOT get a hint, or the hint becomes noise on every typo.
+begin
+  io.puts(STDOUT, "hi\n");
+end.

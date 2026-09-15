@@ -1,24 +1,152 @@
 {
   "name": "wantzel",
   "displayName": "Wantzel",
-  "description": "Syntax highlighting for the Wantzel language (.wz)",
-  "version": "0.1.0",
+  "description": "The Wantzel language (.wz): highlighting, compile errors in the Problems panel, build and run, and snippets",
+  "version": "0.2.0",
   "publisher": "wantzel",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/wantzel/wantzel" },
-  "engines": { "vscode": "^1.60.0" },
-  "categories": ["Programming Languages"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wantzel/wantzel"
+  },
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
   "contributes": {
-    "languages": [{
-      "id": "wantzel",
-      "aliases": ["Wantzel", "wantzel"],
-      "extensions": [".wz"],
-      "configuration": "./language-configuration.json"
-    }],
-    "grammars": [{
-      "language": "wantzel",
-      "scopeName": "source.wantzel",
-      "path": "./syntaxes/wantzel.tmLanguage.json"
-    }]
-  }
+    "languages": [
+      {
+        "id": "wantzel",
+        "aliases": [
+          "Wantzel",
+          "wantzel"
+        ],
+        "extensions": [
+          ".wz"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "wantzel",
+        "scopeName": "source.wantzel",
+        "path": "./syntaxes/wantzel.tmLanguage.json"
+      }
+    ],
+    "problemMatchers": [
+      {
+        "name": "wantzel",
+        "owner": "wantzel",
+        "fileLocation": [
+          "autoDetected",
+          "${workspaceFolder}"
+        ],
+        "pattern": {
+          "regexp": "^wantzel: (.*):(\\d+): (.*)$",
+          "file": 1,
+          "line": 2,
+          "message": 3
+        }
+      }
+    ],
+    "snippets": [
+      {
+        "language": "wantzel",
+        "path": "./snippets/wantzel.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "wantzel.build",
+        "title": "Wantzel: Build (compile this file)"
+      },
+      {
+        "command": "wantzel.run",
+        "title": "Wantzel: Run (compile and run this file)"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "wantzel",
+        "label": "Wantzel",
+        "languages": [
+          "wantzel"
+        ],
+        "initialConfigurations": [
+          {
+            "name": "Wantzel: run current file",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "${fileDirname}/${fileBasenameNoExtension}",
+            "cwd": "${fileDirname}",
+            "preLaunchTask": "wantzel: build"
+          }
+        ]
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "wantzel.build",
+        "key": "ctrl+shift+b",
+        "when": "editorLangId == wantzel"
+      },
+      {
+        "command": "wantzel.run",
+        "key": "ctrl+f5",
+        "when": "editorLangId == wantzel"
+      }
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "wantzel.run",
+          "when": "editorLangId == wantzel",
+          "group": "navigation@1"
+        },
+        {
+          "command": "wantzel.build",
+          "when": "editorLangId == wantzel",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "taskDefinitions": [
+      {
+        "type": "wantzel",
+        "required": [
+          "task"
+        ],
+        "properties": {
+          "task": {
+            "type": "string",
+            "description": "build, run, or build (all)"
+          }
+        }
+      }
+    ],
+    "configuration": {
+      "title": "Wantzel",
+      "properties": {
+        "wantzel.compilerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the wantzel compiler. Empty means bin/wantzel in the workspace, else 'wantzel' on the PATH."
+        }
+      }
+    }
+  },
+  "keywords": [
+    "wantzel",
+    "wz",
+    "compiler",
+    "mcp",
+    "systems"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:wantzel"
+  ]
 }

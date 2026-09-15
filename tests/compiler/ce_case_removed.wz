@@ -1,0 +1,10 @@
+// `case` is no longer part of the language. It is refused by name rather than falling
+// through to "undeclared identifier", because a source written against an older version
+// deserves to be told what to write instead.
+var k: int;
+begin
+  k := 1;
+  case k of
+    1: k := 2;
+  end;
+end.

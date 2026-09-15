@@ -8,7 +8,6 @@
 // the parent normally won and lost under load -- status 0 instead of 9, and then
 // "ok = yes (WRONG)", which is the test reporting the opposite of what it guards.
 // A test that depends on winning a microsecond race is a bug, not noise.
-program proc_t;
 include "io.wz";
 include "proc.wz";
 const CHILD.SLEEP.S = 30;           // long enough that only the kill ends it

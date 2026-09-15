@@ -1,0 +1,4 @@
+wrote = 10
+refused: log record size differs from the table layout: table readings expects 24 bytes, the log record holds 16
+old layout still reads = 10
+rmdir = 0

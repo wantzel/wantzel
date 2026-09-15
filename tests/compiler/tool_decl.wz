@@ -1,6 +1,5 @@
 // A tools block is a compile-time table: generated constants, the handler forward
 // declarations and tool.byname/tool.run exist without any transport included.
-program t;
 include "io.wz";
 include "json.wz";
 schema In = record

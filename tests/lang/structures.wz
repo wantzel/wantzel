@@ -1,0 +1,217 @@
+// The four linked shapes that are normally the reason a language needs pointers, built
+// with the index as the pointer: a doubly-linked list with removal from the middle, a
+// binary search tree, a graph containing cycles, and the same tree written as raw bytes
+// and read back with every link still valid.
+//
+// This is examples/structures.wz, kept as a test so the claim cannot rot: if any of the
+// four stops matching its expected answer, the suite says so.
+
+
+include "io.wz";
+
+const
+  MAXN  = 64;
+  NONE  = -1;
+
+type
+  Item = record val, prev, next: int; end;
+  Node = record val, left, right: int; end;
+  Vert = record name, ne: int; edge: array[0..3] of int; end;
+
+var
+  items: array[0..MAXN - 1] of Item;  nitems, head: int;
+  nodes: array[0..MAXN - 1] of Node;  nnodes, root: int;
+  verts: array[0..MAXN - 1] of Vert;  seen: array[0..MAXN - 1] of bool;
+  out:   array[0..255] of char;       nout: int;
+  path:  array[0..63] of char;
+  ok:    bool;
+
+// ---------------------------------------------------------------- reporting
+
+procedure emit(c: char);
+begin
+  if nout < len(out) then begin out[nout] := c; nout := nout + 1; end;
+end;
+
+procedure emitn(v: int);
+var d: array[0..31] of char;
+    k, m: int;
+begin
+  if v < 0 then begin emit('-'); v := 0 - v; end;
+  k := 0; m := v;
+  if m = 0 then begin emit('0'); return; end;
+  while m > 0 do begin d[k] := chr(48 + (m mod 10)); m := m div 10; k := k + 1; end;
+  while k > 0 do begin k := k - 1; emit(d[k]); end;
+end;
+
+// Compare what we built against the answer written out by hand, and say which it was.
+procedure check(what: str; want: str);
+var i: int;
+begin
+  io.puts(STDOUT, what); io.puts(STDOUT, ": ");
+  io.out(STDOUT, addr(out[0]), nout);
+  if nout <> slen(want) then ok := false
+  else
+  begin
+    i := 0;
+    while i < nout do
+    begin
+      if out[i] <> schar(want, i) then ok := false;
+      i := i + 1;
+    end;
+  end;
+  io.puts(STDOUT, "\n");
+  nout := 0;
+end;
+
+// ------------------------------------------- 1. doubly-linked list, with removal
+
+function push(v: int): int;
+begin
+  if nitems >= MAXN then return NONE;            // full: refuse, never overwrite
+  items[nitems].val := v;
+  items[nitems].prev := NONE;
+  items[nitems].next := head;
+  if head <> NONE then items[head].prev := nitems;
+  head := nitems;
+  nitems := nitems + 1;
+  return nitems - 1;
+end;
+
+// Remove one element from anywhere in the list. This is the operation that needs a
+// pointer elsewhere; here it is four index assignments and no memory management at all.
+procedure unlink(x: int);
+begin
+  if items[x].prev <> NONE then items[items[x].prev].next := items[x].next
+  else head := items[x].next;
+  if items[x].next <> NONE then items[items[x].next].prev := items[x].prev;
+end;
+
+procedure walklist;
+var i: int;
+begin
+  i := head;
+  while i <> NONE do begin emitn(items[i].val); emit(' '); i := items[i].next; end;
+end;
+
+// ---------------------------------------------------------- 2. binary search tree
+
+function newnode(v: int): int;
+begin
+  if nnodes >= MAXN then return NONE;
+  nodes[nnodes].val := v;
+  nodes[nnodes].left := NONE;                    // NOT zero: 0 is a valid index
+  nodes[nnodes].right := NONE;
+  nnodes := nnodes + 1;
+  return nnodes - 1;
+end;
+
+procedure insert(x: int; v: int);
+begin
+  if v < nodes[x].val then
+  begin
+    if nodes[x].left = NONE then nodes[x].left := newnode(v)
+    else insert(nodes[x].left, v);
+  end
+  else
+  begin
+    if nodes[x].right = NONE then nodes[x].right := newnode(v)
+    else insert(nodes[x].right, v);
+  end;
+end;
+
+procedure inorder(x: int);
+begin
+  if x = NONE then return;
+  inorder(nodes[x].left);
+  emitn(nodes[x].val); emit(' ');
+  inorder(nodes[x].right);
+end;
+
+// ------------------------------------------------------- 3. a graph with cycles
+
+procedure edge(a: int; b: int);
+begin
+  if verts[a].ne < 4 then
+  begin
+    verts[a].edge[verts[a].ne] := b;
+    verts[a].ne := verts[a].ne + 1;
+  end;
+end;
+
+// A cycle needs no special handling. An index cannot point at released memory, so the
+// "use after free" that makes cyclic structures dangerous elsewhere cannot occur -- the
+// only thing to guard is visiting a vertex twice.
+procedure visit(x: int);
+var i: int;
+begin
+  if seen[x] then return;
+  seen[x] := true;
+  emitn(verts[x].name); emit(' ');
+  i := 0;
+  while i < verts[x].ne do begin visit(verts[x].edge[i]); i := i + 1; end;
+end;
+
+// ------------------------------------- 4. the tree survives a write and a read back
+
+procedure setpath;
+var i: int;
+begin
+  i := 0;
+  while i < slen("/tmp/wz_structures.bin") do
+  begin
+    path[i] := schar("/tmp/wz_structures.bin", i);
+    i := i + 1;
+  end;
+  path[i] := chr(0);
+end;
+
+var i, fd, n, mid: int;
+
+begin
+  ok := true;
+  nout := 0;
+
+  // 1. list: build 1 2 3 (each pushed at the head), then take the middle one out
+  head := NONE; nitems := 0;
+  i := push(1); mid := push(2); i := push(3);
+  walklist;  check("list built     ", "3 2 1 ");
+  unlink(mid);
+  walklist;  check("middle removed ", "3 1 ");
+
+  // 2. tree
+  nnodes := 0; root := newnode(50);
+  insert(root, 30); insert(root, 70); insert(root, 20); insert(root, 40); insert(root, 60);
+  inorder(root);  check("tree in order  ", "20 30 40 50 60 70 ");
+
+  // 3. graph: 0 -> 1 -> 2 -> 0 is a cycle, and 3 points back into it
+  i := 0;
+  while i < MAXN do begin verts[i].name := i; verts[i].ne := 0; seen[i] := false; i := i + 1; end;
+  edge(0, 1); edge(1, 2); edge(2, 0); edge(2, 3); edge(3, 1);
+  visit(0);  check("graph w/ cycle ", "0 1 2 3 ");
+
+  // 4. write the raw array, wipe memory, read it back. No serialisation: a link is an
+  //    index, so it does not depend on where the data happens to live.
+  setpath;
+  fd := sys3(SYS.open, addr(path[0]), 577, 420);        // O_WRONLY|O_CREAT|O_TRUNC
+  if fd < 0 then begin io.puts(STDERR, "cannot write the file\n"); halt(1); end;
+  n := sys3(SYS.write, fd, addr(nodes[0]), nnodes * 24);
+  sys1(SYS.close, fd);
+
+  i := 0;
+  while i < MAXN do
+  begin
+    nodes[i].val := 0; nodes[i].left := NONE; nodes[i].right := NONE;
+    i := i + 1;
+  end;
+  inorder(root);  check("after wiping   ", "0 ");           // val zeroed, links NONE
+
+  fd := sys3(SYS.open, addr(path[0]), 0, 0);
+  if fd < 0 then begin io.puts(STDERR, "cannot read the file back\n"); halt(1); end;
+  n := sys3(SYS.read, fd, addr(nodes[0]), nnodes * 24);
+  sys1(SYS.close, fd);
+  inorder(root);  check("read back      ", "20 30 40 50 60 70 ");
+
+  if ok then io.puts(STDOUT, "\nall four shapes correct, and not one pointer\n")
+  else begin io.puts(STDOUT, "\nMISMATCH\n"); halt(1); end;
+end.

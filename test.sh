@@ -138,56 +138,55 @@ rt() {                      # rt <name> <expected output>, source on stdin
 }
 
 rt "index above upper bound" "runtime error: array index out of range at SRC:2" <<'PX'
-program t; var a: array[10..20] of int; i: int;
+var a: array[10..20] of int; i: int;
 begin i := 21; a[i] := 1; end.
 PX
 
 rt "index below lower bound" "runtime error: array index out of range at SRC:2" <<'PX'
-program t; var a: array[10..20] of int; i: int;
+var a: array[10..20] of int; i: int;
 begin i := 9; a[i] := 1; end.
 PX
 
-rt "local array bounds" "runtime error: array index out of range at SRC:2" <<'PX'
-program t;
+rt "local array bounds" "runtime error: array index out of range at SRC:1" <<'PX'
 procedure p; var b: array[0..3] of char; i: int; begin i := 4; b[i] := 'x'; end;
 begin p; end.
 PX
 
 rt "division by zero" "runtime error: division by zero at SRC:2" <<'PX'
-program t; var i, j: int;
+var i, j: int;
 begin i := 0; j := 7 div i; end.
 PX
 
 rt "modulo by zero" "runtime error: division by zero at SRC:2" <<'PX'
-program t; var i, j: int;
+var i, j: int;
 begin i := 0; j := 7 mod i; end.
 PX
 
 rt "chr out of range" "runtime error: chr() argument outside 0..255 at SRC:2" <<'PX'
-program t; var i: int; c: char;
+var i: int; c: char;
 begin i := 256; c := chr(i); end.
 PX
 
 rt "string index" "runtime error: string index out of range at SRC:2" <<'PX'
-program t; var s: str; c: char;
+var s: str; c: char;
 begin s := "abc"; c := schar(s, 3); end.
 PX
 
 rt "falling out of a function" "runtime error: function ended without executing a return at SRC:2" <<'PX'
-program t; var i: int;
+var i: int;
 function f(x: int): int; begin if x > 100 then return 1; end;
 begin i := f(1); end.
 PX
 
 rt "locals start at zero" "00" <<'PX'
-program t; var o: array[0..7] of char;
+var o: array[0..7] of char;
 procedure p; var k: int; a: array[0..3] of int; begin
   o[0] := chr(48 + k + a[3]); sys3(1,1,addr(o[0]),1); k := 9; end;
 begin p; p; end.
 PX
 
 rt "array parameter bounds" "runtime error: array index out of range at SRC:2" <<'PX'
-program t; var b: array[0..3] of char;
+var b: array[0..3] of char;
 procedure p(a: array of char); begin a[len(a)] := 'x'; end;
 begin p(b); end.
 PX
@@ -199,103 +198,100 @@ ce() {                      # ce <name> <expected diagnostic>, source on stdin
 }
 
 ce "char := int" "wantzel: SRC:1: type error in assignment: expected char, found int" <<'PX'
-program t; var c: char; begin c := 65; end.
+var c: char; begin c := 65; end.
 PX
 
 ce "int := char" "wantzel: SRC:1: type error in assignment: expected int, found char" <<'PX'
-program t; var i: int; begin i := 'A'; end.
+var i: int; begin i := 'A'; end.
 PX
 
 ce "int + bool" "wantzel: SRC:1: type error in arithmetic: expected int, found bool" <<'PX'
-program t; var i: int; b: bool; begin i := i + b; end.
+var i: int; b: bool; begin i := i + b; end.
 PX
 
 ce "int as a condition" "wantzel: SRC:1: type error in if condition: expected bool, found int" <<'PX'
-program t; var i: int; begin if i then i := 1; end.
+var i: int; begin if i then i := 1; end.
 PX
 
 ce "and on ints" "wantzel: SRC:1: type error in and: expected bool, found int" <<'PX'
-program t; var i: int; begin i := i and 1; end.
+var i: int; begin i := i and 1; end.
 PX
 
 ce "ordering bools" "wantzel: SRC:1: only int, char and real can be ordered" <<'PX'
-program t; var b, c: bool; begin c := b < b; end.
+var b, c: bool; begin c := b < b; end.
 PX
 
-ce "undeclared name" "wantzel: SRC:1: undeclared identifier" <<'PX'
-program t; begin zz := 1; end.
+ce "undeclared name" "wantzel: SRC:1: undeclared identifier: zz" <<'PX'
+begin zz := 1; end.
 PX
 
 ce "wrong argument type" "wantzel: SRC:1: type error in argument: expected int, found char" <<'PX'
-program t; procedure p(x: int); begin end; begin p('a'); end.
+procedure p(x: int); begin end; begin p('a'); end.
 PX
 
 ce "too many arguments" "wantzel: SRC:1: too many arguments in call" <<'PX'
-program t; procedure p(x: int); begin end; begin p(1,2); end.
+procedure p(x: int); begin end; begin p(1,2); end.
 PX
 
 ce "too few arguments" "wantzel: SRC:1: wrong number of arguments in call" <<'PX'
-program t; procedure p(x: int; y: int); begin end; begin p(1); end.
+procedure p(x: int; y: int); begin end; begin p(1); end.
 PX
 
 ce "discarded result" "wantzel: SRC:1: the value of this function call is not used" <<'PX'
-program t; function f: int; begin return 1; end; begin f; end.
+function f: int; begin return 1; end; begin f; end.
 PX
 
 ce "procedure as a value" "wantzel: SRC:1: a procedure has no value" <<'PX'
-program t; var i: int; procedure p; begin end; begin i := p; end.
+var i: int; procedure p; begin end; begin i := p; end.
 PX
 
 ce "array without index" "wantzel: SRC:1: an array can only be used with a subscript, len() or addr()" <<'PX'
-program t; var a: array[0..3] of int; i: int; begin i := a; end.
+var a: array[0..3] of int; i: int; begin i := a; end.
 PX
 
 ce "subscript on a scalar" "wantzel: SRC:1: subscript applied to a variable that is not an array" <<'PX'
-program t; var i, j: int; begin j := i[0]; end.
+var i, j: int; begin j := i[0]; end.
 PX
 
 ce "assignment to const" "wantzel: SRC:1: cannot assign to or take the address of a constant" <<'PX'
-program t; const K = 1; begin K := 2; end.
+const K = 1; begin K := 2; end.
 PX
 
 ce "duplicate global" "wantzel: SRC:1: duplicate global declaration" <<'PX'
-program t; var i: int; i: char; begin end.
+var i: int; i: char; begin end.
 PX
 
 ce "unfulfilled forward" "wantzel: SRC:1: forward declared routine f is never defined" <<'PX'
-program t; function f: int; forward; begin end.
+function f: int; forward; begin end.
 PX
 
 ce "comparing strings" "wantzel: SRC:1: strings cannot be compared with = or <>; compare their characters" <<'PX'
-program t; var b: bool; begin b := "a" = "b"; end.
+var b: bool; begin b := "a" = "b"; end.
 PX
 
 ce "; before else" "wantzel: SRC:1: unexpected else (no ';' may precede it)" <<'PX'
-program t; var i: int; begin if i > 0 then i := 1; else i := 2; end.
+var i: int; begin if i > 0 then i := 1; else i := 2; end.
 PX
 
 ce "wrong array element type" "wantzel: SRC:1: type error in array argument: expected char, found int" <<'PX'
-program t; var b: array[0..3] of int; procedure p(a: array of char); begin end; begin p(b); end.
+var b: array[0..3] of int; procedure p(a: array of char); begin end; begin p(b); end.
 PX
 
 ce "scalar where array expected" "wantzel: SRC:1: this parameter needs an array" <<'PX'
-program t; var i: int; procedure p(a: array of char); begin end; begin p(i); end.
+var i: int; procedure p(a: array of char); begin end; begin p(i); end.
 PX
 
-ce "missing include file" "wantzel: SRC:2: cannot open the included file" <<'PX'
-program t;
+ce "missing include file" "wantzel: SRC:1: cannot open the included file" <<'PX'
 include "nowhere/nothing.wz";
 begin end.
 PX
 
-ce "schema needs record" "wantzel: SRC:2: a schema body starts with 'record'" <<'PX'
-program t;
+ce "schema needs record" "wantzel: SRC:1: a schema body starts with 'record'" <<'PX'
 schema S = int;
 begin end.
 PX
 
-ce "unknown schema field type" "wantzel: SRC:3: a schema field is int, real, bool, text, text[N], text of (...), json, or a schema declared earlier" <<'PX'
-program t;
+ce "unknown schema field type" "wantzel: SRC:2: a schema field is int, real, bool, text, text[N], text of (...), json, or a schema declared earlier" <<'PX'
 schema S = record
   a: float;
 end;
@@ -303,32 +299,42 @@ begin end.
 PX
 
 ce "shadowing a builtin" "wantzel: SRC:1: that name is built in" <<'PX'
-program t; var len: int; begin end.
+var len: int; begin end.
 PX
 
 ce "break outside a loop" "wantzel: SRC:1: break outside a loop" <<'PX'
-program t; begin break; end.
+begin break; end.
 PX
 
 ce "bad forward signature" "wantzel: SRC:2: parameter type differs from the forward declaration" <<'PX'
-program t; function f(a: int): int; forward;
+function f(a: int): int; forward;
 function f(a: char): int; begin return 1; end; begin end.
 PX
 
 ce "eleven parameters" "wantzel: SRC:1: a routine may take at most ten arguments (an array counts as two)" <<'PX'
-program t; procedure p(a,b,c,d,e,f,g,h,i,j,k: int); begin end; begin end.
+procedure p(a,b,c,d,e,f,g,h,i,j,k: int); begin end; begin end.
 PX
 
 ce "six arrays is too many" "wantzel: SRC:1: a routine may take at most ten arguments (an array counts as two)" <<'PX'
-program t; procedure p(a,b,c,d,e,f: array of int); begin end; begin end.
+procedure p(a,b,c,d,e,f: array of int); begin end; begin end.
 PX
 
 ce "return value in a procedure" "wantzel: SRC:1: a procedure cannot return a value" <<'PX'
-program t; procedure p; begin return 1; end; begin end.
+procedure p; begin return 1; end; begin end.
 PX
 
 ce "missing final dot" "wantzel: SRC:2: missing . after the final end" <<'PX'
-program t; begin end
+begin end
+PX
+
+ce "the program header is refused" "wantzel: SRC:1: the 'program' header is no longer part of the language; delete that line" <<'PX'
+program t;
+begin end.
+PX
+
+ce "repeat is refused" "wantzel: SRC:2: 'repeat ... until' is no longer part of the language; write 'while true do begin ... if done then break; end'" <<'PX'
+var i: int;
+begin repeat i := 1; until true; end.
 PX
 
 echo "generated executables are self-contained"

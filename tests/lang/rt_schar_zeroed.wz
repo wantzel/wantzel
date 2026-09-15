@@ -1,0 +1,11 @@
+// A str that was never assigned is (address 0, length 0), and schar() on it must REFUSE,
+// with a message naming the source -- not die with a segmentation fault.
+//
+// The bound sits in the eight bytes BEFORE the text, so comparing the index against it is
+// itself a dereference: on a null address the comparison read address -8 and the process
+// was gone before its own trap could fire. The guard was present and correct; it was
+// unreachable. See str_zeroed.wz for the other half -- slen() ANSWERS 0, because an empty
+// string has length 0, but it has no character at position 0.
+include "io.wz";
+var s: str;
+begin io.putn(STDOUT, ord(schar(s, 0))); end.

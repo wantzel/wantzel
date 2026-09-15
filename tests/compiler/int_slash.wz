@@ -1,5 +1,4 @@
 // '/' is only for reals; integers use div.
-program t;
 var i: int;
 begin
   i := 7 / 2;

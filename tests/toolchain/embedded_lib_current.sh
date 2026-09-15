@@ -1,6 +1,6 @@
 # What the compiler carries is what lib/ says.
 #
-# src/embedded.wz is generated from lib/ by tools/embedlib.wz. Generated files go stale
+# src/embedded.wz is generated from lib/ by bootstrap/tools/embedlib.wz. Generated files go stale
 # quietly: someone fixes a bug in lib/json.wz, does not rebuild, and the compiler keeps
 # handing out the old version to anyone who relies on the embedded copy. Worse, it would
 # behave differently depending on whether the user happens to have lib/ on disk.
@@ -12,7 +12,7 @@ cd "$ROOT"
 
 [ -f src/embedded.wz ] || { echo "src/embedded.wz is missing; run ./build.sh"; exit 1; }
 
-compile tools/embedlib.wz "$T/embedlib"
+compile bootstrap/tools/embedlib.wz "$T/embedlib"
 
 set --
 for f in lib/*.wz; do set -- "$@" "$(basename "$f")" "$f"; done

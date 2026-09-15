@@ -1,2 +1,2 @@
 // Must not compile: "type error in assignment: expected char, found int".
-program t; var c: char; begin c := 65; end.
+var c: char; begin c := 65; end.

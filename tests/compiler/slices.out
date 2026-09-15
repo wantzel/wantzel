@@ -9,4 +9,4 @@ sumfirst 0 = 0
 local slice = 18
 local empty = 0
 items[3].k = 107
-runtime error: slice lies outside the array at slices.wz:56
+runtime error: slice lies outside the array at slices.wz:55

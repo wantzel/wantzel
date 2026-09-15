@@ -1,2 +1,2 @@
 // Must not compile: "undeclared identifier".
-program t; begin zz := 1; end.
+begin zz := 1; end.

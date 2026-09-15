@@ -1,0 +1,26 @@
+// Must not compile: "tool_missing_handler_middle.wz:16: forward declared routine
+// tool.beta is never defined" -- with three tools declared and only the MIDDLE handler
+// missing, the message must name that tool and point at ITS line, not at the first one.
+//
+// The forwards come out of the generated <tools> text, one per tool in table order, and
+// the compiler maps the n-th back to tool n. A single-tool test cannot tell
+// a correct mapping from one that always reports the first entry; this one can.
+//
+// Line 16 is the beta entry. Keep it there.
+include "io.wz";
+include "json.wz";
+schema In = record n: int; end;
+tools
+  alpha(In): In "first";
+  beta(In): In "second";
+  gamma(In): In "third";
+end;
+function tool.alpha(a: array of In; r: array of In): int;
+begin
+  return 0;
+end;
+function tool.gamma(a: array of In; r: array of In): int;
+begin
+  return 0;
+end;
+begin end.

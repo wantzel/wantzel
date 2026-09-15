@@ -1,2 +1,2 @@
 // Must not compile: "type error in if condition: expected bool, found int".
-program t; var i: int; begin if i then i := 1; end.
+var i: int; begin if i then i := 1; end.

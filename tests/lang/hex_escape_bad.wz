@@ -1,0 +1,10 @@
+// Must not compile: "a hex escape needs exactly two hex digits" -- \xZZ is not a byte.
+//
+// The message names the correct form rather than only rejecting, because a generator
+// that gets this wrong gets it wrong on every byte it writes.
+include "io.wz";
+var s: str;
+begin
+  s := "\xZZ";
+  io.puts(STDOUT, s);
+end.

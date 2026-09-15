@@ -94,17 +94,14 @@ begin
   n := io.push(http.logbuf, 0, "{\"t\":");
   n := io.pushnum(http.logbuf, n, io.realtime div 1000000);
   n := io.push(http.logbuf, n, ",\"method\":\"");
-  case http.method of
-    HTTP.GET: n := io.push(http.logbuf, n, "GET");
-    HTTP.POST: n := io.push(http.logbuf, n, "POST");
-    HTTP.PUT: n := io.push(http.logbuf, n, "PUT");
-    HTTP.DELETE: n := io.push(http.logbuf, n, "DELETE");
-    HTTP.PATCH: n := io.push(http.logbuf, n, "PATCH");
-    HTTP.OPTIONS: n := io.push(http.logbuf, n, "OPTIONS");
-    HTTP.HEAD: n := io.push(http.logbuf, n, "HEAD");
-  else
-    n := io.push(http.logbuf, n, "?");
-  end;
+  if http.method = HTTP.GET then n := io.push(http.logbuf, n, "GET")
+  else if http.method = HTTP.POST then n := io.push(http.logbuf, n, "POST")
+  else if http.method = HTTP.PUT then n := io.push(http.logbuf, n, "PUT")
+  else if http.method = HTTP.DELETE then n := io.push(http.logbuf, n, "DELETE")
+  else if http.method = HTTP.PATCH then n := io.push(http.logbuf, n, "PATCH")
+  else if http.method = HTTP.OPTIONS then n := io.push(http.logbuf, n, "OPTIONS")
+  else if http.method = HTTP.HEAD then n := io.push(http.logbuf, n, "HEAD")
+  else n := io.push(http.logbuf, n, "?");
   n := io.push(http.logbuf, n, "\",\"path\":");
   // json.putslice returns -1 when it does not fit.  A log line is not an answer:
   // better an empty path value than a truncated line or a negative position.
@@ -158,30 +155,27 @@ begin
   n := 0;
   n := io.push(http.hdr, n, "HTTP/1.1 ");
   n := io.pushnum(http.hdr, n, status);
-  case status of
-    200: n := io.push(http.hdr, n, " OK\r\n");
-    201: n := io.push(http.hdr, n, " Created\r\n");
-    202: n := io.push(http.hdr, n, " Accepted\r\n");
-    204: n := io.push(http.hdr, n, " No Content\r\n");
-    301: n := io.push(http.hdr, n, " Moved Permanently\r\n");
-    302: n := io.push(http.hdr, n, " Found\r\n");
-    304: n := io.push(http.hdr, n, " Not Modified\r\n");
-    400: n := io.push(http.hdr, n, " Bad Request\r\n");
-    401: n := io.push(http.hdr, n, " Unauthorized\r\n");
-    403: n := io.push(http.hdr, n, " Forbidden\r\n");
-    404: n := io.push(http.hdr, n, " Not Found\r\n");
-    405: n := io.push(http.hdr, n, " Method Not Allowed\r\n");
-    409: n := io.push(http.hdr, n, " Conflict\r\n");
-    413: n := io.push(http.hdr, n, " Payload Too Large\r\n");
-    415: n := io.push(http.hdr, n, " Unsupported Media Type\r\n");
-    422: n := io.push(http.hdr, n, " Unprocessable Entity\r\n");
-    429: n := io.push(http.hdr, n, " Too Many Requests\r\n");
-    500: n := io.push(http.hdr, n, " Internal Server Error\r\n");
-    501: n := io.push(http.hdr, n, " Not Implemented\r\n");
-    503: n := io.push(http.hdr, n, " Service Unavailable\r\n");
-  else
-    n := io.push(http.hdr, n, " Status\r\n");
-  end;
+  if status = 200 then n := io.push(http.hdr, n, " OK\r\n")
+  else if status = 201 then n := io.push(http.hdr, n, " Created\r\n")
+  else if status = 202 then n := io.push(http.hdr, n, " Accepted\r\n")
+  else if status = 204 then n := io.push(http.hdr, n, " No Content\r\n")
+  else if status = 301 then n := io.push(http.hdr, n, " Moved Permanently\r\n")
+  else if status = 302 then n := io.push(http.hdr, n, " Found\r\n")
+  else if status = 304 then n := io.push(http.hdr, n, " Not Modified\r\n")
+  else if status = 400 then n := io.push(http.hdr, n, " Bad Request\r\n")
+  else if status = 401 then n := io.push(http.hdr, n, " Unauthorized\r\n")
+  else if status = 403 then n := io.push(http.hdr, n, " Forbidden\r\n")
+  else if status = 404 then n := io.push(http.hdr, n, " Not Found\r\n")
+  else if status = 405 then n := io.push(http.hdr, n, " Method Not Allowed\r\n")
+  else if status = 409 then n := io.push(http.hdr, n, " Conflict\r\n")
+  else if status = 413 then n := io.push(http.hdr, n, " Payload Too Large\r\n")
+  else if status = 415 then n := io.push(http.hdr, n, " Unsupported Media Type\r\n")
+  else if status = 422 then n := io.push(http.hdr, n, " Unprocessable Entity\r\n")
+  else if status = 429 then n := io.push(http.hdr, n, " Too Many Requests\r\n")
+  else if status = 500 then n := io.push(http.hdr, n, " Internal Server Error\r\n")
+  else if status = 501 then n := io.push(http.hdr, n, " Not Implemented\r\n")
+  else if status = 503 then n := io.push(http.hdr, n, " Service Unavailable\r\n")
+  else n := io.push(http.hdr, n, " Status\r\n");
   n := io.push(http.hdr, n, "Content-Type: ");
   n := io.push(http.hdr, n, ctype);
   n := io.push(http.hdr, n, "\r\nContent-Length: ");
@@ -211,10 +205,15 @@ end;
 
 // ---------------------------------------------------------------- parsing
 
-// case-insensitive compare of the header name at position at
+// Compare the header name at position at, case-insensitive on BOTH sides.
+//
+// It used to lower-case only the bytes from the buffer and compare them with the literal
+// as written, so http.header("Accept") never matched anything and simply answered false
+// -- no error, and the caller concluded the header was absent.  A header
+// name is case-insensitive in HTTP, so the caller may write it either way.
 function http.hdreq(at: int; last: int; s: str): bool;
 var i, n: int;
-    c: char;
+    c, w: char;
 begin
   n := slen(s);
   if at + n > last then return false;
@@ -223,7 +222,9 @@ begin
   begin
     c := http.inbuf[at + i];
     if (c >= 'A') and (c <= 'Z') then c := chr(ord(c) + 32);
-    if c <> schar(s, i) then return false;
+    w := schar(s, i);
+    if (w >= 'A') and (w <= 'Z') then w := chr(ord(w) + 32);
+    if c <> w then return false;
     i := i + 1;
   end;
   return true;

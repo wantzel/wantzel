@@ -1,0 +1,65 @@
+// lib/http.wz: a request header name is case-insensitive on BOTH sides.
+//
+// http.hdreq lower-cased the bytes from the buffer but compared them with the literal as
+// written, so http.header("Accept") never matched and simply answered false.  No error,
+// no warning -- the caller concluded the header was absent, and one server answered a
+// browser with 401 JSON instead of a login page.  The failure this language
+// exists to prevent is exactly this: a wrong answer that refuses nothing.
+//
+// The request is written straight into http.inbuf and parsed there; no socket is needed.
+include "http.wz";
+var
+  req: array[0..511] of char;
+  n, i, total: int;
+// lib/http.wz calls this from its server loop; this test only parses, so it stays empty
+procedure app.request;
+begin
+end;
+procedure yn(s: str; v: bool);
+begin
+  io.puts(STDOUT, s);
+  if v then io.puts(STDOUT, "1\n") else io.puts(STDOUT, "0\n");
+end;
+// ask for a header by name and print its value, or say it was not found
+procedure ask(name: str);
+begin
+  io.puts(STDOUT, "header ");
+  io.puts(STDOUT, name);
+  if http.header(name) then
+  begin
+    io.puts(STDOUT, " -> [");
+    if http.hvend > http.hvat then io.out(STDOUT, addr(http.inbuf[http.hvat]), http.hvend - http.hvat);
+    io.puts(STDOUT, "]\n");
+  end
+  else io.puts(STDOUT, " -> absent\n");
+end;
+begin
+  n := io.push(req, 0, "GET /login HTTP/1.1\r\n");
+  n := io.push(req, n, "Host: example.invalid\r\n");
+  n := io.push(req, n, "Accept: text/html\r\n");
+  n := io.push(req, n, "Cookie: sid=abc\r\n");
+  n := io.push(req, n, "X-Forwarded-Proto: https\r\n");
+  n := io.push(req, n, "AUTHORIZATION: Bearer tok123\r\n");
+  n := io.push(req, n, "\r\n");
+  for i := 0 to n - 1 do http.inbuf[i] := req[i];
+  total := http.parse(0, n);
+  yn("parsed = ", total = n);
+
+  // the three names from the logbook, asked the way a writer spells them
+  ask("Accept");
+  ask("Cookie");
+  ask("X-Forwarded-Proto");
+  // and the same names in lower case: both spellings must give the same answer
+  ask("accept");
+  ask("cookie");
+  ask("x-forwarded-proto");
+  // a name that really is absent still answers absent
+  ask("Referer");
+
+  // http.bearer looks up "authorization" while the request spells it AUTHORIZATION,
+  // and the token itself keeps its case
+  yn("bearer = ", http.bearer);
+  io.puts(STDOUT, "token = [");
+  if http.hvend > http.hvat then io.out(STDOUT, addr(http.inbuf[http.hvat]), http.hvend - http.hvat);
+  io.puts(STDOUT, "]\n");
+end.

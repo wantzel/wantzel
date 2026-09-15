@@ -1,5 +1,4 @@
 // Must not compile: "a schema field is int, real, bool, text, text[N], text of (...), json, or a schema declared earlier".
-program t;
 schema S = record
   a: float;
 end;

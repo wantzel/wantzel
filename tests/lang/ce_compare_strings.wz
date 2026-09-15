@@ -1,2 +1,2 @@
 // Must not compile: "strings cannot be compared with = or <>; compare their characters".
-program t; var b: bool; begin b := "a" = "b"; end.
+var b: bool; begin b := "a" = "b"; end.

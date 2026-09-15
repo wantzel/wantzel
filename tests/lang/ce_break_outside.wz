@@ -1,2 +1,2 @@
 // Must not compile: "break outside a loop".
-program t; begin break; end.
+begin break; end.

@@ -10,6 +10,11 @@ var
   json.ival: int;          // last number scanned
   json.bval: bool;         // last true/false scanned
   json.sat, json.send: int;  // last string: text runs from sat up to send
+  // The key a generated <Schema>.parse refused, as b[json.badkey0..json.badkey1).
+  // A parse returns -1 for every kind of failure, so without this the caller cannot say
+  // WHICH field was wrong and has to guess -- and an unknown key is the one failure the
+  // caller can actually fix.  badkey1 = 0 means the last failure was something else.
+  json.badkey0, json.badkey1: int;
 
 function json.ws(b: array of char; at: int; last: int): int;
 var c: char;

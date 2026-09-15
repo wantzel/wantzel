@@ -1,2 +1,2 @@
 // Must not compile: "a routine may take at most ten arguments (an array counts as two)".
-program t; procedure p(a,b,c,d,e,f,g,h,i,j,k: int); begin end; begin end.
+procedure p(a,b,c,d,e,f,g,h,i,j,k: int); begin end; begin end.

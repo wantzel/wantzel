@@ -10,6 +10,11 @@
 # compile <source> <output> -- compiles, or stops the test with the compile error
 compile() { "$WANTZEL" "$1" "$2" 2>"$T/cerr" || { echo "compile error in $1:"; cat "$T/cerr"; exit 1; }; }
 
+# compile_win <source> <output.exe> -- the same, for the Windows target.
+# The target is ALWAYS passed: an output name ending in .exe no longer selects Windows on
+# its own, and is refused without --target.
+compile_win() { "$WANTZEL" "$1" "$2" --target=windows 2>"$T/cerr" || { echo "Windows compile error in $1:"; cat "$T/cerr"; exit 1; }; }
+
 # assert_eq <name> <got> <expected>
 assert_eq() { if [ "$2" != "$3" ]; then echo "$1"; echo "  expected: $3"; echo "  got:      $2"; exit 1; fi; }
 

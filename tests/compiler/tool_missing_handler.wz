@@ -1,6 +1,10 @@
-// Must not compile: "forward declared routine tool.x is never defined" -- the handler a
-// tools block forward-declares is named, so the reader knows which one is missing.
-program t;
+// Must not compile: "tool_missing_handler.wz:8: forward declared routine tool.x is never
+// defined" -- the handler a tools block forward-declares is named, AND the location is
+// the writer's own tools entry on line 13.
+//
+// The forward comes out of the generated <tools> text, so the message used to read
+// "<tools>:19" -- a file nobody can open, and an AI writer has no way to guess which tool
+// it meant. The line below must therefore stay line 13.
 include "io.wz";
 include "json.wz";
 schema In = record n: int; end;

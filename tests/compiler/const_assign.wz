@@ -1,5 +1,4 @@
 // Must not compile: "cannot assign to or take the address of a constant".
-program t;
 procedure p;
 const K = 1;
 begin

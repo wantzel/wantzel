@@ -1,0 +1,6 @@
+// The baseline for tests/bench/startup.sh: a Wantzel program that does nothing at all.
+// Starting it costs the kernel's process creation plus this language's start-up path and
+// not one instruction more, so the difference between this and a real program is what
+// that program itself costs.
+begin
+end.

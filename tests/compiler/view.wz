@@ -1,5 +1,4 @@
 // view(addr, count): any memory as an array view, for mmap and kernel buffers.
-program t;
 include "io.wz";
 var
   words: array[0..3] of int;

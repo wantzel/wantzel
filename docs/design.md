@@ -4,6 +4,11 @@ Why this language exists, what it deliberately leaves out, and where the idea do
 hold. What the language *is*, rather than why, is [language.md](language.md), which is
 binding.
 
+This document stays at the level of the argument. Where a claim rests on a measurement, it
+links to the document under [`internals/`](internals/) that carries the numbers, the method
+and the caveats — so the reasoning here stays readable and the evidence is one click away
+rather than paraphrased.
+
 ---
 
 ## The name is the idea
@@ -72,6 +77,33 @@ It is measured rather than claimed: `./wztest --bench` reports lines per second 
 against a hard floor kept beside it, so a regression in the thing this language exists for
 shows up as a failing test rather than as a slow afternoon a year later.
 
+**Starting the result is as cheap as compiling it, which is the other half of that loop.**
+There is no dynamic linker, no libc and no runtime to initialise, so a Wantzel binary is
+running before a comparable program has finished loading. Measured 15-09-2026 on one
+machine, each program started 1,500–3,000 times through `fork` + `execve` + `wait` with no
+shell in the loop:
+
+| what starts | µs per start | starts/s |
+|---|---|---|
+| Wantzel, empty program (376 bytes) | 156 | 6,400 |
+| C, static, glibc (785 kB) | 275 | 3,600 |
+| C, dynamically linked (15 kB) | 398 | 2,500 |
+| `/bin/true` | 407 | 2,500 |
+| Go (1.4 MB) | 728 | 1,400 |
+| Python 3 | 7,841 | 128 |
+| Node 24 | 17,582 | 57 |
+
+Read the ratios, not the microseconds: the absolute figure depends on the machine and even
+on the *measuring* process, whose pages are the ones `fork` copies. Two independent
+harnesses of almost the same size, one written in Wantzel and one in C, disagreed by about
+50 µs on the absolute number and agreed to within 1.3 µs on the difference between two
+targets — so the difference is what carries meaning.
+
+The most useful number is the one against ourselves: `hello.wz`, which writes a line, costs
+within a few percent of a Wantzel program that does nothing at all. Almost the whole cost
+of starting is the kernel creating a process; the language adds close to none of it.
+`tests/bench/startup.sh` guards that ratio.
+
 The layers that a stack adds are either in the language or not needed. HTTP, JSON, MCP and
 OAuth are ordinary library code in `lib/`, not a framework you configure. There is nothing
 to keep in sync because there is nothing beside the compiler.
@@ -138,6 +170,22 @@ compiler alone would.
 
 There is a shift underneath all of this that is worth naming plainly, because it changes
 what a language is *for*.
+
+**And it is worth saying what this language is not.** The temptation with any new language
+is to widen the claim until it competes with Rust, Go and C at everything. The narrower
+statement is the stronger one, and it is the one to keep:
+
+> AI generates enormous quantities of code. Wantzel is designed around the fact that the
+> author can be a machine rather than a person.
+
+Every design decision below follows from that, which is what makes them decisions rather
+than arbitrary strictness: strict typing, no implicit ambiguity, few ways to say the same
+thing, a minimal dependency surface, deterministic compilation, refusing as early as
+possible, small binaries, extremely fast compiles, and generated APIs whose schemas are
+checked when the program is built. What a generator actually gets wrong — counted over a
+hundred real mistakes, and not mostly syntax — is in
+[`internals/why-strict.md`](internals/why-strict.md). A language that tried to be good at everything could not
+have made most of those choices.
 
 A growing number of programmers rarely type their own code any more, and read only some
 of it. The AI writes, they review and steer. That changes which properties of a language
@@ -217,6 +265,18 @@ the argument.
   something machine-read acts on it without weighing tone or context. This is where the
   no-warnings rule below comes from, and the yardstick is why it is not negotiable.
 
+- **A check must be able to judge without trusting what it is checking.** `slen(s)` on a
+  `str` that was never assigned killed the process with a segmentation fault and no
+  message — in a language where every array index is checked. The guard was not missing.
+  It was *unreachable*: the length of a string sits in the eight bytes before it, so
+  reading that length to compare against is itself a dereference, and on a null address
+  the comparison died before its own trap could fire. The same shape sat one function
+  away in `schar`, which looked correct for exactly as long as nobody passed it a zeroed
+  string. What makes this worth a rule rather than a fix is that reading the code does not
+  reveal it — the guard is present, it is correctly written, and it is circular. So the
+  question to ask of a check is not "is one here?" but "does this one need something that
+  is only valid once the check has already passed?"
+
 - **A routine's docstring is part of its contract, and a wrong one is a bug.**
   `kv.match` promised "subset match as used by entity searches" and delivered something
   narrower: a stored list could not contain anything, not even itself. The trap survived
@@ -235,7 +295,7 @@ the argument.
   that merely refuses something new — and when it is made anyway, both directions of the
   change get written down, including the shape that used to work and now does not.
 
-- **Linux and Windows stay as identical as they can be made.** Floris, 14-09-2026: a
+- **Linux and Windows stay as identical as they can be made.** A
   platform difference is one more thing the writer has to hold in their head, and that is
   exactly what this language is trying to take off them. It weighs heavier here than in a
   language people write by hand: a human learns "on Windows this one is different" once
@@ -295,6 +355,24 @@ justify a guess is worse than no yardstick, because the guess then arrives with 
   generated code stop corresponding to the source you are reviewing. Straightforward code
   generation keeps what runs recognisable as what you read, and it is a large part of why
   compiling takes milliseconds.
+
+  The obvious objection is that this must cost speed at run time, and for one class of
+  program it measurably does not. A log scanner written here — a tight loop over bytes —
+  was put next to the same program in Go on the same two gigabytes, both returning the
+  same answer: 0.72 s against 0.82 s, with the difference coming mostly from mapping the
+  file rather than reading it in blocks, not from the code generator. What differs is what
+  it took to get there. Go reached its number through SSA, register allocation and
+  inlining, and took 2.65 s to build cold (0.11 s with a warm cache); this compiler has no
+  optimisation pass at all and emitted its binary in 3 ms — the same compiler translates
+  its own 6,772 lines in about 10 ms.
+
+  The usual trade — fast builds or fast output, pick one — did not appear. That will not
+  hold everywhere: code leaning on deep abstraction or many small functions is exactly
+  where inlining earns its keep, and nothing here says otherwise. But for the kind of
+  straightforward, explicit code this language is meant to carry, the optimiser turns out
+  to be buying much less than its cost in build time, and build time is what an iterating
+  loop actually spends. The full comparison, with the caveats that belong with it, is in
+  [`internals/three-measures.md`](internals/three-measures.md).
 - **The language changes rarely, and only on evidence.** A moving target is one more thing you would have to keep
   in your head, and one more way for code written last month to mean something else today.
 
@@ -378,7 +456,7 @@ the same rule applied case by case:
 | Pascal | Wantzel | why |
 |---|---|---|
 | `boolean`, `integer`, `real`, `single`, `double` | `bool`, `int`, `real` | one type per concept; no choice is no mistake |
-| pointers, `new`/`dispose` | absent | no heap means no memory leak and no use-after-free |
+| pointers, `new`/`dispose` | absent | no heap means no memory leak and no use-after-free — see [`internals/no-pointers.md`](internals/no-pointers.md) for what that costs in practice |
 | `string`, `ansistring`, `pchar` | `str` (literal) + `array of char` | no hidden allocation |
 | units, `uses` | `include` | one mechanism |
 | `(* *)` and `{ }` | only `//` | `{ }` ended at the first `}`, so a brace in the comment text turned the rest of the sentence into code |
@@ -468,7 +546,9 @@ for a given job, and what you give up is not little:
 - **No debugger, no profiler, no IDE support.** Printf and tests.
 - **Almost nobody knows this language.** The bus factor is very small.
 - **No proven memory safety.** Only "no pointers" and a test suite — not years of work on a
-  type system that proves it.
+  type system that proves it. Nine structures were built to test whether the absence costs
+  anything ([`internals/no-pointers.md`](internals/no-pointers.md)); nine cases is evidence,
+  not a proof, and that document says so itself.
 - **Every bug in the compiler is your bug.** An example: an enum level starting with a digit
   produces an invalid constant name. Elsewhere that is someone else's issue to fix; here it
   is a ticket with your own name on it.

@@ -1,0 +1,23 @@
+// The remedy the message in str_var_not_array.err suggests, written out exactly as it is
+// given: copy the str into a buffer with io.push and pass the slice. An error message
+// that proposes something has to be checked like any other instruction -- otherwise it
+// sends the reader somewhere that does not work.
+include "kv.wz";
+var b: array[0..63] of char;
+    kbuf: array[0..63] of char;
+    n: int;
+procedure look(s: str);
+var k: int;
+begin
+  k := io.push(kbuf, 0, s);
+  if kv.find(b, 0, n, kbuf[0..k - 1]) then io.puts(STDOUT, "found\n")
+  else io.puts(STDOUT, "absent\n");
+end;
+begin
+  n := io.push(b, 0, "{\"a\":1}");
+  look("a");
+  look("zz");
+  // and a literal still converts in the same position, which is the half that must not
+  // break: the distinction stays, only the message changed
+  if kv.find(b, 0, n, "a") then io.puts(STDOUT, "literal still works\n");
+end.

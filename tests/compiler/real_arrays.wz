@@ -1,5 +1,4 @@
 // real: arrays, array parameters, function results, locals start at zero.
-program t;
 include "io.wz";
 var
   xs: array[1..5] of real;

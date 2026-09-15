@@ -113,3 +113,45 @@ function proc.self: int;
 begin
   return sys1(SYS.getpid, 0);
 end;
+
+// ------------------------------------------------------------- running another program
+
+const
+  PROC.MAXARG = 32;              // argv entries, the terminating null included
+
+var
+  // argv and envp as the kernel wants them: arrays of addresses, null-terminated.
+  // They are globals rather than locals because the addresses must still be valid when
+  // execve reads them, and because proc.exec never returns on success.
+  proc.argv: array[0..PROC.MAXARG - 1] of int;
+  proc.argn: int;
+
+// Start building an argument list.  path is argv[0] as well as the program to run, which
+// is what a shell does too.
+procedure proc.arg0(path: array of char);
+begin
+  proc.argn := 0;
+  proc.argv[0] := addr(path[0]);
+  proc.argn := 1;
+end;
+
+// Add one argument.  The bytes must be NUL-terminated and must stay alive until
+// proc.exec: nothing is copied.
+procedure proc.arg(a: array of char);
+begin
+  if proc.argn >= PROC.MAXARG - 1 then io.fatal("proc: too many arguments");
+  proc.argv[proc.argn] := addr(a[0]);
+  proc.argn := proc.argn + 1;
+end;
+
+// Replace this process with the program built up above.  On success it does NOT return;
+// a negative result is -errno and the process is untouched.
+//
+// The environment is empty on purpose: a measurement or a test that inherits the
+// caller's environment is not repeatable, and anything that needs one can build it the
+// same way as argv.  Pass the path NUL-terminated, as always with a syscall.
+function proc.exec(path: array of char): int;
+begin
+  proc.argv[proc.argn] := 0;
+  return sys3(SYS.execve, addr(path[0]), addr(proc.argv[0]), addr(proc.argv[proc.argn]));
+end;

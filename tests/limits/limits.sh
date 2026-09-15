@@ -46,7 +46,7 @@ mktree() {   # depth name
     printf 'var v%d: int;\n' $i >> "$T/$2/l$i.wz"
     i=$((i + 1))
   done
-  printf 'program t;\ninclude "%s/l1.wz";\nbegin end.\n' "$2" > "$T/$2.wz"
+  printf 'include "%s/l1.wz";\nbegin end.\n' "$2" > "$T/$2.wz"
 }
 mktree 16 inc16
 mktree 17 inc17
@@ -100,7 +100,6 @@ expect_run "recursion depth 100000" "$T/rec100k.wz" 0; expect_run "recursion dep
 # Fixed text with nothing repeated in it, so a heredoc says it more plainly than a
 # generator call would.
 cat > "$T/wrap.wz" <<EOF
-program t;
 include "$ROOT/lib/io.wz";
 var i: int;
 begin i := 9223372036854775807; i := i + 1; if i < 0 then halt(0); halt(1); end.

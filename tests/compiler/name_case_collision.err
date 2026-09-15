@@ -1,0 +1,1 @@
+duplicate declaration; names are case-insensitive, so STORE.SET is the same name as store.set

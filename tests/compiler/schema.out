@@ -1,5 +1,13 @@
 method=2 id=7 loud=- params={"a":1}
-method=3 id=-3 loud=yes params=-
+method=3 id=-3 loud=yes params=[1,{"x":"}"}]
+rejected
+  badkey=extra
+rejected
+  badkey=extra
+rejected
+  badkey=Method
+method=3 id=- loud=- params=-
+  badkey=-
 method=0 id=- loud=- params=-
 method=-1 id=1 loud=- params=-
 rejected

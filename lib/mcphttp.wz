@@ -20,12 +20,9 @@ procedure mcp.pvheader;
 begin
   if not mcp.inited then http.hdradd("Mcp-Protocol-Version: 2025-06-18")
   else
-    case mcp.pvcode of
-      1: http.hdradd("Mcp-Protocol-Version: 2025-03-26");
-      2: http.hdradd("Mcp-Protocol-Version: 2025-06-18");
-    else
-      http.hdradd("Mcp-Protocol-Version: 2024-11-05");
-    end;
+    if mcp.pvcode = 1 then http.hdradd("Mcp-Protocol-Version: 2025-03-26")
+    else if mcp.pvcode = 2 then http.hdradd("Mcp-Protocol-Version: 2025-06-18")
+    else http.hdradd("Mcp-Protocol-Version: 2024-11-05");
 end;
 
 // handle the current request as an MCP message and write the reply

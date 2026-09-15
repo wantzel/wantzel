@@ -35,7 +35,6 @@
 // GetSystemTimeAsFileTime, which returns void and cannot fail, so __wsys reports 0 for
 // every clock id -- including 99. The check is correct there but never taken, and this
 // test is a Linux test for that reason.
-program t;
 include "io.wz";
 
 var

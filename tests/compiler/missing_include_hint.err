@@ -1,0 +1,1 @@
+undeclared identifier: io.puts is declared in io.wz; add: include "io.wz";

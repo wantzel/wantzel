@@ -6,7 +6,7 @@ are kept separately in §9 and are only valid once they move here. Whoever imple
 something reads this file first; whoever changes the language updates this file in the same
 commit.
 
-Last updated: 2026-09-15 (phase 1 complete: real, record, slices, view, case, for, local const, schema v2, tools).
+Last updated: 2026-09-15 (phase 1 complete: real, record, slices, view, for, local const, schema v2, tools).
 
 ## The language in brief
 
@@ -15,8 +15,6 @@ in the numbered sections that follow; where the two seem to differ, the numbered
 is the one that binds.
 
 ```pascal
-program example;
-
 include "lib/json.wz";
 
 const MAX = 100;
@@ -85,6 +83,20 @@ runtime error: array index out of range at examples/httpd.wz:42
 
 Not checked: integer overflow, and anything that goes through `addr`/`sysN`.
 
+**Where the boundary actually runs.** That last sentence is the one to read carefully,
+because it is the whole of what is *not* guaranteed — and it is easier to get wrong than
+it looks. A guard protects you only if it can reach its verdict without first trusting
+the value it is inspecting. Every bound above is compared against either a constant known
+at compile time or a length held in the call frame, neither of which the caller can
+corrupt; that is why they cannot fail on a hostile input. The one case where a bound is
+read *from the value itself* is a `str`, whose length sits in the eight bytes before its
+text — so an unassigned `str` (address 0, length 0) is the edge worth knowing about, and
+`slen` answers 0 for it rather than reading anything.
+
+The practical rule, if you only remember one: **a zeroed variable is a valid value
+everywhere** — an `int` is 0, an array is all zeroes, and a `str` is empty. Anything
+reached through `addr`, `view` or `sys*` is outside all of this and is checked by nothing.
+
 ### Compiled JSON schemas, in brief
 
 This is where a strictly typed compiled language beats a dynamic stack. You describe the
@@ -127,8 +139,6 @@ for people *and* for a model that generates code.
 ## 1. Program
 
 ```pascal
-program name;
-
 include "lib/io.wz";        // textual inclusion, max 16 deep, paths relative to the file
 
 const
@@ -147,11 +157,20 @@ begin                       // main program
 end.                        // the dot is required
 ```
 
+Escapes in a `char` or `str` literal: `\n` `\t` `\r` `\0` `\\` `\'` `\"`, and `\xHH`
+— **exactly two** hex digits, one byte, upper or lower case. Two and not a variable
+number, deliberately: a hex escape that keeps eating digits (as in C) means a generator
+cannot write a byte and then a literal hex character without changing what it wrote, so
+`"\x41BC"` is three characters here. Anything else after a backslash is refused.
+
 Comments: `// to end of line`, and that is the only form. Identifiers are
 **case-insensitive** (`Point` and `point` are the same name, as in
 Pascal); keywords too. Identifiers: letters, digits, `_`, and a **dot**
 as a namespace separator (`io.puts`, `mcp.buf`): the dot is cosmetic, there
-are no modules.
+are no modules. The first character must be a letter or `_`; a part **after**
+a dot may also start with a digit (`Reading.level.1`), which is what a schema
+enum whose value is `"1"` generates. A real literal still reads as one number:
+`3.5` is a value, never a name.
 
 ## 2. Types
 
@@ -160,10 +179,10 @@ There are exactly five scalar types and one composite type.
 | type | meaning | literal |
 |---|---|---|
 | `int` | 64-bit two's complement | `42`, `-7`, `0xFF` |
-| `char` | one byte, 0..255 | `'a'`, `'\n'`, `'\\'`, `'\''` |
+| `char` | one byte, 0..255 | `'a'`, `'\n'`, `'\\'`, `'\''`, `'\x41'` |
 | `bool` | `true` / `false` | |
 | `real` | 64-bit IEEE-754 (what C calls `double` and Python `float`); the only decimal type | `1.5`, `0.25`, `2e-3`, `6.02e23` (a dot or an exponent makes a literal `real`; `1.` and `.5` are not literals) |
-| `str` | an **immutable string literal** (address + length); not a value you build up | `"text\n"` |
+| `str` | an **immutable string literal** (address + length); not a value you build up | `"text\n"`, `"caf\xc3\xa9"` |
 | `array[lo..hi] of T` | fixed array of `int`, `char`, `bool` or `real`; `lo`/`hi` constant ints; `lo` may be ≠ 0 | |
 
 **No implicit conversions.** `int` ↔ `char` via `ord()`/`chr()`;
@@ -298,27 +317,18 @@ x := e;                              // assignment
 p(a, b);  y := f(a);                 // call
 if c then s1 else s2;                // no ';' before 'else'
 while c do s;
-repeat s1; s2; until c;
 for i := a to b do s;                // i is an ordinary int variable; b is computed once
 for i := b downto a do s;
-case e of                            // e is int or char
-  0: s;
-  1, 2: s;                           // several labels per arm
-  MAX: s;                            // constants are allowed as labels
-  'a': s;                            // char labels with a char expression
-else                                 // optional; multiple statements allowed
-  s1; s2;
-end;
 begin s1; s2; end;                   // block
-break;  continue;                    // in while/repeat/for
+break;  continue;                    // in while/for
 return;  return e;
 halt(code);                          // terminate the program
 ```
 
 `for` counts with step 1; after `break` the variable keeps the value it
-stopped on, after a complete loop it is one past the end value. A
-`case` without a matching label and without `else` does nothing; labels are
-constant expressions (no ranges `1..5`). No `with`, no `goto`.
+stopped on, after a complete loop it is one past the end value. There is no
+`case`: write an if-chain, and note that an `else` binds to the nearest
+unclosed `if`. No `with`, no `goto`.
 
 ## 6. Built-in routines
 
@@ -334,7 +344,7 @@ constant expressions (no ranges `1..5`). No `with`, no `goto`.
 | `scan(a, from, upto, c)` | index of the first `c` in `a[from..upto)`, or `upto`; SIMD |
 | `view(addr, n)` | only as an array argument: `n` elements at address `addr` (§4); the only unsafe primitive besides `sys*` |
 | `band bor bxor bnot`, `shl shr` | bits |
-| `argc()`, `argch(k, i)` | number of arguments; i-th byte of argument k (`chr(0)` at the end) |
+| `argc()`, `argch(k, i)` | number of arguments; i-th byte of argument k (`chr(0)` at the end, and `chr(0)` for any `k` or `i` out of range — it answers rather than traps) |
 | `halt(code)` | exit |
 | `sys1(nr, a)` … `sys6(nr, a..f)` | raw Linux syscall (on Windows translated by the runtime) |
 
@@ -410,7 +420,14 @@ Per field `f` the record contains:
 | always | `f_ok` (key present), `f_null` (value was `null`) |
 
 Rules: a missing required field (without `?`) makes `parse` return `-1`;
-unknown keys are skipped; `null` sets `f_null` and `f_ok`;
+an **unknown key is refused** — `parse` returns `-1` and
+`b[json.badkey0..json.badkey1)` is the key it rejected, because `parse` answers `-1` for
+every kind of failure and this is the one the caller can fix. A renamed or removed field
+used to be skipped in silence, so the call succeeded with the default in place of what
+the caller asked for. The consequence is that a schema **must declare everything it may
+receive**: for an open protocol envelope (MCP `initialize`, OAuth registration) that means
+declaring the members the protocol carries, as `json?` where the value is not read.
+`null` sets `f_null` and `f_ok`;
 a text that does not fit in `text[N]` or an array with more than `N`
 elements gives `-1`; an enum value outside the list gives `-1` in the
 field but no error. `write` always writes required fields and optional ones
@@ -485,7 +502,7 @@ a compile error. Annotations: `readonly`, `idempotent`, `destructive`
 | `exit`, `halt` | `return`, `halt(code)` | |
 | units, `uses` | `include` | one mechanism |
 | `set`, `with`, `goto`, pointers | absent and not coming | |
-| `case` with ranges (`1..5:`) | only separate labels | simpler codegen |
+| `case` | absent; write an if-chain | a generator chose it once in five where it could |
 | variant records, `packed` | absent | one layout, see Records |
 | syscalls unreachable | `sys1..sys6`, `addr` | the whole runtime is Wantzel |
 
@@ -571,15 +588,152 @@ assembler, no linker, no C library and no external tool. `bootstrap/boot.c` and
 `src/wantzel.wz` produce byte-identical output, ELF and `.exe` alike; every language change
 lands in both and in `test.sh`.
 
-The target follows from the output name — a name ending in `.exe` gives a Windows binary,
-anything else an ELF — and an explicit flag overrides that:
+### What is portable, and what is not
+
+Almost everything. The library (`io`, `fs`, `net`, `http`, `json`, ...) and `sys1`..`sys6`
+mean the same on both targets: on Linux a `sys*` call is the syscall instruction, on Windows
+the runtime translates it to the matching `kernel32`/`ws2_32` function. **A program written
+against those calls compiles and runs on both, unchanged** — `examples/winfacts.wz` does a
+file round trip, an existence check, a delete and a directory listing, and the ELF and the
+`.exe` print the same thing, which is what `tests/toolchain/win_same_output.sh` checks.
+
+The one exception is `winapi(slot, ...)`, which calls an imported DLL function directly.
+There is no Linux equivalent, so **it does not compile for a Linux target at all**:
+
+```
+winfacts.wz:2: winapi() is only available in a Windows executable
+```
+
+That is deliberate and it is the compile-time half of the rule: a program that reaches for
+a Windows-only facility cannot be built for Linux by accident and fail later. The other half
+is the slot itself — a literal outside the import table is refused the same way:
+
+```
+x.wz:3: winapi(): that import slot does not exist
+```
+
+So if a program builds for both targets, it uses nothing Windows-specific; and if it uses
+`winapi`, the compiler says so at the point where you asked for the wrong target.
+
+**`winapi` can also name the DLL and the function**, which is how a program reaches an API
+the compiler has never heard of:
+
+```pascal
+winapi("user32.dll", "MessageBoxA", 0, text, title, 0);
+```
+
+The name is recorded while translating and written into the import table. That is the point
+— a new Windows API is data, not a change to this compiler — but it means the checking
+happens at **three different moments**, and it is worth knowing which is which:
+
+| what is wrong | when you find out | what you see |
+|---|---|---|
+| built for the wrong target | **compile time** | `winapi() is only available in a Windows executable` |
+| the DLL does not exist | **load time**, before your program runs | the loader refuses to start the process |
+| the function does not exist in it | **run time**, at the call | the process starts, then aborts on that line |
+
+Measured, not assumed. The last row is the one to keep in mind: a missing DLL is fatal
+before `main`, but a *misspelled function* in a DLL that does exist gets filled in with a
+stub that only complains when something calls it. A typo in a rarely-taken path can
+therefore sit unnoticed. The compiler cannot help here — it has no way to know what a DLL on
+the target machine exports — so **exercise every `winapi` call at least once in a test**. Where a
+platform difference genuinely cannot be hidden it is named in this document, rather than
+left for a reader to discover.
+
+**Naming a function the compiler already imports costs nothing extra.** The compiler carries
+48 imports of its own — the ones the runtime needs before your first line runs, such as
+`GetStdHandle`, `WriteFile` and `ExitProcess`. Write `winapi("kernel32.dll", "WriteFile", ...)`
+and the call reuses that existing entry rather than adding a second one; the match ignores
+case, because a source writes `user32.dll` where the table holds `USER32.dll`.
+
+The reuse is per **function**, not per DLL — naming `user32.dll` does not hand you the whole
+built-in user32 block. Three cases, and they are all the compiler does:
+
+| what you name | what happens |
+|---|---|
+| a DLL it has, a function it has | the existing slot; nothing is added |
+| a DLL it has, a function it does not | a new entry, and a second directory entry for that DLL |
+| a DLL it does not have | a new directory entry and new slots |
+
+A function the compiler does *not* have gets an entry of its own, and that puts a **second
+directory entry for the same DLL** in the executable when you name a new `user32` function.
+That is legal and deliberate: the built-in names and the source-named ones are two separate
+runs in the name table, and interleaving them would put the address table out of step with
+the names. Two entries naming one library cost a few bytes; one ordering instead of two
+costs nothing at all.
+
+Why the 48 exist rather than being data like everything else: the loader fills the import
+table **before the first instruction runs**, so a program cannot look up the functions it
+needs in order to start. Those names have to be in the file the compiler wrote. The rest of
+what a program touches is data, which is the whole point of naming imports in the source.
+
+This works the same in both compilers, which matters more than it sounds: `lib/` is compiled
+**into** the compiler, so a library routine that names an import has to be understood by the
+C bootstrap as well — otherwise a fresh clone could not build. It is, and the two produce
+identical bytes. Nothing circular arises from that: the imports a library routine
+names land in **your** executable, not in the compiler's own table.
+
+The one place that boundary is real is the startup path. Code that runs *before* your
+program does cannot reach itself through an import table the loader has not filled yet — so
+the handful of names needed to start a process stay built in, and everything a program calls
+afterwards can be ordinary source.
+
+### `winproc(name)`: letting Windows call your routine
+
+On Windows the operating system calls *you*. A window procedure, a window enumerator, a
+hook, a timer: you hand the system an address and it jumps into your program. This language
+has no function pointers on purpose, so there is exactly one way to produce that address, and
+it is as narrow as the need:
+
+```pascal
+poke64(wc, 8, winproc(wndproc));                  // WNDCLASSEXA.lpfnWndProc
+winapi("user32.dll", "EnumWindows", winproc(onwindow), 0);
+```
+
+`winproc` takes the **name of a routine you declared** — not an expression, not a variable —
+and gives back an address to pass on. It is only valid when building for Windows; on Linux it
+does not compile, because a callback is a Windows notion and pretending otherwise would hide
+the difference rather than handle it.
+
+**What it returns is not your routine's address.** Windows passes arguments in one set of
+registers and this language reads them from another, so the compiler writes a small adapter
+beside your routine and hands back the address of *that*. The adapter moves the arguments
+across, reserves the 32 bytes of shadow space the platform requires, and preserves the
+registers Windows expects to find untouched — `rdi`, `rsi` and `rbx`, which are yours to
+destroy on Linux and yours to preserve on Windows.
+
+The routine itself is ordinary: up to four `int` parameters, returning `int`. That is the
+shape of every callback in the Windows API, so one adapter carries all of them and a routine
+that takes fewer simply ignores the rest.
+
+```pascal
+function wndproc(hw: int; m: int; wp: int; lp: int): int;
+begin
+  if m = WM_DESTROY then begin ... end;
+  return winapi("user32.dll", "DefWindowProcA", hw, m, wp, lp);
+end;
+```
+
+Why this exists at all: a button click is **sent** straight to a window procedure and never
+appears in the message queue a loop reads, so no message loop — however written — can see
+one. There is no way to write an interactive Windows program without a callback.
+
+**The target comes from `--target=` and from nowhere else.** The default is Linux; the
+output name decides nothing:
 
 ```bash
 ./bin/wantzel examples/hello.wz bin/hello                     # Linux ELF
-./bin/wantzel examples/hello.wz bin/hello.exe                 # Windows PE32+
-./bin/wantzel examples/hello.wz bin/hello --target=windows    # PE, despite the name
-./bin/wantzel examples/hello.wz bin/app.exe --target=linux    # ELF, despite the name
+./bin/wantzel examples/hello.wz bin/hello.exe --target=windows # Windows PE32+
+./bin/wantzel examples/hello.wz bin/hello --target=windows    # PE, whatever the name
+./bin/wantzel examples/hello.wz bin/app.exe --target=linux    # ELF under a .exe name
+./bin/wantzel examples/hello.wz bin/hello.exe                 # refused: which target?
 ```
+
+A name ending in `.exe` used to select Windows on its own, which made the output name a
+second and invisible way to choose the target — `wantzel x.wz backup.exe` handed back a
+Windows binary nobody asked for. A `.exe` name with no `--target` is now **refused**
+rather than quietly built for Linux: the two contradict each other, and saying so costs
+nothing.
 
 `--target=linux` and `--target=windows` (short: `-tlinux`, `-twindows`) are the only
 values. The ELF output is unchanged: the same source gives the same ELF as before.

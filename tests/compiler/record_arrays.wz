@@ -1,5 +1,4 @@
 // records in arrays, nested records, arrays inside records, array-of-record parameters, bounds checks.
-program t;
 include "io.wz";
 type
   Vec = record

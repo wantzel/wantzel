@@ -1,0 +1,114 @@
+// startmeter.wz -- how long it takes to START a program, measured without a shell in
+// the loop.
+//
+//   startmeter <runs> <program> [argument]
+//
+// It forks, execs the program, waits for it, and repeats; then prints the average in
+// microseconds. Everything the program writes goes to /dev/null, so output does not
+// enter the measurement.
+//
+// WHY A PROGRAM AND NOT A SHELL LOOP.  The first attempt at this number timed
+// ./hello from bash and came out at about 1.1 us -- FASTER than /bin/true, which is
+// impossible. The loop was measuring bash forking, not the program starting: one
+// process creation through a shell costs on the order of a millisecond, which drowns
+// everything the program itself does. So the loop has to be the thing that forks.
+//
+// AND WHY THE NUMBER IS ONLY MEANINGFUL AGAINST A BASELINE. fork + execve + wait costs
+// what it costs whatever you start; a program that only exits measures the kernel's own
+// floor. The interesting figure is the DIFFERENCE between that floor and a real program,
+// so always measure an empty program in the same run.
+
+include "io.wz";
+include "proc.wz";
+
+var
+  path: array[0..1023] of char;
+  extra: array[0..1023] of char;
+  devnull: array[0..15] of char;
+  runs, i, pid, fd, t0, t1, ok, us: int;
+  havearg: bool;
+
+// copy argument k into b, NUL-terminated; returns its length
+function argz(b: array of char; k: int): int;
+var i: int;
+begin
+  i := 0;
+  while argch(k, i) <> chr(0) do
+  begin
+    if i >= len(b) - 1 then io.fatal("startmeter: argument too long");
+    b[i] := argch(k, i);
+    i := i + 1;
+  end;
+  b[i] := chr(0);
+  return i;
+end;
+
+// argument k as a whole number; -1 when it is not one
+function argnum(k: int): int;
+var i, v: int;
+    c: char;
+begin
+  i := 0;
+  v := 0;
+  if argch(k, 0) = chr(0) then return -1;
+  while argch(k, i) <> chr(0) do
+  begin
+    c := argch(k, i);
+    if (c < '0') or (c > '9') then return -1;
+    v := v * 10 + (ord(c) - 48);
+    i := i + 1;
+  end;
+  return v;
+end;
+
+begin
+  if argc() < 3 then
+  begin
+    io.puts(STDERR, "usage: startmeter <runs> <program> [argument]\n");
+    halt(2);
+  end;
+  runs := argnum(1);
+  if runs < 1 then begin io.puts(STDERR, "startmeter: runs must be a number of at least 1\n"); halt(2); end;
+
+  i := argz(path, 2);
+  havearg := argc() >= 4;
+  if havearg then i := argz(extra, 3);
+  i := io.push(devnull, 0, "/dev/null");
+  devnull[i] := chr(0);
+
+  ok := 0;
+  t0 := io.now;
+  for i := 1 to runs do
+  begin
+    pid := proc.fork;
+    if pid = 0 then
+    begin
+      // the child: silence it, then become the program under measurement
+      fd := sys3(SYS.open, addr(devnull[0]), O_WRONLY, 0);
+      if fd >= 0 then
+      begin
+        sys2(SYS.dup2, fd, STDOUT);
+        sys2(SYS.dup2, fd, STDERR);
+      end;
+      proc.arg0(path);
+      if havearg then proc.arg(extra);
+      // exec does not return on success; a result at all means it failed
+      if proc.exec(path) < 0 then halt(127);
+      halt(127);
+    end;
+    if pid < 0 then begin io.puts(STDERR, "startmeter: fork failed\n"); halt(1); end;
+    if proc.wait(pid) > 0 then if proc.ok(proc.status[0]) then ok := ok + 1;
+  end;
+  t1 := io.now;
+
+  // io.now is nanoseconds; report microseconds per start with three decimals
+  us := (t1 - t0) div runs;
+  io.putn(STDOUT, us div 1000);
+  io.puts(STDOUT, ".");
+  io.putn(STDOUT, us mod 1000);
+  io.puts(STDOUT, " us per start, ");
+  io.putn(STDOUT, ok);
+  io.puts(STDOUT, " of ");
+  io.putn(STDOUT, runs);
+  io.puts(STDOUT, " exited 0\n");
+end.

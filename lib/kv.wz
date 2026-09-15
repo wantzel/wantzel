@@ -12,6 +12,11 @@
 // they return is an int that kv.next re-parses; it is not kept in a global,
 // so a nested kv.find (which also moves kv.k*/kv.v*) does not break an outer
 // loop as long as the caller saved what it needs first.
+//
+// WHICH ROUTINES MOVE THE CURSOR.  The ones that POSITION it do:
+// kv.first, kv.next, kv.pair, kv.scanobj and kv.find.  The ones that only
+// ANSWER A QUESTION restore it: kv.isobject, kv.count and kv.match.  Save
+// kv.vat/kv.vend yourself before any of the first group, never after.
 
 include "json.wz";
 
@@ -78,12 +83,22 @@ begin
 end;
 
 // true when b[at..upto) is whitespace + one complete JSON object + whitespace
+// Does b[at..upto) hold exactly one well-formed object and nothing else?
+//
+// The cursor kv.k*/kv.v* is restored before every return.  Asking a QUESTION about a
+// buffer must not move the cursor a caller is still using: two application bugs came
+// from exactly that, and both were silent -- the answer was right, the
+// caller's next read was not.  The same holds for kv.count and kv.match below.
 function kv.isobject(b: array of char; at: int; upto: int): bool;
-var e: int;
+var e, skat, skend, svat, svend: int;
+    r: bool;
 begin
+  skat := kv.kat; skend := kv.kend; svat := kv.vat; svend := kv.vend;
   e := kv.scanobj(b, at, upto);
-  if e < 0 then return false;
-  return json.ws(b, e, upto) = upto;
+  if e < 0 then r := false
+  else r := json.ws(b, e, upto) = upto;
+  kv.kat := skat; kv.kend := skend; kv.vat := svat; kv.vend := svend;
+  return r;
 end;
 
 // position the cursor on the first key of the object starting at `at`
@@ -111,19 +126,44 @@ begin
   return kv.pair(b, cur + 1, upto);
 end;
 
-// number of keys; 0 for {} or a malformed object
+// number of keys; 0 for {} or a malformed object.  The cursor is restored (see
+// kv.isobject).
 function kv.count(b: array of char; at: int; upto: int): int;
-var cur, cnt: int;
+var cur, cnt, skat, skend, svat, svend: int;
 begin
-  if kv.scanobj(b, at, upto) < 0 then return 0;
+  skat := kv.kat; skend := kv.kend; svat := kv.vat; svend := kv.vend;
   cnt := 0;
-  cur := kv.first(b, at, upto);
-  while cur >= 0 do
+  if kv.scanobj(b, at, upto) >= 0 then
   begin
-    cnt := cnt + 1;
-    cur := kv.next(b, cur, upto);
+    cur := kv.first(b, at, upto);
+    while cur >= 0 do
+    begin
+      cnt := cnt + 1;
+      cur := kv.next(b, cur, upto);
+    end;
   end;
+  kv.kat := skat; kv.kend := skend; kv.vat := svat; kv.vend := svend;
   return cnt;
+end;
+
+// The DECODED text of the value the cursor stands on, appended to dst at `at`;
+// returns the new length in dst, or -1.
+//
+// -1 means the value is not a JSON string (a number, an object, a list, true/false/null)
+// or it does not fit in dst.  It never yields the raw bytes as a fallback: kv.vat/kv.vend
+// span the value AS WRITTEN, quotes and escapes included, and copying those bytes
+// literally gave text like '"dryer"' that compared unequal to 'dryer' in silence -- the
+// caller saw no error at all, its comparison simply never matched.  Two
+// more callers wrote kv.vat + 1, kv.vend - 1 by hand and one of them applied the same
+// arithmetic to the KEY, which is already without quotes, losing a character at each end.
+//
+// Use this rather than the cursor positions whenever you want the text itself.
+function kv.text(b: array of char; dst: array of char; at: int): int;
+begin
+  if kv.vend - kv.vat < 2 then return -1;
+  if b[kv.vat] <> '"' then return -1;
+  if b[kv.vend - 1] <> '"' then return -1;
+  return json.unescape(b, kv.vat + 1, kv.vend - 1, dst, at);
 end;
 
 // are the raw bytes a[aat..aend) and b[bat..bend) identical?
@@ -319,26 +359,38 @@ end;
 //
 // So a stored list contains itself.  An empty filter matches everything; a
 // malformed filter matches nothing.
+// The cursor is restored before every return, the early ones included (see kv.isobject).
 function kv.match(obj: array of char; oat: int; oend: int; f: array of char; fat: int; fend: int): bool;
 var cur, fkat, fkend, fvat, fvend, ovat, ovend: int;
-    ok: bool;
+    skat, skend, svat, svend: int;
+    ok, res, done: bool;
 begin
-  if kv.scanobj(f, fat, fend) < 0 then return false;
-  cur := kv.first(f, fat, fend);
-  while cur >= 0 do
+  skat := kv.kat; skend := kv.kend; svat := kv.vat; svend := kv.vend;
+  res := true;
+  done := false;
+  if kv.scanobj(f, fat, fend) < 0 then begin res := false; done := true; end;
+  if not done then
   begin
-    fkat := kv.kat; fkend := kv.kend; fvat := kv.vat; fvend := kv.vend;
-    if not kv.find(obj, oat, oend, f[fkat..fkend - 1]) then return false;
-    // kv.find left the cursor on the stored value; save it before a nested
-    // call moves it (see the cursor note at the top of this file)
-    ovat := kv.vat; ovend := kv.vend;
-    if kv.isarray(obj, ovat, ovend) then ok := kv.contains(obj, ovat, ovend, f, fvat, fvend)
-    else if f[fvat] = '[' then ok := kv.anyof(obj, ovat, ovend, f, fvat, fvend)
-    else ok := kv.same(obj, ovat, ovend, f, fvat, fvend);
-    if not ok then return false;
-    cur := kv.next(f, cur, fend);
+    cur := kv.first(f, fat, fend);
+    while (cur >= 0) and not done do
+    begin
+      fkat := kv.kat; fkend := kv.kend; fvat := kv.vat; fvend := kv.vend;
+      if not kv.find(obj, oat, oend, f[fkat..fkend - 1]) then begin res := false; done := true; end
+      else
+      begin
+        // kv.find left the cursor on the stored value; save it before a nested
+        // call moves it (see the cursor note at the top of this file)
+        ovat := kv.vat; ovend := kv.vend;
+        if kv.isarray(obj, ovat, ovend) then ok := kv.contains(obj, ovat, ovend, f, fvat, fvend)
+        else if f[fvat] = '[' then ok := kv.anyof(obj, ovat, ovend, f, fvat, fvend)
+        else ok := kv.same(obj, ovat, ovend, f, fvat, fvend);
+        if not ok then begin res := false; done := true; end
+        else cur := kv.next(f, cur, fend);
+      end;
+    end;
   end;
-  return true;
+  kv.kat := skat; kv.kend := skend; kv.vat := svat; kv.vend := svend;
+  return res;
 end;
 
 // ------------------------------------------------------------- merge

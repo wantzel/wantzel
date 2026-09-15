@@ -6,7 +6,6 @@
 // Every request shape is declared as a schema, so the parsers are generated
 // at compile time.  Nothing is allocated while serving.
 
-program mcpserver;
 
 include "mcphttp.wz";
 

@@ -1,0 +1,45 @@
+1. bare arms
+zero
+one
+two
+many
+2. no else
+b
+?
+3. several labels
+2 is small
+8 is not small
+4. block arms
+negative
+  out = 4
+zero
+  out = 0
+positive
+  out = 7
+5. char and bool
+e is a vowel
+z is not
+flag set
+flag clear
+6. the trap, done right
+  k=1 v=5  -> 1
+  k=1 v=-5 -> -1
+  k=2      -> 2
+  k=3      -> 9
+  closed inner, k=1 v=-5 -> 0
+  closed inner, k=2      -> 2
+6b. the same chain WITHOUT begin/end -- what it really does
+  k=1 v=5  -> 1
+  k=1 v=-5 -> 9
+  k=2      -> -1
+  k=3      -> -1
+7. nesting
+  grade(1,1)  = 1
+  grade(1,0)  = 2
+  grade(1,-1) = 3
+  grade(0,1)  = 4
+  grade(0,-1) = 5
+  grade(-1,0) = 6
+8. in a loop
+  firstodd(10) = 1
+  firstodd(1)  = -1

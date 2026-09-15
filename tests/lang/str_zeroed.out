@@ -1,0 +1,6 @@
+slen of an unassigned str = 0
+json.putstr wrote: ""
+io.push of it returned 0
+slen of a real str = 5
+json.putstr wrote: "hello"
+schar of a real str = 101

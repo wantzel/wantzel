@@ -1,0 +1,39 @@
+// A dotted name part may start with a digit: a.1, TArgs.f.2, a.1.2.
+//
+// The lexer required a LETTER right after the dot, so a schema enum whose level is "1"
+// generated a constant the compiler could not read back -- and the message named the
+// GENERATED source (<reading>:9: missing = in constant declaration) instead of the user's
+// file, which is worse than the missing constant.
+//
+// The point of allowing it rather than rewriting the name is that the constant is then
+// literally the JSON value: no translation rule for a writer to remember.  A real
+// literal must keep reading as a number, and that is the other half of this test.
+include "io.wz";
+const
+  TArgs.f.1 = 7;
+  TArgs.f.2 = 8;
+  a.1.2 = 9;
+  ends.with.9 = 10;
+var
+  r: real;
+  n: int;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+begin
+  show("TArgs.f.1 = ", TArgs.f.1);
+  show("TArgs.f.2 = ", TArgs.f.2);
+  show("a.1.2 = ", a.1.2);
+  show("ends.with.9 = ", ends.with.9);
+  // a real literal is still a number, not a name: 3.5 is read as one value
+  r := 3.5;
+  show("3.5 x 10 = ", trunc(r * 10.0));
+  r := 1.25e2;
+  show("1.25e2 = ", trunc(r));
+  // an integer followed by a dotted name in one expression
+  n := 2;
+  show("n + a.1.2 = ", n + a.1.2);
+  // the dot binds to the NAME on its left, so this is (TArgs.f.1) and not TArgs.f + .1
+  show("TArgs.f.1 + 1 = ", TArgs.f.1 + 1);
+end.

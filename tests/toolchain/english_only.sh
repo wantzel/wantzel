@@ -41,4 +41,35 @@ if [ -n "$hits" ]; then
   echo "positive (an identifier, a code fragment), make the line unambiguous."
   exit 1
 fi
-echo "no Dutch prose in any tracked file"
+
+# A SECOND PASS, AND IT NEEDS ONLY ONE WORD.
+#
+# The threshold above is two words, because prose is made of sentences and a lone "de"
+# means nothing. A STRING LITERAL is not prose: it is one or two words that a user reads,
+# so one Dutch word is already the whole leak. lib/openapi.wz tagged every operation in
+# the generated OpenAPI document with "lezen" or "schrijven" -- Dutch, on a page an API
+# user opens -- and the pass above never saw it: one word per line, and neither word was
+# even in the list.
+#
+# Only lib/ and src/ and only double-quoted literals: those are what the compiler bakes
+# into someone's binary. A comment is covered by the pass above.
+#
+# THE WORD LIST IS NARROWER THAN THE ONE ABOVE, and it has to be. At one word per line
+# there is no second word to confirm the guess, so a word that is ALSO English or a
+# Wantzel keyword produces nothing but false alarms: "open", "begin", "regel" and "naam"
+# each matched dozens of correct lines on the first attempt. What is left is words that
+# cannot occur in an English sentence or in this language's own vocabulary.
+LIT='\b(lezen|schrijven|invoer|uitvoer|bestand|bestanden|fout|fouten|melding|waarde|waarden|sleutel|onbekend|verplicht|ontbreekt|mislukt|geslaagd|ongeldig|geheugen|aantal|gesloten|leeg|ongeldige|verwacht|gevonden|te groot|te klein|niet gevonden)\b'
+lits=$(git ls-files 'lib/*.wz' 'src/*.wz' | while read -r f; do
+  # every double-quoted literal on its own line, then match whole words in it
+  grep -noE '"[^"]*"' "$f" 2>/dev/null | grep -iE "$LIT" | sed "s|^|$f:|"
+done)
+if [ -n "$lits" ]; then
+  echo "Dutch in a string literal that ships:"
+  printf '%s\n' "$lits" | sed 's/^/  /'
+  echo
+  echo "These strings end up in someone's binary and in front of a user. One Dutch word"
+  echo "is enough here -- translate it."
+  exit 1
+fi
+echo "no Dutch prose in any tracked file, and no Dutch in a shipped string literal"

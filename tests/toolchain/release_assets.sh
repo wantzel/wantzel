@@ -73,3 +73,19 @@ assert_eq "both compilers print the same banner" "$(./bin/wantzel0 2>&1)" "$bann
   || { echo "the checksums do not match the bytes that were built"; exit 1; }
 
 echo "wantzel $version: both targets reproducible, ELF static, PE valid, checksums verified"
+
+# THE README NAMES THE BINARY BY VERSION, and nothing updates it automatically.
+#
+# "Start here" tells a newcomer to download wantzel-<version>-linux-x86_64; that is the
+# first command anyone runs. release.py sets the version in the source and
+# in the changelog but not here, so at the next release those lines would point at a file
+# that no longer exists -- and the very first instruction would fail. This check is
+# cheaper than remembering.
+stale=$(grep -oE 'wantzel-[0-9]+\.[0-9]+\.[0-9]+-linux-x86_64' README.md | grep -v "wantzel-$version-linux-x86_64" || true)
+if [ -n "$stale" ]; then
+  echo "README.md names a binary from another version than $version:"
+  printf '%s\n' "$stale" | sort -u | sed 's/^/  /'
+  echo "  update the download block in README.md, or the first instruction a newcomer"
+  echo "  follows will point at a file that is not there"
+  exit 1
+fi

@@ -1,5 +1,4 @@
 // lib/math.wz against known values, printed as integers scaled by a power of ten.
-program t;
 include "math.wz";
 var
   buf: array[0..63] of char;

@@ -1,4 +1,3 @@
-program incl;
 include "progs/util.wz";
 include "progs/util.wz";      // twice on purpose; the second must be ignored
 

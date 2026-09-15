@@ -1,5 +1,4 @@
 // type/record: declaration, fields, assignment, records in locals and globals, whole-record copy.
-program t;
 include "io.wz";
 type
   Point = record

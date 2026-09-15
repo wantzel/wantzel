@@ -1,4 +1,4 @@
 // Must stop at run time: "function ended without executing a return", with exit status 1.
-program t; var i: int;
+var i: int;
 function f(x: int): int; begin if x > 100 then return 1; end;
 begin i := f(1); end.

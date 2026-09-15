@@ -33,15 +33,28 @@ only with `--bench`.
 ./wztest --bench                  # plus tests/bench/
 ```
 
-**The Windows tests sit behind `--windows`, and knowing why tells you when to use it.**
-Everything the language itself does is checked natively; Wine answers two narrower
-questions -- does the compiler still cross-compile to a working `.exe`, and do both
-backends reach the same fixed point. Neither can regress from an ordinary change to
-`lib/` or to a test, and they are the slowest thing here: measured 14-09-2026, they were
-19 of the 40 seconds of a full run, so leaving them out halves it (32s to 16s). Use
-`--windows` when you touch the Windows side of the runtime, a syscall shim, or the code
-generator -- and when you release, where `release.py` passes it for you, because a
-release publishes an `.exe`.
+**The Windows tests sit behind `--windows`, and the split is on whether an emulator is
+needed at all.** Two checks need none and run in every `--toolchain` run:
+`tests/toolchain/win_backend_bytes.sh` reads the PE header and compares the `.exe` bytes
+of `bootstrap/boot.c` against those of `src/wantzel.wz`. That is the check that earns its
+keep -- on 14-09-2026 it caught the two counterparts drifting apart on the Windows side
+while everything on Linux was byte-identical -- and it costs milliseconds.
+
+What `--windows` adds is *running* a `.exe`: `win_exe_runs.sh` and `win_syscalls.sh`.
+Those are the slowest thing here (measured 14-09-2026: 19 of the 40 seconds of a full run)
+and they start processes that outlive them. Use `--windows` when you touch the Windows
+side of the runtime, a syscall shim, or the code generator -- and when you release, where
+`release.py` passes it for you, because a release publishes an `.exe`.
+
+**A test switched off by a flag must not be started by another test.** Until 15-09-2026
+`all_suites_green.sh` called `test-win.sh` unconditionally, so Wine ran on every
+`--toolchain` run however you had set the flag: about ten times in one evening, leaving 29
+orphan `wineserver64` and `winedevice.exe` processes, the oldest nearly an hour old. The
+call is gone, and `win_exe_runs.sh` now **fails** if a wine process of its own run
+survives its cleanup -- a leak that nobody reports is how 29 of them got there. It finds
+its own processes through `/proc/<pid>/environ`, because the prefix never appears in a
+command line (`pgrep -f "$WINEPREFIX"` matched nothing, which is why the old cleanup
+silently did nothing).
 
 **Always use `--toolchain` when working on the compiler or the bootstrap.** It is the only
 way to notice that `src/wantzel.wz` and `bootstrap/boot.c` have drifted apart, and
@@ -69,6 +82,48 @@ speed is one of the reasons this language exists — the short loop between writ
 knowing-whether-it-holds is the most valuable thing a language can give you — so a
 regression there is a finding, not noise.
 
+## Write a test helper in Wantzel, not in another language
+
+A test suite grows small helpers: read one field out of a JSON reply, reshape a line,
+count something. The obvious move is a one-liner in whatever scripting language is already
+on the machine. Measure that before you reach for it, because **the cost is not the work,
+it is the interpreter starting up** — and a suite calls a helper like that thousands of
+times.
+
+Measured on a suite that did exactly this (15 September 2026). A one-line interpreted
+helper that pulled one value out of a JSON reply, against the same thing as a Wantzel
+program compiled once by the runner:
+
+| | per call | 1254 calls |
+|---|---|---|
+| the interpreted one-liner | 13.2 ms | 16.6 s |
+| the same in Wantzel | 0.46 ms | 0.6 s |
+
+**29× faster, and 15 seconds off a suite that ran in about four minutes.** Nearly all of
+the difference is process startup: the work itself — parsing a few hundred bytes of JSON —
+is a fraction of a millisecond either way. The interpreter has to load before it can begin.
+
+That makes it the same argument as *no external dependencies*, arriving from a different
+direction. A helper written in Wantzel:
+
+- **costs one exec**, because it is a static binary with nothing to load;
+- **needs nothing installed**, so the suite runs on a machine that has only a C compiler;
+- **is built once by the runner**, exactly like any other binary the tests use, so it costs
+  no more than the build it already does;
+- **exercises the language**, which is the honest test of whether it can carry real work.
+
+The standard library has what such a helper usually needs — `json.wz` for reading and
+writing JSON, `io.wz` for the file descriptors, `argc`/`argch` for the command line. The
+whole program is typically under 200 lines. There is a worked example of one in
+[`writing-wantzel.md`](writing-wantzel.md) under *A whole command-line tool*.
+
+**One warning from the conversion.** If the helper replaces something, compare the output
+case by case against what it replaced, and put those cases in a test — the existing tests
+compare its output, so a difference in *formatting* breaks them just as hard as a
+difference in value. In the measured case the interpreter's JSON writer emitted `{"a": 1, "b": 2}`
+with a space after `:` and `,`, while echoing the source bytes gives `{"a":1,"b":2}`. Both
+are valid JSON and neither is wrong; one of them matched a few hundred recorded outputs and
+the other did not. A single-field object hides this, so test one with a comma in it.
 ## Adding a test
 
 1. Pick the directory: `lang/` (the language), `compiler/` (the translation), `lib/` (the

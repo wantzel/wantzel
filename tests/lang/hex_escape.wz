@@ -1,0 +1,44 @@
+// The \xHH escape: exactly two hex digits, one byte.
+//
+// It exists for generated sources that carry data. Without it a generator embedding
+// binary or UTF-8 writes a chr(n) statement per non-ASCII byte: measured 11-09-2026,
+// 558 kB of data became 2.5 MB of source, four times the size, and unreadable
+//.
+//
+// EXACTLY TWO DIGITS, and "\x41BC" below is the case that pins it. In C that is ONE
+// character, because a hex escape there keeps eating hex digits -- so a generator cannot
+// write a byte and then a literal hex character without changing what it wrote. Here it
+// is three characters: A, B, C.
+include "io.wz";
+var
+  s: str;
+  c: char;
+  b: array[0..15] of char;
+  i, n: int;
+procedure show(t: str; v: int);
+begin
+  io.puts(STDOUT, t); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+begin
+  s := "\x41\x42\x43";
+  io.puts(STDOUT, s); io.puts(STDOUT, "\n");
+  // the boundaries of a byte
+  show("x00 = ", ord('\x00'));
+  show("xff = ", ord('\xFF'));
+  show("x7f = ", ord('\x7f'));
+  // upper and lower case hex digits mean the same, and so does \X
+  show("xAb = ", ord('\xAb'));
+  show("xaB = ", ord('\xaB'));
+  show("X41 = ", ord('\X41'));
+  // a hex digit straight after an escaped byte stays a character of its own
+  s := "\x41BC";
+  io.puts(STDOUT, s); io.puts(STDOUT, "\n");
+  show("length of that = ", slen(s));
+  // and one in a char literal, used as a value
+  c := '\x0a';
+  show("that is a newline = ", ord(c));
+  // UTF-8 as bytes, which is the reason this exists: e-acute is C3 A9
+  n := io.push(b, 0, "caf\xc3\xa9");
+  show("bytes in caf<e-acute> = ", n);
+  io.out(STDOUT, addr(b[0]), n); io.puts(STDOUT, "\n");
+end.

@@ -1,3 +1,3 @@
 // Must stop at run time: "chr() argument outside 0..255", with exit status 1.
-program t; var i: int; c: char;
+var i: int; c: char;
 begin i := 256; c := chr(i); end.

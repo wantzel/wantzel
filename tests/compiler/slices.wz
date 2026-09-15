@@ -1,6 +1,5 @@
 // slices: a[lo..hi] (inclusive, like a declaration) passed as an array view;
 // on globals, locals, array parameters and arrays of records; empty slices; bounds.
-program t;
 include "io.wz";
 type
   Item = record

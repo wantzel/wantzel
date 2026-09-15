@@ -2,7 +2,6 @@
 // (first/next), find, same, match (membership on the filter side, containment
 // on the stored side), contains/haselem, merge (jsonb-style) and count, on
 // good and malformed input.
-program t;
 include "kv.wz";
 var
   ob: array[0..255] of char;      // the object under test
@@ -34,6 +33,22 @@ begin
   io.puts(STDOUT, "isobject ");
   io.puts(STDOUT, s);
   if kv.isobject(ob, 0, ob_n) then io.puts(STDOUT, " -> 1\n") else io.puts(STDOUT, " -> 0\n");
+end;
+// decode the value of key k with kv.text and print it, or say it was refused.
+// The key goes through a buffer because a str VARIABLE is not an array of char --
+// only a literal is (docs/language.md, routines).
+procedure text(k: str);
+var n: int;
+begin
+  io.puts(STDOUT, "text ");
+  io.puts(STDOUT, k);
+  ab_n := io.push(ab, 0, k);
+  if not kv.find(ob, 0, ob_n, ab[0..ab_n - 1]) then begin io.puts(STDOUT, " -> no key\n"); return; end;
+  n := kv.text(ob, out, 0);
+  if n < 0 then begin io.puts(STDOUT, " -> refused\n"); return; end;
+  io.puts(STDOUT, " -> [");
+  if n > 0 then io.out(STDOUT, addr(out[0]), n);
+  io.puts(STDOUT, "]\n");
 end;
 procedure same(a: str; b: str);
 begin
@@ -266,4 +281,47 @@ begin
   count("{\"a\":1,");
   count("");
   count("{\"a\":1} tail");
+  // A routine that only ANSWERS A QUESTION must leave the cursor alone.
+  // kv.find positions kv.vat/kv.vend on the stored value; kv.isobject, kv.count and
+  // kv.match used to move it, and the caller then read a different value without any
+  // error -- the two application bugs behind this ticket.  Each case prints the value
+  // the cursor points at AFTER the question, so a regression shows the wrong text and
+  // not merely a wrong number.
+  ob_n := io.push(ob, 0, "{\"a\":{\"x\":1},\"target\":\"kept\",\"z\":[1,2]}");
+  fb_n := io.push(fb, 0, "{\"z\":1}");
+  yn("cursor: find target = ", kv.find(ob, 0, ob_n, "target"));
+  slice(ob, kv.vat, kv.vend);
+  yn("  isobject asked = ", kv.isobject(ob, 0, ob_n));
+  slice(ob, kv.vat, kv.vend);
+  show("  count asked = ", kv.count(ob, 0, ob_n));
+  slice(ob, kv.vat, kv.vend);
+  yn("  match asked = ", kv.match(ob, 0, ob_n, fb, 0, fb_n));
+  slice(ob, kv.vat, kv.vend);
+  // and the same after each question has FAILED: the early returns are the trap
+  fb_n := io.push(fb, 0, "{\"nosuch\":1}");
+  yn("  match failing = ", kv.match(ob, 0, ob_n, fb, 0, fb_n));
+  slice(ob, kv.vat, kv.vend);
+  fb_n := io.push(fb, 0, "{\"a\":");
+  yn("  match malformed filter = ", kv.match(ob, 0, ob_n, fb, 0, fb_n));
+  slice(ob, kv.vat, kv.vend);
+  ab_n := io.push(ab, 0, "{\"a\":1");
+  yn("  isobject malformed = ", kv.isobject(ab, 0, ab_n));
+  slice(ob, kv.vat, kv.vend);
+  show("  count malformed = ", kv.count(ab, 0, ab_n));
+  slice(ob, kv.vat, kv.vend);
+  // kv.text gives the DECODED text of a string value, and refuses anything
+  // that is not a string instead of handing back the raw bytes.  Copying kv.vat..kv.vend
+  // literally produced text with its quotes still on, which compared unequal to the same
+  // word without them and did so silently.
+  ob_n := io.push(ob, 0, "{\"s\":\"dryer\",\"esc\":\"a\\\"b\\nc\",\"num\":12,\"obj\":{\"k\":1},\"arr\":[1],\"nul\":null,\"empty\":\"\"}");
+  text("s");
+  text("esc");
+  text("num");
+  text("obj");
+  text("arr");
+  text("nul");
+  text("empty");
+  // and it refuses rather than overflowing: tiny holds 4 bytes, "dryer" needs 5
+  yn("text into tiny found = ", kv.find(ob, 0, ob_n, "s"));
+  show("text into tiny = ", kv.text(ob, tiny, 0));
 end.

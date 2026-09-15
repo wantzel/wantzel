@@ -1,6 +1,5 @@
 // spec §3: precedence, div/mod truncate toward zero, bits, shifts, comparisons on
 // int/char/real, short-circuit and/or, no implicit conversions.
-program t;
 include "io.wz";
 var
   calls: int;

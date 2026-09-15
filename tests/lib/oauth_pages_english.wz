@@ -3,7 +3,6 @@
 // leak Dutch and a working name from before this compiler stood on its own;
 // nothing pinned that, which is why it survived.  This test prints the text itself, so a change to the
 // wording is visible in the diff instead of silent.
-program t;
 include "oauth.wz";
 var
   i: int;

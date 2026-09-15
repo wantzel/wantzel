@@ -3,7 +3,7 @@ block 1
 block 2
 while: s = 25
 while: i = 8
-repeat: s = 24
-repeat: i = 3
+nested while: s = 24
+nested while: i = 3
 while true: i = 4
 before halt

@@ -220,26 +220,20 @@ function math.sin(x: real): real;
 begin
   if math.isnan(x) then return x;
   math.reduce(x);
-  case math.quad of
-    0: return math.sinr(math.red);
-    1: return math.cosr(math.red);
-    2: return -math.sinr(math.red);
-  else
-    return -math.cosr(math.red);
-  end;
+  if math.quad = 0 then return math.sinr(math.red)
+  else if math.quad = 1 then return math.cosr(math.red)
+  else if math.quad = 2 then return -math.sinr(math.red)
+  else return -math.cosr(math.red);
 end;
 
 function math.cos(x: real): real;
 begin
   if math.isnan(x) then return x;
   math.reduce(x);
-  case math.quad of
-    0: return math.cosr(math.red);
-    1: return -math.sinr(math.red);
-    2: return -math.cosr(math.red);
-  else
-    return math.sinr(math.red);
-  end;
+  if math.quad = 0 then return math.cosr(math.red)
+  else if math.quad = 1 then return -math.sinr(math.red)
+  else if math.quad = 2 then return -math.cosr(math.red)
+  else return math.sinr(math.red);
 end;
 
 function math.tan(x: real): real;

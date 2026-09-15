@@ -1,6 +1,5 @@
 // lib/net.wz: net.watch and net.nonblock report failure instead of losing it silently.
 // An unwatched fd is a connection that is never served, so the result must be testable.
-program net_watch_checked;
 include "io.wz";
 include "net.wz";
 var ep, s, closed: int;

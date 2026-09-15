@@ -11,14 +11,13 @@
 // This program is a line-by-line counterpart of bootstrap/boot.c; the two must
 // keep producing identical output.
 
-program wantzel;
 
 const
   // The release this compiler was built from.  It is reported by --version, and
   // tests/toolchain/release_assets.sh checks it against the git tag: a binary that
   // cannot say which version it is cannot be matched to a published checksum.
   // bootstrap/boot.c carries the same string.
-  VERSION = "0.2.0";
+  VERSION = "0.2.1";
   SRCMAX  = 67108864;
   CODEMAX = 67108864;
   DATMAX  = 33554432;
@@ -78,7 +77,6 @@ const
   TK_RANGE  = 9;
   TK_REAL   = 10;
 
-  KW_PROGRAM   = 100;
   KW_CONST     = 101;
   KW_VAR       = 102;
   KW_ARRAY     = 103;
@@ -93,8 +91,6 @@ const
   KW_ELSE      = 112;
   KW_WHILE     = 113;
   KW_DO        = 114;
-  KW_REPEAT    = 115;
-  KW_UNTIL     = 116;
   KW_RETURN    = 117;
   KW_BREAK     = 118;
   KW_CONTINUE  = 119;
@@ -119,7 +115,6 @@ const
   KW_FOR       = 138;
   KW_TO        = 139;
   KW_DOWNTO    = 140;
-  KW_CASE      = 141;
   KW_TOOLS     = 142;
   MAXT         = 1024;
 
@@ -133,6 +128,9 @@ const
   FX_WSYS  = 4;       // call __wsys, the Windows system call emulation
   FX_WINIT = 5;       // call __winit, builds argv from the command line
   FX_IAT   = 6;       // rip-relative reference to an import table slot
+  FX_FADR  = 7;       // the ABSOLUTE address of a routine, as a 64-bit value
+  FX_SHIM  = 8;       // the ABSOLUTE address of a code offset (a callback shim)
+  FX_SLOT  = 9;       // an import's IAT slot, resolved after every import is known
 
   VBASE  = 4194304;   // 0x400000
   HDRLEN = 120;       // ELF header; a PE header uses the whole buffer
@@ -143,7 +141,13 @@ const
   KCOUNT = 27;        // kernel32 functions, IAT slots 0..26
   WCOUNT = 11;        // ws2_32 functions, IAT slots 28..38
   ACOUNT = 1;         // advapi32 functions, IAT slot 40
-  NIMP   = 39;        // KCOUNT + WCOUNT + ACOUNT, total names in impname
+  UCOUNT = 9;         // user32 functions, IAT slots 42..50
+  NIMP   = 48;        // KCOUNT + WCOUNT + ACOUNT + UCOUNT, total names in impname
+  // Imports the SOURCE asks for, by name, on top of the built-in ones above. This is what
+  // makes a DLL function data instead of a compiler change: winapi("user32.dll",
+  // "MessageBoxA", ...) records the pair here and the PE writer emits it like any other.
+  MAXEXT  = 256;      // extra (dll, function) pairs a program may name
+  MAXEXTD = 16;       // extra DLLs it may name
 
 var
   src:     array[0..SRCMAX-1] of char;   srclen:  int;
@@ -196,6 +200,13 @@ var
   fino:   array[0..1023] of int;
 
   gnam, gkind, gtyp, gval: array[0..MAXG-1] of int;
+  // extra imports, filled while translating; see MAXEXT
+  extdll:  array[0..MAXEXT-1] of int;    // which extra DLL this function belongs to
+  extfn:   array[0..MAXEXT-1] of int;    // offset into extnam of the function name
+  extdnam: array[0..MAXEXTD-1] of int;   // offset into extnam of the DLL name
+  extnam:  array[0..16383] of char;      // the names themselves, each NUL-terminated
+  next_, nextd, extnamlen: int;
+  extlast: int;                 // the import index extslot last used, or -1 for a built-in
   garr, glo, ghi:          array[0..MAXG-1] of int;
   ngl, bsslen: int;
 
@@ -248,14 +259,29 @@ var
   jslen: int;
   tlnam: array[0..MAXT * 64 - 1] of char;
   tlin, tlout, tldesc, tlro, tlid, tldes: array[0..MAXT - 1] of int;
+  // Where the tool was DECLARED, in the real source.  The forward declarations come out
+  // of the generated <tools> text, so without this an undefined handler is reported at a
+  // line of a file the writer cannot open.
+  tlline, tlfile: array[0..MAXT - 1] of int;
   ntl, tlseen: int;
+  tlfwdfile: int;                     // the pseudo-file id of the generated <tools> text
+  tlfwdn: int;                        // forwards seen in it, in the order gentools emits
 
   tmpnam: array[0..63] of int;
   ptarr, ptlo, pthi: int;
 
   tok, tval, line, pos, mlen: int;
+  // Every runtime check used to carry its own complete sentence, so "runtime error: array
+  // index out of range" was stored once per check rather than once. In a GUI program that
+  // came to a quarter of the binary. The fixed part is now stored once per KIND of check and
+  // the trap routine writes it before the part that differs.
+  tphoff: array[0..15] of int;       // data offset of each fixed heading
+  tphlen: array[0..15] of int;
+  tphtxt: array[0..15] of str;       // the message text that heading belongs to
+  ntph: int;
   trapaddr, argaddr, scanaddr, mainaddr, mainpatch, framepatch: int;
   winmode, sysrawaddr, entryoff: int;
+  tgiven: bool;                       // was --target= given? the output name never decides
   mi: int;
   lvkind, lvimm, lvoff, lvtype, lvpos, lvfx: int;
   elkind, eloff, eltype: int;
@@ -390,6 +416,48 @@ begin
   halt(1);
 end;
 
+// Does the name just read contain a capital?  Then the collision the caller is about to
+// report is very probably about CASE and not about the name itself.
+function hascap: bool;
+var i: int;
+begin
+  i := 0;
+  while obuf[i] <> chr(0) do
+  begin
+    if (ord(obuf[i]) >= 65) and (ord(obuf[i]) <= 90) then return true;
+    i := i + 1;
+  end;
+  return false;
+end;
+
+// "name already used ...", and when the name carries capitals, say that names are
+// case-insensitive and show BOTH spellings.
+//
+// Without that second half the message reads as though the name itself were taken, so
+// the writer picks a different name instead of understanding that STORE.SET and
+// store.set ARE the same name. The result is in the sources: STORE.OPSET and
+// CURVE.NDAYS exist only to dodge a collision nobody explained. Ten of the fifteen
+// namespace errors in the error log are this case.
+procedure failtaken(m: str);
+var i: int;
+begin
+  wrs(2, "wantzel: "); wrname(2); wrs(2, ":"); wrnum(2, line);
+  wrs(2, ": "); wrs(2, m);
+  if hascap then
+  begin
+    wrs(2, "; names are case-insensitive, so ");
+    i := 0;
+    while obuf[i] <> chr(0) do i := i + 1;
+    wrbuf(2, addr(obuf[0]), i);
+    wrs(2, " is the same name as ");
+    i := 0;
+    while tbuf[i] <> chr(0) do i := i + 1;
+    wrbuf(2, addr(tbuf[0]), i);
+  end;
+  wrs(2, "\n");
+  halt(1);
+end;
+
 // ------------------------------------------------------------------
 // lexer
 // ------------------------------------------------------------------
@@ -452,7 +520,6 @@ begin
     if eqt("const")     then return KW_CONST;
     if eqt("continue")  then return KW_CONTINUE;
     if eqt("char")      then return KW_CHAR;
-    if eqt("case")      then return KW_CASE;
   end;
   if c = 100 then
   begin
@@ -493,12 +560,10 @@ begin
   end;
   if c = 112 then
   begin
-    if eqt("program")   then return KW_PROGRAM;
     if eqt("procedure") then return KW_PROCEDURE;
   end;
   if c = 114 then
   begin
-    if eqt("repeat")    then return KW_REPEAT;
     if eqt("return")    then return KW_RETURN;
     if eqt("record")    then return KW_RECORD;
     if eqt("real")      then return KW_REAL;
@@ -520,7 +585,6 @@ begin
   end;
   if c = 117 then
   begin
-    if eqt("until")     then return KW_UNTIL;
   end;
   if c = 118 then
   begin
@@ -533,7 +597,24 @@ begin
   return TK_ID;
 end;
 
+// The value of one hex digit, or -1.
+function hexdig(c: int): int;
+begin
+  if (c >= 48) and (c <= 57) then return c - 48;
+  if (c >= 97) and (c <= 102) then return c - 87;
+  if (c >= 65) and (c <= 70) then return c - 55;
+  return -1;
+end;
+
+// The byte an escape stands for.  `pos` is on the character AFTER the backslash and the
+// caller advances past it; \xHH reads two more here and advances past those itself.
+//
+// EXACTLY TWO HEX DIGITS, never a variable number.  That is where C put its own trap:
+// "\x41BC" is one character there, not three, because the escape keeps eating digits.
+// A generator writing bytes cannot then place a literal hex character after an escaped
+// byte without changing what it wrote.  Two digits always means one byte.
 function escape(c: int): int;
+var h, l: int;
 begin
   if c = 110 then return 10;
   if c = 116 then return 9;
@@ -542,6 +623,15 @@ begin
   if c = 92  then return 92;
   if c = 39  then return 39;
   if c = 34  then return 34;
+  if (c = 120) or (c = 88) then
+  begin
+    if pos + 2 >= srcend then fail("a hex escape needs two digits");
+    h := hexdig(srcb(pos + 1));
+    l := hexdig(srcb(pos + 2));
+    if (h < 0) or (l < 0) then fail("a hex escape needs exactly two hex digits, as in x41 or xff after a backslash");
+    pos := pos + 2;
+    return h * 16 + l;
+  end;
   fail("unknown escape sequence");
   return 0;
 end;
@@ -664,7 +754,7 @@ begin
     // a dotted name is one identifier: net.socket, Rpc.method
     if tok = TK_ID then
     begin
-      while (pos + 1 < srcend) and (srcb(pos) = 46) and isal(srcb(pos + 1)) do
+      while (pos + 1 < srcend) and (srcb(pos) = 46) and (isal(srcb(pos + 1)) or isdg(srcb(pos + 1))) do
       begin
         if n >= TBMAX - 2 then fail("identifier too long");
         tbuf[n] := '.'; obuf[n] := '.'; n := n + 1; pos := pos + 1;
@@ -1036,6 +1126,129 @@ begin
   emb.n := emb.n + 1;
 end;
 
+// Does the embedded library declare the name in tbuf, and in which file?  Returns the
+// file index, or -1.
+//
+// WHY THIS EXISTS.  Forgetting the include is the first mistake a newcomer makes, and
+// "undeclared identifier" on io.puts says nothing about where io.puts lives -- while the
+// compiler is carrying the library that declares it and can simply look.
+//
+// It looks for the name at the start of a line preceded by "function ", "procedure " or
+// a declaration, which is cheap and good enough for a HINT: the worst case is that it
+// stays quiet. It never changes whether the program compiles.
+// The embedded file named after the part of tbuf before the first dot, plus ".wz" --
+// io.puts -> io.wz -- or -1 when there is no dot or no such file.
+function emb.byprefix: int;
+var i, at, j, n: int;
+    ok: bool;
+begin
+  n := 0;
+  while (tbuf[n] <> chr(0)) and (tbuf[n] <> '.') do n := n + 1;
+  if tbuf[n] <> '.' then return -1;
+  if n = 0 then return -1;
+  i := 0;
+  while i < emb.n do
+  begin
+    at := emb.nmat[i];
+    ok := true;
+    j := 0;
+    while (j < n) and ok do
+    begin
+      if emb.nm[at + j] <> tbuf[j] then ok := false;
+      j := j + 1;
+    end;
+    if ok then
+      if (emb.nm[at + n] = '.') and (emb.nm[at + n + 1] = 'w')
+         and (emb.nm[at + n + 2] = 'z') and (emb.nm[at + n + 3] = chr(0)) then return i;
+    i := i + 1;
+  end;
+  return -1;
+end;
+
+function emb.declares: int;
+var i, at, e, j, n: int;
+    ok: bool;
+begin
+  n := 0;
+  while tbuf[n] <> chr(0) do n := n + 1;
+  if n = 0 then return -1;
+  // PREFER THE FILE WHOSE NAME MATCHES THE PREFIX.  store.table occurs in oauth.wz too,
+  // because that file includes store.wz and uses it -- and oauth.wz comes first in the
+  // table, so a plain search names the wrong one. The convention here is that store.*
+  // lives in store.wz, so try that before searching at all.
+  i := emb.byprefix;
+  if i >= 0 then return i;
+  i := 0;
+  while i < emb.n do
+  begin
+    at := emb.off[i];
+    e := emb.fin[i] - n;
+    while at < e do
+    begin
+      // a declaration starts at the beginning of a line, after "function "/"procedure ",
+      // or after two spaces in a var/const block
+      if emb.src[at] = tbuf[0] then
+      begin
+        ok := true;
+        j := 0;
+        while (j < n) and ok do
+        begin
+          if lower(ord(emb.src[at + j])) <> lower(ord(tbuf[j])) then ok := false;
+          j := j + 1;
+        end;
+        // the character after it must end the name, and the one before must not be part
+        // of one -- otherwise "io.put" matches inside "io.putn"
+        if ok then
+        begin
+          if isal(ord(emb.src[at + n])) or isdg(ord(emb.src[at + n]))
+             or (emb.src[at + n] = '.') then ok := false;
+          if at > emb.off[i] then
+            if isal(ord(emb.src[at - 1])) or isdg(ord(emb.src[at - 1]))
+               or (emb.src[at - 1] = '.') then ok := false;
+        end;
+        if ok then return i;
+      end;
+      at := at + 1;
+    end;
+    i := i + 1;
+  end;
+  return -1;
+end;
+
+// "undeclared identifier", with the library that declares it when there is one.
+procedure failundeclared;
+var i, at, n: int;
+begin
+  i := emb.declares;
+  // Not in any library: still say WHICH name. The bare message meant reading the whole
+  // routine to find the one identifier that was wrong -- three build rounds, three times
+  // in one session, for what is one line of output.
+  if i < 0 then
+  begin
+    wrs(2, "wantzel: "); wrname(2); wrs(2, ":"); wrnum(2, line);
+    wrs(2, ": undeclared identifier: ");
+    n := 0;
+    while obuf[n] <> chr(0) do n := n + 1;
+    wrbuf(2, addr(obuf[0]), n);
+    wrs(2, "\n");
+    halt(1);
+  end;
+  wrs(2, "wantzel: "); wrname(2); wrs(2, ":"); wrnum(2, line);
+  wrs(2, ": undeclared identifier: ");
+  n := 0;
+  while obuf[n] <> chr(0) do n := n + 1;
+  wrbuf(2, addr(obuf[0]), n);
+  wrs(2, " is declared in ");
+  at := emb.nmat[i];
+  n := 0;
+  while emb.nm[at + n] <> chr(0) do n := n + 1;
+  wrbuf(2, addr(emb.nm[at]), n);
+  wrs(2, "; add: include \"");
+  wrbuf(2, addr(emb.nm[at]), n);
+  wrs(2, "\";\n");
+  halt(1);
+end;
+
 // Which embedded file is called <name>, or -1.  The name comes from the include as a
 // nul-terminated string in dat.
 function emb.find(doff: int): int;
@@ -1070,7 +1283,7 @@ begin
   return n;
 end;
 
-// emb.fill, generated from lib/ by tools/embedlib.wz.  It is a separate file because it
+// emb.fill, generated from lib/ by bootstrap/tools/embedlib.wz.  It is a separate file because it
 // is generated: nothing in it is written by hand, and build.sh remakes it.
 include "embedded.wz";
 
@@ -1807,9 +2020,24 @@ end;
 
 procedure emittrap;
 begin
+  // Two writes to stderr and then exit(1). The caller passes the shared heading in rdi/rsi
+  // and the file-and-line in rdx/rcx -- splitting the sentence is what keeps one copy of
+  // "runtime error: array index out of range" instead of one per check.
   trapaddr := codelen;
-  e(0x48); e(0x89); e(0xF2);
-  e(0x48); e(0x89); e(0xFE);
+  // keep the second half, which the first write would otherwise destroy
+  e(0x52);                                     // push rdx
+  e(0x51);                                     // push rcx
+  // write(2, rdi, rsi)
+  e(0x48); e(0x89); e(0xF2);                   // mov rdx, rsi   -- length
+  e(0x48); e(0x89); e(0xFE);                   // mov rsi, rdi   -- text
+  imm(2); e(0x48); e(0x89); e(0xC7);           // mov rdi, 2     -- stderr
+  imm(1);
+  syscallinsn;
+  // write(2, place, placelen)
+  e(0x59);                                     // pop rcx
+  e(0x5A);                                     // pop rdx
+  e(0x48); e(0x89); e(0xD6);                   // mov rsi, rdx   -- text
+  e(0x48); e(0x89); e(0xCA);                   // mov rdx, rcx   -- length
   imm(2); e(0x48); e(0x89); e(0xC7);
   imm(1);
   syscallinsn;
@@ -1830,11 +2058,48 @@ begin
   end;
 end;
 
-procedure trap(msg: str);
-var i, o, k: int;
+function eqstr(a: str; b: str): bool;
+var i: int;
 begin
+  if slen(a) <> slen(b) then return false;
+  i := 0;
+  while i < slen(a) do
+  begin
+    if schar(a, i) <> schar(b, i) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// The fixed heading for a kind of check -- "runtime error: array index out of range at " --
+// stored once and reused. Returns its index in the table.
+function trapheading(msg: str): int;
+var i, o: int;
+begin
+  i := 0;
+  while i < ntph do
+  begin
+    if eqstr(tphtxt[i], msg) then return i;
+    i := i + 1;
+  end;
+  if ntph >= len(tphoff) then return 0 - 1;
   mlen := 0;
   mcat("runtime error: "); mcat(msg); mcat(" at ");
+  o := datstr(1, mlen);
+  tphoff[ntph] := o; tphlen[ntph] := mlen; tphtxt[ntph] := msg;
+  ntph := ntph + 1;
+  return ntph - 1;
+end;
+
+procedure trap(msg: str);
+var i, o, k, h: int;
+begin
+  // Two writes rather than one: the heading, which every check of this kind shares, and the
+  // place, which is different for each. Storing the whole sentence per check made the
+  // messages a quarter of a GUI binary.
+  h := trapheading(msg);
+
+  mlen := 0;
   i := 0;
   while i < filelen[curfile] do
   begin
@@ -1849,8 +2114,22 @@ begin
   end;
   mbuf[mlen] := '\n'; mlen := mlen + 1;
   o := datstr(1, mlen);
-  e(0x48); e(0xBF); fixup(FX_DATA, o); e64(0);
-  e(0x48); e(0xBE); e64(mlen);
+
+  if h < 0 then
+  begin
+    // the table is full, which needs more kinds of check than exist; fall back to the
+    // complete sentence so a message is never lost
+    e(0x48); e(0xBF); fixup(FX_DATA, o); e64(0);
+    e(0x48); e(0xBE); e64(mlen);
+    e(0xE8); e32(trapaddr - (codelen + 4));
+    return;
+  end;
+
+  // rdi/rsi carry the heading, rdx/rcx the place
+  e(0x48); e(0xBF); fixup(FX_DATA, tphoff[h]); e64(0);
+  e(0x48); e(0xBE); e64(tphlen[h]);
+  e(0x48); e(0xBA); fixup(FX_DATA, o); e64(0);
+  e(0x48); e(0xB9); e64(mlen);
   e(0xE8); e32(trapaddr - (codelen + 4));
 end;
 
@@ -2164,6 +2443,7 @@ begin
   if eqt("sadr")  then return 14;
   if eqt("scan")  then return 15;
   if eqt("winapi") then return 16;
+  if eqt("winproc") then return 19;
   if eqt("poke")  then return 17;
   if eqt("peek")  then return 18;
   if eqt("trunc") then return 28;
@@ -2371,6 +2651,65 @@ begin
   else imm(refhi - reflo + 1);
 end;
 
+function zlen(a: array of char; at: int): int; forward;
+function impname(i: int): str; forward;
+function extcount(e: int): int; forward;
+function dllname(d: int): str; forward;
+function dllfirst(d: int): int; forward;
+function ndll: int; forward;
+// The IAT slot of extra import i. Every DLL before it contributed its functions plus one
+// null terminator, which is why the slot runs ahead of the name index.
+// Case-insensitive compare of a name in extnam against a literal: DLL names differ in
+// case between sources ("user32.dll") and the import table ("USER32.dll").
+function eqname(at: int; n: int; lit: str): bool;
+var i, a, b: int;
+begin
+  if n <> slen(lit) then return false;
+  i := 0;
+  while i < n do
+  begin
+    a := ord(extnam[at + i]); b := ord(schar(lit, i));
+    if (a >= 65) and (a <= 90) then a := a + 32;
+    if (b >= 65) and (b <= 90) then b := b + 32;
+    if a <> b then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// The slot of a function in a built-in DLL, when the source named it instead of using the
+// number. -1 when that DLL does not export it here; the caller then reports it.
+function builtinslot(d: int; fn: int; fl: int): int;
+var i: int;
+begin
+  i := dllfirst(d);
+  while i < dllfirst(d + 1) do
+  begin
+    if eqname(fn, fl, impname(i)) then return i + d;
+    i := i + 1;
+  end;
+  return 0 - 1;
+end;
+
+function extiat(i: int): int;
+var k, pos: int;
+begin
+  // The name table is written GROUPED BY DLL while imports are recorded in the order the
+  // source names them, so the position is not i: it is how many imports of earlier DLLs
+  // come first, plus how many of its own came before it. Using i directly handed out a
+  // slot the loader never fills as soon as a source named a user32 function before a
+  // gdi32 one -- a call to address zero, far from the call that caused it.
+  pos := 0; k := 0;
+  while k < next_ do
+  begin
+    if extdll[k] < extdll[i] then pos := pos + 1
+    else if (extdll[k] = extdll[i]) and (k < i) then pos := pos + 1;
+    k := k + 1;
+  end;
+  return NIMP + pos + 4 + extdll[i];
+end;
+
+function extslot(dl: int; dn: int; fn: int; fl: int): int; forward;
 procedure argint; forward;
 procedure lparen; forward;
 procedure rparen; forward;
@@ -2401,7 +2740,7 @@ begin
     next; lparen; argint; push; comma; argint; push; rparen;
     return;
   end;
-  if not resolvevar then fail("undeclared identifier");
+  if not resolvevar then failundeclared;
   next;
   allowslice := 1;
   t := pathaddr(spli, spgi);
@@ -2412,6 +2751,12 @@ begin
     push; imm(1); push;
     return;
   end;
+  // A `str` here is worth its own message: a string LITERAL does convert to
+  // `array of char` (see above), a str VARIABLE does not, and "this parameter needs an
+  // array" says nothing about that difference. Four errors in the log came from exactly
+  // this, and the way out is always the same.
+  if (refisarr = 0) and (t = T_STR) then
+    fail("a str variable is not an array of char; only a string literal converts. Copy it first: n := io.push(buf, 0, s); and pass buf[0..n - 1]");
   if refisarr = 0 then fail("this parameter needs an array");
   if t <> et then want(t, et, "array argument");
   push;
@@ -2498,42 +2843,165 @@ end;
 // import address table.  The stack is aligned to sixteen bytes and given
 // the 32-byte shadow space the convention demands; rsi keeps the old rsp,
 // which every Windows function preserves.
-function dowinapi: int;
+// Copy a string literal into extnam, NUL-terminated, and return its offset there. The
+// literal pool is rewound between routines, so a name that has to survive until the PE is
+// written needs its own copy.
+// Does the name in extnam end in ".dll"? Case-insensitive, like everything about DLL names.
+function endsdll(at: int; n: int): bool;
+var c: int;
+begin
+  if n < 5 then return false;                 // "x.dll" is the shortest that can be right
+  if extnam[at + n - 4] <> '.' then return false;
+  c := ord(extnam[at + n - 3]); if (c >= 65) and (c <= 90) then c := c + 32;
+  if c <> 100 then return false;              // d
+  c := ord(extnam[at + n - 2]); if (c >= 65) and (c <= 90) then c := c + 32;
+  if c <> 108 then return false;              // l
+  c := ord(extnam[at + n - 1]); if (c >= 65) and (c <= 90) then c := c + 32;
+  return c = 108;                             // l
+end;
+
+function extput(at: int; n: int): int;
+var o, i: int;
+begin
+  if extnamlen + n + 1 > len(extnam) then return 0 - 1;
+  o := extnamlen; i := 0;
+  while i < n do begin extnam[o + i] := dat[at + i]; i := i + 1; end;
+  extnam[o + n] := chr(0);
+  extnamlen := extnamlen + n + 1;
+  return o;
+end;
+
+// The length of a string literal: it sits in the eight bytes before the text.
+function datlen0(at: int): int;
 var n, i: int;
+begin
+  n := 0; i := 7;
+  while i >= 0 do begin n := bor(n shl 8, ord(dat[at - 8 + i])); i := i - 1; end;
+  return n;
+end;
+
+// The call itself: arguments into the Windows registers, stack aligned, then an indirect
+// call through the import address table. Shared by both winapi() forms.
+function winemit(n: int): int;
+var i, frame: int;
+begin
+  e(0x48); e(0x89); e(0xE6);                   // mov rsi, rsp   -- our arguments live here
+  e(0x48); e(0x8B); e(0x86); e32(8 * n);       // mov rax, [rsi + 8n]  -- the IAT slot
+  // Space for the call: 32 bytes of shadow the callee may spill into, plus a slot for
+  // every argument beyond the fourth, rounded up so rsp stays 16-aligned.
+  frame := 32;
+  if n > 4 then frame := frame + 8 * (n - 4);
+  if (frame mod 16) <> 0 then frame := frame + 8;
+  e(0x48); e(0x83); e(0xE4); e(0xF0);          // and rsp, -16
+  e(0x48); e(0x81); e(0xEC); e32(frame);       // sub rsp, frame
+  // the first four, in registers
+  if n > 0 then begin e(0x48); e(0x8B); e(0x8E); e32(8 * (n - 1)); end;   // mov rcx,[rsi+..]
+  if n > 1 then begin e(0x48); e(0x8B); e(0x96); e32(8 * (n - 2)); end;   // mov rdx,[rsi+..]
+  if n > 2 then begin e(0x4C); e(0x8B); e(0x86); e32(8 * (n - 3)); end;   // mov r8 ,[rsi+..]
+  if n > 3 then begin e(0x4C); e(0x8B); e(0x8E); e32(8 * (n - 4)); end;   // mov r9 ,[rsi+..]
+  // and the rest, onto the stack where the convention expects them
+  i := 4;
+  while i < n do
+  begin
+    e(0x4C); e(0x8B); e(0x96); e32(8 * (n - 1 - i));      // mov r10, [rsi + 8*(n-1-i)]
+    e(0x4C); e(0x89); e(0x54); e(0x24); e(8 * i);         // mov [rsp + 8i], r10
+    i := i + 1;
+  end;
+  e(0x48); e(0x8D); e(0x3D); fixup(FX_IAT, 0); e32(0);    // lea rdi, [rip + iat]
+  e(0xFF); e(0x14); e(0xC7);                              // call [rdi + rax*8]
+  e(0x48); e(0x89); e(0xF4);                              // mov rsp, rsi
+  // drop the arguments and the slot we pushed
+  e(0x48); e(0x81); e(0xC4); e32(8 * (n + 1));            // add rsp, 8*(n+1)
+  return T_INT;
+end;
+
+// The routine whose name is the token we are looking at, or -1.
+function fnbyname2: int;
+var i, j: int;
+begin
+  i := 0;
+  while i < nfn do
+  begin
+    j := 0;
+    while (namesb(fnam[i] + j) = ord(tbuf[j])) and (ord(tbuf[j]) <> 0) do j := j + 1;
+    if (namesb(fnam[i] + j) = 0) and (ord(tbuf[j]) = 0) then return i;
+    i := i + 1;
+  end;
+  return 0 - 1;
+end;
+
+function dowinapi: int;
+var n, i, dn, dl, fn, fl, sl: int;
 begin
   if winmode = 0 then fail("winapi() is only available in a Windows executable");
   lparen;
+  // winapi("user32.dll", "MessageBoxA", ...) -- the source names the import and the
+  // compiler records it, so reaching a new DLL function is data rather than a change
+  // here. The slot form below stays: every call in the generated runtime uses it.
+  if tok = TK_STR then
+  begin
+    dl := datlen0(tval); dn := extput(tval, dl);
+    next;
+    if tok <> 44 then fail("winapi(): after a DLL name comes the function name");
+    next;
+    if tok <> TK_STR then fail("winapi(): the function name must be a string literal");
+    fl := datlen0(tval); fn := extput(tval, fl);
+    next;
+    if (dn < 0) or (fn < 0) then fail("winapi(): too many imported names");
+    // What can be judged here IS judged here. Whether the DLL exists and whether it
+    // exports this function are the target machine's business -- the loader answers the
+    // first, and the second only shows up when the call is reached. But an empty name or
+    // a DLL without its extension is wrong on any machine, and saying so costs nothing.
+    if dl = 0 then fail("winapi(): the DLL name is empty");
+    if fl = 0 then fail("winapi(): the function name is empty");
+    if not endsdll(dn, dl) then
+      fail("winapi(): a DLL name ends in .dll, for example \"user32.dll\"");
+    sl := extslot(dl, dn, fn, fl);
+    if sl < 0 then fail("winapi(): too many imported functions or DLLs");
+    // The slot cannot be known yet. extiat counts how many imports of the same DLL come
+    // BEFORE this one, and a later winapi() call naming that same DLL still has to be
+    // parsed -- so a value baked in here is one short as soon as imports interleave, and
+    // the call lands on a null terminator, which is address zero. Emit the import index
+    // and let the writer substitute the slot once every import is recorded.
+    if extlast >= 0 then
+    begin
+      e(0xB8); fixup(FX_SLOT, extlast); e32(0);
+    end
+    else imm(sl);
+    push;
+    n := 0;
+    while tok = 44 do
+    begin
+      next;
+      if n >= 15 then fail("winapi() takes at most fifteen arguments");
+      argint; push;
+      n := n + 1;
+    end;
+    rparen;
+    return winemit(n);
+  end;
+  // A slot is an index into the import address table, so a wrong one is a call to
+  // whatever happens to sit there: no message, no crash at a recognisable place, just
+  // wrong behaviour. When the slot is a literal -- which is how every call in lib/ writes
+  // it -- the compiler knows enough to refuse, so it does.
+  if tok = TK_INT then
+    if (tval < 0) or (tval >= NIMP) then
+      fail("winapi(): that import slot does not exist");
   argint; push;
   n := 0;
   while tok = 44 do
   begin
     next;
-    if n >= 7 then fail("winapi() takes at most seven arguments");
+    if n >= 15 then fail("winapi() takes at most fifteen arguments");
     argint; push;
     n := n + 1;
   end;
   rparen;
-  i := n - 1;
-  while i >= 0 do
-  begin
-    popwin(i);
-    i := i - 1;
-  end;
-  e(0x58);
-  e(0x48); e(0x89); e(0xE6);
-  e(0x48); e(0x83); e(0xE4); e(0xF0);
-  e(0x48); e(0x83); e(0xEC); e(0x40);
-  e(0x4C); e(0x89); e(0x54); e(0x24); e(0x20);
-  e(0x4C); e(0x89); e(0x5C); e(0x24); e(0x28);
-  e(0x48); e(0x89); e(0x7C); e(0x24); e(0x30);
-  e(0x48); e(0x8D); e(0x3D); fixup(FX_IAT, 0); e32(0);
-  e(0xFF); e(0x14); e(0xC7);
-  e(0x48); e(0x89); e(0xF4);
-  return T_INT;
+  return winemit(n);
 end;
 
 function dobuiltin(b: int): int;
-var t, ok, li, gi, n, i, nsys: int;
+var t, ok, bad, li, gi, n, i, nsys: int;
 begin
   if b = 1 then
   begin
@@ -2568,7 +3036,7 @@ begin
   begin
     lparen;
     if tok <> TK_ID then fail("len() needs an array name");
-    if not resolvevar then fail("undeclared identifier");
+    if not resolvevar then failundeclared;
     next;
     n := codelen; i := nfx;
     t := pathaddr(spli, spgi);
@@ -2585,7 +3053,7 @@ begin
   begin
     lparen;
     if tok <> TK_ID then fail("addr() needs a variable");
-    if not resolvevar then fail("undeclared identifier");
+    if not resolvevar then failundeclared;
     next;
     t := pathaddr(spli, spgi);
     rparen;
@@ -2593,17 +3061,40 @@ begin
   end;
   if b = 9 then
   begin
+    // slen reads the eight bytes BEFORE the text, where the length sits. A str variable
+    // that was never assigned is (address 0, length 0) -- variables are zeroed, the spec
+    // says so -- and reading [rax-8] then dereferences address -8 and the process dies
+    // with a segfault and no message at all. In a language where every array index is
+    // checked, that is the one hole.
+    //
+    // So: a null address answers 0, which is the length such a string has. Two
+    // instructions, and it makes the zeroing promise true instead of an exception to it.
     lparen; t := expr; want(t, T_STR, "slen"); rparen;
-    e(0x48); e(0x8B); e(0x40); e(0xF8);
+    e(0x48); e(0x85); e(0xC0);                  // test rax, rax
+    ok := jfwd(0x0F, 0x84);                     // je -> leave rax at 0
+    e(0x48); e(0x8B); e(0x40); e(0xF8);         // mov rax, [rax-8]
+    patch(ok);
     return T_INT;
   end;
   if b = 10 then
   begin
+    // The bound lives in the eight bytes BEFORE the text, so comparing the index against
+    // it is itself a dereference: on a zeroed str (address 0) the cmp below read address
+    // -8 and the process died with a segfault before its own trap could fire. The guard
+    // was present and correct -- it was unreachable. A check that has to dereference its
+    // own operand does not protect against a broken operand.
+    //
+    // A null address therefore traps: index 0 lies outside 0..-1, which is exactly the
+    // message already emitted here. Note the difference with slen, which ANSWERS 0: the
+    // length of an empty string is 0, but the character at position 0 does not exist.
     lparen; t := expr; want(t, T_STR, "schar"); push;
     comma; argint; rparen;
     popc;
+    e(0x48); e(0x85); e(0xC9);                  // test rcx, rcx   (rcx = the string)
+    bad := jfwd(0x0F, 0x84);                    // je -> the trap below
     e(0x48); e(0x3B); e(0x41); e(0xF8);
     ok := jfwd(0x0F, 0x82);
+    patch(bad);
     trap("string index out of range");
     patch(ok);
     e(0x48); e(0x01); e(0xC8);
@@ -2618,6 +3109,64 @@ begin
     return T_VOID;
   end;
   if b = 16 then return dowinapi;
+  if b = 19 then
+  begin
+    // winproc(name): the address of a routine, as an int, so Windows can call it back.
+    //
+    // This is NOT addr() on a routine and deliberately not spelled like it. It exists for
+    // one thing -- a callback an API demands -- and the name says so. Opening addr() to
+    // every routine would put a function pointer in a language that does not have one; a
+    // separate builtin keeps the door exactly as wide as the need.
+    if winmode = 0 then fail("winproc() is only available in a Windows executable");
+    lparen;
+    if tok <> TK_ID then fail("winproc() takes the name of a routine");
+    li := fnbyname2;
+    if li < 0 then fail("winproc(): no such routine");
+    next; rparen;
+    //
+    // An ADAPTER, not the routine's own address. Windows hands a callback its arguments in
+    // rcx, rdx, r8, r9; a Wantzel routine expects them in rdi, rsi, rdx, rcx. Returning the
+    // bare address would compile and then read the wrong registers -- the kind of failure
+    // that shows up as nonsense rather than as an error.
+    //
+    // So the compiler emits a small shim next to the code and hands back ITS address. The
+    // shim moves the four registers across and calls the routine. Four is not a limit we
+    // picked: it is how many the Windows convention passes in registers, and every callback
+    // in the Win32 surface -- window procedures, dialog procedures, enumerators, hooks,
+    // timers, comparators -- fits in it. A callback that takes fewer simply ignores the
+    // rest, so this shape does not need revisiting per API.
+    //
+    // rcx and rdx have to go via r10/r11 because writing rdi first would destroy rcx
+    // before it has been read.
+    gi := jfwd(0, 0xE9);                         // jump over the shim
+    n := codelen;                                // the shim's address
+    // rdi, rsi and rbx are NONVOLATILE on Windows and VOLATILE on Linux -- the one place
+    // the two conventions disagree about who owns a register. Wantzel routines use rdi and
+    // rsi for their first two parameters, so a callback that did not save them would hand
+    // Windows back its own registers with our values in them. That is not a crash at the
+    // call; it is a crash later, somewhere else, which is the worst kind.
+    e(0x57);                                     // push rdi
+    e(0x56);                                     // push rsi
+    e(0x53);                                     // push rbx
+    e(0x49); e(0x89); e(0xCA);                   // mov r10, rcx
+    e(0x49); e(0x89); e(0xD3);                   // mov r11, rdx
+    e(0x4C); e(0x89); e(0xD7);                   // mov rdi, r10
+    e(0x4C); e(0x89); e(0xDE);                   // mov rsi, r11
+    e(0x4C); e(0x89); e(0xC2);                   // mov rdx, r8
+    e(0x4C); e(0x89); e(0xC9);                   // mov rcx, r9
+    // 32 bytes of shadow space, which the CALLER must provide on this platform. Three
+    // pushes plus the return address already leave rsp 16-aligned, so 32 keeps it so.
+    e(0x48); e(0x83); e(0xEC); e(0x20);          // sub rsp, 32
+    e(0xE8); fixup(FX_CALL, li); e32(0);         // call the routine
+    e(0x48); e(0x83); e(0xC4); e(0x20);          // add rsp, 32
+    e(0x5B);                                     // pop rbx
+    e(0x5E);                                     // pop rsi
+    e(0x5F);                                     // pop rdi
+    e(0xC3);                                     // ret, with the result already in rax
+    patch(gi);
+    e(0x48); e(0xB8); fixup(FX_SHIM, n); e64(0); // mov rax, <address of the shim>
+    return T_INT;
+  end;
   if b = 17 then
   begin
     // poke(addr, byte): store one byte at an absolute address
@@ -2864,7 +3413,7 @@ begin
     fplen := 0;
     if (li < 0) and (gi < 0) then
     begin
-      if not splitname then fail("undeclared identifier");
+      if not splitname then failundeclared;
       li := spli; gi := spgi;
     end;
     next;
@@ -3232,90 +3781,6 @@ begin
   nbrk := brkbase; ncnt := cntbase; brkbase := ob; cntbase := oc;
 end;
 
-// one case label: an int constant expression, or a char
-function caselabel(t: int): int;
-var v, gi, li: int;
-begin
-  if t = T_CHAR then
-  begin
-    if tok = TK_CHR then
-    begin
-      v := tval;
-      next;
-      return v;
-    end;
-    if tok = TK_ID then
-    begin
-      li := findloc; gi := -1;
-      if li < 0 then gi := findglob;
-      if li >= 0 then
-      begin
-        if (lkind[li] = SK_CONST) and (ltyp[li] = T_CHAR) then
-        begin
-          v := loff[li];
-          next;
-          return v;
-        end;
-      end;
-      if gi >= 0 then
-      begin
-        if (gkind[gi] = SK_CONST) and (gtyp[gi] = T_CHAR) then
-        begin
-          v := gval[gi];
-          next;
-          return v;
-        end;
-      end;
-    end;
-    fail("a char case label is a char constant");
-  end;
-  if tok = TK_CHR then fail("an int case label is an int constant");
-  return cexpr;
-end;
-
-// case e of  l1, l2: s;  l3: s;  else s; s  end
-procedure docase;
-var t, slot, v, hit, nxt, endh: int;
-begin
-  next;
-  t := expr;
-  if (t <> T_INT) and (t <> T_CHAR) then fail("case needs an int or char");
-  if tok <> KW_OF then fail("missing of in case");
-  next;
-  slot := hidden;
-  storelocal(slot, T_INT);
-  endh := 0;
-  while (tok <> KW_END) and (tok <> KW_ELSE) do
-  begin
-    hit := 0;
-    while true do
-    begin
-      v := caselabel(t);
-      if (v < 0 - 2147483648) or (v > 2147483647) then fail("a case label must fit in 32 bits");
-      e(0x48); e(0x81); e(0xBD); e32(slot); e32(v);
-      e(0x0F); e(0x84); e32(hit); hit := codelen - 4;
-      if tok <> 44 then break;
-      next;
-    end;
-    if tok <> 58 then fail("missing : after case labels");
-    next;
-    nxt := jfwd(0, 0xE9);
-    chainpatch(hit);
-    stmt;
-    e(0xE9); e32(endh); endh := codelen - 4;
-    patch(nxt);
-    if tok = 59 then next
-    else if (tok <> KW_END) and (tok <> KW_ELSE) then fail("missing ; after a case arm");
-  end;
-  if tok = KW_ELSE then
-  begin
-    next;
-    stmtlist;
-  end;
-  if tok <> KW_END then fail("missing end of case");
-  next;
-  chainpatch(endh);
-end;
 
 procedure stmtlist;
 begin
@@ -3382,39 +3847,12 @@ begin
     nbrk := brkbase; ncnt := cntbase; brkbase := ob; cntbase := oc;
     return;
   end;
-  if tok = KW_REPEAT then
-  begin
-    next;
-    top := codelen;
-    ob := brkbase; oc := cntbase; brkbase := nbrk; cntbase := ncnt;
-    stmtlist;
-    if tok <> KW_UNTIL then fail("missing until");
-    next;
-    i := cntbase;
-    while i < ncnt do
-    begin
-      e32at(cntfix[i], codelen - (cntfix[i] + 4));
-      i := i + 1;
-    end;
-    t := expr;
-    want(t, T_BOOL, "until condition");
-    e(0x48); e(0x85); e(0xC0);
-    jmpto(0x0F, 0x84, top);
-    i := brkbase;
-    while i < nbrk do
-    begin
-      patch(brkfix[i]);
-      i := i + 1;
-    end;
-    nbrk := brkbase; ncnt := cntbase; brkbase := ob; cntbase := oc;
-    return;
-  end;
   if tok = KW_RETURN then
   begin
     next;
     if curret = T_VOID then
     begin
-      if (tok <> 59) and (tok <> KW_END) and (tok <> KW_UNTIL) and (tok <> KW_ELSE) then
+      if (tok <> 59) and (tok <> KW_END) and (tok <> KW_ELSE) then
         fail("a procedure cannot return a value");
       e(0x48); e(0x31); e(0xC0);
     end
@@ -3449,12 +3887,9 @@ begin
     dofor;
     return;
   end;
-  if tok = KW_CASE then
-  begin
-    docase;
-    return;
-  end;
   if tok = KW_ELSE then fail("unexpected else (no ';' may precede it)");
+  if (tok = TK_ID) and eqt("case") then fail("'case' is no longer part of the language; write an if-chain: if x = a then ... else if x = b then ... else ...");
+  if (tok = TK_ID) and eqt("repeat") then fail("'repeat ... until' is no longer part of the language; write 'while true do begin ... if done then break; end'");
   if tok = TK_ID then
   begin
     b := bicode;
@@ -3479,7 +3914,7 @@ begin
         t := callfn(fi);
         return;
       end;
-      if not splitname then fail("undeclared identifier");
+      if not splitname then failundeclared;
       li := spli; gi := spgi;
     end;
     next;
@@ -3539,7 +3974,7 @@ begin
     begin
       // whole-record copy
       if tok <> TK_ID then fail("a record can only be assigned from another record");
-      if not resolvevar then fail("undeclared identifier");
+      if not resolvevar then failundeclared;
       next;
       i := pathaddr(spli, spgi);
       if (i <> t) or (refisarr <> 0) then fail("record types differ in assignment");
@@ -3694,11 +4129,11 @@ begin
     while true do
     begin
       if bicode <> 0 then fail("that name is built in");
-      if findfn >= 0 then fail("name already used by a routine");
-      if findtype >= 0 then fail("name already used by a type");
+      if findfn >= 0 then failtaken("name already used by a routine");
+      if findtype >= 0 then failtaken("name already used by a type");
       if islocal <> 0 then
       begin
-        if findloc >= 0 then fail("duplicate local declaration");
+        if findloc >= 0 then failtaken("duplicate local declaration");
       end
       else
       begin
@@ -3757,7 +4192,7 @@ begin
   while tok = TK_ID do
   begin
     if bicode <> 0 then fail("that name is built in");
-    if (findglob >= 0) or (findfn >= 0) or (findtype >= 0) then fail("duplicate declaration");
+    if (findglob >= 0) or (findfn >= 0) or (findtype >= 0) then failtaken("duplicate declaration");
     if nrt >= MAXR then fail("too many record types");
     r := nrt;
     rtnam[r] := intern; rtf0[r] := nfd; rtnf[r] := 0; rtsize[r] := 0;
@@ -3831,11 +4266,11 @@ begin
     if bicode <> 0 then fail("that name is built in");
     if islocal <> 0 then
     begin
-      if findloc >= 0 then fail("duplicate local declaration");
+      if findloc >= 0 then failtaken("duplicate local declaration");
     end
     else
     begin
-      if (findglob >= 0) or (findfn >= 0) or (findtype >= 0) then fail("duplicate declaration");
+      if (findglob >= 0) or (findfn >= 0) or (findtype >= 0) then failtaken("duplicate declaration");
     end;
     o := intern;
     next;
@@ -4217,14 +4652,15 @@ begin
   end
   else if t = SF_ENUM then
   begin
-    gen("      case "); genr(f); gen(" of\n");
     ei := 0;
     while ei < sfen[f] do
     begin
-      gen("        "); gennum(ei); gen(": at := json.putstr(dst, at, "); genquoted(sfe0[f] + ei); gen(");\n");
+      if ei = 0 then gen("      if ") else gen("      else if ");
+      genr(f); gen(" = "); gennum(ei); gen(" then at := json.putstr(dst, at, "); genquoted(sfe0[f] + ei); gen(")\n");   // no ';' before else
       ei := ei + 1;
     end;
-    gen("      else\n        at := io.push(dst, at, \"null\");\n      end;\n");
+    if sfen[f] > 0 then gen("      else ") else gen("      ");
+    gen("at := io.push(dst, at, \"null\");\n");
     genfull;
   end
   else if t = SF_TEXTN then
@@ -4300,6 +4736,7 @@ begin
   gen("\nfunction "); genname; gen(".parse(b: array of char; at: int; last: int; r: array of "); genname;
   gen("): int;\nvar k0, k1, v0, v1, n: int;\nbegin\n  "); genname; gen(".clear(r);\n");
   gen("  k0 := 0; k1 := 0; v0 := 0; v1 := 0; n := 0;\n");
+  gen("  json.badkey0 := 0; json.badkey1 := 0;\n");
   gen("  at := json.ws(b, at, last);\n");
   gen("  if at >= last then return -1;\n");
   gen("  if b[at] <> '{' then return -1;\n");
@@ -4332,7 +4769,12 @@ begin
     genarm(f);
     f := f + 1;
   end;
-  gen("\n    begin\n      at := json.skip(b, at, last);\n      if at < 0 then return -1;\n    end;\n");
+  // An UNKNOWN KEY IS REFUSED, and the chain used to end in a json.skip that swallowed it
+  //.  A caller that sent a renamed or removed field got a normal answer
+  // computed with the default in place of what it asked for: nothing refused, nothing
+  // warned, and the wrong number travelled on.  json.badkey0/1 name the key, because
+  // parse returns -1 for every failure and an unknown key is the one the caller can fix.
+  gen("\n    begin\n      json.badkey0 := k0; json.badkey1 := k1;\n      return -1;\n    end;\n");
   gen("  end;\n  return -1;\nend;\n");
   // --- write ---
   gen("\n// Returns the position after the object, or -1 when it does not fit in dst.\n");
@@ -4861,19 +5303,23 @@ begin
   gen("  // (see tool.err), -3 when the result JSON does not fit in dst.  The writer\n");
   gen("  // refuses rather than truncating -- half an object is a syntax error -- and -3\n");
   gen("  // keeps that apart from -1, which would blame the caller's arguments for it.\n");
-  gen("function tool.run(idx: int; b: array of char; at: int; upto: int; dst: array of char): int;\nvar rc: int;\nbegin\n  rc := 0;\n  tool.errn := 0;\n  case idx of\n");
+  gen("function tool.run(idx: int; b: array of char; at: int; upto: int; dst: array of char): int;\nvar rc: int;\nbegin\n  rc := 0;\n  tool.errn := 0;\n");
   i := 0;
   while i < ntl do
   begin
-    gen("    "); gennum(i); gen(":\n    begin\n      if "); gensc(tlin[i]); gen(".parse(b, at, upto, tool.in_"); gentl(i); gen(") < 0 then return -1;\n");
+    if i = 0 then gen("  if idx = ") else gen("  else if idx = ");
+    gennum(i); gen(" then\n    begin\n      if "); gensc(tlin[i]); gen(".parse(b, at, upto, tool.in_"); gentl(i); gen(") < 0 then return -1;\n");
     gen("      "); gensc(tlout[i]); gen(".clear(tool.out_"); gentl(i); gen(");\n");
     gen("      tool.vn := 0;\n      rc := tool."); gentl(i); gen("(tool.in_"); gentl(i); gen(", tool.out_"); gentl(i); gen(");\n");
     gen("      if rc <> 0 then return -2;\n");
     gen("      rc := "); gensc(tlout[i]); gen(".write(dst, 0, tool.out_"); gentl(i); gen(", tool.vbuf);\n");
-    gen("      if rc < 0 then return -3;\n      return rc;\n    end;\n");
+    gen("      if rc < 0 then return -3;\n      return rc;\n    end");
+    // No ';' before an 'else', so an arm closes bare and the chain is ended once, after
+    // the loop. A trailing ';' here is the error the parser reports as 'unexpected else'.
+    if i < ntl - 1 then gen("\n") else gen(";\n");
     i := i + 1;
   end;
-  gen("  end;\n  return -1;\nend;\n");
+  gen("  return -1;\nend;\n");
 end;
 
 // tools  <name>(<InSchema>): <OutSchema> "<description>" [readonly] [idempotent] [destructive]; ... end;
@@ -4894,6 +5340,7 @@ begin
     end;
     tlnam[ntl * 64 + i] := chr(0);
     tlro[ntl] := 0; tlid[ntl] := 0; tldes[ntl] := 0; tldesc[ntl] := -1;
+    tlline[ntl] := line; tlfile[ntl] := curfile;   // the writer's own line, for the error
     next;
     if tok <> 40 then fail("a tool is declared as name(InSchema): OutSchema \"description\"");
     next;
@@ -4935,6 +5382,8 @@ begin
   end;
   pathbuf[i] := chr(0);
   fi := addfile;
+  tlfwdfile := fi; tlfwdn := 0;       // see declroutine: the forwards below get the
+                                      // writer's own line rather than a line of <tools>
   incpos[incdepth] := pos; incend[incdepth] := srcend;
   incline[incdepth] := line; incfile[incdepth] := curfile;
   incdepth := incdepth + 1;
@@ -4970,12 +5419,12 @@ begin
   next;
   if tok <> TK_ID then fail("routine name expected");
   if bicode <> 0 then fail("that name is built in");
-  if findglob >= 0 then fail("name already used by a variable or constant");
+  if findglob >= 0 then failtaken("name already used by a variable or constant");
   fi := findfn;
   known := 0;
   if fi >= 0 then
   begin
-    if fdef[fi] <> 0 then fail("routine already defined");
+    if fdef[fi] <> 0 then failtaken("routine already defined");
     known := 1;
   end
   else
@@ -5088,6 +5537,17 @@ begin
     // line -- otherwise an unresolved forward is reported one line too far down.
     fline[fi] := line;
     ffile[fi] := curfile;
+    // A FORWARD OUT OF THE GENERATED <tools> TEXT POINTS AT THE WRITER'S OWN DECLARATION.
+    // "<tools>:19" names a file nobody can open, and an AI writer has no way to guess
+    // which tool it meant; the tools block entry is the thing they can actually change
+    //.  gentools emits exactly one forward per tool, in table order, so
+    // the n-th one here is tool n.
+    if (curfile = tlfwdfile) and (tlfwdn < ntl) then
+    begin
+      fline[fi] := tlline[tlfwdn];
+      ffile[fi] := tlfile[tlfwdn];
+      tlfwdn := tlfwdn + 1;
+    end;
     next;
     if tok <> 59 then fail("missing ; after forward");
     next;
@@ -6028,16 +6488,21 @@ end;
 procedure parseprogram;
 var i, nunres: int;
 begin
-  next;
-  if tok <> KW_PROGRAM then fail("a program must start with 'program'");
-  next;
-  if tok <> TK_ID then fail("program name expected");
-  next;
-  if tok <> 59 then fail("missing ; after the program name");
   emitprelude;
+  // The Windows runtime is injected BEFORE the first token is read. injectwin saves the
+  // read position and returns to it when the injected source ends, so anything already
+  // read at that moment would be lost. With nothing read yet, the saved position is the
+  // start of the file and the first real token is read on the way back -- on Linux the
+  // plain next reads it directly.
   if winmode <> 0 then injectwin else next;
   while true do
   begin
+    // A source that still carries the old 'program <name>;' header gets told so. The
+    // header never did anything -- the name was stored nowhere and an included file was
+    // never treated differently -- and requiring it made a library impossible to compile
+    // on its own.
+    if (tok = TK_ID) and eqt("program") then
+      fail("the 'program' header is no longer part of the language; delete that line");
     if tok = KW_INCLUDE then doinclude
     else if tok = KW_SCHEMA then declschema
     else if tok = KW_TOOLS then decltools
@@ -6206,6 +6671,108 @@ end;
 // IAT.  The first WSBASE slots live in kernel32, the rest in ws2_32; the two
 // DLLs get their own null-terminated thunk arrays, which is why the slot after
 // the last kernel32 entry is reserved as a gap (see the IAT layout below).
+// Record a (DLL, function) pair the source asked for and return its import slot, or -1
+// when a table is full. Looking up an existing pair first means naming the same function
+// twice costs one entry, not two.
+function extslot(dl: int; dn: int; fn: int; fl: int): int;
+var i, k, o, d: int;
+begin
+  // Is this a DLL the compiler already imports, and a function it already has? Then reuse
+  // that slot. A function it does NOT have gets an entry of its own below, which means a
+  // second directory entry naming the same library. That is legal in PE and deliberate:
+  // the built-in names and the source-named ones are two separate runs in the name table,
+  // and interleaving them would put the IAT out of step with the names.
+  i := 0;
+  while i < 4 do
+  begin
+    if eqname(dn, dl, dllname(i)) then
+    begin
+      k := builtinslot(i, fn, fl);
+      if k >= 0 then begin extlast := 0 - 1; return k; end;   // built-in: reuse that slot
+      i := 4;                           // known DLL, function we do not have: see below
+    end
+    else i := i + 1;
+  end;
+  // which extra DLL is this? compare against the names already recorded
+  d := 0 - 1;
+  i := 0;
+  while i < nextd do
+  begin
+    o := extdnam[i]; k := 0;
+    while (k < dl) and (extnam[o + k] = extnam[dn + k]) do k := k + 1;
+    if (k = dl) and (ord(extnam[o + k]) = 0) then d := i;
+    i := i + 1;
+  end;
+  if d < 0 then
+  begin
+    if nextd >= MAXEXTD then return 0 - 1;
+    d := nextd; extdnam[d] := dn; nextd := nextd + 1;
+  end;
+  // already imported this function from this DLL?
+  i := 0;
+  while i < next_ do
+  begin
+    if extdll[i] = d then
+    begin
+      o := extfn[i]; k := 0;
+      while (k < fl) and (extnam[o + k] = extnam[fn + k]) do k := k + 1;
+      if (k = fl) and (ord(extnam[o + k]) = 0) then
+      begin extlast := i; return extiat(i); end;
+    end;
+    i := i + 1;
+  end;
+  if next_ >= MAXEXT then return 0 - 1;
+  extdll[next_] := d; extfn[next_] := fn; next_ := next_ + 1;
+  extlast := next_ - 1;
+  return extiat(next_ - 1);
+end;
+
+// Which extra import sits at grouped position p -- the inverse of the walk in extiat.
+// The import directory writes one entry per DLL with that DLL's names together, while
+// extdll/extfn hold them in the order the source named them. Reading extfn[p] directly
+// filed CreateFontA under user32 and MessageBoxA under gdi32: names the loader cannot
+// resolve, so the slot stays zero and the call lands on address zero.
+function extat(p: int): int;
+var d, k, seen: int;
+begin
+  seen := 0;
+  d := 0;
+  while d < nextd do
+  begin
+    k := 0;
+    while k < next_ do
+    begin
+      if extdll[k] = d then
+      begin
+        if seen = p then return k;
+        seen := seen + 1;
+      end;
+      k := k + 1;
+    end;
+    d := d + 1;
+  end;
+  return 0;
+end;
+
+// The name of import i: built-in ones are literals, the rest live in extnam. impnamelen
+// and pdsimp below handle both, because a str cannot be built at runtime here.
+function impnamelen(i: int): int;
+var o: int;
+begin
+  if i < NIMP then return slen(impname(i));
+  o := extfn[extat(i - NIMP)];
+  return zlen(extnam, o);
+end;
+
+procedure pdsimp(i: int);
+var o, k: int;
+begin
+  if i < NIMP then begin pds(impname(i)); return; end;
+  o := extfn[extat(i - NIMP)]; k := 0;
+  while ord(extnam[o + k]) <> 0 do begin pd(ord(extnam[o + k])); k := k + 1; end;
+  pd(0);
+end;
+
 function impname(i: int): str;
 begin
   if i = 0 then return "GetStdHandle";
@@ -6248,7 +6815,99 @@ begin
   if i = 36 then return "recv";
   if i = 37 then return "WSAPoll";
   // advapi32
-  return "SystemFunction036";
+  if i = 38 then return "SystemFunction036";
+  // user32, from name 39: the smallest set that puts a window on the screen with an
+  // editable text area in it. No gdi32: an EDIT control draws itself, and brings
+  // scrolling, selection and clipboard with it (D-0000-0004).
+  if i = 39 then return "RegisterClassExA";
+  if i = 40 then return "CreateWindowExA";
+  if i = 41 then return "DefWindowProcA";
+  if i = 42 then return "GetMessageA";
+  if i = 43 then return "TranslateMessage";
+  if i = 44 then return "DispatchMessageA";
+  if i = 45 then return "PostQuitMessage";
+  if i = 46 then return "ShowWindow";
+  return "SendMessageA";
+end;
+
+// The DLLs, as a table instead of three hand-kept constants. Adding one is a row here and
+// a row in dllfirst -- the import directory and the IAT/ILT below are written by a loop
+// over ndll, so nothing else counts DLLs by hand. That is deliberate: when the three
+// groups were unrolled, a fourth DLL twice produced an .exe that built, had the right
+// size, and hung -- once because iatlen assumed three terminators, once because a loop
+// ran to NIMP past its own group.
+function ndll: int;
+begin
+  return 4 + nextd;                    // the built-in four, plus what the source named
+end;
+
+// The built-in DLL names are literals; a name the source asked for lives in extnam and is
+// written out by dllnamew below, because a str cannot be built at runtime here.
+function dllname(d: int): str;
+begin
+  if d = 0 then return "KERNEL32.dll";
+  if d = 1 then return "WS2_32.dll";
+  if d = 2 then return "ADVAPI32.dll";
+  return "USER32.dll";
+end;
+
+// length of DLL d's name, built-in or source-named
+function dllnamelen(d: int): int;
+var o: int;
+begin
+  if d < 4 then return slen(dllname(d));
+  o := extdnam[d - 4];
+  return zlen(extnam, o);
+end;
+
+// emit DLL d's name plus its NUL, into the data block
+procedure pdsdll(d: int);
+var o, i: int;
+begin
+  if d < 4 then begin pds(dllname(d)); return; end;
+  o := extdnam[d - 4]; i := 0;
+  while ord(extnam[o + i]) <> 0 do begin pd(ord(extnam[o + i])); i := i + 1; end;
+  pd(0);
+end;
+
+// index of the first function of DLL d in impname(); dllfirst(ndll) is the total
+function dllfirst(d: int): int;
+var i, n: int;
+begin
+  if d = 0 then return 0;
+  if d = 1 then return KCOUNT;
+  if d = 2 then return KCOUNT + WCOUNT;
+  if d = 3 then return KCOUNT + WCOUNT + ACOUNT;
+  // the extra DLLs follow, each with the functions the source named from it
+  n := NIMP; i := 0;
+  while (i < d - 4) and (i < nextd) do
+  begin
+    n := n + extcount(i);
+    i := i + 1;
+  end;
+  return n;
+end;
+
+// how many functions the source named from extra DLL e
+function extcount(e: int): int;
+var i, n: int;
+begin
+  n := 0; i := 0;
+  while i < next_ do
+  begin
+    if extdll[i] = e then n := n + 1;
+    i := i + 1;
+  end;
+  return n;
+end;
+
+// length of a NUL-terminated name in a char array
+function zlen(a: array of char; at: int): int;
+var n: int;
+begin
+  n := 0;
+  while ord(a[at + n]) <> 0 do n := n + 1;
+  return n;
 end;
 
 // offset of hint/name entry i within the name block */
@@ -6259,7 +6918,7 @@ begin
   k := 0;
   while k < i do
   begin
-    n := 3 + slen(impname(k));
+    n := 3 + impnamelen(k);
     if (n mod 2) = 1 then n := n + 1;
     o := o + n;
     k := k + 1;
@@ -6276,71 +6935,63 @@ end;
 procedure writepe;
 var textrva, textraw, rdatarva, rdataraw, bssrva, imgsize: int;
     codeva, datava, bssva, iatva, idt, iat, names, i, k, v, fd, wsys, winit: int;
-    iatlen, w2name, a3name: int;
+    iatlen, d, dnam: int;
 begin
   // The IAT (and an identical ILT) each hold KCOUNT kernel32 thunks, a null,
   // WCOUNT ws2_32 thunks, a null, ACOUNT advapi32 thunks, and a null:
   // NIMP + 3 eight-byte entries.
-  iatlen := 8 * (NIMP + 3);
+  iatlen := 8 * (NIMP + next_ + ndll); // every import, plus one terminator per DLL
   while (codelen mod 8) <> 0 do e(0x90);
   while (datlen mod 8) <> 0 do pd(0);
   textrva := 0x1000;
   rdatarva := align(textrva + codelen, 0x1000);
   idt := datlen;
-  iat := idt + 80;                       // three entries + a null one, 4 * 20
+  iat := idt + 20 * (ndll + 1);          // one entry per DLL, plus a null one
   names := iat + iatlen + iatlen;        // IAT, then ILT, then the names
-  w2name := impoff(NIMP) + slen("KERNEL32.dll") + 1;
-  a3name := w2name + slen("WS2_32.dll") + 1;
-  // --- import directory table: kernel32, ws2_32, advapi32, then null ---
-  pd32(rdatarva + iat + iatlen);                        // kernel32 ILT
-  pd32(0); pd32(0);
-  pd32(rdatarva + names + impoff(NIMP));                // "KERNEL32.dll"
-  pd32(rdatarva + iat);                                 // kernel32 IAT
-  pd32(rdatarva + iat + iatlen + 8 * (KCOUNT + 1));     // ws2_32 ILT
-  pd32(0); pd32(0);
-  pd32(rdatarva + names + w2name);                      // "WS2_32.dll"
-  pd32(rdatarva + iat + 8 * (KCOUNT + 1));              // ws2_32 IAT
-  pd32(rdatarva + iat + iatlen + 8 * (KCOUNT + WCOUNT + 2));   // advapi32 ILT
-  pd32(0); pd32(0);
-  pd32(rdatarva + names + a3name);                      // "ADVAPI32.dll"
-  pd32(rdatarva + iat + 8 * (KCOUNT + WCOUNT + 2));     // advapi32 IAT
-  pd32(0); pd32(0); pd32(0); pd32(0); pd32(0);          // null directory entry
+  // --- import directory table: one entry per DLL, then a null one ---
+  d := 0;
+  dnam := impoff(NIMP + next_);          // the DLL names sit after the hint/name table
+  while d < ndll do
+  begin
+    // thunk k of DLL d sits at slot dllfirst(d) + d + k: every earlier group has
+    // contributed its own functions plus one terminator.
+    v := 8 * (dllfirst(d) + d);
+    pd32(rdatarva + iat + iatlen + v);            // this DLL's ILT
+    pd32(0); pd32(0);
+    pd32(rdatarva + names + dnam);                // its name
+    pd32(rdatarva + iat + v);                     // its IAT
+    dnam := dnam + dllnamelen(d) + 1;
+    d := d + 1;
+  end;
+  pd32(0); pd32(0); pd32(0); pd32(0); pd32(0);    // null directory entry
   // --- the IAT, then an identical ILT ---
   k := 0;
   while k < 2 do
   begin
-    i := 0;
-    while i < KCOUNT do
+    d := 0;
+    while d < ndll do
     begin
-      pd32(rdatarva + names + impoff(i)); pd32(0);
-      i := i + 1;
+      i := dllfirst(d);
+      while i < dllfirst(d + 1) do
+      begin
+        pd32(rdatarva + names + impoff(i)); pd32(0);
+        i := i + 1;
+      end;
+      pd32(0); pd32(0);                           // one terminator per DLL
+      d := d + 1;
     end;
-    pd32(0); pd32(0);                             // kernel32 terminator
-    while i < KCOUNT + WCOUNT do
-    begin
-      pd32(rdatarva + names + impoff(i)); pd32(0);
-      i := i + 1;
-    end;
-    pd32(0); pd32(0);                             // ws2_32 terminator
-    while i < NIMP do
-    begin
-      pd32(rdatarva + names + impoff(i)); pd32(0);
-      i := i + 1;
-    end;
-    pd32(0); pd32(0);                             // advapi32 terminator
     k := k + 1;
   end;
   // --- hint/name table ---
   i := 0;
-  while i < NIMP do
+  while i < NIMP + next_ do
   begin
-    pd16(0); pds(impname(i));
-    if (slen(impname(i)) mod 2) = 0 then pd(0);
+    pd16(0); pdsimp(i);
+    if (impnamelen(i) mod 2) = 0 then pd(0);
     i := i + 1;
   end;
-  pds("KERNEL32.dll");
-  pds("WS2_32.dll");
-  pds("ADVAPI32.dll");
+  d := 0;
+  while d < ndll do begin pdsdll(d); d := d + 1; end;
   textraw := align(codelen, 512);
   rdataraw := align(datlen, 512);
   bssrva := align(rdatarva + datlen, 0x1000);
@@ -6361,6 +7012,21 @@ begin
     else if k = FX_WSYS then e32at(fxoff[i], fadr[wsys] - (fxoff[i] + 4))
     else if k = FX_WINIT then e32at(fxoff[i], fadr[winit] - (fxoff[i] + 4))
     else if k = FX_IAT then e32at(fxoff[i], iatva - (codeva + fxoff[i] + 4))
+    else if k = FX_SLOT then e32at(fxoff[i], extiat(fxval[i]))
+    else if k = FX_SHIM then
+    begin
+      v := codeva + fxval[i];
+      e32at(fxoff[i], v);
+      e32at(fxoff[i] + 4, v shr 32);
+    end
+    else if k = FX_FADR then
+    begin
+      // The address a callback needs: absolute, because Windows calls it from its own
+      // code and nothing rip-relative would mean anything there.
+      v := codeva + fadr[fxval[i]];
+      e32at(fxoff[i], v);
+      e32at(fxoff[i] + 4, v shr 32);
+    end
     else
     begin
       if k = FX_DATA then v := datava + fxval[i] else v := bssva + fxval[i];
@@ -6513,21 +7179,34 @@ begin
   end;
   outname[mi] := chr(0);
   outnamelen := mi;
-  // the target defaults to the host convention read off the output name: a
-  // name ending in .exe means Windows.  An explicit --target= overrides it.
+  // THE TARGET COMES FROM --target= AND FROM NOWHERE ELSE.
+  //
+  // A name ending in .exe used to select Windows on its own, which made the output NAME
+  // a second and invisible way to choose the target: 'wantzel x.wz backup.exe' handed
+  // back a Windows binary nobody asked for. One way per concept, and a hidden second way
+  // is the worst kind -- a generator that picks an output name does not know the
+  // extension decides anything.
+  //
+  // A .exe name without --target is REFUSED rather than quietly built for Linux: the two
+  // contradict each other, and saying so costs nothing.
   winmode := 0;
-  if mi >= 4 then
-  begin
-    if (outname[mi - 4] = '.') and (lower(ord(outname[mi - 3])) = 101)
-       and (lower(ord(outname[mi - 2])) = 120) and (lower(ord(outname[mi - 1])) = 101) then winmode := 1;
-  end;
+  tgiven := false;
   if argc() = 4 then
   begin
-    if argeq(3, "--target=windows") or argeq(3, "-twindows") then winmode := 1
-    else if argeq(3, "--target=linux") or argeq(3, "-tlinux") then winmode := 0
+    if argeq(3, "--target=windows") or argeq(3, "-twindows") then begin winmode := 1; tgiven := true; end
+    else if argeq(3, "--target=linux") or argeq(3, "-tlinux") then begin winmode := 0; tgiven := true; end
     else
     begin
       wrs(2, "wantzel: unknown option (use --target=linux or --target=windows)\n");
+      halt(1);
+    end;
+  end;
+  if (not tgiven) and (mi >= 4) then
+  begin
+    if (outname[mi - 4] = '.') and (lower(ord(outname[mi - 3])) = 101)
+       and (lower(ord(outname[mi - 2])) = 120) and (lower(ord(outname[mi - 1])) = 101) then
+    begin
+      wrs(2, "wantzel: the output name ends in .exe but no target was given; add --target=windows (or --target=linux to build an ELF under that name)\n");
       halt(1);
     end;
   end;

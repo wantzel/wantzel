@@ -1,6 +1,5 @@
 // spec §4: parameters by value, array views write through, ten arguments, forward,
 // recursion, locals zeroed on every call, return on every path, callbacks via forward.
-program t;
 include "io.wz";
 var
   g: array[0..3] of int;

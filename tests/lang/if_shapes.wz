@@ -1,0 +1,218 @@
+// Every shape an if-chain can take, and what each one actually binds to.
+//
+// This file exists because a conversion from `case` to an if-chain got one of these
+// wrong and the compiler said nothing: the code ran and returned nonsense. Read it as
+// a reference -- each section prints what it chose, and if_shapes.out is the proof.
+//
+// THE ONE RULE THAT CATCHES PEOPLE OUT
+//
+//   An `else` binds to the NEAREST unclosed `if`.
+//
+// So an arm whose body is itself an `if` without its own `else` swallows the rest of
+// the chain. Put begin/end around it. Section 6 shows both, side by side.
+include "io.wz";
+
+var
+  n, out: int;
+  c: char;
+  hit: bool;
+
+procedure say(s: str);
+begin io.puts(STDOUT, s); io.puts(STDOUT, "\n"); end;
+
+procedure sayn(s: str; v: int);
+begin io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n"); end;
+
+// ---------------------------------------------------------------- 1. the bare arm
+// One statement per arm, no punctuation between them: the `;` comes after the LAST
+// arm only. This is the form a converted `case` usually takes.
+function classify(v: int): str;
+begin
+  if v = 0 then return "zero"
+  else if v = 1 then return "one"
+  else if v = 2 then return "two"
+  else return "many";
+end;
+
+// ---------------------------------------------------------------- 2. no else at all
+// A chain may simply end. Nothing runs when nothing matches -- there is no default,
+// and a function then falls through to whatever follows.
+function name3(v: int): str;
+begin
+  if v = 1 then return "a"
+  else if v = 2 then return "b"
+  else if v = 3 then return "c";
+  return "?";                      // reached only when no arm matched
+end;
+
+// ---------------------------------------------------------------- 3. several labels
+// `case` allowed `1, 2:` on one arm. The if-chain spells that as `or`, and each
+// comparison needs its own parentheses because `=` binds looser than `or`.
+function small(v: int): bool;
+begin
+  if (v = 1) or (v = 2) or (v = 3) then return true
+  else return false;
+end;
+
+// ---------------------------------------------------------------- 4. a block arm
+// More than one statement per arm needs begin/end. Note that the block's `end`
+// carries NO semicolon when an `else` follows it -- a `;` there ends the statement,
+// and the `else` would then belong to nothing.
+procedure describe(v: int);
+begin
+  if v < 0 then
+  begin
+    say("negative");
+    out := 0 - v;
+  end
+  else if v = 0 then
+  begin
+    say("zero");
+    out := 0;
+  end
+  else
+  begin
+    say("positive");
+    out := v;
+  end;
+end;
+
+// ---------------------------------------------------------------- 5. char and bool
+// The subject may be any comparable type; a bool needs no `= true`.
+function vowel(ch: char): bool;
+begin
+  if (ch = 'a') or (ch = 'e') or (ch = 'i') or (ch = 'o') or (ch = 'u') then return true
+  else return false;
+end;
+
+procedure flag;
+begin
+  if hit then say("flag set")
+  else say("flag clear");
+end;
+
+// ---------------------------------------------------------------- 6. THE TRAP
+// An arm whose body is an `if` WITHOUT its own else.
+//
+// WRONG (not written here, because it compiles and misbehaves):
+//     if k = 1 then
+//       if v > 0 then out := 1        <- this `if` is still open...
+//     else if k = 2 then out := 2     <- ...so this `else` belongs to IT, not to k
+//
+// Reading it, k = 2 looks like a case it handles. It never gets there: k = 1 with
+// v <= 0 runs `out := 2`, and k = 2 does nothing at all.
+//
+// RIGHT: begin/end closes the inner if, and the chain reads as written.
+procedure trap(k: int; v: int);
+begin
+  if k = 1 then
+  begin
+    if v > 0 then out := 1;          // closed, so the chain below is unaffected
+  end
+  else if k = 2 then out := 2
+  else out := 9;
+end;
+
+// And here is the wrong form, compiled and run, so the damage is visible rather than
+// described. Compare its output with trap() above: k = 2 and k = 3 do NOTHING, and
+// k = 1 with v <= 0 runs the final else. Nothing warns you.
+procedure bad(k: int; v: int);
+begin
+  if k = 1 then
+    if v > 0 then out := 1
+  else if k = 2 then out := 2
+  else out := 9;
+end;
+
+// The same body, but the inner if HAS an else. Then no braces are needed: the inner
+// if is complete, so the following `else` can only belong to the outer one. It is
+// still clearer with them, and that is a style choice rather than a correctness one.
+procedure closedinner(k: int; v: int);
+begin
+  if k = 1 then
+    if v > 0 then out := 1 else out := 0
+  else if k = 2 then out := 2
+  else out := 9;
+end;
+
+// ---------------------------------------------------------------- 7. nesting
+// A chain inside a chain. Each level is independent; indentation is for the reader
+// and means nothing to the compiler.
+function grade(a: int; b: int): int;
+begin
+  if a > 0 then
+  begin
+    if b > 0 then return 1
+    else if b = 0 then return 2
+    else return 3;
+  end
+  else if a = 0 then
+  begin
+    if b > 0 then return 4
+    else return 5;
+  end
+  else return 6;
+end;
+
+// ---------------------------------------------------------------- 8. in a loop
+// `break` and `continue` belong to the loop, not to the if that guards them.
+function firstodd(upto: int): int;
+var i: int;
+begin
+  i := 0;
+  while i < upto do
+  begin
+    if (i mod 2) = 1 then return i
+    else if i > 100 then break;
+    i := i + 1;
+  end;
+  return -1;
+end;
+
+begin
+  say("1. bare arms");
+  say(classify(0)); say(classify(1)); say(classify(2)); say(classify(7));
+
+  say("2. no else");
+  say(name3(2)); say(name3(9));
+
+  say("3. several labels");
+  if small(2) then say("2 is small"); if not small(8) then say("8 is not small");
+
+  say("4. block arms");
+  describe(0 - 4); sayn("  out = ", out);
+  describe(0);     sayn("  out = ", out);
+  describe(7);     sayn("  out = ", out);
+
+  say("5. char and bool");
+  c := 'e'; if vowel(c) then say("e is a vowel");
+  c := 'z'; if not vowel(c) then say("z is not");
+  hit := true;  flag;
+  hit := false; flag;
+
+  say("6. the trap, done right");
+  out := 0 - 1; trap(1, 5);  sayn("  k=1 v=5  -> ", out);
+  out := 0 - 1; trap(1, 0 - 5); sayn("  k=1 v=-5 -> ", out);   // stays -1: no arm assigns
+  out := 0 - 1; trap(2, 0);  sayn("  k=2      -> ", out);
+  out := 0 - 1; trap(3, 0);  sayn("  k=3      -> ", out);
+  out := 0 - 1; closedinner(1, 0 - 5); sayn("  closed inner, k=1 v=-5 -> ", out);
+  out := 0 - 1; closedinner(2, 0);     sayn("  closed inner, k=2      -> ", out);
+
+  say("6b. the same chain WITHOUT begin/end -- what it really does");
+  out := 0 - 1; bad(1, 5);     sayn("  k=1 v=5  -> ", out);
+  out := 0 - 1; bad(1, 0 - 5); sayn("  k=1 v=-5 -> ", out);   // 9: the outer else ran
+  out := 0 - 1; bad(2, 0);     sayn("  k=2      -> ", out);   // -1: never reached
+  out := 0 - 1; bad(3, 0);     sayn("  k=3      -> ", out);   // -1: never reached
+
+  say("7. nesting");
+  sayn("  grade(1,1)  = ", grade(1, 1));
+  sayn("  grade(1,0)  = ", grade(1, 0));
+  sayn("  grade(1,-1) = ", grade(1, 0 - 1));
+  sayn("  grade(0,1)  = ", grade(0, 1));
+  sayn("  grade(0,-1) = ", grade(0, 0 - 1));
+  sayn("  grade(-1,0) = ", grade(0 - 1, 0));
+
+  say("8. in a loop");
+  sayn("  firstodd(10) = ", firstodd(10));
+  sayn("  firstodd(1)  = ", firstodd(1));
+end.

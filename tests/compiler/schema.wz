@@ -1,5 +1,4 @@
 // schema.wz -- the compiled schema parser, end to end.
-program schematest;
 
 include "json.wz";
 
@@ -80,11 +79,42 @@ begin
   io.puts(STDOUT, "\n");
 end;
 
+// the key the last parse refused, or "-" when it failed on something else
+procedure badkey;
+begin
+  io.puts(STDOUT, "  badkey=");
+  if json.badkey1 > json.badkey0 then io.out(STDOUT, addr(doc[json.badkey0]), json.badkey1 - json.badkey0)
+  else io.puts(STDOUT, "-");
+  io.puts(STDOUT, "\n");
+end;
+
 begin
   load("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"a\":1}}");
   show;
-  load("{ \"method\":\"ping\" , \"extra\":[1,{\"x\":\"}\"}], \"jsonrpc\":\"2.0\", \"id\":-3, \"loud\":true }");
+  // whitespace everywhere, and a value that contains a } inside a string: the skipper
+  // must not end the object there.  This used to use an UNDECLARED key for the nesting,
+  // which no longer parses at all, so it rides on params, which is json.
+  load("{ \"method\":\"ping\" , \"params\":[1,{\"x\":\"}\"}], \"jsonrpc\":\"2.0\", \"id\":-3, \"loud\":true }");
   show;
+  // An UNDECLARED key is refused, not skipped.  A caller that sends a
+  // renamed or removed field used to get a normal answer computed with the default in
+  // its place -- nothing refused and nothing warned, so the wrong value travelled on.
+  load("{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"extra\":1}");
+  show;
+  badkey;
+  // the refusal names the key, because parse returns -1 for every kind of failure
+  load("{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"extra\":[1,{\"x\":\"}\"}]}");
+  show;
+  badkey;
+  // a key that differs only in case is a DIFFERENT JSON key: JSON is case-sensitive even
+  // though Wantzel identifiers are not
+  load("{\"jsonrpc\":\"2.0\",\"Method\":\"ping\"}");
+  show;
+  badkey;
+  // and a valid object leaves no key behind from an earlier failure
+  load("{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}");
+  show;
+  badkey;
   load("{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}");
   show;
   load("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\"}");

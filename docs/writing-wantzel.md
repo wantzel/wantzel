@@ -46,7 +46,7 @@ Found a new pitfall? Add it under the heading it belongs to.
 - Copying a record field by field in a loop is unnecessary: `a := b` copies the whole record (same type required, otherwise `record types differ in assignment`).
 - No `array of array`, no record in a `const`, no record in an expression.
 - An empty `array of T` argument has no literal form: pass an empty slice `a[0..-1]` (or `a[i..i - 1]`).
-- A builtin or keyword name *is* allowed as part of a dotted name: `addr.x`, `addr.f`, `co.repeat`, `x.end`, `app.type` are ordinary identifiers (the dot makes it one token; `addr.` tested 10-09).
+- A builtin or keyword name *is* allowed as part of a dotted name: `addr.x`, `addr.f`, `co.for`, `x.end`, `app.type` are ordinary identifiers (the dot makes it one token; `addr.` tested 10-09).
 - `len(a)` works on array names and on `array of T` parameters, not on a `str` (that is `slen`) and not on a constant (`a constant has no elements`).
 - `array[lo..hi]`: `lo` may be ≠ 0; indexing starts at `lo`. All arrays are fixed; "growing" means keeping a counter (`docs/language.md` §10b).
 - Large arrays belong **at global scope** (bss); a local array of megabytes sits on the stack (~8 MB) and crashes.
@@ -65,13 +65,20 @@ Found a new pitfall? Add it under the heading it belongs to.
 ## Syntax
 
 - A `;` before `else` → `unexpected else (no ';' may precede it)`. **Right:** `if c then a else b;`
+- **An `else` binds to the nearest unclosed `if`.** So in an if-chain, an arm whose body is itself an `if` **without** its own `else` swallows everything after it — and the compiler says nothing, because the result is valid code that means something else:
+  ```pascal
+  if k = 1 then
+    if v > 0 then out := 1        // still open...
+  else if k = 2 then out := 2     // ...so this else belongs to the INNER if
+  ```
+  Here `k = 2` and `k = 3` never run at all, and `k = 1` with `v <= 0` runs the last arm. **Right:** put `begin ... end` around the inner `if`. This is the mistake to look for after rewriting a `case` into a chain; it cost a silent wrong answer (1e+22 instead of 6830) in an ONNX kernel, caught only by a parity test against recorded reference values. Every shape, with its output, is in `tests/lang/if_shapes.wz`.
+- When a chain is written out by a **generator**, each arm closes bare and only the last one carries the `;` — otherwise the emitted code trips the rule above and the compiler refuses its own output.
 - A routine body without `begin` (for example `var` after `begin`) → `missing begin in routine body`. The order is: header `;`, then the `const`/`var` blocks, then `begin ... end;`.
-- `case` labels are individual constants (`1, 2:`), not ranges `1..5`; `else` is allowed; `end;` closes it.
 - `for i := a to b do` counts in steps of 1, `downto` counts back; `i` is an ordinary `int` variable (not a `real`, not a field).
 - A program ends with `end.` (a period); a routine with `end;`. Anything after `end.` → `text after the end of the program`.
 - `type` and `schema` may appear only at program level, before the routines that use them; `tools ... end;` once, after the schemas.
 - Comments: `//` only. Neither `{ }` nor `(* *)` exists, and a `{` outside a string is refused. The block comment was removed on 15 September 2026 because it ended at the **first** `}`: a JSON example like `{"a":1}` inside one turned the rest of the sentence into code, and the error surfaced far away on a line that looked correct. Write a multi-line comment as several `//` lines.
-- Character escapes: `'\n' '\t' '\r' '\\' '\''` and `"\""`; any other `\x` → `unknown escape sequence`. No `\xNN`; use `chr(0x1B)`.
+- Character escapes: `'\n' '\t' '\r' '\0' '\\' '\''`, `"\""`, and **`'\xHH'` with exactly two hex digits** (since 15-09-2026) — so `'\x1b'` rather than `chr(0x1B)`, and a generator can embed UTF-8 or binary directly: `"caf\xc3\xa9"`. Two digits always, never more: `"\x41BC"` is three characters, unlike C. Anything else after a backslash → `unknown escape sequence`.
 - Hex literals: `0xFF`. No `$FF` (Pascal), no `1_000`.
 
 ## Includes and standalone tests
@@ -102,12 +109,16 @@ Found a new pitfall? Add it under the heading it belongs to.
 - The `curve.*` constants are called `CURVE.NDAYS`, `CURVE.NHOURS`, `CURVE.DAYLEN` (not `CURVE.DAYS`, which collides with `curve.days`).
 - A `text` view (`f_at`/`f_end`) in an output schema is placed between quotes **raw** by `Out.write`: the bytes must already be JSON-escaped. So fill `tool.vbuf` with `json.escslice` (text) or `json.putraw` (only for a `json` field that is already valid JSON).
 - **Two different contracts for "it does not fit", and which one you get depends on what you are building.** The appenders in `lib/` — `io.push`, `io.pushnum`, `json.putraw`, `json.putstr`, `json.escslice`, `json.putreal` — **truncate** at `len(dst)` and hand back a position that is still usable, because a shortened message is still a message. A generated `<Schema>.write` and `json.putslice`/`json.putb` **refuse** with `-1`, because a shortened JSON object is not a shorter object but a syntax error. So: **always test the result of `Out.write`** (`if n < 0 then ...`); never assume a chain of `io.push` wrote everything (compare the position that comes back with the one you passed in). Neither one writes past the end any more, so getting it wrong no longer kills the process — it silently drops bytes or refuses, which is a great deal easier to find. (14-09-2026)
+- **Forgetting the `include` is the first mistake, and the compiler now says so**: `io.puts` without `include "io.wz"` reports `undeclared identifier: io.puts is declared in io.wz; add: include "io.wz";` (since 15-09-2026). If you get the bare message instead, the name is in no library — check the spelling.
+- **A constant and a routine share one namespace, and names are case-insensitive**, so `STORE.SET` is the same name as `store.set` and the dot does not separate them. That is where `STORE.OPSET` and `CURVE.NDAYS` come from — names bent to dodge a collision. Since 15-09-2026 the compiler says so (`duplicate declaration; names are case-insensitive, so STORE.SET is the same name as store.set`) instead of only `duplicate declaration`. Pick a prefix that is not already a routine's, rather than a spelling that happens to slip past.
+- A **`str` variable is not an `array of char`** — only a string *literal* converts (`kv.find(b, 0, n, "key")` compiles, `kv.find(b, 0, n, key)` with `key: str` does not). Copy it first: `k := io.push(buf, 0, s);` then pass `buf[0..k - 1]`. Since 15-09-2026 the compiler says so in those words instead of `this parameter needs an array`, which gave no hint that a literal would have been accepted in the same position.
+- A schema **refuses a key it does not declare** (since 15-09-2026): `parse` returns `-1` and `b[json.badkey0..json.badkey1)` is the offending key. So declare everything the input may carry, not only what you read. For an open protocol envelope — an MCP `initialize`, an OAuth registration — that means declaring the protocol's own members as `json?`; leaving them out makes every genuine message fail, and a caller that ignores the `-1` then runs on defaults. Print the key when you report the failure: `parse` answers `-1` for every kind of failure, and an unknown key is the one the caller can actually fix.
 - `lib/tools.wz` includes `http.wz`, so even a stdio-only program with a `tools` block must define `procedure app.request` (otherwise `forward declared routine is never defined` on the last line). A `forward` error always points at `end.`; look for the missing `app.*` hook in the library headers.
 - `http.serve(port, workers)`: `SO_REUSEPORT` only when `workers > 1`; in tests always use 1 worker.
 - A `json?` argument that may be a list **or a single string**: after `arg.take(at, upto)` a lone JSON string already sits in `arg.buf` without its quotes, and `arg.strings(arg.buf, 0, arg.n)` then returns `-1`. **Right:** `arg.strings(arg.raw, 0, upto - at)` on the raw copy (which understands a list, a string containing a list, and a bare string). `arg.buf` is for a string that contains an object (`arg.object`).
-- Copying a text value out of `kv.find`/`kv.first` raw (`dd.settext(dst, b[kv.vat..kv.vend - 1], ...)`) → the value keeps its **quotes** (`"dryer"` instead of `dryer`) and every comparison after that fails silently: no compile error, no runtime error, the code just does nothing. **Right:** the body is `[kv.vat + 1, kv.vend - 1)` and the escapes have to go: `n := json.unescape(b, kv.vat + 1, kv.vend - 1, dst, 0);` (as in `ctx.wz:136`, `residents.wz:74`). `wantzellog.py check` catches this now. (11-09-2026)
-- `http.header("Accept")` with capitals → finds **nothing, ever**. `http.hdreq` lowercases the bytes from the buffer but compares against the literal exactly as written. No error, no warning: you get `false` and the code concludes the header is absent. **Right:** `http.header("accept")`, `"cookie"`, `"x-forwarded-proto"` — always lowercase. (11-09-2026)
-- `kv.isobject`, `kv.match` and `kv.scanobj` move the cursor `kv.vat`/`kv.vend` (to the last pair of the object they walk). So after `kv.find`, save `iat := kv.vat; iend := kv.vend` before doing such a check and before calling `kv.merge`/`kv.put` (batch submit of configurable values, 10-09).
+- Copying a text value out of `kv.find`/`kv.first` raw (`dd.settext(dst, b[kv.vat..kv.vend - 1], ...)`) → the value keeps its **quotes** (`"dryer"` instead of `dryer`) and every comparison after that fails silently: no compile error, no runtime error, the code just does nothing. **Right:** `n := kv.text(b, dst, 0);` — it strips the quotes, decodes the escapes, and returns `-1` when the value is not a string at all. Doing the arithmetic yourself (`kv.vat + 1, kv.vend - 1`) is what went wrong here and once more on the KEY, which is already without quotes, losing a character at each end. (11-09-2026; `kv.text` added 15-09-2026)
+- `http.header("Accept")` with capitals used to find **nothing, ever**: `http.hdreq` lowercased the bytes from the buffer but compared them against the literal exactly as written, so you got `false` and concluded the header was absent — no error, no warning. **Fixed 15-09-2026: the comparison is case-insensitive on both sides, so either spelling works.** On a compiler older than that, write the name in lower case. (11-09-2026)
+- `kv.scanobj`, `kv.pair`, `kv.first`, `kv.next` and `kv.find` **position** the cursor `kv.kat`/`kv.kend`/`kv.vat`/`kv.vend`; save what you still need before calling one of them. `kv.isobject`, `kv.count` and `kv.match` only ask a question and **restore** the cursor since 15-09-2026 — before that they moved it too, which cost two application bugs, both silent (batch submit of configurable values, 10-09).
 - `arg.take` unwraps a JSON string; `arg.strings(arg.buf, 0, arg.n)` afterwards sees a single string (`"key"`) as bare text and returns -1. For "a list, a string containing a list, or a single string", copy the raw view bytes (`arg.byte`) and run `arg.strings` on those; it unwraps a string-with-a-list itself.
 - `time.parseiso` accepts only `YYYY-MM-DDTHH:MM:SS[.frac][Z]`: no date without a time and no `+HH:MM` offset (Python's `isoformat()` produces `+00:00`). Pad the date with `T00:00:00`, and strip the offset and apply it yourself.
 
@@ -155,10 +166,181 @@ Found a new pitfall? Add it under the heading it belongs to.
 Everything below compiles with the current `wantzel`. Take the nearest
 pattern and adapt it; do not invent your own variant of something listed here.
 
+## The argument order of the routines you use most
+
+**This is the biggest source of errors there is**: 30 of the 100 recorded mistakes are
+library use — a wrong routine name, or the arguments in the wrong order. The two groups
+below cover almost all of it, and each group has ONE shape.
+
+**Appenders — `(buffer, at, what)`, returning the new position.** The buffer first, where
+to write second, what to write third. Chain them by feeding the result back in.
+
+| | |
+|---|---|
+| `io.push(b, at, s)` | a string literal, returns the new `at` |
+| `io.pushnum(b, at, v)` | a number |
+| `json.putstr(dst, at, s)` | a literal, quoted and escaped |
+| `json.putslice(dst, at, src, from, upto)` | bytes from another buffer, quoted and escaped |
+| `json.putraw(dst, at, src, from, upto)` | bytes verbatim, no quotes |
+| `json.putreal(dst, at, v)` | a real |
+| `json.putb(dst, at, c)` | one byte |
+| `kv.text(b, dst, at)` | the cursor's value, decoded — **note: source first, then dst** |
+
+```pascal
+n := io.push(buf, 0, "{\"name\":");
+n := json.putstr(buf, n, "probe");
+n := io.push(buf, n, "}");
+```
+
+**Readers — `(buffer, at, upto)`, `upto` exclusive.** The span to look in, never a length.
+
+| | |
+|---|---|
+| `json.ws(b, at, last)` | skip whitespace, returns the first non-blank position |
+| `json.skip(b, at, last)` | past one whole value |
+| `json.string(b, at, last)` | past a string; the text is `b[json.sat..json.send)` |
+| `json.eq(b, at, last, s)` | is that span exactly this literal? **count the literal including its quotes** |
+| `kv.find(b, at, upto, key)` | key as `array of char`, not a `str` |
+| `kv.first(b, at, upto)` / `kv.next(b, cur, upto)` | walk an object |
+
+**Two traps inside that shape**, both of which have cost real time here:
+
+- `json.eq(b, i, i + 16, "\"total_matched\"")` — the end is **exclusive**, and the literal
+  with its quotes is 15 characters, so the end is `i + 15`. Count it, do not estimate.
+- `kv.find` wants the key as bytes, but `json.eq` takes a `str` literal — which tempts you
+  to pass a literal to both. For `kv.find`, copy it first: `n := io.push(b, 0, "name");`
+  then `kv.find(..., b[0..n - 1])`.
+
+## What each routine gives you when it fails
+
+`-1`, `false` and `0` do not mean the same thing, and which one you get depends on what
+kind of routine it is. The rule behind it:
+
+| kind | on failure | why |
+|---|---|---|
+| **appenders in `lib/`** (`io.push`, `json.put*`) | truncate at `len(dst)` and return a usable position | a shortened message is still a message |
+| **a generated `<Schema>.write`**, `json.putslice`, `json.putb` | `-1`, and nothing usable written | half a JSON object is not a shorter object but a syntax error |
+| **parsers** (`json.skip`, `json.string`, `kv.pair`) | `-1` | there is no position to continue from |
+| **questions** (`kv.find`, `json.eq`, `fs.stat`) | `false` | |
+| **a generated `<Schema>.parse`** | `-1`, with the offending key in `json.badkey0..json.badkey1` | an unknown key is refused, not skipped |
+| **`kv.text`** | `-1` | the value is not a string, or does not fit |
+
+So: **always test the result of `write`** and of anything returning `-1`; never assume a
+chain of `io.push` wrote everything — compare the position that came back with the one you
+passed in.
+
+## A buffer and its length, together
+
+Every one of the six recorded memory errors comes from these two drifting apart. Declare
+them side by side and treat them as one thing:
+
+```pascal
+var
+  buf: array[0..1023] of char;
+  buf_n: int;                      // how much of buf is filled
+
+buf_n := io.push(buf, 0, "text");
+if buf_n >= len(buf) then ...      // it truncated: the position hit the end
+```
+
+Pass the filled part as a **slice**, never the whole array: `use(buf[0..buf_n - 1])`.
+Passing `buf` hands over 1024 bytes of which most are zero, and the receiver cannot tell
+where the text stops.
+
+## A whole command-line tool
+
+Everything below is needed and nothing is spare: the usage line, the argument copied out
+with its length guarded, the failing `open` reported, and a distinct exit code for "you
+used it wrong" (2) versus "it did not work" (1).
+
+```pascal
+include "io.wz";
+
+var
+  path: array[0..1023] of char;
+  buf: array[0..65535] of char;
+  fd, n, i, lines, bytes: int;
+
+begin
+  if argc() < 2 then
+  begin
+    io.puts(STDERR, "usage: wc <file>\n");
+    halt(2);
+  end;
+  i := 0;
+  while argch(1, i) <> chr(0) do
+  begin
+    if i >= len(path) - 1 then begin io.puts(STDERR, "wc: the path is too long\n"); halt(2); end;
+    path[i] := argch(1, i);
+    i := i + 1;
+  end;
+  path[i] := chr(0);                    // a syscall wants it NUL-terminated
+
+  fd := sys3(SYS.open, addr(path[0]), O_RDONLY, 0);
+  if fd < 0 then begin io.puts(STDERR, "wc: cannot open that file\n"); halt(1); end;
+
+  lines := 0; bytes := 0;
+  while true do
+  begin
+    n := io.read(fd, addr(buf[0]), len(buf));
+    if n <= 0 then break;
+    bytes := bytes + n;
+    for i := 0 to n - 1 do
+      if buf[i] = chr(10) then lines := lines + 1;
+  end;
+  sys1(SYS.close, fd);
+
+  io.putn(STDOUT, lines); io.puts(STDOUT, " lines, ");
+  io.putn(STDOUT, bytes); io.puts(STDOUT, " bytes\n");
+end.
+```
+
+## A whole MCP server
+
+The `tools` block generates the tool table, the argument parsing, the dispatch and the
+result writers; what is left to write is the handler. Two lines are easy to leave out and
+neither is optional:
+
+```pascal
+include "json.wz";
+
+schema AddArgs = record
+  a: int "the left operand";
+  b: int "the right operand";
+end;
+
+schema AddResult = record
+  sum: int;
+end;
+
+tools
+  add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
+end;
+
+include "tools.wz";                     // AFTER the tools block: it reads it
+
+function tool.add(a: array of AddArgs; r: array of AddResult): int;
+begin
+  r[0].sum := a[0].a + a[0].b;
+  return 0;
+end;
+
+// lib/tools.wz includes http.wz, so even a stdio-only server must define this
+procedure app.request;
+begin
+end;
+
+begin
+  mcp.stdio;                            // or http.serve(port, 1) for MCP over HTTP
+end.
+```
+
+That answers `initialize` and `tools/call` on standard input, and `mcp.name` /
+`mcp.version` are yours to set if you want your own name in the handshake.
+
 ## Program skeleton with an include
 
 ```pascal
-program prog;
 include "../../../lib/io.wz";       // path relative to THIS file
 const MAX = 10;
 var
@@ -233,6 +415,106 @@ end;
 
 Declare large buffers globally; use a `view` on `mmap` memory if it has to grow
 beyond that (see `docs/language.md` §10b).
+
+## Linked structures without pointers: the index IS the pointer
+
+There are no pointers, and for data you do not need them. Where C keeps an address, keep
+the **index** of the element instead, and use `-1` for "none". An index cannot dangle, it
+is bounds-checked at every use, and — unlike an address — it still means the same thing
+after you write the array to disk and read it back.
+
+**The shape is always the same:** one array holds every node, a counter says how many are
+live, and every link is an `int` into that array.
+
+```pascal
+type Node = record val, next: int; end;       // `next` is an index, not an address
+var nodes: array[0..1023] of Node; nn, head: int;
+
+function alloc(v: int): int;                  // -1 when full: refuse, never truncate
+begin
+  if nn >= len(nodes) then return -1;
+  nodes[nn].val := v; nodes[nn].next := -1;
+  nn := nn + 1; return nn - 1;
+end;
+```
+
+### A doubly-linked list, including removal from the middle
+
+```pascal
+type Node = record val, prev, next: int; end;
+var nodes: array[0..1023] of Node; nn, head: int;
+
+procedure unlink(x: int);
+begin
+  if nodes[x].prev >= 0 then nodes[nodes[x].prev].next := nodes[x].next
+  else head := nodes[x].next;                          // x was the head
+  if nodes[x].next >= 0 then nodes[nodes[x].next].prev := nodes[x].prev;
+end;
+```
+
+### A tree, and a graph that contains cycles
+
+A tree is the same record with `left` and `right`. A graph is the same record with an array
+of edges. **Cycles need no special care** — an index cannot point at freed memory, so the
+"use after free" that makes cyclic structures dangerous elsewhere cannot happen. Guard the
+walk against revisiting, and that is all:
+
+```pascal
+procedure walk(x: int);
+var i: int;
+begin
+  if seen[x] then return;                     // the only thing a cycle needs
+  seen[x] := true;
+  i := 0;
+  while i < g[x].ne do begin walk(g[x].edge[i]); i := i + 1; end;
+end;
+```
+
+### Reuse: a free list, not an allocator
+
+Removing a node does not free memory — nothing was allocated. To reuse the slot, keep the
+freed indexes in a list of their own; `lib/store.wz` does exactly this with a `store.free`
+hint per table. One reservation up front, and inside it every reference is an index.
+
+### It survives a restart, and that is the part people miss
+
+Because a link is an index and not an address, the whole array is **its own file format**.
+Write the raw bytes, read them back, and every link still points where it did — no
+serialisation, no fix-up pass, no version field:
+
+```pascal
+fd := sys3(SYS.open, addr(path[0]), 577, 420);        // O_WRONLY|O_CREAT|O_TRUNC
+n  := sys3(SYS.write, fd, addr(nodes[0]), nn * 24);   // 24 = the record's size
+sys1(SYS.close, fd);
+```
+
+With real pointers this cannot work: every address would be wrong after loading.
+
+### The one thing an index does not protect you from
+
+It cannot dangle, but it **can point at the wrong row**. A zeroed link field means index 0,
+not "none" — so initialise links to `-1` explicitly, or a node ends up as its own child and
+a walk recurses until the stack runs out. That is the mistake to look for, because the
+compiler cannot see it.
+
+## Reaching memory the program never declared
+
+`view(addr, n)` turns any address plus a length into an ordinary, bounds-checked array.
+That is the escape hatch for everything the shapes above do not cover — memory from the
+operating system, a shared segment, a mapped file:
+
+```pascal
+base := sys6(SYS.mmap, 0, 4096, bor(PROT_READ, PROT_WRITE),
+             bor(MAP_PRIVATE, MAP_ANONYMOUS), -1, 0);
+fill(view(base, 4096));                       // an ordinary array of char
+fill(view(base + 10, 100));                   // a window at an offset
+sys2(SYS.munmap, base, 4096);
+```
+
+That second `view` is pointer arithmetic in every respect that matters — except that the
+window carries its own length, so indexing inside it is still checked. `view` and `sys*`
+are the unsafe primitives: nothing verifies that the address and the length are right.
+Everything *inside* the view is as safe as any other array.
 
 ## List arguments (a small `arg.*` layer on top of json)
 
@@ -337,7 +619,6 @@ begin r[0].sum := a[0].a + a[0].b; return 0; end;
 
 ```pascal
 // What the test demonstrates, in one sentence.
-program t;
 include "../../../lib/x.wz";
 procedure show(s: str; v: int); begin io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n"); end;
 begin

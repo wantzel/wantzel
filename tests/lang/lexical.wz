@@ -1,6 +1,5 @@
 // spec §1-2: comments, case-insensitive identifiers and keywords, dotted names,
 // int/hex/char/string literals and escapes, constants of every kind.
-Program Lexical;
 include "io.wz";
 // a brace comment
 // over two lines

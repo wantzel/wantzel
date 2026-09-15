@@ -20,6 +20,18 @@ grammar=editors/vscode/syntaxes/wantzel.tmLanguage.json
 words=$(grep -oE 'eqt\("[a-z0-9]+"\)' src/wantzel.wz | sed 's/eqt("//;s/")//' | sort -u)
 [ -n "$words" ] || { echo "no keywords found in src/wantzel.wz -- has eqt() been renamed?"; exit 1; }
 
+# A word the compiler names only to refuse it is not vocabulary. Those are the ones whose
+# message says the construct is no longer part of the language; the grammar must not
+# colour them either, or an editor would keep suggesting a form the compiler rejects.
+refused=$(grep -oE "'[a-z]+[^']*' (header )?is no longer part of the language" src/wantzel.wz | grep -oE "^'[a-z]+" | tr -d "'" | sort -u)
+for r in $refused; do
+  words=$(echo "$words" | grep -vx "$r")
+  if grep -qE "[|(]$r[|)]" "$grammar"; then
+    echo "the grammar still highlights '$r', which the compiler refuses; remove it from $grammar"
+    exit 1
+  fi
+done
+
 missing=""
 for w in $words; do
   grep -q "\b$w\b" "$grammar" || missing="$missing $w"

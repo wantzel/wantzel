@@ -9,6 +9,18 @@
 # compiles itself to a working .exe.
 #
 # Needs wine64 (apt install wine64).  Skips gracefully if it is absent.
+#
+# THIS SCRIPT IS THE MANUAL ENTRY POINT; NO TEST CALLS IT.  The suite has
+# its own two, and the split is on whether an emulator is needed at all:
+#
+#   tests/toolchain/win_backend_bytes.sh  PE image + identical .exe bytes -- no Wine,
+#                                         runs in every ./wztest --toolchain
+#   tests/toolchain/win_exe_runs.sh       running a .exe under Wine -- only with --windows,
+#                                         and it fails if a process of its own survives
+#
+# tests/toolchain/all_suites_green.sh used to call this file unconditionally, which made
+# the --windows flag meaningless: Wine ran about ten times in one evening without anyone
+# asking for it, leaving 29 orphan processes behind. That call is gone.
 set -e
 cd "$(dirname "$0")"
 T=$(mktemp -d)
@@ -27,21 +39,38 @@ T=$(mktemp -d)
 #
 # So: shut wineserver down first and wait for it, and the rm afterwards must never decide
 # the outcome -- that is already fixed in $fail.
+# ONLY OUR OWN prefix. A broad kill across every wineserver takes down a parallel suite
+# or another worktree, and this repository made that mistake once already.
+#
+# THE PREFIX IS NOT IN THE COMMAND LINE, which is why the old wait loop here did nothing:
+# a wineserver shows as "/usr/lib/wine/wineserver64 -p0" and a winedevice.exe as
+# "C:\windows\system32\winedevice.exe" whatever prefix they serve, so the
+# `pgrep -f "wineserver.*$WINEPREFIX"` below matched nothing and fell straight through.
+# It lives in the ENVIRONMENT, so /proc/<pid>/environ is what identifies it. Measured
+# 15-09-2026: this script left 3 processes behind per run even after the loop
+# "succeeded".
+mine_win() {
+  {
+    for _d in /proc/[0-9]*; do
+      case "$(cat "$_d/comm")" in
+        wine*|*.exe) ;;
+        *) continue ;;
+      esac
+      if tr '\0' '\n' < "$_d/environ" | grep -qxF "WINEPREFIX=$WINEPREFIX"; then
+        echo "${_d#/proc/}"
+      fi
+    done
+  } 2>/dev/null
+}
 cleanup_win() {
   if [ -n "$WINEPREFIX" ] && [ -d "$WINEPREFIX" ]; then
-    # ONLY OUR OWN wineserver.  'wineserver -k' knows exactly one prefix -- the one in
-    # the environment -- and WINEPREFIX still points at $T/wp here, so this never touches
-    # the Wine of another worktree or a parallel suite.  That distinction is not
-    # theoretical: a broad kill across every wineserver is the mistake this repository
-    # already made once with a too-wide pgrep.
     "${WINESERVER:-wineserver}" -k 2>/dev/null || true
     _n=0
-    while [ $_n -lt 50 ]; do
-      # wait for OUR prefix: as long as a process holds a file in $WINEPREFIX open,
-      # the rm below fails.
-      pgrep -f "wineserver.*$WINEPREFIX" >/dev/null 2>&1 || break
-      _n=$((_n + 1)); sleep 0.1
-    done
+    while [ $_n -lt 50 ] && [ -n "$(mine_win)" ]; do _n=$((_n + 1)); sleep 0.1; done
+    # winedevice.exe and friends do not die with the server: kill what is still ours
+    for _p in $(mine_win); do kill -9 "$_p" 2>/dev/null || true; done
+    _n=0
+    while [ $_n -lt 20 ] && [ -n "$(mine_win)" ]; do _n=$((_n + 1)); sleep 0.1; done
   fi
   rm -rf "$T" 2>/dev/null || true
 }
@@ -58,14 +87,14 @@ W() { "$WINE" "$@" 2>/dev/null; }
 [ -x ./bin/wantzel0 ] && [ -x ./bin/wantzel ] || { echo "run ./build.sh first" >&2; exit 1; }
 
 echo "a .exe target produces a PE32+ executable"
-./bin/wantzel examples/hello.wz "$T/hello.exe"
+./bin/wantzel examples/hello.wz "$T/hello.exe" --target=windows
 case "$(od -An -tx1 -N2 "$T/hello.exe" | tr -d ' ')" in
   4d5a) ok "PE starts with MZ" ;; *) bad "not an MZ image" ;;
 esac
 
 echo "wantzel0 and wantzel emit identical .exe (the C bootstrap and Wantzel agree)"
 for f in examples/hello.wz examples/cat.wz examples/primes.wz tests/compiler/feat.wz src/wantzel.wz; do
-    ./bin/wantzel0 "$f" "$T/a.exe" 2>/dev/null && ./bin/wantzel "$f" "$T/b.exe" 2>/dev/null
+    ./bin/wantzel0 "$f" "$T/a.exe" --target=windows 2>/dev/null && ./bin/wantzel "$f" "$T/b.exe" --target=windows 2>/dev/null
     if cmp -s "$T/a.exe" "$T/b.exe"; then ok "identical .exe for $f"; else bad "differing .exe for $f"; fi
 done
 
@@ -73,7 +102,7 @@ echo "the .exe prints what the ELF prints, under Wine"
 same_out() { # name  src  args...
     n=$1; s=$2; shift 2
     ./bin/wantzel "$s" "$T/$n.elf" 2>/dev/null
-    ./bin/wantzel "$s" "$T/$n.exe" 2>/dev/null
+    ./bin/wantzel "$s" "$T/$n.exe" --target=windows 2>/dev/null
     le=$("$T/$n.elf" "$@"); we=$(W "$T/$n.exe" "$@")
     if [ "$le" = "$we" ]; then ok "$n matches"; else bad "$n differs"; fi
 }
@@ -81,7 +110,7 @@ same_out hello  examples/hello.wz
 same_out primes examples/primes.wz
 same_out feat   tests/compiler/feat.wz XYZ
 # cat: stdin path (ReadFile on the console handle)
-./bin/wantzel examples/cat.wz "$T/cat.exe" 2>/dev/null
+./bin/wantzel examples/cat.wz "$T/cat.exe" --target=windows 2>/dev/null
 le=$(printf 'piped\n' | "$T/cat.elf" 2>/dev/null || printf 'piped\n')
 we=$(printf 'piped\n' | W "$T/cat.exe")
 [ "$we" = "piped" ] && ok "cat reads stdin" || bad "cat stdin: got '$we'"
@@ -91,7 +120,7 @@ we=$(W "$T/cat.exe" examples/hello.wz | head -1)
 
 echo "wantzel.exe compiles Wantzel source, under Wine (self-hosting on Windows)"
 ABS="$(pwd)/examples/hello.wz"
-./bin/wantzel src/wantzel.wz "$T/wantzel.exe" 2>/dev/null
+./bin/wantzel src/wantzel.wz "$T/wantzel.exe" --target=windows 2>/dev/null
 W "$T/wantzel.exe" "$ABS" "$T/h_from_win.elf"
 ./bin/wantzel "$ABS" "$T/h_from_linux.elf" 2>/dev/null
 if cmp -s "$T/h_from_win.elf" "$T/h_from_linux.elf"; then ok "wantzel.exe emits the same ELF as the native compiler"; else bad "wantzel.exe ELF differs"; fi
@@ -102,7 +131,7 @@ echo "the MCP file server answers over stdin, as a .exe (stat, getdents, ReadFil
 mkdir -p "$T/proj/sub"
 printf 'hello content\n' > "$T/proj/readme.txt"
 printf 'x\n' > "$T/proj/sub/inner.txt"
-./bin/wantzel examples/mcpfiles.wz "$T/mcpfiles.exe" 2>/dev/null
+./bin/wantzel examples/mcpfiles.wz "$T/mcpfiles.exe" --target=windows 2>/dev/null
 out=$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_dir","arguments":{"path":"."}}}' \
@@ -119,7 +148,7 @@ if command -v curl >/dev/null 2>&1; then
     port=8099
     # compile inside examples/ so the "../lib/http.wz" include resolves
     sed "s/http.serve(8080, 8)/http.serve($port, 8)/" examples/httpd.wz > examples/_httpd_test.wz
-    ./bin/wantzel examples/_httpd_test.wz "$T/httpd.exe" 2>/dev/null
+    ./bin/wantzel examples/_httpd_test.wz "$T/httpd.exe" --target=windows 2>/dev/null
     rm -f examples/_httpd_test.wz
     W "$T/httpd.exe" >/dev/null 2>&1 &
     hp=$!

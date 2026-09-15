@@ -1,6 +1,5 @@
 // httpd.wz -- a small HTTP server: proof that the event loop works.
 
-program httpd;
 
 include "http.wz";
 

@@ -1,2 +1,2 @@
 // Must not compile: "unexpected else (no ';' may precede it)".
-program t; var i: int; begin if i > 0 then i := 1; else i := 2; end.
+var i: int; begin if i > 0 then i := 1; else i := 2; end.

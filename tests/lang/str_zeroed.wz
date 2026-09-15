@@ -1,0 +1,39 @@
+// A str variable that was never assigned is (address 0, length 0), and every operation
+// on it must answer rather than crash.
+//
+// Variables are zeroed -- docs/language.md says so -- but slen() reads the eight bytes
+// BEFORE the text, where the length sits, so a null address meant dereferencing address
+// -8. The process died with a segmentation fault and no message at all: in a language
+// that checks every array index, that was the one hole.
+//
+// It surfaced through lib/mcp.wz, where mcp.name and mcp.version are str globals the
+// application is meant to set. A minimal MCP server that did not set them compiled fine
+// and died on its FIRST request.
+include "json.wz";
+var
+  s: str;
+  t2: str;
+  b: array[0..63] of char;
+  n: int;
+procedure show(what: str; v: int);
+begin
+  io.puts(STDOUT, what); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+begin
+  show("slen of an unassigned str = ", slen(s));
+  // it must still be usable everywhere a str is
+  n := json.putstr(b, 0, s);
+  io.puts(STDOUT, "json.putstr wrote: ");
+  io.out(STDOUT, addr(b[0]), n);
+  io.puts(STDOUT, "\n");
+  n := io.push(b, 0, s);
+  show("io.push of it returned ", n);
+  // and an ordinary string is untouched by the check
+  t2 := "hello";
+  show("slen of a real str = ", slen(t2));
+  n := json.putstr(b, 0, t2);
+  io.puts(STDOUT, "json.putstr wrote: ");
+  io.out(STDOUT, addr(b[0]), n);
+  io.puts(STDOUT, "\n");
+  show("schar of a real str = ", ord(schar(t2, 1)));
+end.

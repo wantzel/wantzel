@@ -8,7 +8,6 @@
 // Claude starts this tiny program, which forwards every message to a server
 // that keeps running between sessions, over one keep-alive connection.
 
-program mcpbridge;
 
 include "net.wz";
 

@@ -36,8 +36,10 @@ var r, k: int;
 begin
   if n <= 0 then io.fatal("rand.below: n must be positive");
   k := ((M mod n) + 1) mod n;                 // 2^63 mod n
-  repeat
+  while true do
+  begin
     r := band(rand.int, M);                   // 63 bits, never negative
-  until (k = 0) or (r <= M - k);              // reject the top partial block
+    if (k = 0) or (r <= M - k) then break;    // reject the top partial block
+  end;
   return r mod n;
 end;

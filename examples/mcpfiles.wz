@@ -7,7 +7,6 @@
 // anything that starts with "/" or contains ".." is refused.  Searching uses
 // the SIMD scan, so it walks a tree at roughly memchr speed.
 
-program mcpfiles;
 
 include "mcp.wz";
 include "http.wz";

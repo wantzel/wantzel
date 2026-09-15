@@ -1,6 +1,5 @@
 // SHA-256 and HMAC-SHA256 against the NIST/RFC test vectors; streaming
 // (byte by byte and in blocks of 4096) must give the same as one-shot.
-program sha256test;
 include "hmac.wz";
 
 var

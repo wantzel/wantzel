@@ -1,0 +1,19 @@
+the document is one JSON object = yes
+openapi = yes
+info = yes
+servers = yes
+paths = yes
+components = yes
+security = yes
+version = "3.1.0"
+paths count = 2
+path 1 = /api/add
+/api/add is a path = yes
+/api/greet is a path = yes
+an undeclared tool has no path = yes
+  add has an operationId = yes
+  add has a requestBody = yes
+    the body carries an example = yes
+  add is tagged for reading = yes
+---
+{"openapi":"3.1.0","info":{"title":"Probe API","version":"1","description":"Generated from the server's tool declarations; what is written here is what the server does."},"servers":[{"url":"http://127.0.0.1:8080"}],"components":{"securitySchemes":{"bearer":{"type":"http","scheme":"bearer"},"session":{"type":"apiKey","in":"cookie","name":"session"}}},"security":[{"bearer":[]},{"session":[]}],"paths":{"/api/add":{"post":{"operationId":"add","summary":"add","description":"Add two whole numbers.","tags":["read"],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"a":{"type":"integer","description":"first term"},"b":{"type":"integer","description":"second term"}},"required":["a","b"]},"example":{"a":1,"b":1}}}},"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{"type":"object","properties":{"sum":{"type":"integer"}},"required":["sum"]}}}},"400":{"description":"Bad Request: the message names the field"},"401":{"description":"Unauthorized: sign in at /login or send a bearer token"},"422":{"description":"Validation Error: the body does not fit the schema"}}}},"/api/greet":{"post":{"operationId":"greet","summary":"greet","description":"Greet someone, optionally more than once.","tags":["write"],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"name":{"type":"string","maxLength":64,"description":"who to greet"},"times":{"type":"integer","description":"how often, default 1"}},"required":["name"]},"example":{"name":""}}}},"responses":{"200":{"description":"Successful Response","content":{"application/json":{"schema":{"type":"object","properties":{"greeting":{"type":"string","maxLength":4096}},"required":["greeting"]}}}},"400":{"description":"Bad Request: the message names the field"},"401":{"description":"Unauthorized: sign in at /login or send a bearer token"},"422":{"description":"Validation Error: the body does not fit the schema"}}}}}}

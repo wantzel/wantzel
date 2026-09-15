@@ -1,5 +1,4 @@
 // schema v2: nested schemas, arrays of schemas, enums, json views, record results, write with nesting.
-program t;
 include "io.wz";
 include "json.wz";
 

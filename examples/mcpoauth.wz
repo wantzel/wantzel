@@ -6,7 +6,6 @@
 // the 401 challenge come from lib/oauth.wz; the tools from a `tools` block.
 // One person can log in: the user/secret pair given on the command line.
 
-program mcpoauth;
 
 include "oauth.wz";
 include "mcphttp.wz";

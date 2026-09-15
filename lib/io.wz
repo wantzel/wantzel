@@ -21,6 +21,8 @@ const
   SYS.listen = 50;
   SYS.setsockopt = 54;
   SYS.fork   = 57;
+  SYS.execve = 59;
+  SYS.dup2   = 33;
   SYS.exit   = 231;
   SYS.epwait = 232;
   SYS.epctl  = 233;

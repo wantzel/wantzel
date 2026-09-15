@@ -1,0 +1,17 @@
+// Must not compile: "duplicate declaration; names are case-insensitive, so STORE.SET is
+// the same name as store.set".
+//
+// Names are case-insensitive and the dot is cosmetic, so STORE.SET and store.set are ONE
+// name. The message used to stop at "duplicate declaration", which reads as though the
+// name itself were taken -- so the writer picks a different name instead of understanding
+// why. The result is visible in the sources: STORE.OPSET and CURVE.NDAYS exist only to
+// dodge a collision nobody explained. Ten of the fifteen namespace errors in the error
+// log are this case.
+//
+// tests/compiler/name_case_collision_same.wz is the other half: a collision WITHOUT
+// capitals must not get the extra sentence, or the explanation becomes noise.
+include "store.wz";
+const
+  STORE.SET = 1;
+begin
+end.

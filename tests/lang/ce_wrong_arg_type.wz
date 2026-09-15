@@ -1,2 +1,2 @@
 // Must not compile: "type error in argument: expected int, found char".
-program t; procedure p(x: int); begin end; begin p('a'); end.
+procedure p(x: int); begin end; begin p('a'); end.

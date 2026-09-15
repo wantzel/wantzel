@@ -1,2 +1,2 @@
 // Must not compile: "subscript applied to a variable that is not an array".
-program t; var i, j: int; begin j := i[0]; end.
+var i, j: int; begin j := i[0]; end.

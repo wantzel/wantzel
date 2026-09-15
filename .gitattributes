@@ -10,9 +10,11 @@ bootstrap/boot.c linguist-vendored
 
 # .wz is mapped to Pascal, and that is a deliberate compromise rather than a mistake.
 #
-# Linguist does not know Wantzel, and it will not for a long time: a new language is
-# only accepted once its extension appears in roughly 2000 files across public
-# repositories. Until then there are two options, and only one of them works:
+# Linguist does not know Wantzel, and it will not for a long time. Its rule, checked
+# against github-linguist/linguist CONTRIBUTING.md on 15-09-2026: an extension expected
+# to occur more than once per repository needs at least 2000 files indexed in the last
+# year, spread across a reasonable number of distinct user/repo combinations -- so one
+# large project of our own does not count towards it. Until then there are two options, and only one of them works:
 #
 #   *.wz linguist-language=Wantzel   -- FAILS SILENTLY. Linguist looks the name up,
 #       finds nothing, and treats every .wz file as undetected: no highlighting, and
@@ -21,7 +23,10 @@ bootstrap/boot.c linguist-vendored
 #
 #   *.wz linguist-language=Pascal    -- works. Pascal is a language Linguist knows,
 #       so the files are counted and highlighted. The grammar is not exact, but it
-#       agrees on what matters here: begin/end, :=, both comment forms, strings.
+#       agrees on what matters here: begin/end, :=, strings, numbers. Pascal also
+#       highlights { } as a comment, which Wantzel stopped doing in 0.2.0 -- so a brace
+#       in a .wz file shows as a comment on GitHub and is a syntax error to the compiler.
+#       That is a cosmetic wrongness in the direction that matters least.
 #
 # The label is wrong and the highlighting is right. Until Linguist knows the language,
 # that trade is the better of the two.

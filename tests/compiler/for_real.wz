@@ -1,5 +1,4 @@
 // Must not compile: "a for variable is a plain int variable".
-program t;
 var r: real;
 begin
   for r := 1.0 to 2.0 do ;

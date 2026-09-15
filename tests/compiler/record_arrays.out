@@ -7,4 +7,4 @@ sumx x10 = 90
 len(tags) = 4
 size = 80
 b1.id after copy = 3
-runtime error: array index out of range at record_arrays.wz:68
+runtime error: array index out of range at record_arrays.wz:67

@@ -16,7 +16,11 @@
 // good record.  The snapshot (<dir>/store.snap) is written to a temporary
 // file, fsynced and renamed; its header names the tables and their sizes,
 // so a recompiled program with a different layout refuses it instead of
-// misreading it.  One process writes; readers of a shared directory are
+// misreading it.  The LOG is checked the same way: a record whose length
+// differs from the declared record size stops the replay and makes
+// store.opendir return false, with store.err and store.det naming the
+// table and both sizes -- skipping it would drop every record behind it
+// without a word.  One process writes; readers of a shared directory are
 // not supported (there is nothing to lock yet but the log, see flock).
 
 include "io.wz";
@@ -48,7 +52,10 @@ var
   store.crctab: array[0..255] of int;
   store.crcready: bool;
   store.open: bool;
+  store.mapped: bool;                              // the tables hold memory, open or not
   store.err: str;                                  // the reason of the last failure
+  store.det: array[0..255] of char;                // the detail beside it (names, sizes)
+  store.detn: int;                                 // 0 when there is no detail
 
 // ------------------------------------------------------------- crc32
 
@@ -159,15 +166,49 @@ begin
   return p;
 end;
 
-// apply one record to memory (no logging)
-procedure store.apply(t: int; op: int; row: int; payload: array of char);
+// the name of table t into store.det from `at`; returns the new length
+function store.putname(at: int; t: int): int;
+var i, n: int;
+begin
+  n := at;
+  for i := 0 to STORE.NAMELEN - 1 do
+    if store.name[t * STORE.NAMELEN + i] <> chr(0) then
+    begin
+      if n < len(store.det) then store.det[n] := store.name[t * STORE.NAMELEN + i];
+      n := n + 1;
+    end;
+  return n;
+end;
+
+// record why a log record could not be applied: the table, and both record sizes.
+// The caller reads store.err for the reason and store.det[0..store.detn - 1] for this.
+procedure store.saylayout(t: int; found: int);
+var n: int;
+begin
+  store.err := "log record size differs from the table layout";
+  n := io.push(store.det, 0, "table ");
+  n := store.putname(n, t);
+  n := io.push(store.det, n, " expects ");
+  n := io.pushnum(store.det, n, store.rs[t]);
+  n := io.push(store.det, n, " bytes, the log record holds ");
+  n := io.pushnum(store.det, n, found);
+  store.detn := n;
+end;
+
+// apply one record to memory (no logging); false means the record does NOT fit the
+// declared layout and nothing was applied -- the caller must stop rather than skip it.
+function store.apply(t: int; op: int; row: int; payload: array of char): bool;
 var a, i: int;
 begin
-  if (t < 0) or (t >= store.nt) then return;
-  if (row < 0) or (row >= store.cap[t]) then return;
+  if (t < 0) or (t >= store.nt) then return false;
+  if (row < 0) or (row >= store.cap[t]) then return false;
   if op = STORE.OPSET then
   begin
-    if len(payload) <> store.rs[t] then return;
+    if len(payload) <> store.rs[t] then
+    begin
+      store.saylayout(t, len(payload));
+      return false;
+    end;
     a := store.base[t] + row * store.rs[t];
     for i := 0 to len(payload) - 1 do poke(a + i, ord(payload[i]));
     if peek(store.lv[t] + row) = 0 then store.n[t] := store.n[t] + 1;
@@ -180,14 +221,18 @@ begin
     poke(store.lv[t] + row, 0);
     if row < store.free[t] then store.free[t] := row;
   end;
+  return true;
 end;
 
 var
   store.rd: array[0..1048575] of char;            // log replay buffer (one record at a time)
 
-// replay the log from offset `from`; stops at the first bad record; returns the applied size
+// replay the log from offset `from`; stops at the first bad record; returns the applied
+// size.  A record that does not fit the declared layout is NOT skipped: store.err is set
+// and replay stops there, so the caller can refuse to open rather than lose the rest.
 function store.replay(from: int): int;
 var fd, got, n, plen, t, op, row, crc, want, at: int;
+    ok: bool;
 begin
   store.mkpath("store.log");
   fd := sys3(SYS.open, addr(store.path[0]), O_RDONLY, 0);
@@ -209,8 +254,9 @@ begin
     t := io.get16(store.rd, 8);
     op := ord(store.rd[10]);
     row := io.get32(store.rd, 12);
-    if plen > 0 then store.apply(t, op, row, store.rd[STORE.HDR..STORE.HDR + plen - 1])
-    else store.apply(t, op, row, store.rd[0..-1]);
+    if plen > 0 then ok := store.apply(t, op, row, store.rd[STORE.HDR..STORE.HDR + plen - 1])
+    else ok := store.apply(t, op, row, store.rd[0..-1]);
+    if not ok then break;
     at := at + STORE.HDR + plen + 4;
   end;
   sys1(SYS.close, fd);
@@ -280,10 +326,15 @@ begin
     store.lv[t] := store.mapzero(store.cap[t]);
     store.n[t] := 0; store.hi[t] := 0; store.free[t] := 0;
   end;
+  store.mapped := true;
   store.err := "";
+  store.detn := 0;
   off := store.loadsnap;
   if off < 0 then return false;
   store.logsize := store.replay(off);
+  // a log record that does not fit the declared layout is not a torn tail: opening anyway
+  // would drop every record behind it without saying so
+  if store.detn > 0 then return false;
   store.mkpath("store.log");
   store.logfd := sys3(SYS.open, addr(store.path[0]), bor(bor(O_WRONLY, O_CREAT), O_APPEND), 420);
   if store.logfd < 0 then begin store.err := "cannot open the log"; return false; end;
@@ -318,8 +369,7 @@ begin
   if sys3(SYS.write, store.logfd, addr(store.wr[0]), n) <> n then begin store.err := "log write failed"; return false; end;
   if sys1(SYS.fsync, store.logfd) < 0 then begin store.err := "log fsync failed"; return false; end;
   store.logsize := store.logsize + n;
-  store.apply(t, op, row, payload);
-  return true;
+  return store.apply(t, op, row, payload);
 end;
 
 // write the record bytes into row (len must equal the record size) and mark it live
@@ -373,16 +423,20 @@ begin
   return true;
 end;
 
+// release everything the store holds.  Also valid after a FAILED store.opendir: that
+// leaves the tables declared and their memory mapped, and without this the next
+// store.table would stack a second table on top of the first ones.
 procedure store.close;
 var t: int;
 begin
-  if not store.open then return;
-  sys1(SYS.close, store.logfd);
-  for t := 0 to store.nt - 1 do
-  begin
-    sys2(SYS.munmap, store.base[t], store.rs[t] * store.cap[t]);
-    sys2(SYS.munmap, store.lv[t], store.cap[t]);
-  end;
+  if store.open then sys1(SYS.close, store.logfd);
+  if store.mapped then
+    for t := 0 to store.nt - 1 do
+    begin
+      sys2(SYS.munmap, store.base[t], store.rs[t] * store.cap[t]);
+      sys2(SYS.munmap, store.lv[t], store.cap[t]);
+    end;
+  store.mapped := false;
   store.open := false;
   store.nt := 0;
 end;

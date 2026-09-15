@@ -1,5 +1,4 @@
 // real: conversions int <-> real, sqrt, pack32/unpack32, rounding modes.
-program t;
 include "io.wz";
 var
   r: real;

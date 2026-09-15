@@ -5,7 +5,7 @@
 # Temporary output of the toolchain tests.
 /tmp/
 
-# Generated from lib/ by tools/embedlib.wz, every time build.sh runs. It is 227 kB of
+# Generated from lib/ by bootstrap/tools/embedlib.wz, every time build.sh runs. It is 227 kB of
 # machine-written source: committing it would double the diff of every library change
 # for no gain, and a fresh clone builds it before it is needed.
 # tests/toolchain/embedded_lib_current.sh fails if it is stale.

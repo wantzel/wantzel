@@ -92,11 +92,11 @@
       "patterns": [
         {
           "name": "keyword.control.wantzel",
-          "match": "(?i)\\b(continue|repeat|downto|return|while|until|break|then|else|case|for|if|of|do|to)\\b"
+          "match": "(?i)\\b(continue|downto|return|while|break|then|else|for|if|of|do|to)\\b"
         },
         {
           "name": "keyword.declaration.wantzel",
-          "match": "(?i)\\b(procedure|function|program|forward|include|schema|winapi|const|begin|tools|type|var|end)\\b"
+          "match": "(?i)\\b(procedure|function|forward|include|schema|winapi|winproc|const|begin|tools|type|var|end)\\b"
         },
         {
           "name": "constant.language.wantzel",

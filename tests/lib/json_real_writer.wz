@@ -1,6 +1,5 @@
 // lib/json.wz: reals in and out (round trips), bounded string copies, raw copies,
 // escaping in putstr/putslice/escslice, number/boolean/skip scanning.
-program t;
 include "json.wz";
 var
   buf: array[0..255] of char;

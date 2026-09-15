@@ -1,5 +1,4 @@
 // spec §6: ord/chr, len/addr, slen/schar/sadr, scan, argc/argch, sys calls.
-program t;
 include "io.wz";
 var
   a: array[5..9] of int;

@@ -1,6 +1,5 @@
 // cat.wz -- copy the named files, or standard input, to standard output.
 
-program cat;
 
 const
   BUFSZ = 65536;

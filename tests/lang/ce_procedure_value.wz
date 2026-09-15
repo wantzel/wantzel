@@ -1,2 +1,2 @@
 // Must not compile: "a procedure has no value".
-program t; var i: int; procedure p; begin end; begin i := p; end.
+var i: int; procedure p; begin end; begin i := p; end.

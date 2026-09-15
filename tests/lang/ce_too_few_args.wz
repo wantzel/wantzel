@@ -1,2 +1,2 @@
 // Must not compile: "wrong number of arguments in call".
-program t; procedure p(x: int; y: int); begin end; begin p(1); end.
+procedure p(x: int; y: int); begin end; begin p(1); end.

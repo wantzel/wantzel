@@ -35,4 +35,10 @@ fi
 export WINEPREFIX=${WINEPREFIX:-$HOME/.wantzel-wine}
 export WINEDEBUG=${WINEDEBUG:--all}
 
+# No crash dialog. When a program faults, Wine starts winedbg, which opens a window and
+# WAITS -- so an automated run hangs until its timeout and the exit status says nothing
+# about the program. Disabling winedbg makes the same failure exit non-zero immediately,
+# with the reason on stderr, which is what a test can actually read.
+export WINEDLLOVERRIDES=${WINEDLLOVERRIDES:-winedbg.exe=d}
+
 exec "$WINE" "$exe" "$@"

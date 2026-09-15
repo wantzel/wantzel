@@ -1,4 +1,3 @@
-program feat;
 
 const
   N = 10;
@@ -74,10 +73,11 @@ begin
   end;
   i := 1;
   j := 0;
-  repeat
+  while i <= N do
+  begin
     j := j + a[i];
     i := i + 1;
-  until i > N;
+  end;
   puts("sum of squares 1..10 = "); putn(j); puts("\n");
 
   puts("fib(20) = "); putn(fib(20)); puts("\n");

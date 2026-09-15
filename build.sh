@@ -30,7 +30,7 @@ mv -f bin/wantzel0.new bin/wantzel0
 # The generator is itself written in Wantzel and compiled by wantzel0, which needs no
 # embedded copy: it reads lib/ from disk, and in this repository lib/ is right there.
 echo "1b. generating src/embedded.wz from lib/"
-./bin/wantzel0 tools/embedlib.wz bin/embedlib.new
+./bin/wantzel0 bootstrap/tools/embedlib.wz bin/embedlib.new
 mv -f bin/embedlib.new bin/embedlib
 ./bin/embedlib src/embedded.wz.new $(for f in lib/*.wz; do printf '%s %s ' "$(basename "$f")" "$f"; done)
 mv -f src/embedded.wz.new src/embedded.wz

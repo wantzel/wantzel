@@ -15,18 +15,24 @@ way.
 
 ## Start here
 
-Download a binary from [Releases](https://github.com/wantzel/wantzel/releases), or build
-from source with a C compiler you need exactly once:
+**Download the compiler** — one file, and the standard library is inside it, so there is
+nothing to put beside it and nothing to install:
+
+```bash
+curl -LO https://github.com/wantzel/wantzel/releases/latest/download/wantzel-0.2.1-linux-x86_64
+chmod +x wantzel-0.2.1-linux-x86_64
+```
+
+**Or build from source**, with a C compiler you need exactly once:
 
 ```bash
 git clone https://github.com/wantzel/wantzel && cd wantzel
 ./build.sh                      # bootstrap, then the compiler builds itself
 ```
 
-Then write a program and run it:
+Either way you now have a compiler. Write a program and run it:
 
 ```pascal
-program hello;
 include "io.wz";
 begin
   io.puts(STDOUT, "hello, world\n");
@@ -35,12 +41,15 @@ end.
 
 ```bash
 ./bin/wantzel hello.wz hello && ./hello
-./bin/wantzel hello.wz hello.exe          # a Windows binary, from Linux
+./bin/wantzel hello.wz hello.exe --target=windows   # a Windows binary, from Linux
 ```
 
-That second line cross-compiles, and there is nothing to install for it: the target
-follows from the output name, one compiler emits both, and a Windows build of that
-compiler does the same in reverse.
+(If you downloaded the binary, it is `./wantzel-0.2.1-linux-x86_64` in place of
+`./bin/wantzel`. The `include "io.wz"` above needs no `lib/` directory either way.)
+
+That second line cross-compiles, and there is nothing to install for it: `--target=`
+picks the target, one compiler emits both, and a Windows build of that compiler does the
+same in reverse.
 
 ## What it can do
 
@@ -67,31 +76,41 @@ A six-core machine, 15 September 2026. Reproduce them with `./build.sh` and `./w
 
 | | |
 |---|---|
-| the compiler compiling itself | **11 ms** for 6,487 lines, about **590,000 lines/second** |
-| full bootstrap from C to a fixed point | **270 ms** (`boot.c` → stage1 = stage2 = stage3) |
-| the whole test suite | **2.3 seconds**, 98 tests |
-| peak memory to compile the compiler | **2.9 MB** |
-| the compiler binary | **514 kB**, statically linked, no libc, no dynamic dependencies |
-| **50 compilers at once** | **130 ms** wall clock, all 50 succeeded, all 50 byte-identical |
+| the compiler compiling itself | **11 ms** for 6,582 lines, about **598,000 lines/second** |
+| a compiled binary starting | **156 µs**, about **6,400 starts/second** — no linker, no libc to initialise |
+| full bootstrap from C to a fixed point | **280 ms** (`boot.c` → stage1 = stage2 = stage3) |
+| the whole test suite | **2.1 seconds**, 107 tests |
+| peak memory to compile the compiler | **3.0 MB** |
+| the compiler binary | **526 kB**, statically linked, no libc, no dynamic dependencies |
+| **400 compilers at once** | **902 ms** wall clock, all 400 succeeded, all 400 byte-identical (50 take 113 ms, 100 take 235) |
 
-That last row is the one that matters for generated code. Fifty parallel agents, each
-compiling the whole compiler, finish in about a third of a second and together peak below
-**100 MB** — so the machine you already have is not the constraint on how many agents you
-run, and a compile is cheap enough to put inside the loop rather than at the end of it.
-Byte-identical output under that load is the other half: when fifty agents build the same
-source, any difference between their binaries is a real difference, never a race.
+That last row is the one that matters for generated code. Four hundred parallel
+compilations of the whole compiler, on six cores, finish in under a second — and the time
+grows in step with the number (50 → 113 ms, 100 → 235 ms, 400 → 902 ms), so nothing is
+contending. The machine you already have is not the constraint on how many agents you run,
+and a compile is cheap enough to put inside the loop rather than at the end of it.
+
+Byte-identical output under that load is the other half: when four hundred builds of the
+same source produce one distinct binary, any difference between two binaries is a real
+difference and never a race.
 
 **And it holds as the source grows**, which is the part a single number cannot tell you.
 Name lookup goes through a hash index, so compile time grows in step with the program
-rather than with the square of it: 2,048 globals take 3 ms, 4,096 take 5 ms, 8,192 take
-8 ms and 16,384 take 16 ms. Doubling the names doubles the time. That is what keeps a
+rather than with the square of it: 2,048 globals take 3 ms, 4,096 take 4 ms, 8,192 take
+6 ms and 16,384 take 10 ms. Doubling the names roughly doubles the time. That is what keeps a
 compile inside the loop on a large generated source instead of only on a small one.
 
-The rate does depend on what the source is made of, so treat one number as one shape of
-code. The compiler's own source — dense procedural code — compiles at about 590,000 lines
-a second; a program built largely from `schema` and `tools` declarations, which generate a
-great deal of code per line written, runs at roughly a third of that. Both are the same
-compiler on the same machine.
+The rate depends heavily on what the source is made of, so treat one number as one shape
+of code — and that caveat is larger than it sounds. Measured over three generated shapes,
+same compiler, same machine: dense procedural code runs at about **667,000 lines a
+second**, a program built largely from `schema` and `tools` declarations at about
+**67,000** — a tenth, because each line written generates a great deal of code — and a
+file that is mostly long string literals at about **41,000 lines** a second, which is
+nonetheless **163 MB** a second, because its lines are enormous.
+
+Lines per second spans a factor of sixteen across those shapes and megabytes per second a
+factor of eighty. Neither unit describes the compiler on its own, which is why
+`./wztest --bench` reports and guards a rate per shape rather than one headline figure.
 
 ## Why it is built this way
 

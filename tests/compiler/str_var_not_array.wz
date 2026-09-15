@@ -1,0 +1,21 @@
+// Must not compile: "a str variable is not an array of char; only a string literal
+// converts" -- the message names the distinction and gives the way out, instead of the
+// generic "this parameter needs an array".
+//
+// A string LITERAL does convert to array of char, a str VARIABLE does not. Four errors in
+// the log came from exactly that, and the generic message left the writer
+// to work out that a literal would have been accepted in the same position.
+//
+// tests/compiler/str_var_remedy.wz is the other half: the remedy this message suggests
+// has to compile, or the message is worse than nothing.
+include "kv.wz";
+var b: array[0..63] of char;
+    n: int;
+procedure look(key: str);
+begin
+  if kv.find(b, 0, n, key) then n := 1;
+end;
+begin
+  n := io.push(b, 0, "{\"a\":1}");
+  look("a");
+end.

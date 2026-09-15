@@ -40,6 +40,16 @@ timeit() {   # <source> -> milliseconds
 "$gen" globals 8192  "$T/g8192.wz"  >/dev/null || { echo "generating 8192 globals failed"; exit 1; }
 "$gen" globals 16384 "$T/g16384.wz" >/dev/null || { echo "generating 16384 globals failed"; exit 1; }
 
+# Compile both ONCE and check the result, before any timing. The check cannot live
+# inside timeit: that runs in $( ), where an `exit 1` ends only the command substitution
+# and the script carries on with an empty measurement -- the suite then reports ok on a
+# compile that never happened (found 15-09-2026 while building shapes.sh).
+for f in "$T/g8192.wz" "$T/g16384.wz"; do
+  "$WANTZEL" "$f" "$T/out.bin" >"$T/cerr" 2>&1 || {
+    echo "compiling $f failed -- timing a failed compile measures nothing:"
+    cat "$T/cerr"; exit 1; }
+done
+
 small=$(timeit "$T/g8192.wz")
 large=$(timeit "$T/g16384.wz")
 

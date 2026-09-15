@@ -1,2 +1,2 @@
 // Must not compile: "duplicate global declaration".
-program t; var i: int; i: char; begin end.
+var i: int; i: char; begin end.

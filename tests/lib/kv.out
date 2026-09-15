@@ -139,3 +139,29 @@ count {"a":{"b":1,"c":2}} -> 1
 count {"a":1, -> 0
 count  -> 0
 count {"a":1} tail -> 1
+cursor: find target = 1
+"kept"
+  isobject asked = 1
+"kept"
+  count asked = 3
+"kept"
+  match asked = 1
+"kept"
+  match failing = 0
+"kept"
+  match malformed filter = 0
+"kept"
+  isobject malformed = 0
+"kept"
+  count malformed = 0
+"kept"
+text s -> [dryer]
+text esc -> [a"b
+c]
+text num -> refused
+text obj -> refused
+text arr -> refused
+text nul -> refused
+text empty -> []
+text into tiny found = 1
+text into tiny = -1

@@ -1,4 +1,3 @@
 // Must stop at run time: "array index out of range", with exit status 1.
-program t;
 procedure p; var b: array[0..3] of char; i: int; begin i := 4; b[i] := chr(120); end;
 begin p; end.

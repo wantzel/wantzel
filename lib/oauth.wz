@@ -299,10 +299,25 @@ end;
 
 // ------------------------------------------------------------- registration
 
+// Dynamic client registration (RFC 7591).  The fields below the first three are declared
+// although nothing here reads them: an undeclared key is REFUSED, and
+// RFC 7591 lets a client send any of these as metadata. Without them a perfectly valid
+// registration came back as "invalid_client_metadata: redirect_uris is required", which
+// names the wrong cause. A protocol envelope declares what the protocol carries.
 schema ORegister = record
   redirect_uris: array[0..3] of text[256];
   client_name: text[64]?;
   token_endpoint_auth_method: text[32]?;
+  grant_types: json?;
+  response_types: json?;
+  scope: json?;
+  client_uri: json?;
+  logo_uri: json?;
+  contacts: json?;
+  tos_uri: json?;
+  policy_uri: json?;
+  software_id: json?;
+  software_version: json?;
 end;
 
 var

@@ -1,3 +1,3 @@
 // Must not compile: "parameter type differs from the forward declaration".
-program t; function f(a: int): int; forward;
+function f(a: int): int; forward;
 function f(a: char): int; begin return 1; end; begin end.

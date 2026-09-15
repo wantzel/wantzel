@@ -1,6 +1,5 @@
 // hello.wz -- the smallest useful Wantzel program
 
-program hello;
 
 const
   STDOUT = 1;

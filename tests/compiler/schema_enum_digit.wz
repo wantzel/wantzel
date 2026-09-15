@@ -1,0 +1,44 @@
+// A schema enum level may be a JSON value that starts with a digit ("1", "2").
+//
+// The generated constant is Reading.level.1, and the compiler used to be unable to
+// read its own generated source back: it failed with "<reading>:9: missing = in constant
+// declaration" -- a message naming the GENERATED file, which points a writer at something
+// they never wrote.  Levels like these come from an external schema and the writer cannot
+// choose them.
+include "io.wz";
+include "json.wz";
+schema Reading = record
+  level: text of ("1", "2", "high");
+  note:  text[16]?;
+end;
+var
+  r: Reading;
+  buf: array[0..127] of char;
+  src: array[0..63] of char;
+  n: int;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+begin
+  // the constants exist and count from zero in the order they were written
+  show("level.1 = ", Reading.level.1);
+  show("level.2 = ", Reading.level.2);
+  show("level.high = ", Reading.level.high);
+  // and they mean the same thing as the JSON value they came from
+  n := io.push(src, 0, "{\"level\":\"2\",\"note\":\"x\"}");
+  show("parse = ", Reading.parse(src, 0, n, r));
+  show("parsed level = ", r.level);
+  if r.level = Reading.level.2 then io.puts(STDOUT, "parsed level is level.2\n")
+  else io.puts(STDOUT, "parsed level is NOT level.2\n");
+  // an enum value outside the list gives -1 in the field, without an error
+  n := io.push(src, 0, "{\"level\":\"3\"}");
+  show("parse unknown = ", Reading.parse(src, 0, n, r));
+  show("unknown level field = ", r.level);
+  // writing it back gives the original text, not the number
+  r.level := Reading.level.1;
+  r.note_ok := false;
+  n := Reading.write(buf, 0, r, src);
+  if n < 0 then io.puts(STDOUT, "write refused\n")
+  else begin io.out(STDOUT, addr(buf[0]), n); io.puts(STDOUT, "\n"); end;
+end.

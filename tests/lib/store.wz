@@ -6,7 +6,6 @@
 // name.  With a fixed name two concurrent runs collided on the same files -- this suite
 // fell over while another one was running, and on its own the same test was always green.
 // A test that depends on someone else's timing is a bug, not noise.
-program t;
 include "store.wz";
 include "hash.wz";
 include "fs.wz";

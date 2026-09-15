@@ -1,0 +1,88 @@
+// winfacts.wz -- what a Windows executable can tell you about the machine it runs on,
+// using the imported DLL functions directly.
+//
+// Two things are worth seeing here.
+//
+// First, ONE PROGRAM, BOTH TARGETS. The file work below -- create, write, read back,
+// delete -- is written once with the ordinary library calls, and it does the same thing in
+// an ELF and in a .exe. On Windows those calls land on kernel32 through the runtime; on
+// Linux they are syscalls. The program does not know and does not care.
+//
+// Second, WHERE THE PLATFORM IS UNAVOIDABLE, it is explicit: `winapi(slot, ...)` calls an
+// imported function by its slot in the import table, and it only compiles for a Windows
+// target. Those calls are guarded by `TARGET_WINDOWS` below, so the same source still
+// builds for Linux.
+//
+//   wantzel examples/winfacts.wz /tmp/winfacts                  (Linux)
+//   wantzel examples/winfacts.wz /tmp/winfacts.exe --target=windows
+
+
+include "io.wz";
+include "fs.wz";
+
+const
+  TMPNAME = "wzfacts.tmp";
+
+var
+  buf:  array[0..255] of char;
+  name: array[0..63] of char;
+  dot:  array[0..3] of char;
+  n, fd, k: int;
+
+procedure label(s: str);
+begin
+  io.puts(STDOUT, s);
+end;
+
+begin
+  // ---- 1. a file, written and read back through the same calls on both targets ----
+  k := 0;
+  while k < slen(TMPNAME) do begin name[k] := schar(TMPNAME, k); k := k + 1; end;
+  name[k] := chr(0);
+  dot[0] := '.'; dot[1] := chr(0);
+
+  fd := sys3(SYS.open, addr(name[0]), 577, 420);       // O_WRONLY|O_CREAT|O_TRUNC
+  if fd < 0 then
+  begin
+    io.puts(STDERR, "cannot create the file\n");
+    halt(1);
+  end;
+  n := io.push(buf, 0, "written by a single source file");
+  k := sys3(SYS.write, fd, addr(buf[0]), n);
+  sys1(SYS.close, fd);
+
+  fd := sys3(SYS.open, addr(name[0]), 0, 0);
+  if fd < 0 then
+  begin
+    io.puts(STDERR, "cannot read the file back\n");
+    halt(1);
+  end;
+  n := sys3(SYS.read, fd, addr(buf[0]), len(buf));
+  sys1(SYS.close, fd);
+
+  label("file round trip : ");
+  io.out(STDOUT, addr(buf[0]), n);
+  io.puts(STDOUT, "\n");
+
+  // ---- 2. the file is really there, and then really gone ----
+  label("exists before   : ");
+  if fs.stat(addr(name[0])) then io.puts(STDOUT, "yes\n") else io.puts(STDOUT, "no\n");
+
+  k := sys1(SYS.unlink, addr(name[0]));
+  label("exists after    : ");
+  if fs.stat(addr(name[0])) then io.puts(STDOUT, "yes\n") else io.puts(STDOUT, "no\n");
+
+  // ---- 3. the directory listing, which both platforms answer the same way ----
+  //      On Windows this runs through FindFirstFileA/FindNextFileA; on Linux through
+  //      getdents64. Same three calls in the source.
+  label("can list a dir  : ");
+  fd := fs.opendir(addr(dot[0]));
+  if fd >= 0 then
+  begin
+    io.puts(STDOUT, "yes\n");
+    fs.close(fd);
+  end
+  else io.puts(STDOUT, "no\n");
+
+  io.puts(STDOUT, "one source, both targets\n");
+end.

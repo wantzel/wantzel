@@ -1,0 +1,82 @@
+// lib/store.wz: a log record whose length differs from the declared record size must
+// STOP the replay and make store.opendir refuse, naming the table and both sizes.
+//
+// store.apply used to skip such a record without a word, and replay counted
+// it as applied: the directory opened with zero live rows and a log that was reported as
+// fully consumed, after which the next write mixed two layouts in one log.  That is
+// silent data loss on every change to a record layout, so the test asserts the REFUSAL
+// and the detail beside it, not just that something went wrong.
+//
+// The working directory carries the process id, like tests/lib/store.wz, so two runs
+// never share a file.
+include "store.wz";
+var
+  tab, i, n, row: int;
+  dir: array[0..31] of char;
+  dirn: int;
+  path: array[0..63] of char;
+  rec: array[0..23] of char;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+function inwork(suffix: str): int;
+var n: int;
+begin
+  for n := 0 to dirn - 1 do path[n] := dir[n];
+  n := io.push(path, dirn, "/");
+  n := io.push(path, n, suffix);
+  path[n] := chr(0);
+  return n;
+end;
+procedure reason;
+begin
+  io.puts(STDOUT, store.err);
+  if store.detn > 0 then
+  begin
+    io.puts(STDOUT, ": ");
+    io.out(STDOUT, addr(store.det[0]), store.detn);
+  end;
+  io.puts(STDOUT, "\n");
+end;
+begin
+  dirn := io.push(dir, 0, "st_mis_");
+  dirn := io.pushnum(dir, dirn, sys1(SYS.getpid, 0));
+  dirn := io.push(dir, dirn, ".d");
+  n := inwork("store.log"); sys1(SYS.unlink, addr(path[0]));
+  n := inwork("store.snap"); sys1(SYS.unlink, addr(path[0]));
+
+  // ten rows of 16 bytes through the log, no snapshot
+  tab := store.table("readings", 16, 100);
+  if not store.opendir(dir[0..dirn - 1]) then begin reason; halt(1); end;
+  for i := 0 to 9 do
+  begin
+    row := store.alloc(tab);
+    for n := 0 to 15 do rec[n] := chr(band(i * 31 + n, 255));
+    if not store.set(tab, row, rec[0..15]) then begin reason; halt(1); end;
+  end;
+  show("wrote = ", store.count(tab));
+  store.close;
+
+  // the same directory, one field wider: 24 instead of 16
+  tab := store.table("readings", 24, 100);
+  if store.opendir(dir[0..dirn - 1]) then
+  begin
+    show("opened anyway, live rows = ", store.count(tab));
+    halt(1);
+  end;
+  io.puts(STDOUT, "refused: "); reason;
+  store.close;
+
+  // and the old layout still opens and still sees its ten rows: nothing was written
+  // over, and the log was not truncated behind our back
+  tab := store.table("readings", 16, 100);
+  if not store.opendir(dir[0..dirn - 1]) then begin reason; halt(1); end;
+  show("old layout still reads = ", store.count(tab));
+  store.close;
+
+  n := inwork("store.log"); sys1(SYS.unlink, addr(path[0]));
+  for n := 0 to dirn - 1 do path[n] := dir[n];
+  path[dirn] := chr(0);
+  show("rmdir = ", sys1(SYS.rmdir, addr(path[0])));
+end.

@@ -1,2 +1,2 @@
 // Must not compile: "missing . after the final end".
-program t; begin end
+begin end

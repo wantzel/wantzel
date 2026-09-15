@@ -1,0 +1,10 @@
+parsed = 1
+header Accept -> [text/html]
+header Cookie -> [sid=abc]
+header X-Forwarded-Proto -> [https]
+header accept -> [text/html]
+header cookie -> [sid=abc]
+header x-forwarded-proto -> [https]
+header Referer -> absent
+bearer = 1
+token = [tok123]

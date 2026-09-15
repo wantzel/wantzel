@@ -14,7 +14,6 @@ mkdir -p "$T/alone"
 cp "$WANTZEL" "$T/alone/wantzel"
 
 cat > "$T/alone/p.wz" <<'EOF'
-program standalone;
 include "io.wz";
 include "json.wz";
 include "math.wz";
@@ -48,7 +47,6 @@ cat > "$T/alone/sub/helper.wz" <<'EOF'
 const HELPER_MARK = 42;
 EOF
 cat > "$T/alone/q.wz" <<'EOF'
-program pathinclude;
 include "io.wz";
 include "sub/helper.wz";
 begin

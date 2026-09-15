@@ -24,11 +24,9 @@ end;
 // days in month m of year y; 0 for a month outside 1..12
 function time.daysin(y, m: int): int;
 begin
-  case m of
-    1, 3, 5, 7, 8, 10, 12: return 31;
-    4, 6, 9, 11: return 30;
-    2: if time.leap(y) then return 29 else return 28;
-  end;
+  if (m = 1) or (m = 3) or (m = 5) or (m = 7) or (m = 8) or (m = 10) or (m = 12) then return 31
+  else if (m = 4) or (m = 6) or (m = 9) or (m = 11) then return 30
+  else if m = 2 then begin if time.leap(y) then return 29 else return 28; end;
   return 0;
 end;
 

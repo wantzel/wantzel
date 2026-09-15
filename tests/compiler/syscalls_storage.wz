@@ -1,7 +1,6 @@
 // The storage system calls, identical on Linux and Windows: files that are
 // created, appended, truncated, renamed and deleted; fsync; lseek; anonymous
 // and file-backed mmap through view(); flock; getrandom; the realtime clock.
-program t;
 include "io.wz";
 var
   name1, name2, dirn: array[0..31] of char;

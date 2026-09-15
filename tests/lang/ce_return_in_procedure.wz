@@ -1,2 +1,2 @@
 // Must not compile: "a procedure cannot return a value".
-program t; procedure p; begin return 1; end; begin end.
+procedure p; begin return 1; end; begin end.

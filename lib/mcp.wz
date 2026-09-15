@@ -32,14 +32,26 @@ schema Rpc = record
   params:  json?;
 end;
 
-// enough of the initialize parameters to echo the client's protocol version
+// enough of the initialize parameters to echo the client's protocol version.
+//
+// capabilities and clientInfo are declared although nothing here reads them, because an
+// undeclared key is REFUSED and every real client sends both. Leaving
+// them out made Init.parse return -1 for every genuine handshake, after which the version
+// the client asked for was silently ignored and the server answered with the oldest one
+// -- a wrong answer that refused nothing, which is the failure this language exists to
+// prevent. A protocol envelope has to declare what the protocol actually carries.
 schema Init = record
   protocolVersion: text?;
+  capabilities:    json?;
+  clientInfo:      json?;
 end;
 
+// tools/call parameters.  _meta is part of the MCP request shape (progress tokens live
+// there), so it is declared for the same reason as the Init fields above.
 schema Call = record
   name:      text;
   arguments: json?;
+  _meta:     json?;
 end;
 
 var
@@ -284,9 +296,13 @@ begin
     mcp.add("{\"protocolVersion\":");
     mcp.addq(mcp.pv);
     mcp.add(",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":");
-    mcp.addq(mcp.name);
+    // A server that never set these still has to answer something: an empty name in the
+    // handshake is a reply a client cannot use, and an unset one used to be a
+    // segfault on the FIRST request. The application overrides both; these are what it
+    // gets for free.
+    if slen(mcp.name) = 0 then mcp.addq("wantzel-mcp") else mcp.addq(mcp.name);
     mcp.add(",\"version\":");
-    mcp.addq(mcp.version);
+    if slen(mcp.version) = 0 then mcp.addq("0") else mcp.addq(mcp.version);
     mcp.add("}}");
     mcp.end_result;
     return mcp.wp;

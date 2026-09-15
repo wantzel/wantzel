@@ -20,7 +20,6 @@
 // The contract pinned here: the position that comes back never exceeds len(b), and it
 // stays usable, so a chain of pushes on a full buffer keeps returning len(b) instead of
 // running off the end.
-program io_push_bounds_t;
 include "json.wz";
 var small: array[0..7] of char;      // deliberately too small
     big:    array[0..63] of char;

@@ -16,9 +16,30 @@
 //
 // The caller supplies the prefix its REST routes live under (tool.rest uses the same
 // one) and the title; everything else comes out of the declarations.
+//
+// WHAT THE CALLER MUST PROVIDE, because none of it comes from here:
+//
+//   a `tools` block before this include   -- oapi.spec reads the tool.list the compiler
+//                                            bakes from it
+//   oauth.issuer / oauth.issuern          -- the server URL in the document (lib/oauth.wz
+//                                            is included below for it)
+//   function app.worthshowing(nat, nend): bool   -- is this property worth an example?
+//   function app.exarray(nat, nend): bool        -- fill a list example from your own
+//   function app.exstring(nat, nend): bool         vocabulary; return false for the
+//                                                  library's generic one
+//
+// The three app.* routines carry DOMAIN knowledge, which is why they are the
+// application's and not this file's. Returning false from all three is a valid answer
+// and gives the generic examples.
+//
+// They were not written down here until 15-09-2026, and oauth.wz was not included at
+// all, so this file only compiled when the caller happened to include it first -- and
+// found out through three "forward declared routine is never defined" messages pointing
+// deep into the library.
 
 include "json.wz";
 include "http.wz";
+include "oauth.wz";
 
 const
   OAPI.MAXTOOLS = 256;
@@ -564,7 +585,7 @@ begin
       if oapi.sub(oapi.vat, oapi.vend, "readOnlyHint") then
         if oapi.vend - oapi.vat = 4 then ro := true;
     http.add(",\"tags\":[\"");
-    if ro then http.add("lezen") else http.add("schrijven");
+    if ro then http.add("read") else http.add("write");
     http.add("\"],\"requestBody\":{\"required\":true,\"content\":{\"application/json\":{\"schema\":");
     if oapi.field(oapi.at[t], "inputSchema") then
     begin

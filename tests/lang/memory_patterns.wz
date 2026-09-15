@@ -1,7 +1,6 @@
 // The examples of docs/memory.md, executed: list with a counter, text arena with
 // slices, index-linked nodes with a free list, a hash table on two arrays, view,
 // anonymous and file-backed mmap, and a record table as a file format.
-program t;
 include "io.wz";
 const
   MAXITEMS = 1000;

@@ -7,7 +7,6 @@
 // tools/list text (with JSON Schemas), the argument parsers, the dispatch
 // and the result writers.  The program only writes the handlers.
 
-program mcptools;
 
 include "mcphttp.wz";
 

@@ -5,7 +5,6 @@
 // alpha (line 9) and gamma (line 11) are never defined; beta is, and must NOT be
 // reported.  The line numbers are the declarations themselves, not the line after them
 // and not the end of the program.
-program t;
 procedure alpha; forward;
 procedure beta; forward;
 procedure gamma; forward;

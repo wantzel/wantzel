@@ -1,5 +1,4 @@
 // schema v2: real fields, arrays of int/real/bool/text[N], text[N] copies, null, optional, write, jsonschema.
-program t;
 include "io.wz";
 include "json.wz";
 
@@ -27,7 +26,7 @@ begin
   n := io.push(doc, 0, t);
 end;
 begin
-  load("{\"name\":\"probe\\n1\",\"value\":2.5,\"points\":[1, 2.25, -3e2, 0.125],\"keys\":[\"a\",\"bc\",\"d\\u00e9f\"],\"flags\":[true,false],\"count\":null,\"extra\":{\"x\":[1,2]}}");
+  load("{\"name\":\"probe\\n1\",\"value\":2.5,\"points\":[1, 2.25, -3e2, 0.125],\"keys\":[\"a\",\"bc\",\"d\\u00e9f\"],\"flags\":[true,false],\"count\":null}");
   r := Sample.parse(doc, 0, n, s);
   show("parse = ", r);
   show("name_n = ", s.name_n);
@@ -61,5 +60,12 @@ begin
   show("name too long = ", Sample.parse(doc, 0, n, s));
   load("{\"name\":\"x\",\"value\":\"1.0\",\"points\":[],\"keys\":[]}");
   show("string for real = ", Sample.parse(doc, 0, n, s));
+  // An undeclared key is refused rather than skipped, whatever it holds --
+  // this one carries a nested object, which the old skipper walked over in silence
+  load("{\"name\":\"x\",\"value\":1.0,\"points\":[],\"keys\":[],\"extra\":{\"x\":[1,2]}}");
+  show("undeclared key = ", Sample.parse(doc, 0, n, s));
+  io.puts(STDOUT, "  refused key = ");
+  io.out(STDOUT, addr(doc[json.badkey0]), json.badkey1 - json.badkey0);
+  io.puts(STDOUT, "\n");
   io.puts(STDOUT, Sample.jsonschema); io.puts(STDOUT, "\n");
 end.

@@ -11,7 +11,6 @@
 // The kinds match the limits being proved; limits.sh passes the number that just fits
 // and the one that just does not, so the knowledge of what the limit IS stays there.
 
-program gen;
 
 include "io.wz";
 
@@ -123,7 +122,7 @@ begin
   begin
     // a,b,c,... like the Python this replaces: byte-identical output matters, so the
     // comparison in limits_gen.sh can be a plain cmp rather than a judgement.
-    put("program t; procedure p(");
+    put("procedure p(");
     i := 0;
     while i < n do
     begin
@@ -138,7 +137,7 @@ begin
   // One identifier of exactly n bytes, declared and assigned.
   else if iskind("ident") then
   begin
-    put("program t; var ");
+    put("var ");
     putrep('a', n);
     put(": int; begin ");
     putrep('a', n);
@@ -148,7 +147,7 @@ begin
   // One string literal of exactly n bytes.
   else if iskind("strlit") then
   begin
-    put("program t; var s: str; begin s := \"");
+    put("var s: str; begin s := \"");
     putrep('x', n);
     put("\"; end.\n");
   end
@@ -156,7 +155,7 @@ begin
   // n globals.
   else if iskind("globals") then
   begin
-    put("program t;\nvar\n");
+    put("var\n");
     i := 0;
     while i < n do begin put("g"); putn(i); put(": int;\n"); i := i + 1; end;
     put("begin end.\n");
@@ -165,7 +164,7 @@ begin
   // n locals in one routine.
   else if iskind("locals") then
   begin
-    put("program t;\nprocedure p;\nvar\n");
+    put("procedure p;\nvar\n");
     i := 0;
     while i < n do begin put("l"); putn(i); put(": int;\n"); i := i + 1; end;
     put("begin end;\nbegin p; end.\n");
@@ -174,7 +173,6 @@ begin
   // n routines.
   else if iskind("routines") then
   begin
-    put("program t;\n");
     i := 0;
     while i < n do begin put("procedure p"); putn(i); put("; begin end;\n"); i := i + 1; end;
     put("begin end.\n");
@@ -183,7 +181,7 @@ begin
   // n names in a single record field declaration.
   else if iskind("fields") then
   begin
-    put("program t;\ntype R = record ");
+    put("type R = record ");
     i := 0;
     while i < n do
     begin
@@ -201,7 +199,7 @@ begin
   // n optional fields in one schema.
   else if iskind("schemafields") then
   begin
-    put("program t;\n"); putinclude;
+    putinclude;
     put("schema S = record\n");
     i := 0;
     while i < n do begin put("f"); putn(i); put(": int?;\n"); i := i + 1; end;
@@ -211,7 +209,7 @@ begin
   // n schemas.
   else if iskind("schemas") then
   begin
-    put("program t;\n"); putinclude;
+    putinclude;
     i := 0;
     while i < n do begin put("schema S"); putn(i); put(" = record a: int; end;\n"); i := i + 1; end;
     put("begin end.\n");
@@ -220,7 +218,7 @@ begin
   // n tools, each with the handler it needs.
   else if iskind("tools") then
   begin
-    put("program t;\n"); putinclude;
+    putinclude;
     put("schema S = record a: int; end;\ntools\n");
     i := 0;
     while i < n do begin put("t"); putn(i); put("(S): S \"d\";\n"); i := i + 1; end;
@@ -239,7 +237,7 @@ begin
   // handlers can matter.
   else if iskind("toolsonly") then
   begin
-    put("program t;\n"); putinclude;
+    putinclude;
     put("schema S = record a: int; end;\ntools\n");
     i := 0;
     while i < n do begin put("t"); putn(i); put("(S): S \"d\";\n"); i := i + 1; end;
@@ -251,7 +249,7 @@ begin
   // count limits.sh passes is what decides whether the segment still has room.
   else if iskind("datseg") then
   begin
-    put("program t;\nvar s: str;\nbegin\n");
+    put("var s: str;\nbegin\n");
     i := 0;
     while i < n do
     begin
@@ -266,7 +264,7 @@ begin
   // A static array of n bytes, with the last element touched.
   else if iskind("bss") then
   begin
-    put("program t;\nvar big: array[0..");
+    put("var big: array[0..");
     putn(n - 1);
     put("] of char;\nbegin big[len(big)-1] := chr(1); end.\n");
   end
@@ -274,7 +272,7 @@ begin
   // Recursion to depth n.
   else if iskind("recurse") then
   begin
-    put("program t;\nfunction d(n: int): int; var a, b, c: int; begin if n = 0 then return 0; return d(n - 1) + 1; end;\nbegin if d(");
+    put("function d(n: int): int; var a, b, c: int; begin if n = 0 then return 0; return d(n - 1) + 1; end;\nbegin if d(");
     putn(n);
     put(") = ");
     putn(n);
