@@ -50,13 +50,13 @@ end.
 WZ
 
 compile_win "$T/gpa.wz" "$T/gpa.exe"
-got=$(cd "$T" && "$ROOT/bootstrap/tools/runexe.sh" "$T/gpa.exe" 2>/dev/null)
+got=$(cd "$T" && run_win "$T/gpa.exe" 2>/dev/null)
 assert_eq "a named import is callable and returns a real address" "$got" "address
 missing is zero
 stable"
 
 # The other half: a name that does NOT exist must fail, and fail READABLY. Wine reports it
-# on stderr and exits non-zero -- no dialog, because runexe.sh disables winedbg. Without
+# on stderr and exits non-zero -- no dialog, because run_win disables winedbg. Without
 # that, this failure opens a window and hangs until the timeout, and the exit status tells
 # you nothing.
 #
@@ -68,7 +68,7 @@ begin
 end.
 WZ
 compile_win "$T/bad.wz" "$T/bad.exe"
-if (cd "$T" && "$ROOT/bootstrap/tools/runexe.sh" "$T/bad.exe" >/dev/null 2>"$T/bad.err"); then
+if (cd "$T" && run_win "$T/bad.exe" >/dev/null 2>"$T/bad.err"); then
   echo "calling a function that does not exist SUCCEEDED; the import is not really being called"
   exit 1
 fi

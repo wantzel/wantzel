@@ -47,4 +47,27 @@ begin p := winproc(f); end.
 '
 both "winproc on a bad name"   'program t; var p: int; begin p := winproc(nope); end.
 '
+
+# A COMPILE-TIME REFUSAL, which is the class that slipped through once and is the reason
+# this file matters. A check that lands in only one of the two gives a self-hosted compiler
+# that refuses a program and a C bootstrap that accepts it -- and the fixed point still
+# reports success, because both compilers still build themselves. Measured 16-09-2026: that
+# is exactly what happened, because boot.c has TWO functions that parse an index and the
+# check went into the wrong one.
+both "a constant index out of range" 'var a: array[0..3] of char;
+begin a[9] := chr(65); end.
+'
+both "a constant index below the lower bound" 'var a: array[5..9] of int;
+begin a[4] := 1; end.
+'
+both "a named constant out of range" 'const K = 12;
+var a: array[0..3] of char;
+begin a[K] := chr(65); end.
+'
+# And the other half: an index that is FINE must be accepted by both, byte for byte. A
+# check that is too eager in one compiler and absent in the other is the same bug wearing
+# the opposite face.
+both "a constant index in range" 'var a: array[5..9] of int;
+begin a[5] := 1; a[9] := 2; end.
+'
 echo "  both compilers agree on every case"

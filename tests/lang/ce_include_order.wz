@@ -1,0 +1,11 @@
+// Must not compile -- but the message should point at the include order, not at a typo.
+//
+// model.zet exists; it is declared in the include at the bottom of this file, which the
+// compiler has not read yet when it reaches line 8. Measured over the error log, six of
+// nine "undeclared identifier" cases were exactly this and none was a misspelling.
+procedure gebruik;
+begin
+  model.zet;
+end;
+include "progs/declared_later.wz";
+begin gebruik; end.

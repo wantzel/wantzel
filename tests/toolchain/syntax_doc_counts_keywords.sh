@@ -10,8 +10,14 @@
 # the compiler and never reads the prose, because a number written out in a sentence is
 # not wired to anything. This is that wire.
 #
-# The list is checked against src/wantzel.wz rather than against a number kept here, so
+# The list is checked against $WZSRC rather than against a number kept here, so
 # removing a keyword means editing the compiler and the page -- never this test.
+# THE COMPILER IS TWO FILES SINCE 17-09-2026: compiler.wz holds everything and has no
+# main program, so it can be included; wantzel.wz is the command-line program around it
+# A scan that reads only one of them finds nothing and reports a rename
+# that never happened -- which is exactly what this test said when the split landed.
+WZSRC="src/compiler.wz src/wantzel.wz"
+
 . "$ROOT/tests/helpers.sh"
 cd "$ROOT"
 
@@ -20,8 +26,8 @@ doc=docs/syntax.md
 
 # The keyword table in the compiler is the truth. Every keyword has a KW_ constant, so
 # counting those counts the language's vocabulary.
-actual=$(grep -oE "KW_[A-Z0-9]+ *=" src/wantzel.wz | sed 's/KW_//; s/ *=//' | sort -u | wc -l)
-[ "$actual" -gt 0 ] || { echo "no KW_ constants found in src/wantzel.wz -- have they been renamed?"; exit 1; }
+actual=$(grep -hoE "KW_[A-Z0-9]+ *=" $WZSRC | sed 's/KW_//; s/ *=//' | sort -u | wc -l)
+[ "$actual" -gt 0 ] || { echo "no KW_ constants found in $WZSRC -- have they been renamed?"; exit 1; }
 
 # The words printed on the page, taken from the fenced block under the heading.
 listed=$(awk '/^## The .* keywords$/ { found = 1; next }
@@ -34,8 +40,8 @@ assert_eq "docs/syntax.md lists as many keywords as the compiler has" "$listed_n
 # Every listed word must really be a keyword, so a typo cannot pad the list back to the
 # right length.
 for w in $listed; do
-  grep -qiE "KW_$(echo "$w" | tr 'a-z' 'A-Z') *=" src/wantzel.wz || {
-    echo "docs/syntax.md lists '$w', which is not a keyword in src/wantzel.wz"
+  grep -qiE "KW_$(echo "$w" | tr 'a-z' 'A-Z') *=" $WZSRC || {
+    echo "docs/syntax.md lists '$w', which is not a keyword in $WZSRC"
     exit 1
   }
 done

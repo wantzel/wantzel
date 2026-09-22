@@ -1,7 +1,7 @@
 {
   "name": "wantzel",
   "displayName": "Wantzel",
-  "description": "The Wantzel language (.wz): highlighting, compile errors in the Problems panel, build and run, and snippets",
+  "description": "The Wantzel language (.wz): highlighting, compile errors in the Problems panel, build and run",
   "version": "0.2.0",
   "publisher": "wantzel",
   "license": "MIT",
@@ -50,12 +50,6 @@
           "line": 2,
           "message": 3
         }
-      }
-    ],
-    "snippets": [
-      {
-        "language": "wantzel",
-        "path": "./snippets/wantzel.json"
       }
     ],
     "commands": [

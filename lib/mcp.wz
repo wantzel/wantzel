@@ -13,7 +13,12 @@
 include "json.wz";
 
 const
-  MCPBUF = 1048576;           // a tools/list with hundreds of tools must fit
+  // BIG ENOUGH FOR THE WORST CASE AND NOT FOR THE TYPICAL ONE. A reply carries text as a
+  // JSON string, and escaping can multiply a byte by SIX (\u00XX for a control byte). So a
+  // 256 kB file answered verbatim needs 1.5 MB of room, and the old 1 MB overflowed on
+  // input that is unusual but entirely legal. 4 MB covers 256 kB at the worst rate with
+  // the envelope to spare; it is a static array, so it costs address space and not work.
+  MCPBUF = 4194304;
 
   RPC.parse_error      = 0 - 32700;
   RPC.invalid_request  = 0 - 32600;
@@ -21,7 +26,7 @@ const
   RPC.invalid_params   = 0 - 32602;
   RPC.internal_error   = 0 - 32603;
 
-schema Rpc = record
+type Rpc = schema
   jsonrpc: text;
   id:      json?;                 // a number or a string; echoed verbatim
   method:  text of ("initialize", "notifications/initialized", "tools/list",
@@ -40,7 +45,7 @@ end;
 // the client asked for was silently ignored and the server answered with the oldest one
 // -- a wrong answer that refused nothing, which is the failure this language exists to
 // prevent. A protocol envelope has to declare what the protocol actually carries.
-schema Init = record
+type Init = schema
   protocolVersion: text?;
   capabilities:    json?;
   clientInfo:      json?;
@@ -48,7 +53,7 @@ end;
 
 // tools/call parameters.  _meta is part of the MCP request shape (progress tokens live
 // there), so it is declared for the same reason as the Init fields above.
-schema Call = record
+type Call = schema
   name:      text;
   arguments: json?;
   _meta:     json?;
@@ -395,6 +400,21 @@ begin
       end;
       mcp.inlen := n;
     end;
-    if mcp.inlen >= MCPBUF then return;
+    // A LINE THAT FILLS THE BUFFER USED TO END THE SERVER SILENTLY, and a client then waits
+    // for a reply that will never come -- the worst failure this transport can have, because
+    // nothing says anything is wrong. Answer with a parse error instead and drop the line:
+    // the connection stays usable, and the caller learns what happened.
+    if mcp.inlen >= MCPBUF then
+    begin
+      mcp.wp := 0;
+      mcp.hasid := false;
+      mcp.error(mcp.in, RPC.parse_error, "a single line exceeded the input buffer and was discarded");
+      if mcp.wp > 0 then
+      begin
+        mcp.buf[mcp.wp] := chr(10);
+        io.out(STDOUT, addr(mcp.buf[0]), mcp.wp + 1);
+      end;
+      mcp.inlen := 0;
+    end;
   end;
 end;

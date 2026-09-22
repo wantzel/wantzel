@@ -15,6 +15,6 @@
 elf=$(cd "$T" && ./wf)
 
 compile_win "$ROOT/examples/winfacts.wz" "$T/wf.exe"
-exe=$(cd "$T" && "$ROOT/bootstrap/tools/runexe.sh" "$T/wf.exe" 2>/dev/null)
+exe=$(cd "$T" && run_win "$T/wf.exe" 2>/dev/null)
 
 assert_eq "the exe prints what the ELF prints" "$exe" "$elf"

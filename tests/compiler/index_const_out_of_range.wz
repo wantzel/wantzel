@@ -1,0 +1,10 @@
+// A constant index outside the array's bounds is a COMPILE error, not a runtime one.
+//
+// The bound and the index are both known while the line is being read, so the compiler
+// can say so without the program ever running -- which for a language built so an agent
+// can fix its own mistake from the message is the difference between one round and two.
+var a: array[0..3] of char;
+
+begin
+  a[9] := 'x';
+end.

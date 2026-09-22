@@ -1,0 +1,6 @@
+// Included by ce_include_order.wz, AFTER the point that uses model.zet.
+var model.waarde: int;
+procedure model.zet;
+begin
+  model.waarde := 1;
+end;

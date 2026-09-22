@@ -96,7 +96,7 @@
         },
         {
           "name": "keyword.declaration.wantzel",
-          "match": "(?i)\\b(procedure|function|forward|include|schema|winapi|winproc|const|begin|tools|type|var|end)\\b"
+          "match": "(?i)\\b(procedure|function|forward|include|schema|winapi|winproc|const|begin|local|tools|type|var|end)\\b"
         },
         {
           "name": "constant.language.wantzel",

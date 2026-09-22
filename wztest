@@ -136,6 +136,20 @@ for f in $list; do
       # happens to be run from.
       if (cd "$dir" && "$WANTZEL" "$(basename "$f")" "$T/prog") >"$T/cerr" 2>&1; then
         bad "$f" "compiled, but should have failed"
+      elif [ $update -eq 1 ]; then
+        # --update WORKS ON .err TOO, and it is the kind of test that needs it most: an
+        # .err file contains a line number by definition -- that is what it tests -- so
+        # every language change that adds or removes a line shifts all of them. Updating
+        # those by hand means copying the new output without reading it, which tests that
+        # the compiler does what it does rather than what it should.
+        #
+        # THE "wantzel: " PREFIX IS STRIPPED because the comparison above is a SUBSTRING
+        # match (grep -F) against the whole message. Leaving the prefix in would still
+        # pass, but it would quietly turn every one of these into a test of the prefix as
+        # well, and a later change to how errors are introduced would fail all of them at
+        # once for no reason.
+        sed 's|^wantzel: ||' "$T/cerr" > "$base.err"
+        updated=$((updated+1)); printf '  upd   %s\n' "$f"
       elif grep -qF "$(cat "$base.err")" "$T/cerr"; then ok "$f"
       else bad "$f" "expected: $(cat "$base.err")
 got: $(limit <"$T/cerr")"; fi
@@ -185,7 +199,7 @@ if [ $toolchain -eq 1 ]; then
 fi
 
 echo
-if [ $updated -gt 0 ]; then echo "$updated .out files updated; check the diff with git"; fi
+if [ $updated -gt 0 ]; then echo "$updated expected-output files updated; check the diff with git"; fi
 if [ $toolchain -eq 0 ]; then echo "(the toolchain tests were not run; use --toolchain)"; fi
 printf '%d passed, %d failed, %d skipped\n' $pass $fail $skip
 [ $fail -eq 0 ] || { printf 'failed:%s\n' "$failed"; exit 1; }

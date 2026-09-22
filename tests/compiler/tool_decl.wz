@@ -2,10 +2,10 @@
 // declarations and tool.byname/tool.run exist without any transport included.
 include "io.wz";
 include "json.wz";
-schema In = record
+type In = schema
   n: int;
 end;
-schema Out = record
+type Out = schema
   twice: int;
   label: text[8];
 end;

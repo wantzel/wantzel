@@ -10,20 +10,20 @@
 include "oauth.wz";
 include "mcphttp.wz";
 
-schema AddArgs = record
+type AddArgs = schema
   a: int "first term";
   b: int "second term";
 end;
 
-schema AddResult = record
+type AddResult = schema
   sum: int;
 end;
 
-schema GreetArgs = record
+type GreetArgs = schema
   name: text[64] "who to greet";
 end;
 
-schema GreetResult = record
+type GreetResult = schema
   greeting: text[256];
 end;
 

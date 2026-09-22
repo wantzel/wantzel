@@ -102,6 +102,7 @@
 #define KW_FOR       138
 #define KW_TO        139
 #define KW_DOWNTO    140
+#define KW_LOCAL     141
 #define KW_TOOLS     142
 
 /* symbol kinds */
@@ -149,6 +150,8 @@ char dat[DATMAX];    long datlen;
 char names[NAMEMAX]; long namelen;
 char tbuf[TBMAX];
 char obuf[TBMAX];
+char nearbuf[TBMAX];   /* the nearest declared name, for a typo hint */
+long nearbufn;
 char mbuf[512]; long mlen;
 /* The fixed heading per kind of runtime check, stored once instead of once per check. */
 long tphoff[16]; long tphlen[16]; char *tphtxt[16]; long ntph;
@@ -162,6 +165,10 @@ long garr[MAXG], glo[MAXG], ghi[MAXG];
    their own index because they are looked up separately.  Entries are only ever
    added -- ngl and nfn never shrink -- so a chain never has to be unlinked. */
 long ghead[NHASH], gnext[MAXG];
+/* Visibility per file: -1 is public and that is the default, so existing source compiles
+   unchanged.  A file index means the name is only visible in that file. */
+long gfile[MAXG];
+long declloc;
 long fhead[NHASH], fnext[MAXF];
 long hashed = 0;
 long ngl, bsslen;
@@ -170,6 +177,7 @@ long ngl, bsslen;
 long fnam[MAXF], frtyp[MAXF], fnpar[MAXF], fptyp[MAXF*MAXP];
 long fadr[MAXF], fdef[MAXF], fline[MAXF], fnreg[MAXF], fparr[MAXF*MAXP];
 long ffile[MAXF];   /* the file a forward declaration stood in */
+long fvis[MAXF];    /* visibility: -1 is public, the default */
 long nfn;
 
 /* record types and their fields */
@@ -204,6 +212,15 @@ char pathbuf[1024];
 /* Where the compiler looks for its library, plus the identity of every file read in
    (st_dev + st_ino from stat(2)).  Counterpart of src/wantzel.wz. */
 char libdir[1024]; long libdirlen;
+/* the name of the type being declared, before it is known whether it is a record or a
+   schema -- see decltypes. Counterpart of tnamebuf in src/wantzel.wz. */
+char tnamebuf[64];
+/* the compiler's own path, read from /proc/self/exe -- see setlibdir */
+char selfbuf[1024];
+/* the lib/ path tried for a bare include name: the fallback overwrites pathbuf with the
+   relative name, so it is kept here for the error message.  Counterpart of
+   src/wantzel.wz:triedlib. */
+char triedlib[1024]; long triedlibn;
 char stbuf[144];
 long fdev[1024]; long fino[1024];
 
@@ -358,6 +375,9 @@ long keyword(){
         if(eqt("if")){ return KW_IF; }
         if(eqt("int")){ return KW_INT; }
         if(eqt("include")){ return KW_INCLUDE; }
+    }
+    if(c == 108){
+        if(eqt("local")){ return KW_LOCAL; }
     }
     if(c == 109){
         if(eqt("mod")){ return KW_MOD; }
@@ -743,12 +763,23 @@ long makepath(long doff){
 }
 
 /* The directory the compiler itself is in plus "lib/": the search path for includes.
-   The anchor is argv[0], just as argch(0,..) in src/wantzel.wz. */
+
+   THE ANCHOR IS /proc/self/exe AND NOT argv[0], counterpart of src/wantzel.wz.  argv[0]
+   is whatever the caller said: started through PATH it is the bare word "wantzel" with no
+   '/' in it, cut stays 0, and the search path collapses to a relative "lib/" that depends
+   on the working directory.  readlink answers where the process really came from; argv[0]
+   remains the fallback when it cannot (no /proc). */
 long setlibdir(char *a0){
-    long i; long cut;
+    long i; long cut; long n;
     libdirlen = 0; i = 0; cut = 0;
-    while(a0[i] != 0 && i < 900){ if(a0[i] == 47){ cut = i + 1; } i = i + 1; }
-    i = 0; while(i < cut){ libdir[i] = a0[i]; i = i + 1; }
+    n = readlink("/proc/self/exe", selfbuf, 1023);
+    if(n > 0){
+        i = 0; while(i < n){ if(selfbuf[i] == 47){ cut = i + 1; } i = i + 1; }
+        i = 0; while(i < cut){ libdir[i] = selfbuf[i]; i = i + 1; }
+    } else {
+        while(a0[i] != 0 && i < 900){ if(a0[i] == 47){ cut = i + 1; } i = i + 1; }
+        i = 0; while(i < cut){ libdir[i] = a0[i]; i = i + 1; }
+    }
     libdirlen = cut;
     /* If the compiler sits in .../bin/, its library belongs in .../lib/ beside it
        (prefix/bin next to prefix/lib).  Counterpart of src/wantzel.wz. */
@@ -772,16 +803,213 @@ long setlibdir(char *a0){
  */
 /* Not in any library: still say WHICH name. The bare message meant reading the whole
    routine to find the one identifier that was wrong. */
+long laterinclude(void);
+
+/* AND WHEN THERE IS AN INCLUDE BELOW, SAY SO. Measured over the error log: of nine logged
+   "undeclared identifier" cases, SIX were the include order -- the name exists, it just
+   comes later -- and NONE was a misspelling of an existing name.  The bare message is true
+   and sends the reader looking for a typo that is not there.
+
+   The compiler cannot name the file: at this point the later includes have not been read.
+   Claiming "declared in model.wz" would be a guess, and a wrong guess in an error message
+   costs more than no guess at all. */
 void failname(void){
     wrs(2,"wantzel: "); wrname(2); wrs(2,":"); wrnum(2,line);
     wrs(2,": undeclared identifier: ");
     { long j; j = 0; while(obuf[j] != 0){ j = j + 1; } wrbuf(2,(long)(size_t)&obuf[0],j); }
     wrs(2,"\n");
+    if(laterinclude() >= 0){
+        wrs(2,"  there is an include further down this file; a name is only visible after the include that declares it\n");
+    }
+    _exit(1);
+}
+
+/* isnamech(c) -- part of a name? Letters, digits, '_' and the dot that qualifies it. */
+long isnamech(char c){
+    if(c >= 'a' && c <= 'z'){ return 1; }
+    if(c >= 'A' && c <= 'Z'){ return 1; }
+    if(c >= '0' && c <= '9'){ return 1; }
+    return c == '_' || c == '.';
+}
+
+/* onetypo(a, an, at, bn) -- do `a` and src[at..at+bn] differ by at most ONE insertion,
+   deletion or substitution?
+
+   DISTANCE ONE, AND DELIBERATELY NOT MORE. Measured against the 144 real errors in the
+   error log: every name a writer actually invented -- print, writeln, say, js.obj -- has
+   its nearest real neighbour 3 to 5 edits away, and suggesting "Init" for "print" is
+   worse than saying nothing. */
+long onetypo(char *a, long an, long at, long bn){
+    long i; long j; long diff;
+    if(an == bn){
+        diff = 0;
+        i = 0;
+        while(i < an){
+            if(a[i] != src[at + i]){ diff = diff + 1; }
+            if(diff > 1){ return 0; }
+            i = i + 1;
+        }
+        return diff == 1;
+    }
+    if(an == bn + 1){
+        i = 0;
+        while(i < bn && a[i] == src[at + i]){ i = i + 1; }
+        j = i;
+        while(j < bn){
+            if(a[j + 1] != src[at + j]){ return 0; }
+            j = j + 1;
+        }
+        return 1;
+    }
+    if(bn == an + 1){
+        i = 0;
+        while(i < an && a[i] == src[at + i]){ i = i + 1; }
+        j = i;
+        while(j < an){
+            if(a[j] != src[at + j + 1]){ return 0; }
+            j = j + 1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* kwhere(at, upto, w) -- does the word w start exactly at `at`? */
+long kwhere(long at, long upto, char *w){
+    long i; long n;
+    n = 0; while(w[n] != 0){ n = n + 1; }
+    if(at + n > upto){ return 0; }
+    i = 0;
+    while(i < n){
+        if(src[at + i] != w[i]){ return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+/* laterinclude -- is there still an `include` ahead of us in what has been read?
+
+   A cheap look, not a second pass: everything read so far sits in one buffer, so scanning
+   from the failure point to the end of the current file walks bytes that are already there.
+   It does not prove the name is in that include -- it proves the SHAPE of the problem is
+   possible, which is what sends the reader to the include order instead of to a spelling
+   mistake. */
+long laterinclude(void){
+    long i;
+    i = pos;
+    while(i < srcend){
+        if(kwhere(i, srcend, "include")){ return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/* namehere(at, upto, want, wantn) -- is exactly `want` at `at`, and nothing more?
+
+   THE END MATTERS: without it io.put would match io.putn, and the compiler would keep
+   quiet about a name that really is missing. */
+long namehere(long at, long upto, char *want, long wantn){
+    long i; char c;
+    if(at + wantn > upto){ return 0; }
+    i = 0;
+    while(i < wantn){
+        if(src[at + i] != want[i]){ return 0; }
+        i = i + 1;
+    }
+    c = src[at + wantn];
+    if(c >= 'a' && c <= 'z'){ return 0; }
+    if(c >= 'A' && c <= 'Z'){ return 0; }
+    if(c >= '0' && c <= '9'){ return 0; }
+    return c != '_' && c != '.';
+}
+
+/* libdeclares(at, n, want, wantn) -- is `want` declared in the library text at
+   src[at..at+n]?
+
+   A DECLARATION POSITION, NOT ANY OCCURRENCE. The name has to follow `procedure`,
+   `function`, `const`, `var` or `type` -- otherwise io.puts would "declare" itself in
+   every file that CALLS it, and the answer would be yes everywhere.
+
+   THIS IS NOT THE SEARCH THAT WAS REMOVED. That one scanned EVERY library to work out
+   which file declares a name, and needed a preference rule because store.table also
+   occurs in oauth.wz. This reads ONE file whose name the convention already gave us. */
+long libdeclares(long at, long n, char *want, long wantn){
+    long i; long j; long k; long e;
+    e = at + n;
+    i = at;
+    while(i < e){
+        while(i < e && (src[i] == ' ' || src[i] == 9)){ i = i + 1; }
+        j = i;
+        while(j < e && src[j] != 10){ j = j + 1; }
+        k = i;
+        if(kwhere(k, j, "procedure ")){ k = k + 10; }
+        else if(kwhere(k, j, "function ")){ k = k + 9; }
+        else if(kwhere(k, j, "const ")){ k = k + 6; }
+        else if(kwhere(k, j, "var ")){ k = k + 4; }
+        else if(kwhere(k, j, "type ")){ k = k + 5; }
+        else { k = -1; }
+        if(k >= 0){
+            while(k < j && (src[k] == ' ' || src[k] == 9)){ k = k + 1; }
+            if(namehere(k, j, want, wantn)){ return 1; }
+        }
+        i = j + 1;
+    }
+    return 0;
+}
+
+/* nearname(at, n, want, wantn) -- the declared name in this library that is ONE typo
+   away, or 0 if there is none. Fills nearbuf.
+
+   ONLY WITHIN THIS MODULE, which is what the compiler knows at this point anyway: the
+   name before the dot picked the file. That filter is doing real work -- it is the reason
+   `print` and `writeln` get no suggestion at all rather than a wrong one. */
+long nearname(long at, long n, char *want, long wantn){
+    long i; long j; long k; long e; long nl;
+    e = at + n;
+    i = at;
+    while(i < e){
+        while(i < e && (src[i] == ' ' || src[i] == 9)){ i = i + 1; }
+        j = i;
+        while(j < e && src[j] != 10){ j = j + 1; }
+        k = i;
+        if(kwhere(k, j, "procedure ")){ k = k + 10; }
+        else if(kwhere(k, j, "function ")){ k = k + 9; }
+        else if(kwhere(k, j, "const ")){ k = k + 6; }
+        else if(kwhere(k, j, "var ")){ k = k + 4; }
+        else if(kwhere(k, j, "type ")){ k = k + 5; }
+        else { k = -1; }
+        if(k >= 0){
+            while(k < j && (src[k] == ' ' || src[k] == 9)){ k = k + 1; }
+            nl = 0;
+            while(k + nl < j && isnamech(src[k + nl])){ nl = nl + 1; }
+            if(nl > 0 && onetypo(want, wantn, k, nl)){
+                if(nl >= TBMAX){ return 0; }
+                nearbufn = 0;
+                while(nearbufn < nl){ nearbuf[nearbufn] = src[k + nearbufn]; nearbufn = nearbufn + 1; }
+                return nearbufn;
+            }
+        }
+        i = j + 1;
+    }
+    return 0;
+}
+
+/* failnear(n) -- "undeclared identifier: X -- did you mean Y?"
+
+   THE NAME FIRST, THE SUGGESTION AFTER A DASH. The fact the reader needs is that X does
+   not exist; the nearest name is help, not the finding. */
+void failnear(long n){
+    wrs(2,"wantzel: "); wrname(2); wrs(2,":"); wrnum(2,line);
+    wrs(2,": undeclared identifier: ");
+    { long j; j = 0; while(obuf[j] != 0){ j = j + 1; } wrbuf(2,(long)(size_t)&obuf[0],j); }
+    wrs(2," -- did you mean ");
+    wrbuf(2,(long)(size_t)&nearbuf[0],n);
+    wrs(2,"?\n");
     _exit(1);
 }
 
 long failundeclared(void){
-    long i; long n; long fd;
+    long i; long n; long fd; long mark; long n2; long olen; long erin; long near;
     n = 0;
     while(tbuf[n] != 0 && tbuf[n] != '.'){ n = n + 1; }
     if(tbuf[n] != '.' || n == 0){ failname(); }
@@ -794,6 +1022,35 @@ long failundeclared(void){
     fd = (long)open(pathbuf, 0, 0);
     if(fd < 0){ failname(); }
     close((int)fd);
+    /* THE FILE EXISTS -- BUT IS IT ALREADY INCLUDED? Then this name is NOT in it, and the
+       suggestion would be wrong twice over: wrong about where the name lives, and wrong
+       about what to do, because the include is already there.
+
+       MEASURED 18-09-2026: io.putc does not exist, io.wz was included three
+       lines above, and the compiler answered "io.putc is declared in io.wz; add: include
+       "io.wz";". An agent adds the include it already has, recompiles, gets the identical
+       error, and loops.
+
+       pathbuf holds the library path right now, which is what samefile compares against. */
+    /* THE FILE EXISTS -- BUT IS THE NAME IN IT? That is the question the old code never
+       asked, and it is the whole bug. Asking about the name answers both halves at once,
+       whether or not the file is already included.
+
+       The text is read and then dropped: srclen goes back to where it was. */
+    olen = 0;
+    while(obuf[olen] != 0){ olen = olen + 1; }
+    mark = srclen;
+    n2 = readfile();
+    if(n2 > 0){
+        erin = libdeclares(mark, n2, obuf, olen);
+        if(!erin){
+            near = nearname(mark, n2, obuf, olen);
+            srclen = mark;
+            if(near > 0){ failnear(near); }
+            failname();
+        }
+        srclen = mark;
+    } else { srclen = mark; }
     wrs(2,"wantzel: "); wrname(2); wrs(2,":"); wrnum(2,line);
     wrs(2,": undeclared identifier: ");
     { long j; j = 0; while(obuf[j] != 0){ j = j + 1; } wrbuf(2,(long)(size_t)&obuf[0],j); }
@@ -868,8 +1125,19 @@ long doinclude(){
     if(tok != 59){ fail("missing ; after include"); }
     /* A BARE NAME is a library name, a name with a '/' is a path.
        Counterpart of src/wantzel.wz. */
+    triedlibn = 0;
     if(haspath(doff)){ makepath(doff); }
-    else { makelibpath(doff); if(!fileexists()){ makepath(doff); } }
+    else {
+        makelibpath(doff);
+        /* keep the library path before makepath writes the relative name over it */
+        if(!fileexists()){
+            while(pathbuf[triedlibn] != 0 && triedlibn < 1023){
+                triedlib[triedlibn] = pathbuf[triedlibn]; triedlibn = triedlibn + 1;
+            }
+            triedlib[triedlibn] = 0;
+            makepath(doff);
+        }
+    }
     normpath();
     datlen = datmark;                 /* the path is not program data */
     i = 0;
@@ -885,7 +1153,22 @@ long doinclude(){
     incdepth = incdepth + 1;
     start = srclen;
     n = readfile();
-    if(n < 0){ fail("cannot open the included file"); }
+    /* NAMING THE PATH IT TRIED, not just "cannot open": a bare library name is resolved
+       against <compiler dir>/lib/ first, so the path attempted is not what is written on
+       the line. The counterpart in src/wantzel.wz is failinclude. */
+    if(n < 0){
+        long q;
+        wrs(2,"wantzel: "); wrname(2); wrs(2,":"); wrnum(2,line);
+        wrs(2,": cannot open the included file: ");
+        q = 0; while(pathbuf[q] != 0){ q = q + 1; }
+        wrbuf(2,(long)(size_t)&pathbuf[0],q);
+        if(triedlibn > 0){
+            wrs(2,"\n  looked in the library first: ");
+            wrbuf(2,(long)(size_t)&triedlib[0],triedlibn);
+        }
+        wrs(2,"\n");
+        _exit(1);
+    }
     pos = start; srcend = start + n; line = 1; curfile = fi;
     next();
     return 0;
@@ -1010,7 +1293,8 @@ long findglob(){
     hashinit();
     i = ghead[tokhash()];
     while(i >= 0){
-        if(nameq(gnam[i])){ return i; }
+        /* A local name from another file does not exist here. */
+        if(nameq(gnam[i]) && (gfile[i] < 0 || gfile[i] == curfile)){ return i; }
         i = gnext[i];
     }
     return -1;
@@ -1021,7 +1305,8 @@ long findfn(){
     hashinit();
     i = fhead[tokhash()];
     while(i >= 0){
-        if(nameq(fnam[i])){ return i; }
+        /* A local routine from another file does not exist here. */
+        if(nameq(fnam[i]) && (fvis[i] < 0 || fvis[i] == curfile)){ return i; }
         i = fnext[i];
     }
     return -1;
@@ -1312,12 +1597,56 @@ long trapheading(char *msg){
 /* Two writes rather than one: the heading, which every check of this kind shares, and the
    place, which differs per check. Storing the whole sentence per check made the messages a
    quarter of a GUI binary. */
+/* trapskip(fi) -- where the name of file fi starts, for a message stored IN THE BINARY.
+
+   THE PROBLEM THIS SOLVES. trap embeds "<file>:<line>" as a string in the output, and the
+   file name used to be whatever the compiler had resolved. So the same source compiled to
+   two different binaries:
+
+       wantzel src/main.wz out.exe                  ->  "src/main.wz:101"
+       wantzel /abs/path/to/src/main.wz out.exe     ->  "/abs/path/to/src/main.wz:101"
+
+   Measured on 16-09-2026 in a GUI program with 1288 checks: 513024 bytes against 581632,
+   a 68KB difference out of identical source. Two things are wrong with that. A build is
+   supposed to be reproducible, and it was not -- a build server naming its sources
+   absolutely cannot produce the artifact a developer verified. And the second is worse:
+   the build machine's directory layout, including a user's home directory, ends up inside
+   every executable anyone ships. The embedded LIBRARY files leaked it either way, because
+   they are named <libdir>/<name> and libdir is found from /proc/self/exe.
+
+   THE RULE IS THE LAST TWO SEGMENTS OF THE DIRECTORY, AT MOST. A diagnostic has to say
+   which file and which line; what it does not have to say is where the tree was checked
+   out. "src/win32/main.wz:412" and "lib/io.wz:88" point a reader at the right file in the
+   project, and carry nothing about the machine that built it.
+
+   WHY SEGMENTS AND NOT A COMMON PREFIX, which is what I tried first: the main file can sit
+   DEEPER than its includes (src/win32/main.wz including src/agent.wz), so stripping the
+   main file's directory strips nothing from the ones that matter. Counting from the END is
+   independent of which file is the entry point, which is the property that was missing. */
+long trapskip(long fi){
+    long i; long n; long seg;
+    n = filelen[fi];
+    /* Count directory separators backwards, and stop after two. A name with fewer is
+       already short enough to embed whole. */
+    seg = 0;
+    i = n - 1;
+    while(i >= 0){
+        if(fnpool[filenam[fi]+i] == 47){
+            seg = seg + 1;
+            if(seg >= 3){ return i + 1; }
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
 long trap(char *msg){
-    long i; long o; long k; long h;
+    long i; long o; long k; long h; long sk;
     h = trapheading(msg);
 
     mlen = 0;
-    i = 0; while(i < filelen[curfile]){ mbuf[mlen]=fnpool[filenam[curfile]+i]; mlen=mlen+1; i=i+1; }
+    sk = trapskip(curfile);
+    i = sk; while(i < filelen[curfile]){ mbuf[mlen]=fnpool[filenam[curfile]+i]; mlen=mlen+1; i=i+1; }
     mbuf[mlen] = 58; mlen = mlen + 1;
     k = numstr(line);
     i = 0; while(i < k){ mbuf[mlen]=nbuf[i]; mlen=mlen+1; i=i+1; }
@@ -1533,6 +1862,20 @@ long elemsetup(long li,long gi){
     want(t,T_INT,"array index");
     if(tok == TK_RANGE){ fail("a slice can only be passed as an array argument"); }
     if(tok != 93){ fail("missing ] after array index"); }
+
+    /* A CONSTANT INDEX OUTSIDE THE BOUNDS IS REFUSED HERE, not at run time.  The
+       counterpart of the same check in src/wantzel.wz's elemsetup.
+
+       lvkind == 1 means the expression just parsed was an immediate, with the value in
+       lvimm -- a literal or a named constant.
+
+       k == 2 is an `array of T` parameter, whose length only the caller knows, so the
+       runtime check below is the only one possible for it.  This check is in addition to
+       that one, not instead of it. */
+    if(k != 2 && lvkind == 1 && (lvimm < lo || lvimm > hi)){
+        fail("array index out of range at compile time");
+    }
+
     next();
     elkind = k; eloff = o; eltype = et;
     if(elkind == 2){
@@ -1670,6 +2013,22 @@ long pathaddr(long li,long gi){
                 return et;
             }
             if(tok != 93){ fail("missing ] after array index"); }
+
+            /* A CONSTANT INDEX OUTSIDE THE BOUNDS IS REFUSED HERE, not at run time.
+               The counterpart of the same check in src/wantzel.wz: a[9] on a four-element
+               array used to compile clean and fail when it ran, while the compiler knew
+               both the bound and the index as it read the line.
+
+               lvkind == 1 means the expression just parsed was an immediate, with the
+               value in lvimm -- a literal or a named constant.
+
+               isarr == 2 is an `array of T` parameter, whose length only the caller
+               knows, so the runtime check below is the only one possible for it. That is
+               why this check is in addition to it and not instead of it. */
+            if(isarr != 2 && lvkind == 1 && (lvimm < lo || lvimm > hi)){
+                fail("array index out of range at compile time");
+            }
+
             next();
             if(isarr == 2){
                 e(0x48); e(0x3B); e(0x85); e32(dyn);           /* cmp rax,[rbp+len] */
@@ -2777,6 +3136,7 @@ long declvars(long islocal){
                 if(ngl >= MAXG){ fail("too many globals"); }
                 gnam[ngl] = tmpnam[i]; gkind[ngl] = SK_VAR; gtyp[ngl] = t;
                 garr[ngl] = ptarr; glo[ngl] = ptlo; ghi[ngl] = pthi;
+                gfile[ngl] = declloc;
                 gval[ngl] = bsslen;
                 bsslen = bsslen + sz;
                 gindex(ngl);
@@ -2790,7 +3150,12 @@ long declvars(long islocal){
     return 0;
 }
 
-/* type NAME = record <names: type;>... end; */
+/* declschema is defined below but called from decltypes: a schema is declared with
+   'type X = schema ... end', so the type declaration is what dispatches to it. */
+long declschema(void);
+
+/* type NAME = record <names: type;>... end;
+   type NAME = schema <field: type[?] ["description"];>... end; */
 long decltypes(){
     long r; long n; long i; long t; long nb; long sz; long off; long al;
     next();                                          /* skip 'type' */
@@ -2800,11 +3165,32 @@ long decltypes(){
         if(findglob() >= 0 || findfn() >= 0 || findtype() >= 0){ failtaken("duplicate declaration"); }
         if(nrt >= MAXR){ fail("too many record types"); }
         r = nrt;
+        /* the name as bytes, before interning: a schema needs it in schname/scnam and
+           which of the two kinds this is is not known until after the '='. */
+        i = 0;
+        while(tbuf[i] != 0){
+            if(i >= 62){ fail("type name too long"); }
+            tnamebuf[i] = tbuf[i]; i = i + 1;
+        }
+        tnamebuf[i] = 0;
         rtnam[r] = intern(); rtf0[r] = nfd; rtnf[r] = 0; rtsize[r] = 0;
         next();
         if(tok != 61){ fail("missing = in type declaration"); }
         next();
-        if(tok != KW_RECORD){ fail("a type is declared as 'record ... end'"); }
+        /* a record (a memory layout) or a schema (a JSON contract): they share the
+           notation and nothing else, and the word after '=' says which. */
+        if(tok == KW_SCHEMA){
+            if(nsc >= MAXS){ fail("too many schemas"); }
+            i = 0;
+            while(tnamebuf[i] != 0){
+                schname[i] = tnamebuf[i]; scnam[nsc*64+i] = tnamebuf[i]; i = i + 1;
+            }
+            schname[i] = 0; scnam[nsc*64+i] = 0;
+            next();
+            declschema();
+            continue;
+        }
+        if(tok != KW_RECORD){ fail("a type is declared as 'record ... end' or 'schema ... end'"); }
         next();
         off = 0;
         while(tok == TK_ID){
@@ -2885,6 +3271,7 @@ long declconsts(long islocal){
             if(ngl >= MAXG){ fail("too many globals"); }
             gnam[ngl] = o; gkind[ngl] = SK_CONST; gval[ngl] = v; gtyp[ngl] = t;
             garr[ngl] = 0; glo[ngl] = 0; ghi[ngl] = 0;
+            gfile[ngl] = declloc;
             gindex(ngl);
             ngl = ngl + 1;
         }
@@ -3346,20 +3733,11 @@ long findschema(){                    /* the schema whose name is in tbuf, or -1
     return -1;
 }
 
-/* schema NAME = record <field: type[?] ["description"];>... end; */
+/* The body of one schema, from the field list to 'end'.  The name, the '=' and the word
+   'schema' are already read by decltypes, the only caller.  Counterpart of
+   src/wantzel.wz:declschema. */
 long declschema(){
     long i; long f; long fi; long lo; long hi;
-    next();
-    if(tok != TK_ID){ fail("schema name expected"); }
-    if(nsc >= MAXS){ fail("too many schemas"); }
-    i = 0;
-    while(tbuf[i] != 0){ schname[i] = tbuf[i]; scnam[nsc*64+i] = tbuf[i]; i = i + 1; }
-    schname[i] = 0; scnam[nsc*64+i] = 0;
-    next();
-    if(tok != 61){ fail("missing = in schema declaration"); }
-    next();
-    if(tok != KW_RECORD){ fail("a schema body starts with 'record'"); }
-    next();
     nfld = 0; nenum = 0;
     while(tok == TK_ID){
         if(nfld >= MAXFLD){ fail("too many fields in a schema"); }
@@ -3456,6 +3834,7 @@ long declschema(){
     if(ngl >= MAXG){ fail("too many globals"); }
     gnam[ngl] = intern(); gkind[ngl] = SK_CONST; gtyp[ngl] = T_STR; gval[ngl] = scjs[nsc];
     garr[ngl] = 0; glo[ngl] = 0; ghi[ngl] = 0;
+    gfile[ngl] = -1;                 /* compiler-generated: always public */
     gindex(ngl);
     ngl = ngl + 1;
     nsc = nsc + 1;
@@ -3521,6 +3900,7 @@ long gentools(){
     if(ngl >= MAXG){ fail("too many globals"); }
     gnam[ngl] = intern(); gkind[ngl] = SK_CONST; gtyp[ngl] = T_STR; gval[ngl] = tlseen;
     garr[ngl] = 0; glo[ngl] = 0; ghi[ngl] = 0;
+    gfile[ngl] = -1;                 /* compiler-generated: always public */
     gindex(ngl);
     ngl = ngl + 1;
     /* --- constants, argument/result records, handler declarations --- */
@@ -3664,6 +4044,7 @@ long declroutine(long isproc){
         if(nfn >= MAXF){ fail("too many routines"); }
         fi = nfn; nfn = nfn + 1;
         fnam[fi] = intern(); fdef[fi] = 0; fadr[fi] = 0;
+        fvis[fi] = declloc;
         findex(fi);
     }
     next();
@@ -4473,6 +4854,10 @@ long genwin(){
     gen("    return 0;\n");
     gen("  end;\n");
     gen("  if nr = 90 then return 0;   // chmod: no-op\n");
+    /* readlink: -1 and not a trap. Windows has no /proc/self/exe, which setlibdir asks
+       for first; the error is what makes it fall back to argv[0]. Counterpart of
+       src/wantzel.wz. */
+    gen("  if nr = 89 then return 0 - 1;   // readlink: no /proc, caller falls back\n");
     gen("  if nr = 57 then return 0;   // fork: no worker processes, run single-process\n");
     gen("  if nr = 61 then return 0;   // wait4: nothing to wait for\n");
     gen("  if (nr = 60) or (nr = 231) then winapi(__K_EXITPROCESS, band(a, 0xFFFFFFFF));\n");
@@ -4687,8 +5072,20 @@ long parseprogram(){
             fail("the 'program' header is no longer part of the language; delete that line");
         }
         if(tok == KW_INCLUDE){ doinclude(); }
-        else if(tok == KW_SCHEMA){ declschema(); }
+        else if(tok == KW_SCHEMA){ fail("a schema is declared as 'type X = schema ... end;'"); }
         else if(tok == KW_TOOLS){ decltools(); }
+        /* `local` before a declaration limits it to this file.  declloc
+           carries the file number until the declaration is read, then goes back to -1. */
+        else if(tok == KW_LOCAL){
+            next();
+            declloc = curfile;
+            if(tok == KW_CONST){ declconsts(0); }
+            else if(tok == KW_VAR){ declvars(0); }
+            else if(tok == KW_FUNCTION){ declroutine(0); }
+            else if(tok == KW_PROCEDURE){ declroutine(1); }
+            else { fail("after 'local' comes var, const, procedure or function"); }
+            declloc = -1;
+        }
         else if(tok == KW_CONST){ declconsts(0); }
         else if(tok == KW_TYPE){ decltypes(); }
         else if(tok == KW_VAR){ declvars(0); }
@@ -5224,6 +5621,7 @@ long compile(){
     long n;
     line = 1;
     srclen = 0; fnplen = 0; nfiles = 0; incdepth = 0;
+    declloc = -1;   /* public is the default, so existing source is unchanged */
     curfile = addfile();              /* pathbuf holds the main source name */
     n = readfile();
     if(n < 0){

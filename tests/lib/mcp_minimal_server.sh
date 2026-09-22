@@ -11,11 +11,11 @@
 
 cat > "$T/minimal.wz" <<'WZ'
 include "json.wz";
-schema AddArgs = record
+type AddArgs = schema
   a: int "the left operand";
   b: int "the right operand";
 end;
-schema AddResult = record
+type AddResult = schema
   sum: int;
 end;
 tools

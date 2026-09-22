@@ -7,7 +7,7 @@
 // choose them.
 include "io.wz";
 include "json.wz";
-schema Reading = record
+type Reading = schema
   level: text of ("1", "2", "high");
   note:  text[16]?;
 end;

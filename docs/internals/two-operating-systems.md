@@ -133,8 +133,8 @@ pass are evidence the hypothesis is wrong, not that the case is exotic.
 
 - **"No platform code" applies to the standard library, not to everything.** A program that
   calls `winapi` directly is Windows-specific and should be, the same way a program calling
-  X11 is Linux-specific. The calculator example has one shared arithmetic core and two
-  separate front ends — that is the honest shape.
+  X11 is Linux-specific. A desktop program of this kind has one shared core and two separate
+  front ends — that is the honest shape.
 - **The 48 is not a number to brag about driving to zero.** Most of it could move into `lib/`
   now the slot arithmetic is right, but ws2_32 is reached through `__wsys` rather than
   directly, and every name moved out is one the compiler can no longer count or check.

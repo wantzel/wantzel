@@ -1,0 +1,5 @@
+// Must not compile: a `local` name from another file is not visible here.
+include "progs/local_scope_helper.wz";
+begin
+  hidden.n := 1;
+end.

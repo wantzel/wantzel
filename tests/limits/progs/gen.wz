@@ -200,7 +200,7 @@ begin
   else if iskind("schemafields") then
   begin
     putinclude;
-    put("schema S = record\n");
+    put("type S = schema\n");
     i := 0;
     while i < n do begin put("f"); putn(i); put(": int?;\n"); i := i + 1; end;
     put("end;\nbegin end.\n");
@@ -211,7 +211,7 @@ begin
   begin
     putinclude;
     i := 0;
-    while i < n do begin put("schema S"); putn(i); put(" = record a: int; end;\n"); i := i + 1; end;
+    while i < n do begin put("type S"); putn(i); put(" = schema a: int; end;\n"); i := i + 1; end;
     put("begin end.\n");
   end
 
@@ -219,7 +219,7 @@ begin
   else if iskind("tools") then
   begin
     putinclude;
-    put("schema S = record a: int; end;\ntools\n");
+    put("type S = schema a: int; end;\ntools\n");
     i := 0;
     while i < n do begin put("t"); putn(i); put("(S): S \"d\";\n"); i := i + 1; end;
     put("end;\n");
@@ -238,7 +238,7 @@ begin
   else if iskind("toolsonly") then
   begin
     putinclude;
-    put("schema S = record a: int; end;\ntools\n");
+    put("type S = schema a: int; end;\ntools\n");
     i := 0;
     while i < n do begin put("t"); putn(i); put("(S): S \"d\";\n"); i := i + 1; end;
     put("end;\nbegin end.\n");

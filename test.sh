@@ -134,7 +134,14 @@ echo "runtime safety checks"
 rt() {                      # rt <name> <expected output>, source on stdin
     cat > "$T/c.wz"
     ./bin/wantzel "$T/c.wz" "$T/c" >/dev/null 2>&1 || { bad "$1 (did not compile)"; return; }
-    same "$1" "$("$T/c" 2>&1 | sed "s|$T/c.wz|SRC|")" "$2"
+    # ANY LEADING DIRECTORY BECOMES "SRC", not just the one we passed.
+    #
+    # It used to substitute "$T/c.wz" literally, which silently assumed the binary embeds
+    # the path exactly as given on the command line -- and that assumption WAS the bug
+    # fixed on 16-09-2026: naming the source absolutely put the build machine's directory
+    # layout inside every executable. What this test is actually about is the message and
+    # the LINE NUMBER, so it should not care how the file is spelled.
+    same "$1" "$("$T/c" 2>&1 | sed -E "s|( at )[^ ]*c\\.wz:|\\1SRC:|")" "$2"
 }
 
 rt "index above upper bound" "runtime error: array index out of range at SRC:2" <<'PX'
@@ -194,7 +201,10 @@ PX
 echo "compile-time checks"
 ce() {                      # ce <name> <expected diagnostic>, source on stdin
     cat > "$T/c.wz"
-    same "$1" "$(./bin/wantzel "$T/c.wz" "$T/c" 2>&1 | sed "s|$T/c.wz|SRC|")" "$2"
+    # $T is a fresh mkdtemp directory, so it also has to come out of the message: an
+    # include that could not be opened now names the path it tried, and that path is
+    # different on every run.
+    same "$1" "$(./bin/wantzel "$T/c.wz" "$T/c" 2>&1 | sed -e "s|$T/c.wz|SRC|" -e "s|$T/|DIR/|g")" "$2"
 }
 
 ce "char := int" "wantzel: SRC:1: type error in assignment: expected char, found int" <<'PX'
@@ -281,18 +291,29 @@ ce "scalar where array expected" "wantzel: SRC:1: this parameter needs an array"
 var i: int; procedure p(a: array of char); begin end; begin p(i); end.
 PX
 
-ce "missing include file" "wantzel: SRC:1: cannot open the included file" <<'PX'
+# THE PATH IS PART OF THE MESSAGE, since 16-09-2026. A bare library name is resolved
+# against <compiler dir>/lib/ before the includer's own directory, so the path attempted
+# is not always what is written on the line -- and someone who unpacked a release without
+# lib/ beside it needs to see where the compiler looked.
+ce "missing include file" "wantzel: SRC:1: cannot open the included file: DIR/nowhere/nothing.wz" <<'PX'
 include "nowhere/nothing.wz";
 begin end.
 PX
 
-ce "schema needs record" "wantzel: SRC:1: a schema body starts with 'record'" <<'PX'
-schema S = int;
+# The old top-level form, refused by name: a source written before 17-09-2026 gets the new
+# spelling rather than a puzzle about an unexpected keyword.
+ce "old schema form is refused with the new spelling" "wantzel: SRC:1: a schema is declared as 'type X = schema ... end;'" <<'PX'
+schema S = record a: int; end;
+begin end.
+PX
+
+ce "a type is a record or a schema" "wantzel: SRC:1: a type is declared as 'record ... end' or 'schema ... end'" <<'PX'
+type S = int;
 begin end.
 PX
 
 ce "unknown schema field type" "wantzel: SRC:2: a schema field is int, real, bool, text, text[N], text of (...), json, or a schema declared earlier" <<'PX'
-schema S = record
+type S = schema
   a: float;
 end;
 begin end.

@@ -1,0 +1,65 @@
+// jsonpretty.wz -- lay a JSON document out over lines.
+//
+//   jsonpretty config.json      the file, formatted
+//   jsonpretty < config.json    the same, from standard input
+//
+// The work is one call: json.pretty in lib/json.wz.  Everything else here is
+// reading the input and writing the result, which is what an example is for --
+// it shows that the library function does the job on its own.
+//
+// It FORMATS and does not repair: a document with a trailing comma, a missing
+// brace or a stray word is refused with a message on standard error and exit
+// status 1, because a formatter that guesses has edited your file.
+include "io.wz";
+include "fs.wz";
+include "json.wz";
+
+const
+  MAXIN = 262144;
+
+var
+  src: array[0..MAXIN-1] of char;
+  dst: array[0..MAXIN*3-1] of char;   // room for the newlines and the indent
+  path: array[0..1023] of char;
+  n, e, fd, got, i: int;
+
+procedure fout(m: str);
+begin
+  io.puts(STDERR, m);
+  io.puts(STDERR, "\n");
+  halt(1);
+end;
+
+begin
+  // ---- read it, from the named file or from standard input -----------------
+  fd := STDIN;
+  if argc() >= 2 then
+  begin
+    i := 0;
+    while (argch(1, i) <> chr(0)) and (i < len(path) - 1) do
+    begin path[i] := argch(1, i); i := i + 1; end;
+    path[i] := chr(0);
+    fd := fs.open(addr(path[0]));
+    if fd < 0 then fout("cannot open that file");
+  end;
+
+  n := 0;
+  while true do
+  begin
+    got := io.read(fd, addr(src[n]), MAXIN - n);
+    if got <= 0 then break;
+    n := n + got;
+    // THE LIMIT IS SAID OUT LOUD.  Silently formatting the first 256 kB of a
+    // larger file would produce valid-looking output that is missing its tail.
+    if n >= MAXIN then fout("that document is larger than 256 kB");
+  end;
+  if fd <> STDIN then fs.close(fd);
+  if n = 0 then fout("nothing to read");
+
+  // ---- one call ------------------------------------------------------------
+  e := json.pretty(src, 0, n, dst, 0, 0);
+  if e < 0 then fout("that is not valid JSON");
+
+  io.out(STDOUT, addr(dst[0]), e);
+  io.puts(STDOUT, "\n");
+end.

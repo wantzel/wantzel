@@ -304,7 +304,7 @@ end;
 // RFC 7591 lets a client send any of these as metadata. Without them a perfectly valid
 // registration came back as "invalid_client_metadata: redirect_uris is required", which
 // names the wrong cause. A protocol envelope declares what the protocol carries.
-schema ORegister = record
+type ORegister = schema
   redirect_uris: array[0..3] of text[256];
   client_name: text[64]?;
   token_endpoint_auth_method: text[32]?;

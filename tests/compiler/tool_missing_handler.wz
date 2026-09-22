@@ -7,7 +7,7 @@
 // it meant. The line below must therefore stay line 13.
 include "io.wz";
 include "json.wz";
-schema In = record n: int; end;
+type In = schema n: int; end;
 tools
   x(In): In "no handler follows";
 end;

@@ -28,7 +28,7 @@ begin
 end.
 WZ
 compile_win "$T/wp.wz" "$T/wp.exe"
-got=$(cd "$T" && "$ROOT/bootstrap/tools/runexe.sh" "$T/wp.exe" 2>/dev/null)
+got=$(cd "$T" && run_win "$T/wp.exe" 2>/dev/null)
 assert_eq "winproc gives each routine its own address" "$got" "distinct"
 
 # and it refuses what it cannot answer
@@ -75,7 +75,7 @@ begin
 end.
 WZ
 compile_win "$T/cb.wz" "$T/cb.exe"
-got=$(cd "$T" && "$ROOT/bootstrap/tools/runexe.sh" "$T/cb.exe" 2>/dev/null)
+got=$(cd "$T" && run_win "$T/cb.exe" 2>/dev/null)
 assert_eq "Windows calls a Wantzel routine through winproc" "$got" "called"
 
 echo "  refuses an unknown routine, and refuses a Linux target"

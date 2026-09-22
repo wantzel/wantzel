@@ -14,18 +14,18 @@
 // It has to come after the tools block, because it reads the tool.list the compiler
 // bakes from it.
 include "kv.wz";
-schema AddArgs = record
+type AddArgs = schema
   a: int "first term";
   b: int "second term";
 end;
-schema AddResult = record
+type AddResult = schema
   sum: int;
 end;
-schema GreetArgs = record
+type GreetArgs = schema
   name: text[64] "who to greet";
   times: int? "how often, default 1";
 end;
-schema GreetResult = record
+type GreetResult = schema
   greeting: text[4096];
 end;
 tools

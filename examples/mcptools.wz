@@ -10,20 +10,20 @@
 
 include "mcphttp.wz";
 
-schema AddArgs = record
+type AddArgs = schema
   a: int "first term";
   b: int "second term";
 end;
 
-schema AddResult = record
+type AddResult = schema
   sum: int;
 end;
 
-schema StatsArgs = record
+type StatsArgs = schema
   values: array[0..1023] of real "the numbers to summarise";
 end;
 
-schema StatsResult = record
+type StatsResult = schema
   count: int;
   total: real;
   mean: real;
@@ -31,12 +31,12 @@ schema StatsResult = record
   max: real;
 end;
 
-schema GreetArgs = record
+type GreetArgs = schema
   name: text[64] "who to greet";
   times: int? "how often, default 1";
 end;
 
-schema GreetResult = record
+type GreetResult = schema
   greeting: text[4096];
 end;
 

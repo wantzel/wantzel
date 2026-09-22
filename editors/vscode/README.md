@@ -1,7 +1,6 @@
 # Wantzel for VS Code
 
-Highlighting for `.wz` files, compile errors in the Problems panel, build and run, and
-snippets.
+Highlighting for `.wz` files, compile errors in the Problems panel, and build and run.
 
 ## Install
 
@@ -97,31 +96,17 @@ If you would rather write the task yourself, the matcher is available as `$wantz
 }
 ```
 
-## Snippets
+## What is not here, and why it stays that way
 
-Thirteen. Nine for the shapes you write most — `main`, `procedure`, `function`,
-`schema`, `tools`, `for`, `while`, `buffer`, `readfile` — and four that exist because they
-prevent a mistake recorded in the error log: `jsontext` (reading a text value out of JSON
-without its quotes), `growing` (a list of unknown length with its bound checked before the
-write), `mapfile`, and `checkwrite` (a generated `write` refuses with `-1` rather than
-truncating, so the result has to be tested).
+**This extension is deliberately compact: highlighting, errors, build and run.** Three
+things, and it is not meant to grow past them. An editor plugin that keeps acquiring
+features ends up a half-built IDE that nobody maintains, and each addition here would be a
+second implementation of something the compiler or a real editor already does better.
 
-That is the rule for what earns a place here: **a snippet is added when it prevents an
-error that is actually in the log**, not when it seems useful. Type the prefix and press
-tab.
-
-Each one is a **complete, compiling** fragment, including the includes it needs — the
-`tools` snippet brings `json.wz` and `tools.wz` and defines the `app.request` that
-`lib/tools.wz` requires, because leaving those out is precisely what a newcomer would not
-know. `tests/toolchain/vscode_snippets_compile.sh` compiles every snippet on every
-`--toolchain` run, with the placeholders filled in as an editor would fill them — and it
-fails when a snippet is added that no wrapper compiles, because an untested snippet is how
-a broken one ships.
-
-## What is not here
-
-- **Jump to a declaration** needs a language server or at least a symbol index; that is
-  much more than the three above and is not needed for a first release.
+- **Snippets** were dropped in 0.2.1. The complete working programs live in
+  [`docs/writing-wantzel.md`](../../docs/writing-wantzel.md), where a test compiles them on
+  every run and where they are found by anyone, not only by a VS Code user.
+- **Jump to a declaration** needs a language server or at least a symbol index.
 - **Formatting**: there is no formatter for Wantzel and none planned, so there is nothing
   to call.
 - **A debugger.** Run Without Debugging compiles and runs; Start Debugging does the same.

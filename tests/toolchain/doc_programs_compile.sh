@@ -1,13 +1,19 @@
-# The complete programs in docs/writing-wantzel.md must compile and run.
+# The complete programs in docs/writing-wantzel.md and docs/lib/*.md must compile.
 #
-# Those two -- a command-line tool and an MCP server -- are there to be COPIED. Someone
-# takes the whole block, pastes it, and expects it to work; that is what "a complete
-# program" promises and what a fragment does not. A block that does not compile is worse
-# than no block, because the reader assumes the fault is theirs.
+# A code block that reads as a whole program is there to be COPIED. Someone takes it,
+# pastes it, and expects it to work; that is what "a complete program" promises and what
+# a fragment does not. A block that does not compile is worse than no block, because the
+# reader assumes the fault is theirs.
 #
-# Only the blocks under a "## A whole ..." heading are checked. The other code in that
-# file is deliberately fragmentary -- a routine, a loop, a pattern -- and wrapping those
-# in a program would test the wrapper.
+# Two different ways to spot "a whole program" are used below, matching how the two
+# kinds of document are written:
+#   - in docs/writing-wantzel.md, only the blocks under a "## A whole ..." heading are
+#     checked; the other code in that file is deliberately fragmentary -- a routine, a
+#     loop, a pattern -- and wrapping those in a program would test the wrapper, not the
+#     documentation.
+#   - in docs/lib/*.md, every fenced pascal block that contains its own "end." line is
+#     checked, regardless of heading; a per-module reference page mixes short complete
+#     examples with fragments inline, so the heading text is not a reliable marker there.
 . "$ROOT/tests/helpers.sh"
 cd "$ROOT"
 
@@ -51,4 +57,45 @@ assert_contains "and says how to use it" "$(cat "$T/u")" "usage:"
 out=$(printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add","arguments":{"a":19,"b":23}}}' | "$T/mcp" 2>&1)
 assert_contains "the MCP server adds two numbers" "$out" '"sum":42'
 
-echo "$n complete programs from the documentation, all compiled and run"
+echo "$n complete programs from docs/writing-wantzel.md, all compiled and run"
+
+# docs/lib/*.md -- one reference page per standard-library module.  Every fenced pascal
+# block that is a COMPLETE program (it has its own "end." line) must compile on its own;
+# a block without "end." is a fragment meant to be read in context, not copied whole, and
+# is left alone -- the same split writing-wantzel.md makes above.
+libdocs="$ROOT/docs/lib"
+[ -d "$libdocs" ] || { echo "docs/lib is missing"; exit 1; }
+
+m=0
+for doc in "$libdocs"/*.md; do
+  [ -f "$doc" ] || continue
+  base=$(basename "$doc" .md)
+  blk=0
+  inblk=0
+  file=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$inblk" = "1" ]; then
+      if [ "$line" = '```' ]; then
+        inblk=0
+        if grep -q '^end\.$' "$file"; then
+          m=$((m + 1))
+          out="$T/libdoc_${base}_${blk}"
+          if ! "$WANTZEL" "$file" "$out" >"$T/cerr" 2>&1; then
+            echo "a complete program in docs/lib/$base.md (block $blk) does not compile:"
+            sed 's/^/    /' "$T/cerr"
+            exit 1
+          fi
+        fi
+      else
+        printf '%s\n' "$line" >> "$file"
+      fi
+    elif [ "$line" = '```pascal' ]; then
+      blk=$((blk + 1))
+      inblk=1
+      file="$T/libdoc_${base}_${blk}.wz"
+      : > "$file"
+    fi
+  done < "$doc"
+done
+
+echo "$m complete programs from docs/lib/*.md, all compiled"

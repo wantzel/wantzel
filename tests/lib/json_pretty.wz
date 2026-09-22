@@ -1,0 +1,54 @@
+// lib/json.wz: json.pretty -- laying a value out over lines without reparsing it.
+//
+// The point of the checks below is that formatting must not CHANGE the document.
+// A formatter that reparses numbers, drops escapes or reorders keys has edited the
+// file while claiming to format it, and that is worse than not formatting at all.
+include "json.wz";
+var
+  src: array[0..2047] of char;
+  dst: array[0..8191] of char;
+  n, e: int;
+procedure zet(s: str);
+var i: int;
+begin
+  i := 0;
+  while i < slen(s) do begin src[i] := schar(s, i); i := i + 1; end;
+  n := i;
+end;
+// format s and print it, or say it was rejected
+procedure toon(s: str);
+begin
+  zet(s);
+  e := json.pretty(src, 0, n, dst, 0, 0);
+  if e < 0 then io.puts(STDOUT, "INVALID")
+  else io.out(STDOUT, addr(dst[0]), e);
+  io.puts(STDOUT, "\n--\n");
+end;
+begin
+  // nesting of both kinds
+  toon("{\"a\":1,\"b\":[1,2,3],\"c\":{\"d\":\"x\"}}");
+
+  // empty containers stay on one line, at top level and nested
+  toon("[]");
+  toon("{}");
+  toon("{\"empty\":{},\"list\":[]}");
+
+  // 1.10 must come out as 1.10: the digits are copied, not reparsed
+  // escapes inside a string are copied verbatim
+  toon("[1.10,true,null,\"with \\\"escape\\\"\"]");
+
+  // a key with a brace in it must not be mistaken for structure
+  toon("{\"a{b\":\"c}d\"}");
+
+  // whitespace in the input is irrelevant -- the output is the same either way
+  toon("  {  \"a\" :  1  }  ");
+
+  // deeper than one level of each
+  toon("[[[1]],{\"a\":[{\"b\":2}]}]");
+
+  // and the refusals
+  toon("{oops}");
+  toon("{\"a\":1");
+  toon("[1,]");
+  toon("");
+end.

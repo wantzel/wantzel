@@ -2,13 +2,13 @@
 include "io.wz";
 include "json.wz";
 
-schema Point = record
+type Point = schema
   x: real;
   y: real;
   tag: text of ("start", "mid", "end")?;
 end;
 
-schema Path = record
+type Path = schema
   id:     int;
   origin: Point;
   pts:    array[0..3] of Point;

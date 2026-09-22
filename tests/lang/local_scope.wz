@@ -1,0 +1,21 @@
+// `local` limits a name to the file it is declared in.
+//
+// The include below declares `hidden.n` and `hidden.bump` as local, and a public
+// `shared.seen`.  This file declares its OWN `hidden.n` -- which is only possible
+// because the one in the include is invisible here.  Without `local` that is a
+// "duplicate global declaration" and this program does not compile.
+include "io.wz";
+include "progs/local_scope_helper.wz";
+
+var hidden.n: int;
+
+begin
+  hidden.n := 99;                 // ours, not the one in the helper
+  helper.run;                     // bumps the helper's own hidden.n to 1
+  helper.run;                     // and again, to 2
+  io.puts(STDOUT, "helper counted ");
+  io.putn(STDOUT, shared.seen);   // 2 -- the helper's copy
+  io.puts(STDOUT, ", ours is still ");
+  io.putn(STDOUT, hidden.n);      // 99 -- untouched
+  io.puts(STDOUT, "\n");
+end.

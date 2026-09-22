@@ -19,6 +19,30 @@ reachable without touching the language.* A new capability is a constant plus a 
 compiler change. What remains to decide is **where** it belongs: in `lib/` (almost always) or
 in the application (almost never).
 
+### The same holds on Windows, through `winapi()`
+
+`winapi("kernel32.dll", "GetModuleFileNameA", ...)` names a DLL and a function **as
+strings**, and the PE writer emits the import like any other. So a Windows API the compiler
+has never heard of is also reachable without a compiler change — the dynamic route
+(`GetProcAddress`) is there as well when a function should not be a hard import.
+
+**Worth writing down because it was missed in exactly the situation it was made for.** On
+17 September 2026 the library search path was being anchored on the executable instead of
+`argv[0]`, which on Linux is `readlink("/proc/self/exe")`. The Windows equivalent is
+`GetModuleFileNameA`, and that name is *not* in the compiler's own import table — from which
+the wrong conclusion followed, that the Windows side needed the import table extended and
+therefore a compiler change. It did not: the name is a string, and a string is data.
+
+Two lessons, and the second is the reusable one:
+
+1. **Not in the built-in import table is not the same as not reachable.** The table exists
+   for what the *runtime* needs before user code runs; anything else is named by the source.
+2. **Check the reachability question before the scope question.** "This needs a compiler
+   change" was reached by looking at the wrong list. The rule at the top of this document is
+   the answer on both platforms, and forgetting it on one of them costs the same as
+   forgetting it on both — see also `fork`, shared memory and `flock` below, each called
+   impossible here before someone tried.
+
 ## Processes and concurrency
 
 | | state | evidence |
@@ -126,3 +150,12 @@ TLS is the honest exception to "zero dependencies" and is open as such.
 3. **Measure it with a small program** before believing it. Every "yes" above was written only
    after a running program produced the number next to it.
 4. **Put it in `lib/`**, not in the application — the next program needs it too.
+5. **Carry the Windows side in the same change**, with `winapi()` and the DLL function by
+   name. A capability that exists on one target only is half a capability, and the
+   asymmetry is discovered much later — usually by a test under Wine.
+
+**And if a system call has no Windows counterpart, make the emulation return an error rather
+than refuse.** `__wsys` traps on a number it does not know, which is right for a program that
+cannot continue and wrong for a caller that has a fallback ready: `readlink` on Windows
+returns `-1` so the anchor above falls back to `argv[0]`. Trapping there killed the compiler
+itself before it compiled anything.

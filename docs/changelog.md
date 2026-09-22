@@ -17,6 +17,126 @@ Newest first. Dates are the day the change landed.
 
 ---
 
+## Unreleased
+
+**Read this row first: the standard library is no longer inside the compiler binary.** It is
+read from `lib/` beside the compiler's own executable. **Download the archive, not the bare
+binary** — the archive contains `lib/`; a lone binary cannot resolve `include "io.wz"` and
+now says so, naming the path it looked for.
+
+**Library**
+
+- `lib/` is ordinary Wantzel source on disk and nowhere else. You can read it, step into it
+  in a debugger, and change it: edit `lib/io.wz` beside the compiler and the next compile
+  uses your version, with nothing to rebuild.
+
+- **`json.pretty` lays a JSON document out over lines**, two spaces per level, one key per
+  line, no trailing comma. It copies values rather than reparsing them, so a number stays
+  exactly as it was written. Invalid input is refused instead of repaired. `examples/jsonpretty.wz`
+  is the whole program around it: read, call, print.
+
+**Language**
+
+- **`local` keeps a name inside its file.** Put it in front of a top-level `var`, `const`,
+  `procedure` or `function` and nothing outside that file can see it — two files can now
+  both declare `hidden.n` without colliding. Public is still the default, so existing
+  source is unchanged. The unit is the file: no module system, no separate compilation.
+  `local` is now a keyword, so a routine or variable that was called exactly `local` needs
+  a different name (a dotted name like `dpy.local` is unaffected).
+
+- **A schema is declared like every other type: `type X = schema ... end;`**, where it used
+  to be `schema X = record ... end;`. The old form is refused by name, so an older source
+  gets the new spelling rather than a puzzle. Nothing else changes: the fields, the
+  optional `?`, the descriptions and the generated `parse`/`write`/`jsonschema` are the
+  same.
+
+  The word `record` in the old form said nothing — a schema body could never be anything
+  else, and a schema shares none of a record's machinery (it has eleven tables of its own
+  and touches the record tables not at all). What it did do is offer two shapes for what
+  looks like one thing, `type X = record` beside `schema X = record`, where the difference
+  is not in the form but only in the meaning. That is the kind of distinction a generator
+  gets wrong.
+
+**Library**
+
+- **An oversized input line no longer ends an MCP server silently.** `mcp.stdio` used to
+  `return` when a single line filled the input buffer, so the client waited for a reply
+  that never came — the worst failure this transport has, because nothing says anything is
+  wrong. It now answers with a JSON-RPC parse error, drops the line and carries on.
+- **`MCPBUF` is 4 MB, up from 1 MB.** A reply carries text as a JSON string, and escaping
+  can multiply a byte by six (`\u00XX` for a control byte), so a 256 kB file answered
+  verbatim needs 1.5 MB of room. Measured: 200 kB of control bytes becomes 1.2 MB of valid
+  JSON, which the old buffer could not hold. It is a static array, so the cost is address
+  space and not work.
+
+**Compiler**
+
+- **"`io.putc` is declared in `io.wz`; add: `include "io.wz";`" is no longer said about a
+  name that is not there.** The compiler checked only that `lib/io.wz` EXISTS, never that it
+  declares the name — so any misspelling whose prefix happens to be a library got a
+  confident pointer to a file that does not have it, and often to an `include` that was
+  already three lines up. It now reads that one file and asks; when the name is not in it,
+  the message is the plain `undeclared identifier: io.putc`. The hint is unchanged where it
+  was right.
+
+- **A name that is one typo from a real one now says which.** `io.putc` answers
+  `undeclared identifier: io.putc -- did you mean io.puts?`. Only one edit, and only within
+  the module the prefix names: measured against the errors that writers really make, a name
+  that was invented rather than mistyped has its nearest neighbour three to five edits away,
+  and a suggestion at that distance is worse than none.
+
+- **The compiler can be included by another program.** `src/compiler.wz` holds all of it
+  and has no main program; `src/wantzel.wz` is the command-line program around it. A source
+  file ending in `end.` is a *program*, and only one of those is allowed per compilation, so
+  before this the compiler could only be used as a separate executable — which is where
+  finding it on `PATH`, finding `lib/` beside it, and starting it at all came from.
+
+  An error still exits, from 234 places in 45 mutually recursive routines; threading a
+  return value through those is a rewrite of the parser's control flow, not a refactor. A
+  host that must survive a failed compile calls `compile` in a `fork`: the child may exit,
+  the parent reads its code. Note that the language has one global namespace, so a host
+  prefixes its own names — the compiler owns short ones like `i`, `out` and `line`.
+- **An include that cannot be opened names the library path it tried.** For a bare name
+  like `io.wz` the compiler looks in `lib/` beside its own executable first, and when that
+  file is absent the message now says so on a second line. It used to print only the name
+  written on the line — which the reader can already see, and which sent them looking in
+  their own directory for a file the compiler expected elsewhere. This is the case a
+  download without `lib/` produces. An include containing a `/` is unchanged: one path was
+  tried, one path is named.
+- **`lib/` is found when the compiler is started through `PATH`.** The search path is
+  anchored on the compiler's own executable, read from `/proc/self/exe` instead of taken
+  from `argv[0]`. Started by its bare name — which is what an editor or a script does —
+  `argv[0]` is `wantzel` with no directory in it, and the anchor used to collapse to a
+  relative `lib/`: `include "io.wz"` then depended on the working directory and failed in a
+  correct installation. Naming the compiler by an absolute path is no longer necessary.
+- A constant array index outside the array's bounds is now a **compile error** rather than a
+  runtime one: `a[9]` on an `array[0..3]` is refused while the line is being read. The
+  runtime check stays and is still the only possible one for an `array of T` parameter,
+  whose length only the caller knows. A literal and a named constant are both covered; a
+  runtime variable is unchanged.
+- The compiler no longer carries a copy of the standard library. One search path, `lib/`
+  next to the executable; a bare name is looked for there and then beside the source, and a
+  name containing `/` is only ever a path. Before, a third place could answer an include and
+  nothing said which one had — so behaviour depended on the working directory.
+- **The binary is 48% smaller**: 536561 → 280313 bytes.
+- A runtime message names its file relative to the project, at most two directory segments
+  deep (`src/win32/main.wz:412`). The same source therefore produces the same executable
+  whether you name it relatively or absolutely, and no binary carries the directory layout of
+  the machine that built it. Measured before the fix on a program with 1288 checks: 513024
+  bytes against 581632, from identical source, with the build machine's home directory
+  embedded 1288 times.
+- An include that cannot be opened now names the path it tried, which for a bare library
+  name is not what is written on the line.
+
+**Editor**
+
+- The VS Code extension no longer ships snippets. It keeps highlighting, compile errors in
+  the Problems panel, and build and run — and it stays at those three on purpose. The
+  complete working programs live in `docs/writing-wantzel.md`, where a test compiles them on
+  every run and anyone can find them, not only a VS Code user.
+
+---
+
 ## 0.2.1 — 15 September 2026
 
 **Read this row first: three keywords are gone, and sources that use them no longer
@@ -88,7 +208,7 @@ keywords became thirty-nine.
   the file name and the line number. In a GUI program that came to a quarter of the binary.
   The heading is now shared and the trap routine writes it before the place, so the message
   you see is unchanged. Measured: the compiler itself went from 554,041 to 534,169 bytes, and
-  the calculator demos lost 9-10% each. It costs about 20 bytes of runtime, so a program with
+  GUI programs built with it lost 9-10% each. It costs about 20 bytes of runtime, so a program with
   only a handful of checks comes out marginally larger.
 - **Imports from two DLLs, interleaved, now get the right IAT slot.** The import address
   table is written grouped by DLL, while `winapi()` calls are read in source order — so the
@@ -107,7 +227,7 @@ keywords became thirty-nine.
   drawing a window there needed no change to the language, the compiler or `lib/`. Windows
   needed two — reaching an API by name, and handing out a callback — because the operating
   system calls you rather than the other way round. Both sides are demonstrated by the same
-  calculator in the demos repository.
+  program built for each.
 - **`winproc(name)` gives a Windows API a callback it can call**, which is the one thing
   the language could not express: a window procedure, an enumerator, a hook or a comparator
   is invoked by Windows from its own code, so a compile-time link cannot serve.

@@ -766,3 +766,117 @@ begin
   end;
   return at;
 end;
+
+
+// ---------------------------------------------------------------- pretty printing
+
+var
+  // How far json.pretty read.  The function returns the WRITE position, because
+  // that is what a caller needs to keep appending; this is the read position it
+  // stopped at, which only the recursion cares about.
+  json.pread: int;
+
+// json.indent(dst, at, depth) -- a newline and two spaces per level.
+//
+// Two spaces, because that is what nearly every formatter emits and what keeps a
+// deeply nested document from running off the right edge.
+function json.indent(dst: array of char; at: int; depth: int): int;
+var i: int;
+begin
+  at := json.putb(dst, at, chr(10));
+  i := 0;
+  while i < depth * 2 do
+  begin
+    at := json.putb(dst, at, ' ');
+    i := i + 1;
+  end;
+  return at;
+end;
+
+// json.pretty(src, from, upto, dst, at, depth) -- one value, laid out.
+//
+// Returns the new write position in dst, or -1 if the input is not valid JSON.
+// json.pread is left at the point in src just past the value.
+//
+// The value is COPIED, not parsed into a tree.  Strings, numbers and literals go
+// through unchanged and only the punctuation between them moves, so every number
+// stays exactly as it was written -- a formatter that reparses 1.10 and prints 1.1
+// has changed the document while claiming to format it.
+//
+// A -1 leaves a half-written value in dst.  Treat the whole result as unusable
+// rather than printing what is there.
+//
+// EMPTY OBJECTS AND ARRAYS STAY ON ONE LINE.  {} spread over two lines is noise,
+// and every formatter agrees on this one.
+function json.pretty(src: array of char; from: int; upto: int;
+                     dst: array of char; at: int; depth: int): int;
+var c: char;
+    eind, first: int;
+begin
+  from := json.ws(src, from, upto);
+  if from >= upto then return -1;
+  c := src[from];
+
+  if (c = '{') or (c = '[') then
+  begin
+    at := json.putb(dst, at, c);
+    from := from + 1;
+    first := 1;
+    while true do
+    begin
+      from := json.ws(src, from, upto);
+      if from >= upto then return -1;
+      // The closing bracket goes on its own line at the PARENT's indent -- unless
+      // nothing was written between the brackets at all.
+      if (src[from] = '}') or (src[from] = ']') then
+      begin
+        if first = 0 then at := json.indent(dst, at, depth);
+        at := json.putb(dst, at, src[from]);
+        json.pread := from + 1;
+        return at;
+      end;
+      if first = 0 then
+      begin
+        if src[from] <> ',' then return -1;
+        at := json.putb(dst, at, ',');
+        from := json.ws(src, from + 1, upto);
+        if from >= upto then return -1;
+        // A TRAILING COMMA IS NOT JSON.  [1,] parses in JavaScript and in nearly
+        // every config dialect, so it turns up in real files -- and without this
+        // check the comma was written and then an empty element followed it, which
+        // is output that is not valid JSON either.  Refusing is the honest answer:
+        // this function formats JSON, it does not repair it.
+        if (src[from] = '}') or (src[from] = ']') then return -1;
+      end;
+      first := 0;
+      at := json.indent(dst, at, depth + 1);
+
+      // In an object a key and a colon come first.  The key is a string and is
+      // copied as it stands, escapes and all.
+      if c = '{' then
+      begin
+        if src[from] <> '"' then return -1;
+        eind := json.strend(src, from + 1, upto);
+        if eind < 0 then return -1;
+        at := json.putraw(dst, at, src, from, eind + 1);
+        from := json.ws(src, eind + 1, upto);
+        if from >= upto then return -1;
+        if src[from] <> ':' then return -1;
+        at := json.putb(dst, at, ':');
+        at := json.putb(dst, at, ' ');
+        from := from + 1;
+      end;
+
+      at := json.pretty(src, from, upto, dst, at, depth + 1);
+      if at < 0 then return -1;
+      from := json.pread;
+    end;
+  end;
+
+  // A scalar: string, number, true, false or null.  Copied byte for byte.
+  eind := json.skip(src, from, upto);
+  if eind < 0 then return -1;
+  at := json.putraw(dst, at, src, from, eind);
+  json.pread := eind;
+  return at;
+end;

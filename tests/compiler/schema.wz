@@ -2,7 +2,7 @@
 
 include "json.wz";
 
-schema Msg = record
+type Msg = schema
   jsonrpc: text;
   id:      int?;
   method:  text of ("initialize", "tools/list", "tools/call", "ping");

@@ -19,17 +19,17 @@ const
   MAXQUEUE = 8192;
   MAXLINE  = 300;
 
-schema PathArgs = record
+type PathArgs = schema
   path: text?;
 end;
 
-schema ReadArgs = record
+type ReadArgs = schema
   path:   text;
   offset: int?;
   limit:  int?;
 end;
 
-schema SearchArgs = record
+type SearchArgs = schema
   query: text;
   path:  text?;
   max:   int?;

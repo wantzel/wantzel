@@ -15,12 +15,12 @@
 include "io.wz";
 include "json.wz";
 
-schema Unit = record
+type Unit = schema
   key: text[16];
   factor: real;
 end;
 
-schema Reply = record
+type Reply = schema
   id:     int;
   total:  real;
   ok:     bool;

@@ -12,28 +12,21 @@ mkdir -p bin
 # Every file this script installs is written under a temporary name and RENAMED into
 # place.  A rename within one filesystem is atomic: a reader sees either the old file or
 # the new one, never half of one.  That matters because the suite rebuilds while the
-# rest of it is running -- tests/toolchain/all_suites_green.sh calls this script, and test.sh,
-# test-win.sh and embedded_lib_current.sh read bin/wantzel0 and src/embedded.wz.  Writing
-# in place gave those readers a truncated file: `cc -o bin/wantzel0` empties the target
-# first, so a concurrent ./bin/wantzel0 got "Permission denied" (measured: 2 failures in
-# 176 attempts during one build), and a half-written src/embedded.wz fails
-# embedded_lib_current.sh and tests/compiler/schema.wz without either naming the cause.
+# rest of it is running -- tests/toolchain/all_suites_green.sh calls this script, and
+# test.sh and test-win.sh read bin/wantzel0.  Writing in place gave those readers a
+# truncated file: `cc -o bin/wantzel0` empties the target first, so a concurrent
+# ./bin/wantzel0 got "Permission denied" (measured: 2 failures in 176 attempts during one
+# build).
 echo "1. cc bootstrap/boot.c -> bin/wantzel0    (the one and only external step)"
 cc -w -o bin/wantzel0.new bootstrap/boot.c
 mv -f bin/wantzel0.new bin/wantzel0
 
-# The standard library goes INSIDE the compiler, so a binary that was downloaded rather
-# than built can still resolve include "io.wz". Regenerated every build: src/embedded.wz
-# is generated, never edited, and a stale copy would ship a library that differs from
-# lib/ -- which tests/toolchain/embedded_lib_current.sh refuses.
-#
-# The generator is itself written in Wantzel and compiled by wantzel0, which needs no
-# embedded copy: it reads lib/ from disk, and in this repository lib/ is right there.
-echo "1b. generating src/embedded.wz from lib/"
-./bin/wantzel0 bootstrap/tools/embedlib.wz bin/embedlib.new
-mv -f bin/embedlib.new bin/embedlib
-./bin/embedlib src/embedded.wz.new $(for f in lib/*.wz; do printf '%s %s ' "$(basename "$f")" "$f"; done)
-mv -f src/embedded.wz.new src/embedded.wz
+# THERE IS NO STEP 1b ANY MORE. It used to generate src/embedded.wz from lib/ so the
+# standard library travelled inside the compiler. That went on 16-09-2026: it cost a
+# 238KB generated source in the repository, a permanent difference between the two
+# counterparts (boot.c never had an embedded copy), no way to tell which copy answered an
+# include, and no source on disk for an editor or debugger to show. lib/ ships beside the
+# binary instead.
 
 echo "2. boot   src/wantzel.wz       -> bin/wantzel.stage1 (first self-hosted compiler)"
 ./bin/wantzel0 src/wantzel.wz bin/wantzel.stage1

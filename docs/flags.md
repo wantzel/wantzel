@@ -5,9 +5,8 @@ wantzel <source.wz> <executable> [--target=linux|windows]
 wantzel --version
 ```
 
-Two arguments and one option. That is the whole interface, and it is short on purpose: a
-compiler with thirty switches is thirty things to get wrong, and an agent in a loop should
-not have to choose.
+Two arguments and one option. That is the whole interface, and it is short on purpose: a compiler with thirty switches is thirty things to get wrong, and an agent in a
+loop should not have to choose.
 
 ## The options
 
@@ -53,9 +52,10 @@ wantzel --target=windows prog.wz bin/prog     # refused
 | | |
 |---|---|
 | **optimisation level** | there is no optimiser. Straightforward code generation keeps what runs recognisable as what you read, and it is a large part of why compiling takes milliseconds. See [`design.md`](design.md) |
-| **include paths** | `include "io.wz"` finds the standard library because it is compiled into the compiler; everything else is relative to the source file |
+| **include paths** | there is one, and it is not configurable: `lib/` beside the compiler's own executable. `include "io.wz"` is looked for there first, then beside the source file; a name with a `/` in it is a path and is only looked for beside the source. Point it somewhere else by putting the compiler somewhere else |
 | **warnings** | there are none. Something is an error or it is fine — a warning is a thing you learn to scroll past |
-| **debug information** | a binary carries the file and line of every runtime check, always. That is what an agent needs to fix its own mistake, so it is not something to switch on |
+| **debug information** | a binary carries the file and line of every runtime check, always. That is what an agent needs to fix its own mistake, so it is not something to switch on. The file is named relative to the project, never by its path on the build machine — see below |
+| **stripping the build path** | nothing to strip. A runtime message carries at most the last two directory segments (`src/win32/main.wz:412`), so the same source gives the same binary whether you name it relatively or absolutely, and no executable carries the layout of the machine that built it |
 | **linking** | there is no linker and nothing to link. No libc, no runtime, no shared libraries |
 
 Each of those is a decision rather than a gap. If one of them turns out to be wrong it

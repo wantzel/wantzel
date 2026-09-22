@@ -9,7 +9,7 @@
 // Line 16 is the beta entry. Keep it there.
 include "io.wz";
 include "json.wz";
-schema In = record n: int; end;
+type In = schema n: int; end;
 tools
   alpha(In): In "first";
   beta(In): In "second";

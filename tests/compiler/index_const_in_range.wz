@@ -1,0 +1,59 @@
+// The other half of the compile-time index check: everything it must NOT refuse.
+//
+// A bounds check that is too eager is worse than none -- it refuses working programs, and
+// the author has no way to argue. So each case below is one the check has to let through:
+// the bounds themselves, a non-zero lower bound, a named constant, a runtime variable, and
+// an index into an `array of T` parameter, whose length only the caller knows.
+include "io.wz";
+
+const
+  LAST = 3;
+  FIRST = 0;
+
+var
+  a: array[0..3] of char;
+  b: array[5..9] of int;
+  i: int;
+
+// WHAT THE CHECK DOES NOT CATCH, measured 16-09-2026 and stated here so nobody mistakes
+// its silence for approval: an index that is only constant AFTER folding. `a[0-1]` and
+// `a[2+5]` on a four-element array both compile, and fail at run time as they did before.
+//
+// That is the conservative direction, which is the right one to err in: the check refuses
+// nothing it should allow, and the runtime check still catches what it misses. Widening it
+// means reading lvimm after the folding rather than before, and the value is only reliable
+// there for a bare factor -- so it would be a second, different piece of work with its own
+// risk of a false refusal. Not worth it on top of a check that already catches the two
+// forms a person actually writes: a literal, and a named constant.
+//
+// A PARAMETER'S LENGTH IS NOT KNOWN HERE, so a constant index into it cannot be checked at
+// compile time and must stay a runtime check. Refusing this would make every library
+// routine that indexes its argument uncompilable.
+function second(s: array of char): char;
+begin
+  if len(s) < 2 then return '?';
+  return s[1];
+end;
+
+begin
+  a[0] := 'o';                      // the lower bound itself
+  a[LAST] := 'k';                   // a named constant, on the upper bound
+  i := 2;
+  a[i] := '-';                      // a runtime variable: never checkable here
+
+  b[5] := 1;                        // a non-zero lower bound
+  b[9] := 2;                        // and its upper bound
+  b[5 + 4] := 3;                    // a folded expression landing on the upper bound
+  b[9 - 4] := 4;                    // and one landing on the lower bound
+  a[FIRST] := 'O';                  // a named constant on the lower bound
+
+  // EVERY INDEX OF b, EXHAUSTIVELY. Five lines rather than a loop on purpose: a loop
+  // index is a runtime value and would not exercise the compile-time check at all, which
+  // is the thing being guarded here.
+  b[5] := 0; b[6] := 0; b[7] := 0; b[8] := 0; b[9] := 0;
+
+  a[1] := second("xy");             // the parameter case, through a real call
+  io.out(STDOUT, addr(a[0]), 4);
+  io.putn(STDOUT, b[5] + b[9]);
+  io.puts(STDOUT, "\n");
+end.

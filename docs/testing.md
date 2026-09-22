@@ -74,6 +74,32 @@ The two sources are **counterparts**: the same logic, line by line, and the same
 Change one and you change the other in the same commit. `./build.sh` builds the chain,
 `./wztest --toolchain` checks it.
 
+### What the fixed point does not catch
+
+**Two counterparts that disagree about whether to REFUSE a program still reach a fixed
+point.** Measured on 16 September 2026, while adding a compile-time check: the check went
+into `src/wantzel.wz` and into the wrong one of the two functions in `boot.c` that parse an
+index. The result was a self-hosted compiler that refused a bad program and a C bootstrap
+that accepted it — and `./build.sh` reported the fixed point reached, correctly, because
+both compilers still built themselves byte-identically.
+
+The fixed point proves each compiler translates *itself* the same way. It says nothing about
+whether they agree on a program neither of them is.
+
+So for any change to the counterparts, compile the same source with **both binaries** and
+compare:
+
+```bash
+./bin/wantzel0 case.wz /tmp/a    # the C bootstrap
+./bin/wantzel  case.wz /tmp/b    # the self-hosted compiler
+```
+
+For a program that should build, the two executables must be byte-identical — which
+`tests/toolchain/counterparts_agree.sh` checks. For a program that should be **refused**,
+both must refuse it with the same message, and nothing checks that automatically: an `.err`
+test is compiled by `bin/wantzel` only. That gap is why the mistake above survived a green
+suite.
+
 ## Watching the speed
 
 `tests/bench/compile_self.sh` measures how fast the compiler compiles its own source, in

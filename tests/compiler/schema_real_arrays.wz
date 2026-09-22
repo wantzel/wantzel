@@ -2,7 +2,7 @@
 include "io.wz";
 include "json.wz";
 
-schema Sample = record
+type Sample = schema
   name:   text[16] "a short name";
   value:  real;
   count:  int?;

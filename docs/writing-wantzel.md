@@ -24,6 +24,8 @@ Found a new pitfall? Add it under the heading it belongs to.
 - `tools` as a namespace (`tools.list`) → `variable name expected`: `tools` is a keyword. **Right:** `tool.list`, `tool.run`.
 - A type name (record, schema) is *also* an ordinary identifier: `schema Point` and `var point: ...` collide. **Right:** `var p: Point`.
 - Dotted names are cosmetic: `mcp.buf` and `mcp.Buf` are the same thing; so are `a.b` and `A.B`. There is no module scope.
+- **A prefix is claimed globally, so two files cannot both own one.** Two includes that each build a `run.*` namespace give `duplicate global declaration` on the first variable of the second one — and only in a program that happens to include both, so each file compiles on its own and the pair does not. **Right:** before choosing a prefix, grep for it across everything the program can include and take one that is free; rename the newer file rather than the one that already has callers. (18-09-2026)
+- **A builtin with no arguments still needs its brackets**: `if argc < 2` → `missing ( after builtin`. **Right:** `argc()`. Same for anything in the builtin list used as a value. (18-09-2026)
 
 ## Types
 
@@ -120,7 +122,10 @@ Found a new pitfall? Add it under the heading it belongs to.
 - `http.header("Accept")` with capitals used to find **nothing, ever**: `http.hdreq` lowercased the bytes from the buffer but compared them against the literal exactly as written, so you got `false` and concluded the header was absent — no error, no warning. **Fixed 15-09-2026: the comparison is case-insensitive on both sides, so either spelling works.** On a compiler older than that, write the name in lower case. (11-09-2026)
 - `kv.scanobj`, `kv.pair`, `kv.first`, `kv.next` and `kv.find` **position** the cursor `kv.kat`/`kv.kend`/`kv.vat`/`kv.vend`; save what you still need before calling one of them. `kv.isobject`, `kv.count` and `kv.match` only ask a question and **restore** the cursor since 15-09-2026 — before that they moved it too, which cost two application bugs, both silent (batch submit of configurable values, 10-09).
 - `arg.take` unwraps a JSON string; `arg.strings(arg.buf, 0, arg.n)` afterwards sees a single string (`"key"`) as bare text and returns -1. For "a list, a string containing a list, or a single string", copy the raw view bytes (`arg.byte`) and run `arg.strings` on those; it unwraps a string-with-a-list itself.
-- `time.parseiso` accepts only `YYYY-MM-DDTHH:MM:SS[.frac][Z]`: no date without a time and no `+HH:MM` offset (Python's `isoformat()` produces `+00:00`). Pad the date with `T00:00:00`, and strip the offset and apply it yourself.
+- `time.parseiso` reports failure through `time.ok`, not through what it returns. A refused
+  string gives `-1`, but so does a moment one second before the epoch, so read the flag.
+  It accepts a bare date, a fractional part, `Z`, a `+HH:MM` offset and a space in place of
+  the `T`; see [`lib/time.md`](lib/time.md) for the shapes.
 
 ## Working copies (one global record per entity)
 
@@ -151,6 +156,41 @@ Found a new pitfall? Add it under the heading it belongs to.
   the TICKET (`tests:`), not in the test file: two places saying the same thing drift apart.
   Open instead with a line saying what the test guards. (This holds in the compiler repo;
   the application still has such headers -- see its own docs.)
+
+## A wrong result that looks like a choice
+
+Most pitfalls above announce themselves: a compile error, a crash, a wrong number. The
+expensive ones do not. They produce output that is *plausible* — faded, slightly off,
+oddly spaced — and a plausible result invites you to adjust taste instead of to debug.
+
+**Rules that pay for themselves:**
+
+- **If you change an input and the output does not change, you are tuning the wrong
+  variable.** Two rounds of this is the signal to stop adjusting and start measuring. The
+  constraint is somewhere you have not looked.
+- **Measure the data, not the rendering.** Print the actual values your code produced —
+  maxima, counts, ranges — rather than judging the picture. `max 31 of 255` settles in one
+  line what an hour of staring cannot.
+- **Know the healthy range before you look.** A number only reads as wrong next to what it
+  should have been, so state the expected bound first, then measure.
+- **Suspect off-by-a-factor before off-by-a-pixel.** A value that is 1/8th or 1/64th of what
+  it should be points at a loop that exits early or a divisor that does not match what was
+  counted — not at a formula that is slightly out.
+
+**A loop that counts and a divisor that disagree** is the classic source. If you accumulate
+over a nested loop, make sure nothing leaves it early:
+
+```
+// WRONG: the break leaves the inner loop, so hits can never exceed n --
+// yet the divisor is still n * n. Everything comes out at 1/n of its true value.
+for i := 0 to n - 1 do
+  for j := 0 to n - 1 do
+    if inside(i, j) then begin hits := hits + 1; break; end;
+value := hits * 255 div (n * n);
+```
+
+The fix is to remove the early exit; the lesson is that the result was *usable*, just
+uniformly wrong, so nothing ever flagged it.
 
 ## Spec versus compiler (findings)
 
@@ -304,12 +344,12 @@ neither is optional:
 ```pascal
 include "json.wz";
 
-schema AddArgs = record
+type AddArgs = schema
   a: int "the left operand";
   b: int "the right operand";
 end;
 
-schema AddResult = record
+type AddResult = schema
   sum: int;
 end;
 
@@ -605,8 +645,8 @@ end;
 ## Schema + tools (MCP/REST without the handwork)
 
 ```pascal
-schema AddArgs = record a: int "left"; b: int "right"; end;
-schema AddResult = record sum: int; end;
+type AddArgs = schema a: int "left"; b: int "right"; end;
+type AddResult = schema sum: int; end;
 tools
   add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
 end;

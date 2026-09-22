@@ -6,7 +6,7 @@ are kept separately in §9 and are only valid once they move here. Whoever imple
 something reads this file first; whoever changes the language updates this file in the same
 commit.
 
-Last updated: 2026-09-15 (phase 1 complete: real, record, slices, view, for, local const, schema v2, tools).
+Last updated: 2026-09-17 (phase 1 complete: real, record, slices, view, for, local const, schema v2, tools; a schema is declared as `type X = schema ... end;`).
 
 ## The language in brief
 
@@ -104,7 +104,7 @@ shape of a message, and the compiler makes a record type, a parser, a writer and
 Schema out of it; there is no DOM, no reflection and no allocation:
 
 ```pascal
-schema Rpc = record
+type Rpc = schema
   jsonrpc: text;
   id:      json?;                       // '?' makes the field optional
   method:  text of ("initialize", "tools/list", "tools/call", "ping");
@@ -262,6 +262,33 @@ the left-hand side does not already determine the result (`false and f()` does n
 `f`). Ordering (`<` etc.) only
 on `int`, `char` and `real`. Overflow of `int` is not checked.
 
+## 3b. Visibility: `local`
+
+Every name is global and the namespace is shared, so two files cannot both declare
+`hidden.n`. Put `local` in front of a top-level declaration and the name is visible **only in
+the file that declares it**:
+
+```pascal
+local var   hidden.n: int;          // this file only
+local const HIDDEN.MAX = 64;
+local procedure hidden.bump;
+local function hidden.count: int;
+
+var   shared.seen: int;             // public, as before
+```
+
+- `local` applies to `var`, `const`, `procedure` and `function` at the top level. Not to
+  `type` or `schema`.
+- **Public is the default.** A declaration without `local` behaves exactly as it always did,
+  so existing source needs no change.
+- The unit is the **file**. There is no module system, no separate compilation and no
+  nesting: `local` means "this file", and nothing else.
+- Naming a local from another file is `undeclared identifier`, the same as a name that does
+  not exist — because from there, it does not.
+
+Note that `local` in front of a `const` block **inside** a routine is a different thing: that
+one is local to the call, and it predates this. The place you write it decides which is meant.
+
 ## 4. Routines
 
 ```pascal
@@ -378,13 +405,13 @@ into, in one go: a **record type** with the same name, `Name.clear`,
 DOM and no reflection; the parser reads straight from the input buffer.
 
 ```pascal
-schema Point = record
+type Point = schema
   x: real;
   y: real;
   tag: text of ("start", "mid", "end")?;        // enum → int, with constants Point.tag.start ...
 end;
 
-schema Path = record
+type Path = schema
   id:     int              "unique id";         // a description goes along into the JSON Schema
   name:   text[64];                             // text as a copy (unescaped), at most 64 bytes
   note:   text?;                                // text as a view (_at/_end) in the input buffer
@@ -758,6 +785,6 @@ language:
   — and the fix is an Authenticode signature the machine trusts, a folder exclusion from
   your administrator, or testing in Windows Sandbox.
 
-`bootstrap/tools/runexe.sh` runs an `.exe` under Wine, and `./wztest --toolchain` exercises
-the Windows side that way, so the two targets are tested together rather than one being
-assumed to still work.
+`./wztest --toolchain` runs the Windows output under Wine (`run_win` in
+`tests/helpers.sh` sets the prefix and disables the crash dialog), so the two targets are
+tested together rather than one being assumed to still work.

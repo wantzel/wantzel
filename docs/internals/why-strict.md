@@ -51,9 +51,14 @@ takes `(buffer, at, s)`" is a fact you have to remember. A complete, working fra
 fills a buffer and guards its bound is a shape to copy, and copying a shape is what a
 generator is good at.
 
-That is why the editor extension ships snippets rather than only documentation, and why a
-test compiles every one of them on each run. A fragment that no longer compiles is a failing
+That is why [`writing-wantzel.md`](../writing-wantzel.md) carries whole working programs
+rather than only reference tables, and why `tests/toolchain/doc_programs_compile.sh`
+compiles every one of them on each run. A fragment that no longer compiles is a failing
 test, not a quietly rotting file.
+
+It is also why the compiler answers `undeclared identifier: io.puts` with the library the
+name lives in and the include line to add: the fix arrives with the diagnosis instead of
+requiring a lookup.
 
 ### The history worth knowing
 

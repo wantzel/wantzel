@@ -1,0 +1,15 @@
+// Included by local_scope.wz.  Everything `local` here is invisible to the includer.
+local var hidden.n: int;
+
+local procedure hidden.bump;
+begin
+  hidden.n := hidden.n + 1;
+end;
+
+var shared.seen: int;             // public: the includer reads this
+
+procedure helper.run;
+begin
+  hidden.bump;
+  shared.seen := hidden.n;
+end;

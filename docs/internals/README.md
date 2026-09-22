@@ -16,6 +16,7 @@ the API documentation did not prepare you for.
 | [`callbacks.md`](callbacks.md) | what it takes to let Windows call a Wantzel routine, and the register convention that makes it harder than it looks |
 | [`memory.md`](memory.md) | arrays, indexes, slices, `view` and `mmap`: how you work with large data with no heap and no pointers |
 | [`what-the-system-can-already-do.md`](what-the-system-can-already-do.md) | what is available today and proven by an experiment, and which limits are a choice rather than a property |
+| [`ui-architecture.md`](ui-architecture.md) | the three layers of a program with a window — protocol, rendering, components — what each may know, what a component demands from below, and how two platforms keep one look |
 
 ## What the design rests on
 

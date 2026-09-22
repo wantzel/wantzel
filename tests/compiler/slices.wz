@@ -29,7 +29,7 @@ procedure bump(it: array of Item);
 begin
   it[0].k := it[0].k + 100;           // a one-element slice stands in for a record parameter
 end;
-procedure local;
+procedure onstack;
 var buf: array[0..7] of int;
 begin
   buf[2] := 5; buf[3] := 6; buf[4] := 7;
@@ -47,7 +47,7 @@ begin
   show("sumfirst 3 = ", sumfirst(data, 3));           // 33
   show("sumfirst 10 = ", sumfirst(data, 10));         // 145
   show("sumfirst 0 = ", sumfirst(data, 0));           // 0
-  local;
+  onstack;
   items[3].k := 7;
   bump(items[3..3]);
   show("items[3].k = ", items[3].k);                  // 107

@@ -60,7 +60,7 @@ arguments carries all of them, and one that takes fewer simply ignores the rest.
 
 The proof is that the first thing it was tested against was not a window at all:
 `EnumWindows` handed a Wantzel routine each open window in turn, ten times, and returned
-cleanly. Nothing about that call knows it was built for a calculator.
+cleanly. Nothing about that call knows what kind of program it was built for.
 
 ## How this gets used, and how it should not
 
@@ -72,7 +72,7 @@ winapi("user32.dll", "EnumWindows", winproc(onwindow), 0);
 
 Two low-level things in one line: a raw DLL call and a raw callback address. **That is the
 right shape for the compiler and the wrong shape for an application.** Nobody writing a
-calculator should be thinking about user32.dll.
+desktop program should be thinking about user32.dll.
 
 What belongs above it is an ordinary library, so the application writes ordinary code:
 
@@ -82,8 +82,8 @@ include "win.wz";
 procedure onclick(id: int); forward;      // you write this
 
 begin
-  win.window("Calculator", 326, 539);
-  win.button("7", 0, 2);
+  win.window("Totals", 326, 539);
+  win.button("Refresh", 0, 2);
   win.run;                                // the loop lives in here
 end;
 ```

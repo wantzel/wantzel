@@ -11,16 +11,16 @@ include "mcphttp.wz";
 
 // ---- tool argument shapes ------------------------------------------
 
-schema AddArgs = record
+type AddArgs = schema
   a: int;
   b: int;
 end;
 
-schema EchoArgs = record
+type EchoArgs = schema
   text: text;
 end;
 
-schema CountArgs = record
+type CountArgs = schema
   text: text;
   word: text?;
 end;

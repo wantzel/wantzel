@@ -1,25 +1,31 @@
 # Syntax
 
-The whole of it. Wantzel is small on purpose: thirty-nine keywords, one way to say each
+The whole of it. Wantzel is small on purpose: forty keywords, one way to say each
 thing, and no construct that needs a second look.
 
 For what the language *means* rather than how it is written, see
 [`language.md`](language.md), which is binding. For how to write it well, see
-[`writing-wantzel.md`](writing-wantzel.md).
+[`writing-wantzel.md`](writing-wantzel.md). For agreements that shape a project without
+being part of the language — how an entry point is named, how a module prefixes its names —
+see [`conventions.md`](conventions.md).
 
-## The thirty-nine keywords
+## The forty keywords
 
 ```
 and       array     begin     bool      break     char      const     continue
 div       do        downto    else      end       false     for       forward
-function  if        include   int       mod       not       of        or
-procedure real      record    return    schema    shl       shr       str
-then      to        tools     true      type      var       while
+function  if        include   int       local     mod       not       of
+or        procedure real      record    return    schema    shl       shr
+str       then      to        tools     true      type      var       while
 ```
 
 **Case does not distinguish names.** `Foo`, `foo` and `FOO` are one name, and so are
 `STORE.SET` and `store.set` — a constant in capitals beside a routine in lower case is a
 collision, not a convention.
+
+**`local` keeps a name inside its file.** Put it in front of a top-level `var`, `const`,
+`procedure` or `function` and nothing outside that file can see it, which is the way to stop
+two files colliding over the same name. Public is still the default.
 
 ## A program
 

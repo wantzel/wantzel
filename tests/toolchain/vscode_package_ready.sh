@@ -29,9 +29,8 @@ grep -q '"license"' "$pkg" && { [ -f LICENSE ] || {
   echo "  vsce looks beside the manifest, not in the repository root"
   exit 1; }; }
 
-# Every path the manifest points at must exist. These are the ones that break silently:
-# a missing grammar means no highlighting and no error, a missing snippet file means the
-# snippets simply never appear.
+# Every path the manifest points at must exist, and these break SILENTLY: a missing
+# grammar means no highlighting and no error message either.
 for rel in $(grep -oE '"\./[^"]+"' "$pkg" | tr -d '"'); do
   [ -e "$rel" ] || { echo "package.json points at $rel, which does not exist"; exit 1; }
 done
