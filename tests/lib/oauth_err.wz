@@ -1,0 +1,107 @@
+// lib/oauth.wz: oauth.take, oauth.readcookie and oauth.newsession must let a caller tell
+// WHY they refused apart from the fact that they refused.
+//
+// oauth.take threw its own false away into oauth.ok ("results this module does not act
+// on"); oauth.readcookie answered the same false for "no session cookie" and "a session
+// cookie too big to be real"; oauth.newsession collapsed three different store/index
+// failures into one false, so its only caller always reported 503 "no room for more
+// sessions" even when the real cause was a write or an index failure.  oauth.err now
+// carries the reason, first-fail-wins, the same convention as acme.err and store.err.
+//
+// No socket and no running server: requests are written straight into http.inbuf and
+// parsed there, the way tests/lib/http_header_case.wz already does for lib/http.wz.
+include "io.wz";
+include "oauth.wz";
+
+var
+  req: array[0..511] of char;
+  n, i, row: int;
+  dir: array[0..63] of char;
+  dirn: int;
+
+// the application hooks oauth.wz forward-declares; unused by these checks
+function app.authenticate(user: array of char; secret: array of char): int;
+begin
+  return -1;
+end;
+function app.machinetoken(token: array of char): int;
+begin
+  return -1;
+end;
+procedure app.request;
+begin
+end;
+
+procedure show(label: str; ok: bool);
+begin
+  io.puts(STDOUT, label);
+  io.puts(STDOUT, " ok=");
+  if ok then io.puts(STDOUT, "1") else io.puts(STDOUT, "0");
+  io.puts(STDOUT, " err=[");
+  io.puts(STDOUT, oauth.err);
+  io.puts(STDOUT, "]\n");
+end;
+
+begin
+  // ---- oauth.take: a value that does not fit its destination ----------------------------
+  http.pvlen := 5;
+  for i := 0 to 4 do http.pval[i] := 'x';
+  oauth.err := "";
+  show("take-fits", oauth.take(oauth.user[0..7]));       // dst of 8, value of 5: fits
+
+  http.pvlen := 9;
+  for i := 0 to 8 do http.pval[i] := 'y';
+  oauth.err := "";
+  show("take-toolong", oauth.take(oauth.user[0..7]));    // dst of 8, value of 9: refused
+
+  // ---- oauth.readcookie: absent vs. present-but-oversized --------------------------------
+  n := io.push(req, 0, "GET / HTTP/1.1\r\n");
+  n := io.push(req, n, "Host: example.invalid\r\n");
+  n := io.push(req, n, "\r\n");
+  for i := 0 to n - 1 do http.inbuf[i] := req[i];
+  n := http.parse(0, n);
+  oauth.err := "";
+  show("cookie-header-absent", oauth.readcookie);        // no Cookie header at all: quiet
+
+  n := io.push(req, 0, "GET / HTTP/1.1\r\n");
+  n := io.push(req, n, "Host: example.invalid\r\n");
+  n := io.push(req, n, "Cookie: other=1\r\n");
+  n := io.push(req, n, "\r\n");
+  for i := 0 to n - 1 do http.inbuf[i] := req[i];
+  n := http.parse(0, n);
+  oauth.err := "";
+  show("cookie-no-session", oauth.readcookie);            // header present, wrong cookie: quiet
+
+  n := io.push(req, 0, "GET / HTTP/1.1\r\n");
+  n := io.push(req, n, "Host: example.invalid\r\n");
+  n := io.push(req, n, "Cookie: session=");
+  for i := 0 to 299 do n := io.push(req, n, "a");         // 300 bytes: over the 255 limit
+  n := io.push(req, n, "\r\n\r\n");
+  for i := 0 to n - 1 do http.inbuf[i] := req[i];
+  n := http.parse(0, n);
+  oauth.err := "";
+  show("cookie-oversize", oauth.readcookie);              // present but too big: says why
+
+  // ---- oauth.newsession: needs an open store -----------------------------------------
+  oauth.configure("https://example.invalid");
+  oauth.tables;
+  dirn := io.push(dir, 0, "oauth_err_test.d");
+  if not store.opendir(dir[0..dirn - 1]) then io.fatal("cannot open the test store");
+  oauth.load;
+  oauth.err := "";
+  show("newsession-ok", oauth.newsession(1));             // room available: succeeds, quiet
+
+  // Exhaust the token table so the next session has nowhere to go, and confirm the
+  // resulting oauth.err names the real cause instead of a generic refusal.  Filling it
+  // through oauth.newsession itself (rather than store.alloc directly) is what actually
+  // marks each row live -- store.alloc alone hands back the same free row every time
+  // until something writes it.  http.xlen normally resets once per request (http.wz's own
+  // loop does it); this test calls oauth.newsession thousands of times without a request
+  // in between, so it has to reset it itself or the Set-Cookie header oauth.newsession
+  // appends every time eventually runs past http.xhdr's end.
+  row := 0;
+  http.xlen := 0;
+  while oauth.newsession(1) do begin row := row + 1; http.xlen := 0; end;
+  oauth.err := "";
+  show("newsession-full", oauth.newsession(1));           // no room: says so
+end.

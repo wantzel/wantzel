@@ -1,0 +1,8 @@
+ok   the RFC's plaintext is 114 bytes
+ok   the first 32 bytes of the RFC ciphertext
+ok   and the last 18 bytes of it
+ok   and the tag is the RFC's
+ok   the same message opens
+ok   and the plaintext is back
+ok   one flipped bit is refused
+ok   changed associated data is refused

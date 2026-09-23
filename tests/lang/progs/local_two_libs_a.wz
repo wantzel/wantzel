@@ -1,0 +1,29 @@
+// One of two sibling library files that both want the same helper names.
+//
+// `i` and `buf` are the names a loop and a scratch buffer actually get called, in every
+// file that has one. Without `local` the SECOND library file to declare them fails with
+// "duplicate global declaration", and the writer renames them to a.i, a.buf -- which is a
+// workaround for a flat namespace, not a choice anyone makes on purpose.
+local var i: int;
+local var buf: array[0..15] of char;
+
+function a.sum(n: int): int;
+var t: int;
+begin
+  t := 0;
+  i := 0;
+  while i < n do
+  begin
+    t := t + i;
+    i := i + 1;
+  end;
+  // The buffer is touched so the declaration is not optimised into nothing.
+  buf[0] := chr(65);
+  return t;
+end;
+
+// What this file's own `i` holds afterwards -- the other file must not have changed it.
+function a.lasti: int;
+begin
+  return i;
+end;

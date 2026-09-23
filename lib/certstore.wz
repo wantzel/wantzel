@@ -1,0 +1,246 @@
+// lib/certstore.wz -- keeping keys and certificates on disk, beside the binary.
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// WHY THIS EXISTS AT ALL, when the rest of the stack is happy to hold everything in memory:
+// because without it a restart means asking the authority again, and authorities count.
+// Let's Encrypt allows five certificates per exact domain per week; a service that
+// revalidates on every restart is locked out for a week after the fifth restart. The cache
+// is not an optimisation, it is what makes restarting safe.
+//
+// BESIDE THE BINARY, NOT THE WORKING DIRECTORY. The path is resolved from /proc/self/exe,
+// because the working directory differs depending on how the program was started -- systemd,
+// a shell, a double click -- and a service that cannot find its own certificates after a
+// reboot is exactly the failure this is meant to prevent.
+//
+// WRITTEN THROUGH A TEMPORARY NAME AND RENAMED. A rename within one directory is atomic, so
+// a crash or a restart halfway through a write leaves either the old file or the new one,
+// never half of either. Writing in place would leave a truncated key, which reads as a
+// corrupt store rather than as an interrupted write.
+//
+// A MISSING OR UNREADABLE STORE IS NOT AN ERROR. It means "nothing cached yet": the caller
+// validates again and tries to save the result. A read-only disk therefore still works, just
+// without the benefit -- which is the right behaviour for something whose whole job is to
+// avoid unnecessary work.
+
+include "io.wz";
+include "fs.wz";
+
+const
+  // readlink(2) is syscall 89 on x86-64. Defined here rather than added to lib/io.wz:
+  // that file is the shared standard library and a new constant in it is a change every
+  // program inherits, which deserves its own decision. A number one module needs once
+  // belongs in that module.
+  SYS_READLINK = 89;
+
+  CS.MAXPATH = 1024;
+  CS.MAXFILE = 16384;
+
+var
+  cs.dir:   array[0..CS.MAXPATH-1] of char;   // the directory, with a trailing slash
+  cs.dirn:  int;
+  cs.path:  array[0..CS.MAXPATH-1] of char;   // a full path being built, NUL-terminated
+  cs.pathn: int;
+  cs.tmp:   array[0..CS.MAXPATH-1] of char;
+  cs.buf:   array[0..CS.MAXFILE-1] of char;   // the file just read
+  cs.bufn:  int;
+  cs.err:   str;
+  cs.ready: bool;
+
+procedure cs.fail(m: str);
+begin
+  cs.err := m;
+end;
+
+// ---- where the store lives ------------------------------------------------------------------
+
+// The directory holding the running binary, from /proc/self/exe.
+//
+// THE SYMLINK IS READ, NOT FOLLOWED BY OPENING IT: readlink gives the path, which is what is
+// wanted. Opening /proc/self/exe would give the binary's contents.
+function cs.exedir(dst: array of char): int;
+var n, i, last: int;
+    link: array[0..CS.MAXPATH-1] of char;
+begin
+  n := sys3(SYS_READLINK, sadr("/proc/self/exe"), addr(link[0]), CS.MAXPATH - 1);
+  if n <= 0 then return 0 - 1;
+  last := 0 - 1;
+  i := 0;
+  while i < n do
+  begin
+    if link[i] = '/' then last := i;
+    i := i + 1;
+  end;
+  if last < 0 then return 0 - 1;
+  i := 0;
+  while i <= last do begin dst[i] := link[i]; i := i + 1; end;
+  return last + 1;                      // includes the trailing slash
+end;
+
+// Point the store at <exedir>/certs/, creating it when it is not there.
+//
+// 0700 ON THE DIRECTORY AND 0600 ON THE FILES: private keys live here. A store that anyone
+// on the machine can read is worse than no store, because it looks like security.
+function cs.open: bool;
+var i: int;
+begin
+  cs.err := "";
+  cs.dirn := cs.exedir(cs.dir);
+  if cs.dirn < 0 then
+  begin
+    cs.fail("cannot find where this program lives");
+    return false;
+  end;
+  cs.dirn := io.push(cs.dir, cs.dirn, "certs/");
+  // The NUL-terminated form for mkdir.
+  i := 0;
+  while i < cs.dirn - 1 do begin cs.tmp[i] := cs.dir[i]; i := i + 1; end;
+  cs.tmp[cs.dirn - 1] := chr(0);        // without the trailing slash
+  i := sys2(SYS.mkdir, addr(cs.tmp[0]), 448);         // 0700
+  // EEXIST (-17) is the normal case and not a failure.
+  if (i < 0) and (i <> 0 - 17) then
+  begin
+    cs.fail("cannot make the certificate directory");
+    return false;
+  end;
+  cs.ready := true;
+  return true;
+end;
+
+// Point the store somewhere explicit instead, for a caller that was given a path.
+function cs.opendir(path: array of char; n: int): bool;
+var i: int;
+begin
+  cs.err := "";
+  if n + 2 > CS.MAXPATH then
+  begin
+    cs.fail("the certificate path is too long");
+    return false;
+  end;
+  i := 0;
+  while i < n do begin cs.dir[i] := path[i]; i := i + 1; end;
+  cs.dirn := n;
+  if cs.dir[cs.dirn - 1] <> '/' then
+  begin
+    cs.dir[cs.dirn] := '/';
+    cs.dirn := cs.dirn + 1;
+  end;
+  i := 0;
+  while i < cs.dirn - 1 do begin cs.tmp[i] := cs.dir[i]; i := i + 1; end;
+  cs.tmp[cs.dirn - 1] := chr(0);
+  i := sys2(SYS.mkdir, addr(cs.tmp[0]), 448);
+  if (i < 0) and (i <> 0 - 17) then
+  begin
+    cs.fail("cannot make the certificate directory");
+    return false;
+  end;
+  cs.ready := true;
+  return true;
+end;
+
+// Build <dir><name> into cs.path, NUL-terminated.
+procedure cs.setname(name: array of char; n: int);
+var i: int;
+begin
+  i := 0;
+  while i < cs.dirn do begin cs.path[i] := cs.dir[i]; i := i + 1; end;
+  cs.pathn := cs.dirn;
+  i := 0;
+  while (i < n) and (cs.pathn < CS.MAXPATH - 8) do
+  begin
+    // ONLY SAFE CHARACTERS IN A FILE NAME. The name is a hostname, which arrives from the
+    // command line or a configuration file; a '/' in it would write somewhere else entirely
+    // and "..", would climb out of the directory. Anything unexpected becomes an underscore.
+    if ((name[i] >= 'a') and (name[i] <= 'z')) or ((name[i] >= 'A') and (name[i] <= 'Z'))
+       or ((name[i] >= '0') and (name[i] <= '9')) or (name[i] = '.') or (name[i] = '-') then
+      cs.path[cs.pathn] := name[i]
+    else cs.path[cs.pathn] := '_';
+    // AND A LEADING DOT IS NOT ALLOWED EITHER, so "..", cannot appear at the start.
+    if (cs.pathn = cs.dirn) and (cs.path[cs.pathn] = '.') then cs.path[cs.pathn] := '_';
+    cs.pathn := cs.pathn + 1;
+    i := i + 1;
+  end;
+  cs.path[cs.pathn] := chr(0);
+end;
+
+// ---- reading -----------------------------------------------------------------------------------
+
+// Read <name> into cs.buf. Returns its length, or -1 when it is not there -- which is the
+// ordinary case on a first run and not an error.
+function cs.read(name: array of char; n: int): int;
+var fd, got, r: int;
+begin
+  cs.err := "";
+  if not cs.ready then return 0 - 1;
+  cs.setname(name, n);
+  fd := sys3(SYS.open, addr(cs.path[0]), O_RDONLY, 0);
+  if fd < 0 then return 0 - 1;
+  got := 0;
+  while got < CS.MAXFILE do
+  begin
+    r := sys3(SYS.read, fd, addr(cs.buf[got]), CS.MAXFILE - got);
+    if r <= 0 then break;
+    got := got + r;
+  end;
+  sys1(SYS.close, fd);
+  cs.bufn := got;
+  return got;
+end;
+
+// ---- writing -------------------------------------------------------------------------------------
+
+// Write b[0..n) to <name>, through a temporary file and a rename.
+//
+// THE RENAME IS WHAT MAKES THIS SAFE. Without it a restart during the write leaves a
+// truncated key on disk, and the next start reads a corrupt store rather than falling back
+// to "nothing cached". With it, either the old file or the new one is there.
+function cs.write(name: array of char; n: int; b: array of char; blen: int): bool;
+var fd, wrote, i, r: int;
+begin
+  cs.err := "";
+  if not cs.ready then
+  begin
+    cs.fail("the store is not open");
+    return false;
+  end;
+  cs.setname(name, n);
+  // The temporary lives in the SAME directory, because rename is only atomic within one
+  // filesystem and only guaranteed within one directory.
+  i := 0;
+  while i < cs.pathn do begin cs.tmp[i] := cs.path[i]; i := i + 1; end;
+  i := io.push(cs.tmp, cs.pathn, ".new");
+  cs.tmp[i] := chr(0);
+
+  // 0600: a private key must not be readable by anyone else on the machine.
+  fd := sys3(SYS.open, addr(cs.tmp[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 384);
+  if fd < 0 then
+  begin
+    cs.fail("cannot write to the certificate directory");
+    return false;
+  end;
+  wrote := 0;
+  while wrote < blen do
+  begin
+    r := sys3(SYS.write, fd, addr(b[wrote]), blen - wrote);
+    if r <= 0 then break;
+    wrote := wrote + r;
+  end;
+  sys1(SYS.close, fd);
+  if wrote <> blen then
+  begin
+    // A PARTIAL WRITE IS CLEANED UP rather than left behind: the temporary name would
+    // otherwise accumulate and the next attempt would find a stale file in its way.
+    r := sys1(SYS.unlink, addr(cs.tmp[0]));
+    cs.fail("the certificate could not be written completely");
+    return false;
+  end;
+  if sys2(SYS.rename, addr(cs.tmp[0]), addr(cs.path[0])) < 0 then
+  begin
+    r := sys1(SYS.unlink, addr(cs.tmp[0]));
+    cs.fail("cannot replace the certificate");
+    return false;
+  end;
+  return true;
+end;

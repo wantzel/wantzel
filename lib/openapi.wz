@@ -1,4 +1,8 @@
 // lib/openapi.wz -- an OpenAPI 3.1 document and a Swagger UI page, generated from
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
 // the same tool declarations that feed MCP tools/list.
 //
 // The compiler bakes `tool.list` into the binary: a JSON array of

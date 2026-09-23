@@ -1,5 +1,9 @@
 // lib/hash.wz -- open-addressing hash tables on caller-supplied arrays.
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 // A table is two arrays the caller declares: `keys` holds fixed-width keys
 // (klen bytes each, capacity = len(rows)) and `rows` holds the value for
 // each slot (any int, usually a row index).  A slot is empty when rows[i]
@@ -97,11 +101,18 @@ begin
 end;
 
 // store value for key (replacing an earlier value); false when the table is too full
+//
+// A WRONG KEY LENGTH OR A NEGATIVE VALUE IS THE CALLER'S CONTRACT, NOT A FULL TABLE. Both
+// used to come back as the same plain false as "there was no room", which is the answer a
+// caller acts on by growing the table or evicting something -- neither of which does
+// anything about a key of the wrong width or a value that collides with HASH.EMPTY/
+// HASH.DEAD. io.fatal says so instead of leaving the caller to chase a table that never
+// seems to fill up.
 function hash.put(keys: array of char; rows: array of int; klen: int; key: array of char; value: int): bool;
 var i, k: int;
 begin
-  if len(key) <> klen then return false;
-  if value < 0 then return false;
+  if len(key) <> klen then io.fatal("hash.put: key length does not match klen");
+  if value < 0 then io.fatal("hash.put: value must not be negative (HASH.EMPTY/HASH.DEAD use negative sentinels)");
   i := hash.slot(keys, rows, klen, key);
   if i < 0 then return false;
   if rows[i] < 0 then
@@ -114,10 +125,13 @@ begin
 end;
 
 // remove key; true when it was there
+//
+// Same contract as hash.put above: a wrong key length is the caller's bug, not a
+// legitimate "not found".
 function hash.del(keys: array of char; rows: array of int; klen: int; key: array of char): bool;
 var i: int;
 begin
-  if len(key) <> klen then return false;
+  if len(key) <> klen then io.fatal("hash.del: key length does not match klen");
   i := hash.slot(keys, rows, klen, key);
   if i < 0 then return false;
   if rows[i] < 0 then return false;
@@ -140,16 +154,17 @@ begin
   return hash.get(keys, rows, klen, hash.pad[0..klen - 1]);
 end;
 
+// A key too long to pad is the caller's contract, same as hash.put/hash.del above.
 function hash.putpad(keys: array of char; rows: array of int; klen: int; key: array of char; value: int): bool;
 begin
-  if len(key) > klen then return false;
+  if len(key) > klen then io.fatal("hash.putpad: key is longer than klen");
   hash.padkey(klen, key);
   return hash.put(keys, rows, klen, hash.pad[0..klen - 1], value);
 end;
 
 function hash.delpad(keys: array of char; rows: array of int; klen: int; key: array of char): bool;
 begin
-  if len(key) > klen then return false;
+  if len(key) > klen then io.fatal("hash.delpad: key is longer than klen");
   hash.padkey(klen, key);
   return hash.del(keys, rows, klen, hash.pad[0..klen - 1]);
 end;

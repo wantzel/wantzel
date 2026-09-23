@@ -1,0 +1,7 @@
+// Must not compile: "variable name expected" with a name plainly there said nothing about
+// why it did not count. Now the word and the reason.
+var
+  count: int;
+  to: int;
+begin
+end.

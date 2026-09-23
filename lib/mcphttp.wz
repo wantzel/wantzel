@@ -1,5 +1,9 @@
 // lib/mcphttp.wz -- MCP over HTTP: the endpoint routine for app.request.
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 //   include "lib/mcphttp.wz";       (brings in lib/mcp.wz and lib/http.wz)
 //   procedure app.request;
 //   begin

@@ -1,0 +1,8 @@
+ok   a missing path is refused
+ok   and fs.err stays empty for the common case
+ok   a path through a plain file is refused
+ok   and fs.err names the reason this time
+ok   with the raw errno beside it
+ok   an exhausted directory leaves fs.err empty
+ok   getdents on a plain file is refused
+ok   and fs.err names the reason, not silent exhaustion

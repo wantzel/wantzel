@@ -1,0 +1,10 @@
+// Must not compile: a keyword cannot name a tool. Used to be "missing end of the tools".
+include "json.wz";
+type A = schema
+  x: int;
+end;
+tools
+  type(A): A "Names the tool after a keyword.";
+end;
+begin
+end.

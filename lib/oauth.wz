@@ -1,4 +1,8 @@
 // lib/oauth.wz -- an OAuth 2.1 authorization server for MCP clients, in one
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
 // process with the resource server it protects.
 //
 // What a Claude connector needs (MCP authorization, RFC 9728/8414/7591/7636):
@@ -113,6 +117,19 @@ var
   oauth.uid: int;                                    // the user of the last verified token
   oauth.ok: bool;                                    // results this module does not act on
   oauth.dummy: int;
+  oauth.err: str;                                    // the reason a routine below returned
+                                                       // false, when it is worth telling apart
+                                                       // from every other reason; empty when
+                                                       // the caller's own bound already
+                                                       // refused a routine that would have set
+                                                       // it (see oauth.fail)
+
+// First reason wins, same as acme.fail and store.err: an outer, generic message never
+// overwrites the specific one that a routine underneath it already recorded.
+procedure oauth.fail(m: str);
+begin
+  if slen(oauth.err) = 0 then oauth.err := m;
+end;
 
 // ------------------------------------------------------------- setup
 
@@ -411,11 +428,15 @@ var
   oauth.q.chal: array[0..63] of char;
   oauth.q.chaln: int;
 
-// copy http.pval into dst; false when it does not fit
+// copy http.pval into dst; false when it does not fit.  Every call site so far bounds
+// http.pvlen against the same or a tighter limit before calling this, so the false branch
+// is not reachable today -- but its result used to be thrown away regardless (into
+// oauth.ok, "results this module does not act on"), so a future caller that forgot the
+// bound would silently keep whatever dst held before, with no sign anything was wrong.
 function oauth.take(dst: array of char): bool;
 var i: int;
 begin
-  if http.pvlen > len(dst) then return false;
+  if http.pvlen > len(dst) then begin oauth.fail("oauth.take: the value is too long for the destination"); return false; end;
   for i := 0 to http.pvlen - 1 do dst[i] := http.pval[i];
   return true;
 end;
@@ -680,6 +701,13 @@ procedure oauth.take_slice(b: array of char; from: int; upto: int); forward;
 // the user id of the bearer token of the current request, or -1
 // The value of our session cookie, into oauth.presented, or false.  A Cookie header
 // holds "a=1; b=2", so we walk the pairs rather than matching the whole header.
+//
+// "no Cookie header", "a Cookie header with no session cookie in it" and "a session
+// cookie so oversized it cannot be the real thing" used to be the same bare false.  The
+// first two are ordinary and stay silent; the oversized case sets oauth.err, because a
+// cookie that big is not a client with no session -- it is a client sending something
+// wrong, and oauth.verify answering -1 either way hid that difference from a caller
+// trying to work out why a request was rejected.
 function oauth.readcookie: bool;
 var at, upto, i, j, n: int;
     ok: bool;
@@ -701,7 +729,7 @@ begin
       begin
         j := i + 1;
         while (j < upto) and (http.inbuf[j] <> ';') do j := j + 1;
-        if j - (i + 1) > 255 then return false;
+        if j - (i + 1) > 255 then begin oauth.fail("oauth.readcookie: the session cookie is too long"); return false; end;
         oauth.take_slice(http.inbuf, i + 1, j);
         return oauth.pn > 0;
       end;
@@ -823,11 +851,19 @@ end;
 // Store a session for uid and set the cookie.  Secure only when the request came in
 // over TLS: through the tunnel everything is https, but plain 127.0.0.1 during
 // development is not, and a blindly Secure cookie would simply never come back.
+//
+// THREE DIFFERENT FAILURES used to come back as the same bare false, and oauth.dologin
+// (the only caller) reported all three alike as 503 "no room for more sessions" -- true
+// for the first, misleading for the other two, which are a write or an index failure that
+// "make room" does nothing about.  oauth.register already reports each of its own store
+// failures separately (503 "no room", 500 "cannot store", 503 "index full"); this follows
+// the same split, through oauth.err rather than a direct reply, because this routine has
+// no request of its own to answer.
 function oauth.newsession(uid: int): bool;
 var row, i: int;
 begin
   row := store.alloc(oauth.ttok);
-  if row < 0 then return false;
+  if row < 0 then begin oauth.fail("oauth.newsession: no room for more sessions"); return false; end;
   oauth.newsecret;                                     // the session id: oauth.txt
   oauth.hashtext(oauth.txt[0..oauth.txtn - 1]);
   for i := 0 to 31 do oauth.tk.hash[i] := oauth.dig[i];
@@ -836,8 +872,8 @@ begin
   for i := 0 to 31 do oauth.tk.client[i] := '0';
   oauth.tk.created := time.nowsec;
   oauth.tk.expires := oauth.tk.created + OAUTH.SESSION_TTL;
-  if not oauth.savetoken(row) then return false;
-  if not hash.put(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.tk.hash, row) then return false;
+  if not oauth.savetoken(row) then begin oauth.fail("oauth.newsession: cannot store the session"); return false; end;
+  if not hash.put(oauth.tidx.keys, oauth.tidx.rows, 32, oauth.tk.hash, row) then begin oauth.fail("oauth.newsession: session index full"); return false; end;
   http.xlen := io.push(http.xhdr, http.xlen, "Set-Cookie: ");
   http.xlen := io.push(http.xhdr, http.xlen, OAUTH.CNAME);
   http.xlen := io.push(http.xhdr, http.xlen, "=");
@@ -906,7 +942,7 @@ begin
   oauth.ok := oauth.take(oauth.secret); oauth.secretn := http.pvlen;
   uid := app.authenticate(oauth.user[0..oauth.usern - 1], oauth.secret[0..oauth.secretn - 1]);
   if uid < 0 then begin oauth.loginpage(true); return; end;
-  if not oauth.newsession(uid) then begin router.error(503, "no room for more sessions"); return; end;
+  if not oauth.newsession(uid) then begin router.error(503, oauth.err); return; end;
   http.hdradd("Cache-Control: no-store");
   http.xlen := io.push(http.xhdr, http.xlen, "Location: ");
   n := 0;

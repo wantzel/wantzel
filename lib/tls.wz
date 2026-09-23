@@ -1,0 +1,1674 @@
+// lib/tls.wz -- a TLS 1.3 client: the handshake and the record layer.
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// WHAT IT SPEAKS, and the narrowness is deliberate rather than provisional. TLS 1.3 only,
+// one cipher suite (TLS_CHACHA20_POLY1305_SHA256), one group (X25519). No 1.2 fallback, no
+// session resumption, no client certificates, no renegotiation. Every one of those is a
+// separate state machine and most historical TLS vulnerabilities live in the seams between
+// them -- a client that cannot be downgraded because it cannot speak the older thing at all
+// is simpler AND safer than one that can and refuses.
+//
+//   tls.connect(fd, "example.com")   the handshake, on an already-connected socket
+//   tls.write(buf, n)                send application data
+//   tls.read(buf, max)               receive application data
+//   tls.close                        send close_notify
+//
+// WHAT tls.verified MEANS, AND WHAT IT DOES NOT. After a handshake it is true when the
+// server's certificate matched the hostname, was in date, and the server PROVED it holds
+// the matching private key by signing the handshake transcript.
+//
+// IT DOES NOT MEAN THE CERTIFICATE IS TRUSTED. There is no root store yet, so nothing says
+// the certificate was issued by anyone in particular -- a self-signed certificate for the
+// right hostname sets this true. Chain validation against a root store is not built yet;
+// until it is, verified is
+// necessary and not sufficient, and this file says so rather than implying more.
+//
+// Set tls.now to the current time before connecting to have the dates checked; 0 skips
+// that, which is a real case on a machine with no clock but has to be the CALLER's choice.
+//
+// THE RECORD LAYER IS WHERE THE NONCE LIVES, and it is the part that silently breaks: each
+// record's nonce is the 12-byte IV XORed with the sequence number, and the sequence resets
+// to zero on every key change. Get it wrong and the first record still decrypts -- because
+// sequence 0 XOR anything is the IV itself -- and the second one does not.
+
+include "io.wz";
+include "net.wz";
+include "rand.wz";
+include "sha256.wz";
+include "hkdf.wz";
+include "x25519.wz";
+include "aead.wz";
+include "x509.wz";
+include "chain.wz";
+include "p256.wz";
+include "p384.wz";
+
+const
+  // HOW MANY CERTIFICATES A CHAIN MAY HAVE. Real chains are two or three; eight is generous
+  // and bounded, which matters because the list comes from the other end.
+  TLS.MAXCHAIN = 8;
+
+  // Record types, RFC 8446 §5.1.
+  TLS.CHANGECIPHER = 20;
+  TLS.ALERT        = 21;
+  TLS.HANDSHAKE    = 22;
+  TLS.APPDATA      = 23;
+
+  // Handshake message types, §4.
+  TLS.CLIENTHELLO  = 1;
+  TLS.SERVERHELLO  = 2;
+  TLS.NEWTICKET    = 4;
+  TLS.ENCEXT       = 8;
+  TLS.CERT         = 11;
+  TLS.CERTVERIFY   = 15;
+  TLS.FINISHED     = 20;
+
+  TLS.MAXREC   = 18432;   // 16384 of payload plus room for the header, tag and padding
+  TLS.MAXPLAIN = 16384;
+
+var
+  tls.fd:       int;
+  tls.verified: bool;     // ALWAYS false for now: see the note at the top of this file
+  tls.err:      int;      // 0 while healthy; an alert code or a negative errno otherwise
+  tls.errmsg:   str;
+
+  // keys and secrets
+  tls.priv:    array[0..31] of char;   // our X25519 private key
+  tls.pub:     array[0..31] of char;
+  tls.shared:  array[0..31] of char;
+  tls.early:   array[0..31] of char;
+  tls.hsec:    array[0..31] of char;   // handshake secret
+  tls.msec:    array[0..31] of char;   // master secret
+  tls.chs:     array[0..31] of char;   // client handshake traffic secret
+  tls.shs:     array[0..31] of char;   // server handshake traffic secret
+  tls.cap:     array[0..31] of char;   // client application traffic secret
+  tls.sap:     array[0..31] of char;   // server application traffic secret
+
+  tls.ckey: array[0..31] of char;      // the key/iv pair currently used for WRITING
+  tls.civ:  array[0..11] of char;
+  tls.skey: array[0..31] of char;      // and for READING
+  tls.siv:  array[0..11] of char;
+  tls.cseq: int;
+  tls.sseq: int;
+  tls.encrypting: bool;                // are we writing encrypted records yet?
+  tls.decrypting: bool;
+
+  // the transcript hash, kept incrementally
+  tls.th:   array[0..31] of char;      // hash of everything so far, recomputed on demand
+  tls.tr:   array[0..16383] of char;   // the transcript itself
+  tls.trn:  int;
+
+  tls.rec:  array[0..TLS.MAXREC-1] of char;   // one record, in or out
+  tls.recn: int;
+  tls.plain: array[0..TLS.MAXPLAIN-1] of char; // decrypted payload of the current record
+  tls.plainn: int;
+  tls.plainat: int;                            // how much of it the caller has taken
+  tls.plaintype: int;
+
+  tls.nonce: array[0..11] of char;
+  tls.aad:   array[0..4] of char;
+  tls.tag:   array[0..15] of char;
+  tls.tmp:   array[0..255] of char;
+  tls.fin:   array[0..31] of char;
+  tls.fkey:  array[0..31] of char;
+  tls.rnd:   array[0..31] of char;
+
+  // Where the peer's certificate chain sits inside tls.tr.
+  tls.certat: int;
+  tls.certn:  int;
+
+  // WHERE EVERY CERTIFICATE IN THE CHAIN SITS, for lib/chain.wz to walk. Recorded as
+  // offsets into the handshake buffer rather than copied: the bytes are already there and
+  // the signature covers them exactly as they lie.
+  tls.chainat:  array[0..TLS.MAXCHAIN-1] of int;
+  tls.chainn:   array[0..TLS.MAXCHAIN-1] of int;
+  tls.chaincnt: int;
+  tls.chainerr: str;      // why the chain was refused, when it was
+
+  // THE CHAIN IS COPIED, NOT POINTED AT, and that was a real bug: the offsets were taken
+  // into the handshake message buffer, which by the time Finished arrives holds Finished.
+  // The certificate had been overwritten and x509.parse read whatever was there -- it said
+  // "not a SEQUENCE", which is the good outcome; the bad one would have been bytes that
+  // parsed. Certificates are small and there are at most a handful, so a copy is cheap.
+  tls.chainbuf: array[0..16383] of char;
+  tls.chainlen: int;
+  // The leaf certificate's public key, taken out while it is still in view.
+  tls.qx: array[0..P.N-1] of int;
+  // The leaf's key, in whichever form it came. keykind: 1 = RSA, 2 = P-256, 4 = P-384.
+  tls.qx4, tls.qy4: array[0..Q.N-1] of int;
+  tls.rsakey: array[0..1023] of char;
+  tls.rsakeyn: int;
+  tls.keykind: int;
+  tls.qy: array[0..P.N-1] of int;
+  tls.haskey: bool;
+  tls.now: int;          // the caller's idea of the current time, 0 to skip the date check
+  tls.host:  array[0..255] of char;
+  tls.hostn: int;
+  // The CertificateVerify signature, and the transcript hash it covers.
+  tls.cvsig: array[0..255] of char;
+  tls.cvsign: int;
+  tls.cvalg: int;
+  tls.cvth: array[0..31] of char;
+  tls.sigbuf: array[0..255] of char;
+  tls.sid:  array[0..31] of char;     // the client's legacy session id, echoed back
+  tls.sidn: int;
+  tls.cve:  array[0..P.N-1] of int;   // the CertificateVerify digest as a scalar
+  tls.connectraw: bool;              // the hostname was set by tls.connectb, keep it
+
+procedure tls.fail(code: int; msg: str);
+begin
+  if tls.err = 0 then
+  begin
+    tls.err := code;
+    tls.errmsg := msg;
+  end;
+end;
+
+// ---- the transcript ---------------------------------------------------------------------
+//
+// EVERY HANDSHAKE MESSAGE GOES IN, in the order it appeared on the wire, and the record
+// headers do NOT. The transcript is the concatenation of handshake MESSAGES -- type, length,
+// body -- which is not the same as the bytes that crossed the wire, because one record can
+// hold several messages and one message can span records.
+procedure tls.tradd(b: array of char; at: int; n: int);
+var i: int;
+begin
+  i := 0;
+  while i < n do
+  begin
+    if tls.trn < len(tls.tr) then
+    begin
+      tls.tr[tls.trn] := b[at + i];
+      tls.trn := tls.trn + 1;
+    end
+    else tls.fail(80, "handshake transcript too large");
+    i := i + 1;
+  end;
+end;
+
+// The hash of the transcript SO FAR. Recomputed from scratch each time rather than kept as
+// running SHA-256 state, because the schedule needs the hash at several points while the
+// transcript keeps growing -- and sha256's state is global, so one running context cannot be
+// snapshotted. A handshake is a few kilobytes and this happens about five times.
+procedure tls.trhash(out: array of char);
+var i: int;
+begin
+  sha256.init;
+  // hk.feed hashes a PREFIX of a buffer; sha256.update takes a whole array and sizes it
+  // with len(), which cannot express "the first trn bytes of tls.tr".
+  hk.feed(tls.tr, tls.trn);
+  sha256.final(out);
+end;
+
+// Copy n bytes out of src at `at` into dst[0..n).
+procedure tls.copyin(dst: array of char; src: array of char; at: int; n: int);
+var i: int;
+begin
+  i := 0;
+  while i < n do begin dst[i] := src[at + i]; i := i + 1; end;
+end;
+
+// Write an ECDSA signature as DER: SEQUENCE { INTEGER r, INTEGER s }. Returns the position
+// after it.
+//
+// A DER INTEGER IS SIGNED, so a value whose top bit is set needs a leading zero byte --
+// otherwise it reads as negative and the peer rejects the signature. And leading zeros are
+// otherwise forbidden, so they have to be stripped first. Both halves of that rule matter.
+function tls.derwrite(dst: array of char; at: int; r: array of int; sg: array of int): int;
+var seqat, i, n: int;
+    tmp: array[0..31] of char;
+begin
+  dst[at] := chr(0x30);
+  seqat := at + 1;
+  at := at + 2;
+  i := 0;
+  while i < 2 do
+  begin
+    if i = 0 then p256.tobytes(tmp, 0, r) else p256.tobytes(tmp, 0, sg);
+    n := 0;
+    while (n < 31) and (tmp[n] = chr(0)) do n := n + 1;   // strip leading zeros
+    dst[at] := chr(0x02);
+    if ord(tmp[n]) >= 128 then
+    begin
+      dst[at + 1] := chr(32 - n + 1);
+      dst[at + 2] := chr(0);
+      at := at + 3;
+    end
+    else
+    begin
+      dst[at + 1] := chr(32 - n);
+      at := at + 2;
+    end;
+    while n < 32 do begin dst[at] := tmp[n]; at := at + 1; n := n + 1; end;
+    i := i + 1;
+  end;
+  dst[seqat] := chr(at - seqat - 1);
+  return at;
+end;
+
+// ---- byte helpers -------------------------------------------------------------------------
+
+procedure tls.put8(b: array of char; at: int; v: int);
+begin
+  b[at] := chr(band(v, 255));
+end;
+
+procedure tls.put16(b: array of char; at: int; v: int);
+begin
+  b[at]     := chr(band(v shr 8, 255));
+  b[at + 1] := chr(band(v, 255));
+end;
+
+procedure tls.put24(b: array of char; at: int; v: int);
+begin
+  b[at]     := chr(band(v shr 16, 255));
+  b[at + 1] := chr(band(v shr 8, 255));
+  b[at + 2] := chr(band(v, 255));
+end;
+
+function tls.get16(b: array of char; at: int): int;
+begin
+  return ord(b[at]) * 256 + ord(b[at + 1]);
+end;
+
+function tls.get24(b: array of char; at: int): int;
+begin
+  return ord(b[at]) * 65536 + ord(b[at + 1]) * 256 + ord(b[at + 2]);
+end;
+
+// ---- blocking send and receive ------------------------------------------------------------
+//
+// The socket may be non-blocking, so a short write is normal and must be retried rather than
+// treated as an error -- the same rule as in examples/tcpproxy.wz, and for the same reason.
+function tls.sendall(b: array of char; n: int): bool;
+var sent, r, tries: int;
+begin
+  sent := 0;
+  tries := 0;
+  while (sent < n) and (tries < 100000) do
+  begin
+    r := net.send(tls.fd, addr(b[sent]), n - sent);
+    if r > 0 then begin sent := sent + r; tries := 0; end
+    else if r = EAGAIN then tries := tries + 1
+    else
+    begin
+      tls.fail(0 - 1, "the connection closed while sending");
+      return false;
+    end;
+  end;
+  return sent = n;
+end;
+
+function tls.recvall(b: array of char; at: int; n: int): bool;
+var got, r, tries: int;
+begin
+  got := 0;
+  tries := 0;
+  while (got < n) and (tries < 100000) do
+  begin
+    r := net.recv(tls.fd, addr(b[at + got]), n - got);
+    if r > 0 then begin got := got + r; tries := 0; end
+    else if r = EAGAIN then tries := tries + 1
+    else
+    begin
+      tls.fail(0 - 1, "the connection closed while receiving");
+      return false;
+    end;
+  end;
+  return got = n;
+end;
+
+// ---- the record layer -----------------------------------------------------------------------
+//
+// THE NONCE IS THE IV XORED WITH THE SEQUENCE NUMBER, right-aligned in the 12 bytes
+// (RFC 8446 §5.3). Sequence numbers start at zero and RESET on every key change -- which is
+// why a bug here hides: record 0 uses nonce = IV, so the very first record after a key
+// change works no matter what, and only the second one fails.
+procedure tls.mknonce(iv: array of char; seq: int);
+var i, s: int;
+begin
+  i := 0;
+  while i < 12 do begin tls.nonce[i] := iv[i]; i := i + 1; end;
+  s := seq;
+  i := 11;
+  while i >= 4 do
+  begin
+    tls.nonce[i] := chr(bxor(ord(tls.nonce[i]), band(s, 255)));
+    s := s shr 8;
+    i := i - 1;
+  end;
+end;
+
+// Send one record. When encrypting, the real content type is appended to the plaintext and
+// the outer header claims application_data -- that is TLS 1.3's way of hiding which records
+// are handshake and which are data (§5.2).
+function tls.sendrec(ctype: int; b: array of char; at: int; n: int): bool;
+var i, total: int;
+begin
+  if not tls.encrypting then
+  begin
+    // COPIED BACKWARDS, because the caller's buffer IS tls.rec.
+    //
+    // tls.hello builds its message in tls.rec and then asks to send it from there, so this
+    // copy has source and destination in the same array with the destination five bytes
+    // HIGHER. Copying forwards overwrites each source byte before it is read: measured, the
+    // ClientHello went out as its own 5-byte record header repeated 34 times. Going from the
+    // top down, the source byte is always still untouched when it is read.
+    i := n - 1;
+    while i >= 0 do begin tls.rec[5 + i] := b[at + i]; i := i - 1; end;
+    tls.rec[0] := chr(ctype);
+    tls.put16(tls.rec, 1, 0x0303);
+    tls.put16(tls.rec, 3, n);
+    return tls.sendall(tls.rec, 5 + n);
+  end;
+
+  i := 0;
+  while i < n do begin tls.plain[i] := b[at + i]; i := i + 1; end;
+  tls.plain[n] := chr(ctype);          // the true type, inside the encryption
+  total := n + 1 + 16;                 // plus the Poly1305 tag
+
+  tls.rec[0] := chr(TLS.APPDATA);      // the outer type is always application_data
+  tls.put16(tls.rec, 1, 0x0303);
+  tls.put16(tls.rec, 3, total);
+
+  // THE HEADER IS THE ADDITIONAL DATA, all five bytes of it, with the length of the
+  // ENCRYPTED record. Using the plaintext length here is a classic mistake: it authenticates
+  // a number the peer never sees.
+  i := 0;
+  while i < 5 do begin tls.aad[i] := tls.rec[i]; i := i + 1; end;
+
+  tls.mknonce(tls.civ, tls.cseq);
+  ae.setkey(tls.ckey);
+  ae.setnonce(tls.nonce);
+  ae.seal(tls.aad, 5, tls.plain, 0, n + 1, tls.tag);
+  tls.cseq := tls.cseq + 1;
+
+  i := 0;
+  while i < n + 1 do begin tls.rec[5 + i] := tls.plain[i]; i := i + 1; end;
+  i := 0;
+  while i < 16 do begin tls.rec[5 + n + 1 + i] := tls.tag[i]; i := i + 1; end;
+  return tls.sendall(tls.rec, 5 + total);
+end;
+
+// Read one record into tls.plain, decrypting when the keys are up. Returns false on error.
+//
+// PADDING IS STRIPPED FROM THE RIGHT. An encrypted record is content || type || zero or more
+// zero bytes, so the real type is the LAST NON-ZERO byte -- not the last byte.
+function tls.readrec: bool;
+var n, i, ctype: int;
+begin
+  if not tls.recvall(tls.rec, 0, 5) then return false;
+  ctype := ord(tls.rec[0]);
+  n := tls.get16(tls.rec, 3);
+  if (n < 0) or (n > TLS.MAXREC - 5) then
+  begin
+    tls.fail(22, "a record claims an impossible length");
+    return false;
+  end;
+  if not tls.recvall(tls.rec, 5, n) then return false;
+
+  if (not tls.decrypting) or (ctype = TLS.CHANGECIPHER) then
+  begin
+    // change_cipher_spec is ignored entirely: in TLS 1.3 it carries no meaning and exists
+    // only so middleboxes believe they are watching a TLS 1.2 session (§5).
+    i := 0;
+    while i < n do begin tls.plain[i] := tls.rec[5 + i]; i := i + 1; end;
+    tls.plainn := n;
+    tls.plaintype := ctype;
+    tls.plainat := 0;
+    return true;
+  end;
+
+  if n < 17 then
+  begin
+    tls.fail(22, "an encrypted record is too short to hold a tag");
+    return false;
+  end;
+  // THE PLAINTEXT MUST FIT, and this check was missing. A record may legitimately carry up
+  // to 16384 bytes of plaintext plus a 16-byte tag, so a full-sized record overflowed
+  // tls.plain by exactly the tag -- and the failure was a runtime bounds error partway
+  // through the copy, on the first server whose certificate chain was large enough.
+  // Measured 22-09-2026 against github.com, whose chain is three certificates.
+  if n - 16 > TLS.MAXPLAIN then
+  begin
+    tls.fail(22, "a record carries more plaintext than TLS allows");
+    return false;
+  end;
+  i := 0;
+  while i < 5 do begin tls.aad[i] := tls.rec[i]; i := i + 1; end;
+  i := 0;
+  while i < 16 do begin tls.tag[i] := tls.rec[5 + n - 16 + i]; i := i + 1; end;
+  i := 0;
+  while i < n - 16 do begin tls.plain[i] := tls.rec[5 + i]; i := i + 1; end;
+
+  tls.mknonce(tls.siv, tls.sseq);
+  ae.setkey(tls.skey);
+  ae.setnonce(tls.nonce);
+  if not ae.open(tls.aad, 5, tls.plain, 0, n - 16, tls.tag) then
+  begin
+    tls.fail(20, "a record failed to authenticate");
+    return false;
+  end;
+  tls.sseq := tls.sseq + 1;
+
+  i := n - 16;
+  while (i > 0) and (tls.plain[i - 1] = chr(0)) do i := i - 1;
+  if i = 0 then
+  begin
+    tls.fail(22, "a decrypted record is all padding and has no content type");
+    return false;
+  end;
+  tls.plaintype := ord(tls.plain[i - 1]);
+  tls.plainn := i - 1;
+  tls.plainat := 0;
+  return true;
+end;
+
+// ---- the key schedule ---------------------------------------------------------------------
+//
+// RFC 8446 §7.1, and THE ORDER IS THE SPECIFICATION. Each secret is derived from the one
+// before it, with a label and the transcript hash at that exact point. A label typo or a
+// hash taken one message too late gives a valid key the server does not share, and the only
+// symptom is that Finished does not match.
+procedure tls.keys(secret: array of char; key: array of char; iv: array of char);
+begin
+  tls.expandlabel(secret, "key", tls.tmp, 0, key, 32);
+  tls.expandlabel(secret, "iv", tls.tmp, 0, iv, 12);
+end;
+
+procedure tls.schedule;
+var zeros: array[0..31] of char;
+    i: int;
+    derived: array[0..31] of char;
+begin
+  i := 0;
+  while i < 32 do begin zeros[i] := chr(0); i := i + 1; end;
+
+  // early secret = HKDF-Extract(salt = 0, ikm = 0) -- no PSK, so both are all zeros.
+  hkdf.extract(zeros, 0, zeros, 32, tls.early);
+
+  // handshake secret = Extract(Derive-Secret(early, "derived", ""), ECDHE)
+  sha256.init;
+  sha256.final(tls.th);                       // the hash of the EMPTY string
+  tls.derivesecret(tls.early, "derived", tls.th, derived);
+  hkdf.extract(derived, 32, tls.shared, 32, tls.hsec);
+
+  // The traffic secrets use the transcript through ServerHello.
+  tls.trhash(tls.th);
+  tls.derivesecret(tls.hsec, "c hs traffic", tls.th, tls.chs);
+  tls.derivesecret(tls.hsec, "s hs traffic", tls.th, tls.shs);
+
+  // master secret = Extract(Derive-Secret(handshake, "derived", ""), 0)
+  sha256.init;
+  sha256.final(tls.th);
+  tls.derivesecret(tls.hsec, "derived", tls.th, derived);
+  hkdf.extract(derived, 32, zeros, 32, tls.msec);
+
+  tls.keys(tls.chs, tls.ckey, tls.civ);
+  tls.keys(tls.shs, tls.skey, tls.siv);
+  tls.cseq := 0;
+  tls.sseq := 0;
+end;
+
+// Finished = HMAC(finished_key, transcript_hash). This is what proves both sides saw the
+// SAME handshake: an attacker who altered any message cannot produce it.
+//
+// The caller sets tls.fkey (from the right traffic secret) and tls.th (the transcript hash
+// at the right point) first, because WHICH secret and WHICH point differ between the
+// server's Finished and ours -- passing them in would hide that they are two decisions.
+procedure tls.finishedmac(dst: array of char);
+var i: int;
+begin
+  i := 0;
+  while i < 32 do begin hk.msg[i] := tls.th[i]; i := i + 1; end;
+  hk.msgn := 32;
+  hk.mac(tls.fkey, 32, dst);
+end;
+
+// ---- ClientHello ----------------------------------------------------------------------------
+
+function tls.hello(host: str): bool;
+var n, extat, extlen, i, hn: int;
+begin
+  n := 0;
+  tls.tmp[0] := chr(0);                       // unused; the message is built in tls.rec
+
+  // The handshake message body starts at 4 (type + 3-byte length go in front).
+  n := 4;
+  tls.put16(tls.rec, n, 0x0303); n := n + 2;  // legacy_version: TLS 1.2, always
+  // rand.bytes fills a WHOLE array, so the 32 bytes are drawn into a local buffer and
+  // copied in. Writing into the middle of tls.rec directly is not expressible.
+  rand.bytes(tls.rnd);
+  i := 0;
+  while i < 32 do begin tls.rec[n] := tls.rnd[i]; n := n + 1; i := i + 1; end;
+  tls.rec[n] := chr(32); n := n + 1;          // a legacy session id, 32 random bytes
+  rand.bytes(tls.rnd);
+  i := 0;
+  while i < 32 do begin tls.rec[n] := tls.rnd[i]; n := n + 1; i := i + 1; end;
+
+  // cipher_suites: exactly one.
+  tls.put16(tls.rec, n, 2); n := n + 2;
+  tls.put16(tls.rec, n, 0x1303); n := n + 2;  // TLS_CHACHA20_POLY1305_SHA256
+  tls.rec[n] := chr(1); n := n + 1;           // legacy_compression_methods: null only
+  tls.rec[n] := chr(0); n := n + 1;
+
+  extat := n; n := n + 2;                     // extensions length, filled in at the end
+
+  // server_name (0), so a host serving several sites picks the right certificate.
+  //
+  // THE NAME COMES FROM tls.host, NOT FROM THE PARAMETER, and that was a real bug: a caller
+  // using tls.connectb passes its hostname as BYTES (Wantzel cannot build a str from
+  // characters), which connectb stored in tls.host and then called tls.connect with "".
+  // So the SNI went out EMPTY. Measured 22-09-2026: github.com, cloudflare.com and
+  // wantzel.com all answered alert 112, unrecognized_name -- which is exactly what a server
+  // says when it cannot tell which site you want. tls.host is filled on both paths, so
+  // reading it here covers the str caller and the byte caller with one piece of code.
+  //
+  // AN EMPTY NAME OMITS THE EXTENSION ENTIRELY rather than sending an empty one. RFC 6066
+  // has no use for a zero-length host_name, and a server that sees one is entitled to the
+  // same alert.
+  hn := tls.hostn;
+  if hn > 0 then
+  begin
+    tls.put16(tls.rec, n, 0); n := n + 2;
+    tls.put16(tls.rec, n, hn + 5); n := n + 2;
+    tls.put16(tls.rec, n, hn + 3); n := n + 2;
+    tls.rec[n] := chr(0); n := n + 1;           // name_type: host_name
+    tls.put16(tls.rec, n, hn); n := n + 2;
+    i := 0;
+    while i < hn do begin tls.rec[n] := tls.host[i]; n := n + 1; i := i + 1; end;
+  end;
+
+  // supported_versions (43): TLS 1.3 ONLY. This is what makes a downgrade impossible --
+  // legacy_version above still says 1.2 and is ignored by any 1.3 server.
+  tls.put16(tls.rec, n, 43); n := n + 2;
+  tls.put16(tls.rec, n, 3); n := n + 2;
+  tls.rec[n] := chr(2); n := n + 1;
+  tls.put16(tls.rec, n, 0x0304); n := n + 2;
+
+  // supported_groups (10): X25519 only.
+  tls.put16(tls.rec, n, 10); n := n + 2;
+  tls.put16(tls.rec, n, 4); n := n + 2;
+  tls.put16(tls.rec, n, 2); n := n + 2;
+  tls.put16(tls.rec, n, 29); n := n + 2;      // x25519
+
+  // signature_algorithms (13): what we are willing to see on a certificate. Advertised now
+  // even though verification comes later, because a server picks its certificate from this.
+  // ADVERTISE ONLY WHAT WE CAN ACTUALLY CHECK. A scheme listed here and unsupported in
+  // tls.checkcv gives a handshake that completes and a verification that fails -- the worst
+  // of both, because the failure arrives after the connection looks established.
+  //
+  // rsa_pkcs1_sha256 stays in the list for the CERTIFICATE's own signature (a chain may be
+  // signed with it), but TLS 1.3 forbids it for CertificateVerify, so a server will not
+  // choose it there.
+  tls.put16(tls.rec, n, 13); n := n + 2;
+  tls.put16(tls.rec, n, 12); n := n + 2;
+  tls.put16(tls.rec, n, 10); n := n + 2;
+  tls.put16(tls.rec, n, 0x0403); n := n + 2;  // ecdsa_secp256r1_sha256
+  tls.put16(tls.rec, n, 0x0503); n := n + 2;  // ecdsa_secp384r1_sha384
+  tls.put16(tls.rec, n, 0x0804); n := n + 2;  // rsa_pss_rsae_sha256
+  tls.put16(tls.rec, n, 0x0805); n := n + 2;  // rsa_pss_rsae_sha384
+  tls.put16(tls.rec, n, 0x0401); n := n + 2;  // rsa_pkcs1_sha256
+
+  // key_share (51): our X25519 public key, sent with the hello so one round trip is enough.
+  tls.put16(tls.rec, n, 51); n := n + 2;
+  tls.put16(tls.rec, n, 38); n := n + 2;
+  tls.put16(tls.rec, n, 36); n := n + 2;
+  tls.put16(tls.rec, n, 29); n := n + 2;
+  tls.put16(tls.rec, n, 32); n := n + 2;
+  i := 0;
+  while i < 32 do begin tls.rec[n] := tls.pub[i]; n := n + 1; i := i + 1; end;
+
+  extlen := n - extat - 2;
+  tls.put16(tls.rec, extat, extlen);
+
+  tls.rec[0] := chr(TLS.CLIENTHELLO);
+  tls.put24(tls.rec, 1, n - 4);
+
+  tls.tradd(tls.rec, 0, n);
+  return tls.sendrec(TLS.HANDSHAKE, tls.rec, 0, n);
+end;
+
+// ---- ServerHello -----------------------------------------------------------------------------
+
+// Pull the server's key_share out of a ServerHello body and multiply it with our private key.
+//
+// NAMED readsh AND NOT serverhello: identifiers are case-insensitive here, so tls.serverhello
+// is the same name as the constant TLS.SERVERHELLO and the compiler refuses it.
+function tls.readsh(b: array of char; at: int; n: int): bool;
+var at2, endp, ext, extlen, exttype, sidlen, group, klen, i: int;
+    peer: array[0..31] of char;
+begin
+  at2 := at + 2;                      // skip legacy_version
+  at2 := at2 + 32;                      // skip random
+  sidlen := ord(b[at2]); at2 := at2 + 1 + sidlen;
+  if tls.get16(b, at2) <> 0x1303 then
+  begin
+    tls.fail(40, "the server chose a cipher suite we did not offer");
+    return false;
+  end;
+  at2 := at2 + 2;
+  at2 := at2 + 1;                       // legacy_compression_method
+  extlen := tls.get16(b, at2); at2 := at2 + 2;
+  endp := at2 + extlen;
+
+  group := 0 - 1;
+  while at2 + 4 <= endp do
+  begin
+    exttype := tls.get16(b, at2);
+    ext := tls.get16(b, at2 + 2);
+    at2 := at2 + 4;
+    if exttype = 51 then
+    begin
+      group := tls.get16(b, at2);
+      klen := tls.get16(b, at2 + 2);
+      if (group <> 29) or (klen <> 32) then
+      begin
+        tls.fail(40, "the server picked a group we did not offer");
+        return false;
+      end;
+      i := 0;
+      while i < 32 do begin peer[i] := b[at2 + 4 + i]; i := i + 1; end;
+    end;
+    at2 := at2 + ext;
+  end;
+  if group <> 29 then
+  begin
+    tls.fail(40, "the server sent no usable key_share");
+    return false;
+  end;
+
+  x.scalarmult(tls.shared, tls.priv, peer);
+  return true;
+end;
+
+// ---- the server's certificate ----------------------------------------------------------------
+
+// Certificate ::= { context [1 byte length], certificate_list }
+// each entry ::= { cert_data [3-byte length], extensions [2-byte length] }
+//
+// THE LEAF DECIDES WHO THIS IS; THE REST DECIDES WHETHER TO BELIEVE IT. The leaf's key is
+// what signs CertificateVerify and its names and dates say whether this is the right server,
+// so that part is checked here. The remaining certificates are RECORDED, in the order sent,
+// for lib/chain.wz to walk up to a trust anchor afterwards -- which is what turns "the
+// server holds this key" into "and someone we trust issued it".
+// tls.recordchain -- note where every certificate in the list begins and how long it is.
+//
+// The list is { 3-byte length, cert, 2-byte extensions } repeated. Extensions are skipped:
+// nothing this client does depends on them, and a certificate's own bytes are what get
+// verified.
+procedure tls.recordchain(b: array of char; at: int; listend: int);
+var clen, elen, i: int;
+begin
+  tls.chaincnt := 0;
+  tls.chainlen := 0;
+  while (at + 3 <= listend) and (tls.chaincnt < TLS.MAXCHAIN) do
+  begin
+    clen := tls.get24(b, at);
+    at := at + 3;
+    if at + clen > listend then return;
+    if tls.chainlen + clen > len(tls.chainbuf) then return;
+    i := 0;
+    while i < clen do begin tls.chainbuf[tls.chainlen + i] := b[at + i]; i := i + 1; end;
+    tls.chainat[tls.chaincnt] := tls.chainlen;
+    tls.chainn[tls.chaincnt] := clen;
+    tls.chainlen := tls.chainlen + clen;
+    tls.chaincnt := tls.chaincnt + 1;
+    at := at + clen;
+    if at + 2 > listend then return;
+    elen := ord(b[at]) * 256 + ord(b[at + 1]);
+    at := at + 2 + elen;
+  end;
+end;
+
+function tls.readcert(b: array of char; n: int): bool;
+var at, listend, clen, i: int;
+begin
+  tls.haskey := false;
+  tls.keykind := 0;
+  tls.chaincnt := 0;
+  at := 4;                                   // past the handshake header
+  if at >= n then begin tls.fail(42, "an empty Certificate message"); return false; end;
+  at := at + 1 + ord(b[at]);                 // skip the certificate_request_context
+  if at + 3 > n then begin tls.fail(42, "a truncated certificate_list"); return false; end;
+  listend := at + 3 + tls.get24(b, at);
+  at := at + 3;
+  if listend > n then begin tls.fail(42, "the certificate_list runs past the message"); return false; end;
+  if at + 3 > listend then begin tls.fail(42, "no certificate in the list"); return false; end;
+
+  clen := tls.get24(b, at);
+  at := at + 3;
+  if at + clen > listend then begin tls.fail(42, "a certificate runs past the list"); return false; end;
+
+  // REMEMBER THE WHOLE LIST BEFORE LOOKING AT THE LEAF. The walk below consumes `at`, and
+  // the chain has to be recorded from where each certificate actually starts -- an offset
+  // taken after the leaf has been parsed points at the wrong place.
+  tls.recordchain(b, at - 3, listend);
+
+  if not x509.parse(b, at, at + clen) then
+  begin
+    tls.fail(42, "the server's certificate does not parse");
+    return false;
+  end;
+
+  // THE NAME MUST MATCH. Without this any valid certificate for any domain works -- which
+  // is the classic way to have TLS and no security at all.
+  if tls.hostn > 0 then
+  begin
+    if not x509.matchesb(b, tls.host, tls.hostn) then
+    begin
+      tls.fail(42, "the certificate is not valid for this hostname");
+      return false;
+    end;
+  end;
+
+  // AND IT MUST BE IN DATE. Skipped when the caller passes 0, because a machine with no
+  // clock is a real situation -- but then it must be the CALLER's decision, not a silent
+  // default.
+  if tls.now > 0 then
+  begin
+    if tls.now < x509.notbefore then
+    begin
+      tls.fail(45, "the certificate is not valid yet");
+      return false;
+    end;
+    if tls.now > x509.notafter then
+    begin
+      tls.fail(45, "the certificate has expired");
+      return false;
+    end;
+  end;
+
+  if x509.keyalg = 2 then
+  begin
+    // An EC point: 0x04 then X then Y, uncompressed. A compressed point would need a square
+    // root in the field, which is more machinery than this client needs today.
+    if (x509.keyn <> 65) or (b[x509.keyat] <> chr(4)) then
+    begin
+      tls.fail(42, "the EC public key is not an uncompressed P-256 point");
+      return false;
+    end;
+    p256.frombytes(tls.qx, b, x509.keyat + 1);
+    p256.frombytes(tls.qy, b, x509.keyat + 33);
+    p256.setup;
+    if not p256.oncurve(tls.qx, tls.qy) then
+    begin
+      tls.fail(42, "the certificate's public key is not on the curve");
+      return false;
+    end;
+    tls.keykind := 2;
+    tls.haskey := true;
+  end;
+  if x509.keyalg = 4 then
+  begin
+    // A P-384 point: 0x04 then X then Y, 48 bytes each.
+    if (x509.keyn <> 97) or (b[x509.keyat] <> chr(4)) then
+    begin
+      tls.fail(42, "the EC public key is not an uncompressed P-384 point");
+      return false;
+    end;
+    p384.frombytes(tls.qx4, b, x509.keyat + 1);
+    p384.frombytes(tls.qy4, b, x509.keyat + 49);
+    p384.setup;
+    if not p384.oncurve(tls.qx4, tls.qy4) then
+    begin
+      tls.fail(42, "the certificate's public key is not on the P-384 curve");
+      return false;
+    end;
+    tls.keykind := 4;
+    tls.haskey := true;
+  end;
+
+  if x509.keyalg = 1 then
+  begin
+    // AN RSA KEY, which the server signs CertificateVerify with -- in PKCS#1 v1.5 or, far
+    // more often now, in PSS. The key is remembered as the SEQUENCE it is; rsa.setkey pulls
+    // the modulus and exponent out of it at verification time, so nothing is parsed twice.
+    if x509.keyn > len(tls.rsakey) then
+    begin
+      tls.fail(42, "the RSA public key is larger than this client holds");
+      return false;
+    end;
+    i := 0;
+    while i < x509.keyn do begin tls.rsakey[i] := b[x509.keyat + i]; i := i + 1; end;
+    tls.rsakeyn := x509.keyn;
+    tls.keykind := 1;
+    tls.haskey := true;
+  end;
+
+  return true;
+end;
+
+// CertificateVerify ::= { algorithm [2 bytes], signature [2-byte length] }
+function tls.readcv(b: array of char; n: int): bool;
+var at, sn: int;
+    i: int;
+begin
+  at := 4;
+  if at + 4 > n then begin tls.fail(50, "a truncated CertificateVerify"); return false; end;
+  tls.cvalg := tls.get16(b, at);
+  at := at + 2;
+  sn := tls.get16(b, at);
+  at := at + 2;
+  if (sn < 0) or (at + sn > n) or (sn > len(tls.cvsig)) then
+  begin
+    tls.fail(50, "the CertificateVerify signature has an impossible length");
+    return false;
+  end;
+  i := 0;
+  while i < sn do begin tls.cvsig[i] := b[at + i]; i := i + 1; end;
+  tls.cvsign := sn;
+  return true;
+end;
+
+// What CertificateVerify actually signs (RFC 8446 §4.4.3): 64 spaces, a context string, a
+// zero byte, then the transcript hash. Leaves the digest in tls.th.
+//
+// THE 64 SPACES ARE NOT DECORATION. They make the signed blob impossible to confuse with a
+// certificate's own signed bytes, which is what stopped a whole family of cross-protocol
+// attacks in earlier TLS versions.
+// THE CONTEXT STRING DIFFERS BY ONE WORD between the two directions: "server
+// CertificateVerify" against "client CertificateVerify". That is deliberate in the RFC --
+// it stops a signature made in one direction being replayed in the other -- and using the
+// wrong one produces a signature the peer rejects with no error that points here.
+procedure tls.cvdigestfor(server: bool);
+var i, n: int;
+    ctx: str;
+begin
+  if server then ctx := "TLS 1.3, server CertificateVerify"
+  else ctx := "TLS 1.3, client CertificateVerify";
+  sha256.init;
+  i := 0;
+  while i < 64 do begin tls.tmp[i] := chr(32); i := i + 1; end;
+  hk.feed(tls.tmp, 64);
+  n := slen(ctx);
+  i := 0;
+  while i < n do begin tls.tmp[i] := schar(ctx, i); i := i + 1; end;
+  hk.feed(tls.tmp, n);
+  tls.tmp[0] := chr(0);
+  hk.feed(tls.tmp, 1);
+  hk.feed(tls.cvth, 32);
+  sha256.final(tls.th);
+end;
+
+procedure tls.cvdigest;
+begin
+  tls.cvdigestfor(true);
+end;
+
+// A DER INTEGER into eight limbs, right-aligned into 32 bytes.
+function tls.derint(r: array of int; b: array of char; at: int; n: int): bool;
+var i: int;
+begin
+  while (n > 0) and (b[at] = chr(0)) do begin at := at + 1; n := n - 1; end;
+  if (n = 0) or (n > 32) then begin tls.fail(50, "a DER INTEGER in the CertificateVerify signature is empty or too wide"); return false; end;
+  i := 0;
+  while i < 32 do begin tls.sigbuf[i] := chr(0); i := i + 1; end;
+  i := 0;
+  while i < n do begin tls.sigbuf[32 - n + i] := b[at + i]; i := i + 1; end;
+  p256.frombytes(r, tls.sigbuf, 0);
+  return true;
+end;
+
+// Check the server's CertificateVerify against the leaf certificate's key.
+//
+// Returns true only when the signature was actually checked and passed. An algorithm or a
+// key type this client cannot handle returns FALSE -- an unverified connection must never
+// look like a verified one.
+// tls.checkchain -- does the certificate chain the server sent reach a trusted root?
+//
+// SEPARATE FROM tls.checkcv ON PURPOSE. CertificateVerify proves possession of a key; this
+// proves the key belongs to someone a root vouched for. They fail for different reasons and
+// a caller debugging a refused connection needs to know which.
+//
+// THE TRUST STORE IS THE CALLER'S. lib/chain.wz holds it, the caller fills it, and an empty
+// store refuses everything -- there is no system store to fall back on and no default to be
+// surprised by. That is the price of zero dependencies and it is the right way round: what
+// is trusted is stated, not inherited.
+function tls.checkchain: bool;
+var i: int;
+begin
+  if tls.chaincnt <= 0 then begin tls.fail(42, "the server sent no certificate chain"); return false; end;
+  ch.reset;
+  i := 0;
+  while i < tls.chaincnt do
+  begin
+    if not ch.setcert(i, tls.chainat[i], tls.chainn[i]) then
+      begin tls.fail(42, ch.err); return false; end;
+    i := i + 1;
+  end;
+  // THE HOSTNAME AND THE CLOCK ARE CHECKED AGAIN HERE, and the repetition is deliberate:
+  // tls.readcert checks the leaf as it arrives so a wrong certificate is refused early,
+  // and chain.wz checks the whole chain so no certificate in it can be out of date.
+  if not ch.verify(tls.chainbuf, tls.host, tls.hostn, tls.now) then
+    begin tls.chainerr := ch.err; return false; end;
+  return true;
+end;
+
+// Load the leaf's RSA key into lib/rsa.wz. The key is a SEQUENCE { modulus, exponent }.
+function tls.rsakeyload: bool;
+var inner, upto, nat, nn, eat, en: int;
+begin
+  if der.next(tls.rsakey, 0, tls.rsakeyn) < 0 then begin tls.fail(50, "the leaf key does not parse as DER"); return false; end;
+  if der.tag <> DER.SEQ then begin tls.fail(50, "the leaf key is not a SEQUENCE"); return false; end;
+  inner := der.vat; upto := der.vend;
+  if der.next(tls.rsakey, inner, upto) < 0 then begin tls.fail(50, "no modulus in the leaf key"); return false; end;
+  if der.tag <> DER.INT then begin tls.fail(50, "the modulus is not an INTEGER"); return false; end;
+  nat := der.vat; nn := der.vend - der.vat;
+  if der.next(tls.rsakey, der.vend, upto) < 0 then begin tls.fail(50, "no exponent in the leaf key"); return false; end;
+  if der.tag <> DER.INT then begin tls.fail(50, "the exponent is not an INTEGER"); return false; end;
+  eat := der.vat; en := der.vend - der.vat;
+  if not rsa.setkey(tls.rsakey, nat, nn, tls.rsakey, eat, en) then begin tls.fail(50, rsa.err); return false; end;
+  return true;
+end;
+
+// The same signed blob as tls.cvdigest, hashed with SHA-384 instead of SHA-256.
+//
+// THE TRANSCRIPT HASH INSIDE IT STAYS SHA-256, and that is not an oversight. RFC 8446 ties
+// the transcript hash to the CIPHER SUITE, not to the signature scheme: with
+// TLS_CHACHA20_POLY1305_SHA256 the transcript is SHA-256 whatever the server signs with.
+// Hashing the transcript with SHA-384 because the signature says SHA-384 is the obvious
+// wrong move here, and it fails in a way that looks like a bad signature.
+//
+// SEPARATE ROUTINE RATHER THAN A FLAG: the blob is assembled identically and only the outer
+// hash differs, so a flag threaded through the assembly would be one more thing to get
+// backwards.
+procedure tls.cvdigest384;
+var i, n: int;
+    ctx: str;
+begin
+  ctx := "TLS 1.3, server CertificateVerify";
+  sha384.init;
+  i := 0;
+  while i < 64 do begin tls.tmp[i] := chr(32); i := i + 1; end;
+  sha384.updateat(tls.tmp, 0, 64);
+  n := slen(ctx);
+  i := 0;
+  while i < n do begin tls.tmp[i] := schar(ctx, i); i := i + 1; end;
+  sha384.updateat(tls.tmp, 0, n);
+  tls.tmp[0] := chr(0);
+  sha384.updateat(tls.tmp, 0, 1);
+  sha384.updateat(tls.cvth, 0, 32);
+  sha384.final(tls.th);
+end;
+
+// A DER INTEGER into a 384-bit value: strip DER's leading zero, then right-align.
+function tls.derint384(r: array of int; b: array of char; at: int; n: int): bool;
+var i: int;
+begin
+  while (n > 0) and (b[at] = chr(0)) do begin at := at + 1; n := n - 1; end;
+  if (n = 0) or (n > 48) then begin tls.fail(50, "a DER INTEGER in the CertificateVerify signature is empty or too wide"); return false; end;
+  i := 0;
+  while i < 48 do begin tls.sigbuf[i] := chr(0); i := i + 1; end;
+  i := 0;
+  while i < n do begin tls.sigbuf[48 - n + i] := b[at + i]; i := i + 1; end;
+  p384.frombytes(r, tls.sigbuf, 0);
+  return true;
+end;
+
+// CertificateVerify signed with RSA-PSS. hid: 0 = SHA-256, 1 = SHA-384.
+//
+// THE TRANSCRIPT HASH IS TAKEN WITH THE SAME HASH the scheme names -- tls.cvdigest uses
+// SHA-256, which is right for 0x0804 and wrong for 0x0805. The second case needs its own
+// digest, and getting that wrong gives a value of the right shape that never matches.
+function tls.checkcvpss(hid: int): bool;
+begin
+  if tls.keykind <> 1 then begin tls.fail(50, "an RSA-PSS CertificateVerify under a key that is not RSA"); return false; end;
+  if tls.rsakeyn <= 0 then begin tls.fail(50, "no RSA key was loaded for this CertificateVerify"); return false; end;
+  if not tls.rsakeyload then return false;   // tls.rsakeyload already called tls.fail
+  if hid = 1 then tls.cvdigest384 else tls.cvdigest;
+  // THE SIGNATURE ITSELF IS CHECKED HERE, and that result stays opaque on purpose: whether
+  // it verified or not must look the same to anyone probing the connection.
+  return rsa.verifypss(hid, tls.cvsig, 0, tls.cvsign, tls.th);
+end;
+
+// CertificateVerify signed with ECDSA over P-384.
+function tls.checkcv384: bool;
+var e, r, sg: array[0..Q.N-1] of int;
+    at, rn, sn, rat, sat: int;
+begin
+  if tls.keykind <> 4 then begin tls.fail(50, "an ECDSA P-384 CertificateVerify under a key that is not P-384"); return false; end;
+  tls.cvdigest384;
+  p384.frombytes(e, tls.th, 0);
+  if der.enter(tls.cvsig, 0, tls.cvsign) < 0 then begin tls.fail(50, "the CertificateVerify signature does not parse"); return false; end;
+  at := der.vat;
+  if der.next(tls.cvsig, at, tls.cvsign) < 0 then begin tls.fail(50, "no r in the CertificateVerify signature"); return false; end;
+  if der.tag <> DER.INT then begin tls.fail(50, "r is not an INTEGER"); return false; end;
+  rat := der.vat; rn := der.vend - der.vat;
+  at := der.vend;
+  if der.next(tls.cvsig, at, tls.cvsign) < 0 then begin tls.fail(50, "no s in the CertificateVerify signature"); return false; end;
+  if der.tag <> DER.INT then begin tls.fail(50, "s is not an INTEGER"); return false; end;
+  sat := der.vat; sn := der.vend - der.vat;
+  if not tls.derint384(r, tls.cvsig, rat, rn) then return false;   // tls.derint384 already called tls.fail
+  if not tls.derint384(sg, tls.cvsig, sat, sn) then return false;  // tls.derint384 already called tls.fail
+  // THE SIGNATURE ITSELF IS CHECKED HERE, and that result stays opaque on purpose.
+  return p384.verify(tls.qx4, tls.qy4, e, r, sg);
+end;
+
+function tls.checkcv: bool;
+var e, r, sg: array[0..P.N-1] of int;
+    at, rn, sn, rat, sat: int;
+begin
+  if not tls.haskey then begin tls.fail(50, "no key was loaded from the leaf certificate"); return false; end;
+
+  // THE SIGNATURE SCHEME SAYS BOTH THE ALGORITHM AND THE HASH, and the key must match it.
+  // A scheme the key cannot carry is not a mismatch to shrug at -- it is the shape of an
+  // attack -- so each branch checks keykind explicitly rather than falling through.
+  //
+  //   0x0403  ecdsa_secp256r1_sha256    P-256 + SHA-256
+  //   0x0503  ecdsa_secp384r1_sha384    P-384 + SHA-384
+  //   0x0804  rsa_pss_rsae_sha256       RSA PSS + SHA-256
+  //   0x0805  rsa_pss_rsae_sha384       RSA PSS + SHA-384
+  //
+  // PSS IS THE COMMON CASE NOW, not an exotic one: TLS 1.3 forbids PKCS#1 v1.5 for
+  // CertificateVerify (RFC 8446 §4.2.3), so every RSA server signs with PSS. Measured
+  // 22-09-2026: wantzel.com does.
+  if tls.cvalg = 0x0804 then return tls.checkcvpss(0);
+  if tls.cvalg = 0x0805 then return tls.checkcvpss(1);
+  if tls.cvalg = 0x0503 then return tls.checkcv384;
+  if tls.cvalg <> 0x0403 then begin tls.fail(50, "an unsupported CertificateVerify signature scheme"); return false; end;
+  if tls.keykind <> 2 then begin tls.fail(50, "an ECDSA P-256 CertificateVerify under a key that is not P-256"); return false; end;
+
+  tls.cvdigest;
+  p256.frombytes(e, tls.th, 0);
+
+  // The signature is DER: SEQUENCE { INTEGER r, INTEGER s }.
+  if der.enter(tls.cvsig, 0, tls.cvsign) < 0 then begin tls.fail(50, "the CertificateVerify signature does not parse"); return false; end;
+  at := der.vat;
+  if der.next(tls.cvsig, at, tls.cvsign) < 0 then begin tls.fail(50, "no r in the CertificateVerify signature"); return false; end;
+  if der.tag <> DER.INT then begin tls.fail(50, "r is not an INTEGER"); return false; end;
+  rat := der.vat; rn := der.vend - der.vat;
+  at := der.vend;
+  if der.next(tls.cvsig, at, tls.cvsign) < 0 then begin tls.fail(50, "no s in the CertificateVerify signature"); return false; end;
+  if der.tag <> DER.INT then begin tls.fail(50, "s is not an INTEGER"); return false; end;
+  sat := der.vat; sn := der.vend - der.vat;
+
+  // A DER INTEGER carries a leading zero when its top bit is set, and drops leading zeros
+  // otherwise -- so r and s are 31, 32 or 33 bytes and have to be right-aligned into 32.
+  if not tls.derint(r, tls.cvsig, rat, rn) then return false;   // tls.derint already called tls.fail
+  if not tls.derint(sg, tls.cvsig, sat, sn) then return false;  // tls.derint already called tls.fail
+
+  // THE SIGNATURE ITSELF IS CHECKED HERE, and that result stays opaque on purpose.
+  return p256.verify(tls.qx, tls.qy, e, r, sg);
+end;
+
+// ---- the handshake ------------------------------------------------------------------------
+
+// Read one handshake message into tls.rec, spanning records if it has to.
+//
+// A MESSAGE CAN CROSS A RECORD BOUNDARY and several can share one record. Assuming one
+// message per record works against most servers and fails against some, which is the worst
+// kind of bug to find later.
+function tls.readhs(out: array of char): int;
+var need, got, avail, i: int;
+begin
+  // The 4-byte header first.
+  got := 0;
+  while got < 4 do
+  begin
+    if tls.plainat >= tls.plainn then
+    begin
+      if not tls.readrec then return 0 - 1;
+      if tls.plaintype = TLS.CHANGECIPHER then tls.plainat := tls.plainn;
+      if tls.plaintype = TLS.ALERT then
+      begin
+        tls.fail(ord(tls.plain[1]), "the server sent an alert");
+        return 0 - 1;
+      end;
+    end
+    else
+    begin
+      out[got] := tls.plain[tls.plainat];
+      tls.plainat := tls.plainat + 1;
+      got := got + 1;
+    end;
+  end;
+  need := tls.get24(out, 1);
+  if need > len(out) - 4 then
+  begin
+    tls.fail(80, "a handshake message is larger than the buffer");
+    return 0 - 1;
+  end;
+  while got < need + 4 do
+  begin
+    if tls.plainat >= tls.plainn then
+    begin
+      if not tls.readrec then return 0 - 1;
+      if tls.plaintype = TLS.CHANGECIPHER then tls.plainat := tls.plainn;
+    end
+    else
+    begin
+      avail := tls.plainn - tls.plainat;
+      if avail > need + 4 - got then avail := need + 4 - got;
+      i := 0;
+      while i < avail do
+      begin
+        out[got + i] := tls.plain[tls.plainat + i];
+        i := i + 1;
+      end;
+      got := got + avail;
+      tls.plainat := tls.plainat + avail;
+    end;
+  end;
+  return need + 4;
+end;
+
+function tls.connect(fd: int; host: str): bool;
+var n, mt, i: int;
+    msg: array[0..16383] of char;
+    want: array[0..31] of char;
+    got:  array[0..31] of char;
+begin
+  tls.fd := fd;
+  tls.err := 0;
+  tls.errmsg := "";
+  tls.verified := false;
+  if not tls.connectraw then
+  begin
+    tls.hostn := 0;
+    while (tls.hostn < slen(host)) and (tls.hostn < 255) do
+    begin
+      tls.host[tls.hostn] := schar(host, tls.hostn);
+      tls.hostn := tls.hostn + 1;
+    end;
+  end;
+  tls.connectraw := false;
+  tls.haskey := false;
+  tls.cvsign := 0;
+  tls.encrypting := false;
+  tls.decrypting := false;
+  tls.trn := 0;
+  tls.cseq := 0;
+  tls.sseq := 0;
+  tls.plainn := 0;
+  tls.plainat := 0;
+  tls.certat := 0;
+  tls.certn := 0;
+
+  rand.bytes(tls.priv);
+  x.base(tls.pub, tls.priv);
+
+  if not tls.hello(host) then return false;
+
+  // ServerHello.
+  n := tls.readhs(msg);
+  if n < 0 then return false;
+  if ord(msg[0]) <> TLS.SERVERHELLO then
+  begin
+    tls.fail(10, "the server did not answer with a ServerHello");
+    return false;
+  end;
+  tls.tradd(msg, 0, n);
+  if not tls.readsh(msg, 4, n - 4) then return false;
+
+  tls.schedule;
+  tls.decrypting := true;       // everything after ServerHello is encrypted
+
+  // EncryptedExtensions, Certificate, CertificateVerify, Finished.
+  while true do
+  begin
+    n := tls.readhs(msg);
+    if n < 0 then return false;
+    mt := ord(msg[0]);
+    if mt = TLS.FINISHED then
+    begin
+      // CHECK IT BEFORE ADDING IT to the transcript: the server's Finished covers everything
+      // up to but NOT including itself.
+      tls.expandlabel(tls.shs, "finished", tls.tmp, 0, tls.fkey, 32);
+      tls.trhash(tls.th);
+      tls.finishedmac(want);
+      i := 0;
+      while i < 32 do begin got[i] := msg[4 + i]; i := i + 1; end;
+      mt := 0;
+      i := 0;
+      while i < 32 do begin mt := bor(mt, bxor(ord(want[i]), ord(got[i]))); i := i + 1; end;
+      if mt <> 0 then
+      begin
+        tls.fail(51, "the server's Finished does not match");
+        return false;
+      end;
+      tls.tradd(msg, 0, n);
+      i := 0;
+      while i < 1 do i := i + 1;
+      // Application keys come from the transcript through the server's Finished.
+      tls.trhash(tls.th);
+      tls.derivesecret(tls.msec, "c ap traffic", tls.th, tls.cap);
+      tls.derivesecret(tls.msec, "s ap traffic", tls.th, tls.sap);
+      // OUR Finished still goes out under the HANDSHAKE key, so send it before switching.
+      tls.expandlabel(tls.chs, "finished", tls.tmp, 0, tls.fkey, 32);
+      tls.trhash(tls.th);
+      tls.finishedmac(tls.fin);
+      msg[0] := chr(TLS.FINISHED);
+      tls.put24(msg, 1, 32);
+      i := 0;
+      while i < 32 do begin msg[4 + i] := tls.fin[i]; i := i + 1; end;
+      tls.keys(tls.chs, tls.ckey, tls.civ);
+      tls.cseq := 0;
+      tls.encrypting := true;
+      if not tls.sendrec(TLS.HANDSHAKE, msg, 0, 36) then return false;
+      // NOW switch both directions to the application keys.
+      tls.keys(tls.cap, tls.ckey, tls.civ);
+      tls.keys(tls.sap, tls.skey, tls.siv);
+      tls.cseq := 0;
+      tls.sseq := 0;
+      // THE SIGNATURE IS CHECKED LAST, and its result is reported rather than enforced.
+      //
+      // tls.verified NOW MEANS BOTH HALVES, which it did not before:
+      //   1. the server PROVED it holds the key in the certificate (CertificateVerify), and
+      //   2. that certificate CHAINS to a root in the trust store (lib/chain.wz).
+      //
+      // Either half alone is worthless. Without 1, anyone can replay a certificate they
+      // copied off a real server; without 2, anyone can make their own certificate for any
+      // name. Both are required and both are checked here.
+      //
+      // AN EMPTY TRUST STORE MEANS verified = false, not "skip the check". A caller that
+      // has not loaded roots gets an encrypted connection to an unauthenticated peer, and
+      // it is told so rather than reassured.
+      tls.verified := tls.checkcv and tls.checkchain;
+      return true;
+    end;
+    if mt = TLS.CERT then
+    begin
+      tls.certat := tls.trn;
+      tls.certn := n;
+      if not tls.readcert(msg, n) then return false;
+    end;
+    if mt = TLS.CERTVERIFY then
+    begin
+      // THE HASH IS TAKEN BEFORE THIS MESSAGE GOES INTO THE TRANSCRIPT. CertificateVerify
+      // signs everything up to but NOT including itself; adding it first and then hashing
+      // gives a different value and the signature can never verify.
+      tls.trhash(tls.cvth);
+      if not tls.readcv(msg, n) then return false;
+    end;
+    tls.tradd(msg, 0, n);
+  end;
+  // Unreachable: the loop above only leaves through one of the returns inside it. Kept so
+  // every path has a result, and set through tls.fail rather than a bare false in case that
+  // ever stops being true.
+  tls.fail(80, "the handshake loop ended without a Finished");
+  return false;
+end;
+
+// The hostname as BYTES rather than a str, for a caller that got it from the command line:
+// Wantzel cannot build a str from characters, so argch output can never reach tls.connect.
+function tls.connectb(fd: int; hb: array of char; hn: int): bool;
+var i: int;
+begin
+  tls.hostn := 0;
+  while (tls.hostn < hn) and (tls.hostn < 255) do
+  begin
+    tls.host[tls.hostn] := hb[tls.hostn];
+    tls.hostn := tls.hostn + 1;
+  end;
+  i := tls.hostn;
+  tls.connectraw := true;
+  return tls.connect(fd, "");
+end;
+
+// ---- application data -----------------------------------------------------------------------
+
+function tls.write(b: array of char; n: int): bool;
+var at, chunk: int;
+begin
+  at := 0;
+  while at < n do
+  begin
+    chunk := n - at;
+    if chunk > TLS.MAXPLAIN - 64 then chunk := TLS.MAXPLAIN - 64;
+    if not tls.sendrec(TLS.APPDATA, b, at, chunk) then return false;
+    at := at + chunk;
+  end;
+  return true;
+end;
+
+// Read up to max bytes. Returns how many, 0 at a clean close, or -1 on error.
+function tls.read(b: array of char; max: int): int;
+var i, n: int;
+begin
+  while tls.plainat >= tls.plainn do
+  begin
+    if not tls.readrec then return 0 - 1;
+    if tls.plaintype = TLS.ALERT then
+    begin
+      // close_notify (0) is an orderly shutdown, not a failure.
+      if ord(tls.plain[1]) = 0 then return 0;
+      tls.fail(ord(tls.plain[1]), "the server sent an alert");
+      return 0 - 1;
+    end;
+    // A session ticket after the handshake is normal and carries nothing we use.
+    if tls.plaintype = TLS.HANDSHAKE then tls.plainat := tls.plainn;
+  end;
+  n := tls.plainn - tls.plainat;
+  if n > max then n := max;
+  i := 0;
+  while i < n do
+  begin
+    b[i] := tls.plain[tls.plainat + i];
+    i := i + 1;
+  end;
+  tls.plainat := tls.plainat + n;
+  return n;
+end;
+
+procedure tls.close;
+var a: array[0..1] of char;
+begin
+  a[0] := chr(1);      // warning
+  a[1] := chr(0);      // close_notify
+  if tls.encrypting then
+  begin
+    if tls.sendrec(TLS.ALERT, a, 0, 2) then a[0] := a[0];
+  end;
+end;
+
+// ---- the server side --------------------------------------------------------------------------
+//
+// THE RECORD LAYER AND THE KEY SCHEDULE ARE THE SAME, which is why this is short. What
+// differs is the direction: the server READS with the client's traffic secret and WRITES
+// with its own, exactly mirrored. Getting that pair the wrong way round produces two sides
+// that both encrypt happily and can decrypt nothing -- and the first symptom is a tag
+// failure, which reads like a corrupted record.
+//
+// WHAT IT SERVES: one certificate, one key, TLS 1.3, TLS_CHACHA20_POLY1305_SHA256, X25519.
+// No client certificates, no resumption, no session tickets, no ALPN negotiation beyond
+// accepting whatever the client offers.
+//
+// THE PRIVATE KEY NEVER LEAVES THIS PROCESS. It is set once with tls.setcert and lives in
+// module state; there is no accessor that hands it back.
+
+var
+  // The certificate chain as it goes on the wire: each entry is a 3-byte length then DER.
+  tls.mycert:  array[0..16383] of char;
+  tls.mycertn: int;
+  tls.mykey:   array[0..P.N-1] of int;   // our ECDSA private key
+  tls.mykeyx:  array[0..P.N-1] of int;
+  tls.mykeyy:  array[0..P.N-1] of int;
+  tls.haveserverkey: bool;
+  tls.srvrand: array[0..31] of char;
+
+// Install the certificate (DER, one certificate) and the P-256 private key that matches it.
+function tls.setcert(cert: array of char; certn: int; d: array of int): bool;
+var i: int;
+begin
+  if certn > len(tls.mycert) then
+  begin
+    tls.fail(80, "the certificate does not fit");
+    return false;
+  end;
+  i := 0;
+  while i < certn do begin tls.mycert[i] := cert[i]; i := i + 1; end;
+  tls.mycertn := certn;
+  p256.setup;
+  p256.copy(tls.mykey, d);
+  // THE PUBLIC KEY IS DERIVED, NOT SUPPLIED. A caller passing a public key that does not
+  // match the private one produces a server whose CertificateVerify never validates, and
+  // the client's error says only "bad signature".
+  p256.mulpoint(p256.gx, p256.gy, d);
+  if p256.iszero(p256.az) then
+  begin
+    tls.fail(80, "the private key is not usable");
+    return false;
+  end;
+  p256.affine;
+  p256.copy(tls.mykeyx, p256.t0);
+  p256.copy(tls.mykeyy, p256.t1);
+  tls.haveserverkey := true;
+  return true;
+end;
+
+// Build and send our ServerHello, answering the client's key_share.
+function tls.sendsh(peer: array of char): bool;
+var n, extat, i: int;
+begin
+  n := 4;
+  tls.put16(tls.rec, n, 0x0303); n := n + 2;      // legacy_version, always 1.2 on the wire
+  rand.bytes(tls.srvrand);
+  i := 0;
+  while i < 32 do begin tls.rec[n] := tls.srvrand[i]; n := n + 1; i := i + 1; end;
+  // ECHO THE CLIENT'S session id, byte for byte. TLS 1.3 does not use it, but a client that
+  // sent one expects it back -- it is how middlebox compatibility mode is signalled.
+  tls.rec[n] := chr(tls.sidn); n := n + 1;
+  i := 0;
+  while i < tls.sidn do begin tls.rec[n] := tls.sid[i]; n := n + 1; i := i + 1; end;
+  tls.put16(tls.rec, n, 0x1303); n := n + 2;      // the one suite we speak
+  tls.rec[n] := chr(0); n := n + 1;               // legacy_compression_method
+
+  extat := n; n := n + 2;
+  // supported_versions: 1.3. In a ServerHello this is a single version, not a list.
+  tls.put16(tls.rec, n, 43); n := n + 2;
+  tls.put16(tls.rec, n, 2); n := n + 2;
+  tls.put16(tls.rec, n, 0x0304); n := n + 2;
+  // key_share: our public value
+  tls.put16(tls.rec, n, 51); n := n + 2;
+  tls.put16(tls.rec, n, 36); n := n + 2;
+  tls.put16(tls.rec, n, 29); n := n + 2;
+  tls.put16(tls.rec, n, 32); n := n + 2;
+  i := 0;
+  while i < 32 do begin tls.rec[n] := tls.pub[i]; n := n + 1; i := i + 1; end;
+  tls.put16(tls.rec, extat, n - extat - 2);
+
+  tls.rec[0] := chr(TLS.SERVERHELLO);
+  tls.put24(tls.rec, 1, n - 4);
+  tls.tradd(tls.rec, 0, n);
+  if not tls.sendrec(TLS.HANDSHAKE, tls.rec, 0, n) then return false;
+
+  // The shared secret, and from here everything is encrypted.
+  x.scalarmult(tls.shared, tls.priv, peer);
+  return true;
+end;
+
+// Read the client's ClientHello and take its key_share and session id out of it.
+function tls.readch(b: array of char; n: int; peer: array of char): bool;
+var at, endp, extlen, exttype, extn, sublen, group, klen, i, found: int;
+begin
+  at := 4 + 2 + 32;                        // header, legacy_version, random
+  if at >= n then begin tls.fail(50, "a truncated ClientHello"); return false; end;
+  tls.sidn := ord(b[at]); at := at + 1;
+  if (tls.sidn > 32) or (at + tls.sidn > n) then
+  begin
+    tls.fail(50, "the session id does not fit");
+    return false;
+  end;
+  i := 0;
+  while i < tls.sidn do begin tls.sid[i] := b[at + i]; i := i + 1; end;
+  at := at + tls.sidn;
+
+  // cipher_suites: we need ours to be in there.
+  sublen := tls.get16(b, at); at := at + 2;
+  found := 0;
+  i := 0;
+  while i + 1 < sublen do
+  begin
+    if tls.get16(b, at + i) = 0x1303 then found := 1;
+    i := i + 2;
+  end;
+  at := at + sublen;
+  if found = 0 then
+  begin
+    tls.fail(40, "the client does not offer TLS_CHACHA20_POLY1305_SHA256");
+    return false;
+  end;
+  at := at + 1 + ord(b[at]);               // legacy_compression_methods
+
+  if at + 2 > n then begin tls.fail(50, "no extensions"); return false; end;
+  extlen := tls.get16(b, at); at := at + 2;
+  endp := at + extlen;
+  if endp > n then begin tls.fail(50, "the extensions run past the message"); return false; end;
+
+  group := 0 - 1;
+  while at + 4 <= endp do
+  begin
+    exttype := tls.get16(b, at);
+    extn := tls.get16(b, at + 2);
+    at := at + 4;
+    if exttype = 51 then
+    begin
+      // key_share: a LIST of shares, and we take the X25519 one. A client commonly offers
+      // several; picking the first without checking its group is how a server ends up doing
+      // X25519 arithmetic on a P-256 point.
+      sublen := tls.get16(b, at);
+      i := at + 2;
+      while i + 4 <= at + 2 + sublen do
+      begin
+        if tls.get16(b, i) = 29 then
+        begin
+          klen := tls.get16(b, i + 2);
+          if klen = 32 then
+          begin
+            group := 29;
+            tls.copyin(peer, b, i + 4, 32);
+          end;
+        end;
+        i := i + 4 + tls.get16(b, i + 2);
+      end;
+    end;
+    at := at + extn;
+  end;
+  if group <> 29 then
+  begin
+    tls.fail(40, "the client sent no X25519 key_share");
+    return false;
+  end;
+  return true;
+end;
+
+// Send one handshake message that is already built in msg[0..n).
+function tls.sendhs(msg: array of char; n: int): bool;
+begin
+  tls.tradd(msg, 0, n);
+  return tls.sendrec(TLS.HANDSHAKE, msg, 0, n);
+end;
+
+// The whole server handshake on an accepted socket.
+function tls.accept(fd: int): bool;
+var n, i, mt: int;
+    msg: array[0..16383] of char;
+    peer: array[0..31] of char;
+    want: array[0..31] of char;
+begin
+  if not tls.haveserverkey then
+  begin
+    tls.fail(80, "no certificate installed");
+    return false;
+  end;
+  tls.fd := fd;
+  tls.err := 0;
+  tls.errmsg := "";
+  tls.verified := false;
+  tls.encrypting := false;
+  tls.decrypting := false;
+  tls.trn := 0;
+  tls.cseq := 0;
+  tls.sseq := 0;
+  tls.plainn := 0;
+  tls.plainat := 0;
+
+  rand.bytes(tls.priv);
+  x.base(tls.pub, tls.priv);
+
+  // ---- ClientHello ----
+  n := tls.readhs(msg);
+  if n < 0 then return false;
+  if ord(msg[0]) <> TLS.CLIENTHELLO then
+  begin
+    tls.fail(10, "the client did not open with a ClientHello");
+    return false;
+  end;
+  tls.tradd(msg, 0, n);
+  if not tls.readch(msg, n, peer) then return false;
+
+  // ---- ServerHello, then the keys ----
+  if not tls.sendsh(peer) then return false;
+  tls.schedule;
+  // MIRRORED: the server writes with the SERVER secret and reads with the CLIENT one. The
+  // client does the opposite, and tls.schedule fills them from the client's point of view.
+  tls.keys(tls.shs, tls.ckey, tls.civ);
+  tls.keys(tls.chs, tls.skey, tls.siv);
+  tls.cseq := 0;
+  tls.sseq := 0;
+  tls.encrypting := true;
+  tls.decrypting := true;
+
+  // ---- EncryptedExtensions: empty, but not optional ----
+  msg[0] := chr(TLS.ENCEXT);
+  tls.put24(msg, 1, 2);
+  tls.put16(msg, 4, 0);
+  if not tls.sendhs(msg, 6) then return false;
+
+  // ---- Certificate ----
+  msg[0] := chr(TLS.CERT);
+  n := 4;
+  msg[n] := chr(0); n := n + 1;                       // empty certificate_request_context
+  tls.put24(msg, n, tls.mycertn + 5); n := n + 3;     // the list: one entry
+  tls.put24(msg, n, tls.mycertn); n := n + 3;
+  i := 0;
+  while i < tls.mycertn do begin msg[n] := tls.mycert[i]; n := n + 1; i := i + 1; end;
+  tls.put16(msg, n, 0); n := n + 2;                   // no per-certificate extensions
+  tls.put24(msg, 1, n - 4);
+  if not tls.sendhs(msg, n) then return false;
+
+  // ---- CertificateVerify: we sign the transcript with the certificate's key ----
+  //
+  // THE CONTEXT STRING IS THE SERVER'S, and it differs from the client's by one word. Using
+  // the client's string produces a signature the peer rejects with no useful error.
+  tls.trhash(tls.cvth);
+  tls.cvdigestfor(true);
+  p256.frombytes(tls.cve, tls.th, 0);
+  if not p256.sign(tls.mykey, tls.cve) then
+  begin
+    tls.fail(80, "could not sign the handshake");
+    return false;
+  end;
+  msg[0] := chr(TLS.CERTVERIFY);
+  tls.put16(msg, 4, 0x0403);                          // ecdsa_secp256r1_sha256
+  n := tls.derwrite(msg, 8, p256.sigr, p256.sigs);
+  tls.put16(msg, 6, n - 8);
+  tls.put24(msg, 1, n - 4);
+  if not tls.sendhs(msg, n) then return false;
+
+  // ---- our Finished ----
+  tls.expandlabel(tls.shs, "finished", tls.tmp, 0, tls.fkey, 32);
+  tls.trhash(tls.th);
+  tls.finishedmac(tls.fin);
+  msg[0] := chr(TLS.FINISHED);
+  tls.put24(msg, 1, 32);
+  i := 0;
+  while i < 32 do begin msg[4 + i] := tls.fin[i]; i := i + 1; end;
+  if not tls.sendhs(msg, 36) then return false;
+
+  // Application keys come from the transcript through our Finished.
+  tls.trhash(tls.th);
+  tls.derivesecret(tls.msec, "c ap traffic", tls.th, tls.cap);
+  tls.derivesecret(tls.msec, "s ap traffic", tls.th, tls.sap);
+  // OUR writing switches now; reading stays on the handshake key until the client's
+  // Finished has been read, because that message is still encrypted under it.
+  tls.keys(tls.sap, tls.ckey, tls.civ);
+  tls.cseq := 0;
+
+  // ---- the client's Finished ----
+  n := tls.readhs(msg);
+  if n < 0 then return false;
+  if ord(msg[0]) <> TLS.FINISHED then
+  begin
+    tls.fail(10, "the client did not send a Finished");
+    return false;
+  end;
+  tls.expandlabel(tls.chs, "finished", tls.tmp, 0, tls.fkey, 32);
+  tls.finishedmac(want);
+  mt := 0;
+  i := 0;
+  while i < 32 do begin mt := bor(mt, bxor(ord(want[i]), ord(msg[4 + i]))); i := i + 1; end;
+  if mt <> 0 then
+  begin
+    tls.fail(51, "the client's Finished does not match");
+    return false;
+  end;
+  tls.tradd(msg, 0, n);
+  tls.keys(tls.cap, tls.skey, tls.siv);
+  tls.sseq := 0;
+  return true;
+end;

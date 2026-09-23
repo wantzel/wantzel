@@ -1,0 +1,530 @@
+// lib/websocket.wz -- a WebSocket server (RFC 6455) that takes over a connection from
+// lib/http.wz, on the SAME port.
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// TAKEOVER, NOT A FORWARD HOOK. `lib/http.wz` declares `app.request` with `forward`,
+// and Wantzel has no function pointers and no optional override (docs/language.md §4,
+// §8) -- a `forward` routine MUST be defined by every program that includes the file
+// declaring it, whether or not that program ever uses it. Adding a second mandatory
+// hook to http.wz for the upgrade path would break every EXISTING program that
+// includes http.wz and never touches a WebSocket, which is not an acceptable cost for
+// a shared, released library.
+//
+// So the two libraries never call into each other. Instead, `app.request` -- the
+// application's own handler, already required by http.wz -- checks for an
+// `Upgrade: websocket` request itself and, when it wants to accept it, sets
+// `http.detach := true` before returning without writing a reply. http.wz sees that
+// flag, takes the connection OUT of its own bookkeeping (closes nothing, removes fd
+// from http.ep) and returns control to app.request having done so. The application
+// then calls `ws.take(fd)`, which reads the Sec-WebSocket-Key from the SAME parsed
+// request http.wz already has (via http.header, before detaching), sends the 101, and
+// adds fd to this module's OWN epoll set. From that point the fd is read through
+// `ws.poll`, which the application calls from its own loop (see below) -- there is no
+// second http.serve-style entry point here, because the socket already has one owner
+// (http.serve's) and workers/forking are its job, not this module's.
+//
+// ONE fd, ONE PORT, ONE ORIGIN, ONE COOKIE. The point of this shape (DEC-0000-0106) is
+// that a WebSocket upgrade is indistinguishable, up to the handshake, from any other
+// request on the server's one listening socket: same host, same cookie, and it passes
+// through any reverse proxy the same way an ordinary request does. An existing
+// http.wz program that never sets http.detach behaves exactly as before -- this file
+// changes nothing about http.wz's default path.
+//
+// THE CLIENT ALWAYS MASKS. Every frame from a browser carries a four-byte key and the
+// payload XORed with it, cycling; a server that forgets this reads plausible-looking
+// rubbish instead of failing loudly. The server never masks its own frames.
+
+include "net.wz";
+include "base64.wz";
+include "http.wz";
+
+const
+  WS.MAXCONN = 256;
+  WS.INMAX   = 65536;   // one buffered frame's worth of input per connection
+  WS.OUTMAX  = 65536;   // one frame's worth of output per connection
+  WS.MAXEV   = 256;
+
+  // Opcodes, from RFC 6455.
+  WS.CONT  = 0;
+  WS.TEXT  = 1;
+  WS.BIN   = 2;
+  WS.CLOSE = 8;
+  WS.PING  = 9;
+  WS.PONG  = 10;
+
+  // THE ACCEPT KEY IS EXACTLY 60 BYTES BEFORE HASHING: a 24-character base64 nonce plus
+  // the 36-character magic string. Sized exactly ON PURPOSE -- sha1.hash hashes ALL of
+  // its input, so a buffer with slack would hash the slack too and the browser would
+  // refuse the connection for no visible reason.
+  WS.KEYLEN = 60;
+
+var
+  // Per connection, indexed by fd, exactly like lib/http.wz's own tables -- the two
+  // never overlap for the same fd, because http.wz has already let go of it by the
+  // time ws.take adds it here.
+  ws.open: array[0..WS.MAXCONN - 1] of bool;
+
+  // The frame stream.
+  ws.in:  array[0..WS.MAXCONN * WS.INMAX - 1] of char;
+  ws.inn: array[0..WS.MAXCONN - 1] of int;
+  ws.out: array[0..WS.OUTMAX - 1] of char;   // one frame at a time is ever being sent
+
+  // The frame ws.read found, as an offset into this connection's slot of ws.in and a
+  // length -- filled by ws.read, consumed by the caller before ws.consumeframe.
+  ws.at:  int;
+  ws.len: int;
+  ws.op:  int;
+
+  ws.key:    array[0..WS.KEYLEN - 1] of char;
+  ws.dig:    array[0..19] of char;
+  ws.accept: array[0..63] of char;
+  ws.hdr:    array[0..255] of char;
+  ws.ignored: bool;   // a result deliberately not acted on, same convention as http.ignored
+
+  // this module's OWN epoll set -- never http.ep, see the file header. Globals start
+  // zeroed (docs/language.md), and epoll_create never legitimately returns fd 0 (fd 0
+  // is stdin, already open before this process's first syscall) -- so 0 doubles as
+  // "ws.take was never called, there is nothing to poll" without a separate flag.
+  ws.ep: int;
+  ws.evs: array[0..WS.MAXEV * 12 - 1] of char;
+
+// The application defines these two, the same "declare here, define in the
+// application" contract lib/http.wz uses for app.request (docs/language.md §4).
+
+// Called once per complete frame from fd, with the payload at
+// ws.in[fd * WS.INMAX + ws.at .. +ws.len) and its opcode in ws.op. Control frames
+// (close, ping, pong) are answered by this module before the application ever sees
+// them; only WS.TEXT, WS.BIN and WS.CONT reach here.
+procedure app.wsframe(fd: int); forward;
+
+// Called once a connection is dropped -- after ws.take succeeded and before, so the
+// application need not track which fds actually reached app.wsframe at least once.
+procedure app.wsclose(fd: int); forward;
+
+// ---------------------------------------------------------------- SHA-1
+//
+// WRITTEN OUT HERE RATHER THAN REUSING lib/sha256.wz OR lib/sha384.wz, because RFC 6455
+// names SHA-1 specifically and the browser CHECKS the answer against its own
+// computation of the same hash -- a well-formed header with the wrong digest is closed
+// on sight, with nothing in the log to say why. It is not used here as a security
+// primitive: the value is a handshake token proving the server read the specification,
+// not a signature, so SHA-1's weakness against collisions does not matter for this use.
+// No general SHA-1 exists elsewhere in lib/ to reuse (checked before writing this).
+//
+// MEASURED AGAINST THE KNOWN VECTORS, including every padding boundary, because the
+// padding is where a hand-written hash goes wrong and it goes wrong only for SOME
+// lengths: see tests/lib/websocket.sh.
+
+var
+  sha1.h: array[0..4] of int;
+  sha1.w: array[0..79] of int;
+  sha1.pad: array[0..127] of char;
+
+function sha1.rotl(x: int; n: int): int;
+var v: int;
+begin
+  // MASKED BACK TO 32 BITS AT EVERY STEP: an int here is 64 bits, so a left shift keeps
+  // bits SHA-1 expects to have fallen off the end, and the right half of the rotate
+  // would otherwise see rubbish in the high bits.
+  v := band(x, 0xFFFFFFFF);
+  return band(bor(v shl n, v shr (32 - n)), 0xFFFFFFFF);
+end;
+
+procedure sha1.block(b: array of char; at: int);
+var i, a, bb, c, d, e, f, k, t: int;
+begin
+  // THE MESSAGE SCHEDULE IS BIG-ENDIAN, which SHA-1 requires.
+  for i := 0 to 15 do
+    sha1.w[i] := bor(bor(bor(ord(b[at + i * 4]) shl 24, ord(b[at + i * 4 + 1]) shl 16),
+                         ord(b[at + i * 4 + 2]) shl 8), ord(b[at + i * 4 + 3]));
+  for i := 16 to 79 do
+    sha1.w[i] := sha1.rotl(bxor(bxor(sha1.w[i - 3], sha1.w[i - 8]),
+                                bxor(sha1.w[i - 14], sha1.w[i - 16])), 1);
+  a := sha1.h[0]; bb := sha1.h[1]; c := sha1.h[2]; d := sha1.h[3]; e := sha1.h[4];
+  for i := 0 to 79 do
+  begin
+    if i < 20 then begin f := bor(band(bb, c), band(bnot(bb), d)); k := 0x5A827999; end
+    else if i < 40 then begin f := bxor(bxor(bb, c), d); k := 0x6ED9EBA1; end
+    else if i < 60 then begin f := bor(bor(band(bb, c), band(bb, d)), band(c, d)); k := 0x8F1BBCDC; end
+    else begin f := bxor(bxor(bb, c), d); k := 0xCA62C1D6; end;
+    t := band(sha1.rotl(a, 5) + band(f, 0xFFFFFFFF) + e + k + sha1.w[i], 0xFFFFFFFF);
+    e := d; d := c; c := sha1.rotl(bb, 30); bb := a; a := t;
+  end;
+  sha1.h[0] := band(sha1.h[0] + a, 0xFFFFFFFF);
+  sha1.h[1] := band(sha1.h[1] + bb, 0xFFFFFFFF);
+  sha1.h[2] := band(sha1.h[2] + c, 0xFFFFFFFF);
+  sha1.h[3] := band(sha1.h[3] + d, 0xFFFFFFFF);
+  sha1.h[4] := band(sha1.h[4] + e, 0xFFFFFFFF);
+end;
+
+// sha1.hash(b, digest) -- the 20-byte digest of all of b.
+//
+// THE PADDING IS WHERE THIS GOES WRONG, and only for some lengths. A message is padded
+// with one 0x80 byte, then zeros, then its length in bits as eight big-endian bytes at
+// the very end of the last block. When the tail plus that 0x80 leaves fewer than eight
+// bytes free, the length no longer fits and a SECOND block is needed.
+procedure sha1.hash(b: array of char; digest: array of char);
+var n, i, at, rem, bits, padn: int;
+begin
+  sha1.h[0] := 0x67452301; sha1.h[1] := 0xEFCDAB89; sha1.h[2] := 0x98BADCFE;
+  sha1.h[3] := 0x10325476; sha1.h[4] := 0xC3D2E1F0;
+  n := len(b);
+  at := 0;
+  while at + 64 <= n do begin sha1.block(b, at); at := at + 64; end;
+  rem := n - at;
+  for i := 0 to 127 do sha1.pad[i] := chr(0);
+  for i := 0 to rem - 1 do sha1.pad[i] := b[at + i];
+  sha1.pad[rem] := chr(0x80);
+  if rem + 1 <= 56 then padn := 64 else padn := 128;
+  bits := n * 8;
+  for i := 0 to 7 do sha1.pad[padn - 1 - i] := chr(band(bits shr (i * 8), 255));
+  sha1.block(sha1.pad, 0);
+  if padn = 128 then sha1.block(sha1.pad, 64);
+  for i := 0 to 4 do
+  begin
+    digest[i * 4]     := chr(band(sha1.h[i] shr 24, 255));
+    digest[i * 4 + 1] := chr(band(sha1.h[i] shr 16, 255));
+    digest[i * 4 + 2] := chr(band(sha1.h[i] shr 8, 255));
+    digest[i * 4 + 3] := chr(band(sha1.h[i], 255));
+  end;
+end;
+
+// ---------------------------------------------------------------- taking over a connection
+
+// ws.take(fd) -- turn the connection http.wz just detached into a live WebSocket:
+// compute the accept key from http.wz's OWN parsed Sec-WebSocket-Key header (read
+// through http.header, same as any other header lib/http.wz exposes), send the 101,
+// and start watching fd on this module's own epoll set. Returns false when the
+// header is missing or malformed -- a non-browser client, or a plain GET with
+// Upgrade set but no key -- in which case the caller should close fd itself (it is
+// NOT added to ws.open, so ws.dropconn/ws.poll never touch it).
+//
+// MUST BE CALLED AFTER http.detach := true AND BEFORE app.request RETURNS: that is
+// the only point at which http.hvat/http.hvend (left by http.header) still describe
+// THIS request, and the only point at which fd is still a plain blocking-free socket
+// nobody else is reading from yet.
+function ws.take(fd: int): bool;
+var n, i, acceptn: int;
+begin
+  if not http.header("sec-websocket-key") then return false;
+  // THE VALUE IS ALWAYS 24 CHARACTERS: the key is 16 random bytes and base64 of 16
+  // bytes is 24 with padding. Taking a fixed 24 rather than the whole header value
+  // means a malformed header cannot make this read past what was actually sent.
+  if http.hvend - http.hvat <> 24 then return false;
+  if fd < 0 then return false;
+  if fd >= WS.MAXCONN then return false;
+
+  i := 0;
+  while i < 24 do begin ws.key[i] := http.inbuf[http.hvat + i]; i := i + 1; end;
+  i := 0;
+  while i < 36 do
+  begin
+    ws.key[24 + i] := schar("258EAFA5-E914-47DA-95CA-C5AB0DC85B11", i);
+    i := i + 1;
+  end;
+  sha1.hash(ws.key[0..WS.KEYLEN - 1], ws.dig);
+  acceptn := base64.encode(ws.accept, 0, ws.dig[0..19]);
+
+  n := io.push(ws.hdr, 0, "HTTP/1.1 101 Switching Protocols\r\n");
+  n := io.push(ws.hdr, n, "Upgrade: websocket\r\n");
+  n := io.push(ws.hdr, n, "Connection: Upgrade\r\n");
+  n := io.push(ws.hdr, n, "Sec-WebSocket-Accept: ");
+  // The computed accept key lives in a buffer, and io.push takes a `str` -- only a
+  // LITERAL converts to one in this language, so it is copied byte by byte instead.
+  i := 0;
+  while i < acceptn do
+  begin
+    ws.hdr[n] := ws.accept[i];
+    n := n + 1;
+    i := i + 1;
+  end;
+  n := io.push(ws.hdr, n, "\r\n\r\n");
+  if net.send(fd, addr(ws.hdr[0]), n) <> n then return false;
+
+  if ws.ep = 0 then
+  begin
+    // Lazily created on the first takeover: a program that includes this module but
+    // never actually upgrades a connection should not pay for an epoll set it never
+    // uses, and http.serve's forked workers each need their OWN set (created after
+    // fork, same reason http.serve creates http.ep after forking) rather than one
+    // inherited from the parent.
+    ws.ep := net.epoll;
+    if ws.ep < 0 then io.fatal("ws.take: cannot create the epoll set");
+  end;
+  ws.open[fd] := true;
+  ws.inn[fd] := 0;
+  if not net.watch(ws.ep, EPOLL_ADD, fd, EPOLLIN) then
+  begin
+    ws.open[fd] := false;
+    return false;
+  end;
+  return true;
+end;
+
+// ---------------------------------------------------------------- framing
+
+// ws.send(fd, opcode, a, n) -- one frame carrying n bytes of a to fd.
+//
+// THE HEADER IS TWO, FOUR OR TEN BYTES and the payload length decides which. A server
+// never masks, so there is no masking key on this side.
+function ws.send(fd: int; opcode: int; a: array of char; n: int): bool;
+var i, hn, sent: int;
+begin
+  if (fd < 0) or (fd >= WS.MAXCONN) or (not ws.open[fd]) then return false;
+  if n < 0 then return false;
+  if n > WS.OUTMAX - 10 then return false;
+
+  ws.out[0] := chr(128 + opcode);          // FIN set
+  if n < 126 then
+  begin
+    ws.out[1] := chr(n);
+    hn := 2;
+  end
+  else if n < 65536 then
+  begin
+    ws.out[1] := chr(126);
+    // THE FRAME LENGTH IS BIG-ENDIAN, per RFC 6455 -- the payload it wraps may be
+    // anything the application likes, but the frame header itself is always network
+    // byte order.
+    ws.out[2] := chr(band(n shr 8, 255));
+    ws.out[3] := chr(band(n, 255));
+    hn := 4;
+  end
+  else
+  begin
+    ws.out[1] := chr(127);
+    i := 0;
+    while i < 8 do
+    begin
+      ws.out[2 + i] := chr(band(n shr (56 - i * 8), 255));
+      i := i + 1;
+    end;
+    hn := 10;
+  end;
+
+  i := 0;
+  while i < n do
+  begin
+    ws.out[hn + i] := a[i];
+    i := i + 1;
+  end;
+
+  sent := net.send(fd, addr(ws.out[0]), hn + n);
+  return sent = hn + n;
+end;
+
+// ws.sendempty(fd, opcode) -- a frame with no payload (a bare ping or pong). Separate
+// from ws.send because n = 0 has no slice to pass: [x..x-1] has hi < lo, which is not
+// how an empty range is written in this language, so the zero-length case is its own
+// routine rather than a slice expression callers would have to special-case themselves.
+function ws.sendempty(fd: int; opcode: int): bool;
+begin
+  return ws.send(fd, opcode, ws.out, 0);
+end;
+
+function ws.sendtext(fd: int; a: array of char; n: int): bool;
+begin
+  return ws.send(fd, WS.TEXT, a, n);
+end;
+
+// ---------------------------------------------------------------- the connection loop
+
+procedure ws.dropconn(fd: int);
+begin
+  ws.ignored := net.watch(ws.ep, EPOLL_DEL, fd, 0);
+  net.close(fd);
+  if ws.open[fd] then app.wsclose(fd);
+  ws.open[fd] := false;
+end;
+
+// ws.consume(fd, total) -- drop the first `total` bytes of fd's frame buffer (header,
+// mask and payload together) and shuffle what follows down.
+//
+// SEPARATE FROM ws.read because the caller needs the payload before it moves, and
+// because ws.read itself consumes control frames before returning. What is left over
+// belongs to the NEXT frame and must be kept: a browser can put several frames in one
+// TCP segment, and discarding the tail would drop every event but the first.
+procedure ws.consume(fd: int; total: int);
+var base, rest, i: int;
+begin
+  base := fd * WS.INMAX;
+  if total > ws.inn[fd] then total := ws.inn[fd];
+  rest := ws.inn[fd] - total;
+  i := 0;
+  while i < rest do
+  begin
+    ws.in[base + i] := ws.in[base + total + i];
+    i := i + 1;
+  end;
+  ws.inn[fd] := rest;
+end;
+
+procedure ws.consumeframe(fd: int);
+begin
+  ws.consume(fd, ws.at + ws.len);
+end;
+
+// ws.closefd(fd, code) -- a close frame that SAYS WHY, then the socket goes down.
+//
+// WITHOUT A REASON the page sees the socket drop and cannot tell a finished program
+// from a crashed one. 1000 is "normal closure"; the application may use 4000-4999 for
+// its own meanings, the range RFC 6455 reserves for that.
+procedure ws.closefd(fd: int; code: int);
+var ignored: int;
+begin
+  if (fd < 0) or (fd >= WS.MAXCONN) or (not ws.open[fd]) then return;
+  ws.out[0] := chr(128 + WS.CLOSE);
+  ws.out[1] := chr(2);
+  ws.out[2] := chr((code div 256) mod 256);
+  ws.out[3] := chr(code mod 256);
+  ignored := net.send(fd, addr(ws.out[0]), 4);
+  ws.dropconn(fd);
+end;
+
+// ws.read(fd) -- is a complete frame now buffered for fd? Its payload is
+// ws.in[fd * WS.INMAX + ws.at .. +ws.len). Control frames (ping/pong/close) are
+// answered here and never returned to the caller; only WS.TEXT/WS.BIN/WS.CONT come
+// back as true.
+//
+// FALSE MEANS "NOT YET OR HANDLED", NOT "NOTHING WENT WRONG" -- a close frame or a
+// protocol violation both return false after having already dropped the connection,
+// same as a frame that is simply incomplete. The caller only needs to keep reading.
+function ws.read(fd: int): bool;
+var base, hn, plen, i, op: int;
+begin
+  base := fd * WS.INMAX;
+  if ws.inn[fd] < 2 then return false;
+  op := band(ord(ws.in[base + 0]), 15);
+  plen := band(ord(ws.in[base + 1]), 127);
+  hn := 2;
+  if plen = 126 then
+  begin
+    if ws.inn[fd] < 4 then return false;
+    plen := ord(ws.in[base + 2]) * 256 + ord(ws.in[base + 3]);
+    hn := 4;
+  end
+  else if plen = 127 then
+  begin
+    if ws.inn[fd] < 10 then return false;
+    plen := 0;
+    i := 0;
+    while i < 8 do
+    begin
+      plen := plen * 256 + ord(ws.in[base + 2 + i]);
+      i := i + 1;
+    end;
+    hn := 10;
+  end;
+  // AN UNMASKED FRAME FROM A CLIENT IS A PROTOCOL VIOLATION -- RFC 6455 says to drop
+  // the connection, which is also the only safe answer: carrying on would read every
+  // later frame four bytes wrong.
+  if band(ord(ws.in[base + 1]), 128) = 0 then
+  begin
+    ws.closefd(fd, 1002);
+    return false;
+  end;
+  if plen < 0 then begin ws.closefd(fd, 1002); return false; end;
+  if hn + 4 + plen > WS.INMAX then begin ws.closefd(fd, 1009); return false; end;
+  if ws.inn[fd] < hn + 4 + plen then return false;
+
+  // UNMASK IN PLACE: byte i of the payload is XORed with key byte i mod 4.
+  i := 0;
+  while i < plen do
+  begin
+    ws.in[base + hn + 4 + i] := chr(bxor(ord(ws.in[base + hn + 4 + i]), ord(ws.in[base + hn + (i mod 4)])));
+    i := i + 1;
+  end;
+
+  if op = WS.CLOSE then
+  begin
+    ws.closefd(fd, 1000);
+    return false;
+  end;
+  if op = WS.PING then
+  begin
+    // A pong MUST echo the ping's payload back exactly (RFC 6455 §5.5.3). ws.send
+    // copies from its `a` argument into ws.out itself, so the unmasked payload still
+    // sitting in ws.in is passed straight through as a slice. A ping with no payload
+    // (plen = 0) takes the sendempty path instead: a slice [x..x-1] with hi < lo has
+    // no meaning here, so it is never constructed. The result is deliberately
+    // ignored: a pong that fails to send costs this one heartbeat, not the frame the
+    // caller is waiting to read next.
+    if plen > 0 then ws.ignored := ws.send(fd, WS.PONG, ws.in[base + hn + 4 .. base + hn + 4 + plen - 1], plen)
+    else ws.ignored := ws.sendempty(fd, WS.PONG);
+    ws.consume(fd, hn + 4 + plen);
+    return ws.read(fd);
+  end;
+  if op = WS.PONG then
+  begin
+    ws.consume(fd, hn + 4 + plen);
+    return ws.read(fd);
+  end;
+
+  ws.at := hn + 4;
+  ws.len := plen;
+  ws.op := op;
+  return true;
+end;
+
+procedure ws.readframes(fd: int);
+var base, r: int;
+begin
+  base := fd * WS.INMAX;
+  while true do
+  begin
+    if not ws.open[fd] then return;          // dropped by a control frame just above
+    if ws.inn[fd] >= WS.INMAX then begin ws.closefd(fd, 1009); return; end;
+    r := net.recv(fd, addr(ws.in[base + ws.inn[fd]]), WS.INMAX - ws.inn[fd]);
+    if r > 0 then
+    begin
+      ws.inn[fd] := ws.inn[fd] + r;
+      while ws.open[fd] and ws.read(fd) do
+      begin
+        app.wsframe(fd);
+        ws.consumeframe(fd);
+      end;
+    end
+    else if r = EAGAIN then return
+    else if r <> EINTR then begin ws.dropconn(fd); return; end;
+  end;
+end;
+
+// ws.poll(timeout) -- wait up to timeout ms (0 = do not block, -1 = forever) for
+// activity on any WebSocket connection this module owns, and serve it. Returns the
+// number of connections that had something to read (0 on a timeout).
+//
+// THE APPLICATION CALLS THIS ITSELF, FROM ITS OWN LOOP -- there is no `ws.serve`
+// here. The listening socket, its workers and its accept loop belong to http.serve;
+// this module only ever gains fds one at a time, through ws.take, so it has nothing
+// to accept and no reason to own the process's main loop. A program that also wants
+// its own periodic work (the studio's srv.tick) calls ws.poll(0) or a short timeout
+// from inside that loop instead of blocking here forever.
+function ws.poll(timeout: int): int;
+var n, i, ev, fd, served: int;
+begin
+  if ws.ep = 0 then return 0;   // ws.take was never called: nothing to poll
+  n := net.wait(ws.ep, addr(ws.evs[0]), WS.MAXEV, timeout);
+  if n < 0 then
+  begin
+    if n = EINTR then return 0;
+    io.fatal("ws.poll: epoll_wait failed");
+  end;
+  served := 0;
+  i := 0;
+  while i < n do
+  begin
+    ev := io.get32(ws.evs, i * 12);
+    fd := io.get32(ws.evs, i * 12 + 4);
+    if (fd >= 0) and (fd < WS.MAXCONN) and ws.open[fd] then
+    begin
+      served := served + 1;
+      if band(ev, bor(EPOLLERR, EPOLLHUP)) <> 0 then ws.dropconn(fd)
+      else if band(ev, EPOLLIN) <> 0 then ws.readframes(fd);
+    end;
+    i := i + 1;
+  end;
+  return served;
+end;

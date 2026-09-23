@@ -88,6 +88,18 @@ begin
   io.puts(STDOUT, "\n");
 end;
 
+// the first key the last parse IGNORED and how many there were, or "-" when it declared
+// every key it was given
+procedure ignored;
+begin
+  io.puts(STDOUT, "  ignored=");
+  if json.ignoredn > 0 then io.out(STDOUT, addr(doc[json.ignored0]), json.ignored1 - json.ignored0)
+  else io.puts(STDOUT, "-");
+  io.puts(STDOUT, " n=");
+  io.putn(STDOUT, json.ignoredn);
+  io.puts(STDOUT, "\n");
+end;
+
 begin
   load("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"a\":1}}");
   show;
@@ -96,25 +108,47 @@ begin
   // which no longer parses at all, so it rides on params, which is json.
   load("{ \"method\":\"ping\" , \"params\":[1,{\"x\":\"}\"}], \"jsonrpc\":\"2.0\", \"id\":-3, \"loud\":true }");
   show;
-  // An UNDECLARED key is refused, not skipped.  A caller that sends a
-  // renamed or removed field used to get a normal answer computed with the default in
-  // its place -- nothing refused and nothing warned, so the wrong value travelled on.
+  // An UNDECLARED key is SKIPPED, not refused: a caller may send a superset of what the
+  // schema declares and still be answered.  But it is RECORDED, so a renamed or removed
+  // field does not vanish -- the layer above can name what it dropped instead of
+  // returning a normal answer computed with the default in silence.
   load("{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"extra\":1}");
   show;
-  badkey;
-  // the refusal names the key, because parse returns -1 for every kind of failure
+  ignored;
+  // whatever the undeclared value holds, including a nested object with a '}' inside a
+  // string: the skipper walks it rather than stopping at the first brace it sees
   load("{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"extra\":[1,{\"x\":\"}\"}]}");
   show;
-  badkey;
+  ignored;
   // a key that differs only in case is a DIFFERENT JSON key: JSON is case-sensitive even
-  // though Wantzel identifiers are not
+  // though Wantzel identifiers are not.  So this does NOT fill `method` -- it is ignored
+  // like any other undeclared key, and the required `method` is then missing.
   load("{\"jsonrpc\":\"2.0\",\"Method\":\"ping\"}");
   show;
-  badkey;
-  // and a valid object leaves no key behind from an earlier failure
+  ignored;
+  // two undeclared keys: the first is the one named, and both are counted
+  load("{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"aaa\":1,\"bbb\":2}");
+  show;
+  ignored;
+  // and a clean object leaves nothing behind from the parse before it
   load("{\"jsonrpc\":\"2.0\",\"method\":\"ping\"}");
   show;
   badkey;
+  ignored;
+  // A DECLARED key with a value the schema cannot hold is still refused, even in a
+  // document that also carries an undeclared key: tolerance is for keys the schema does
+  // not know, never for values it cannot hold.  Here `method` is a text and gets a
+  // number, which its own arm refuses before the undeclared key is ever reached.
+  load("{\"jsonrpc\":\"2.0\",\"method\":5,\"extra\":1}");
+  show;
+  // and it names the DECLARED field it choked on -- badkey is now only ever that, since
+  // an undeclared key is no longer a failure at all
+  badkey;
+  // and a required field that is ONLY present as an undeclared lookalike is missing,
+  // which is what keeps a renamed REQUIRED field from slipping through as a default
+  load("{\"jsonrpc\":\"2.0\",\"methodd\":\"ping\"}");
+  show;
+  ignored;
   load("{\"jsonrpc\":\"2.0\",\"method\":\"initialize\"}");
   show;
   load("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\"}");

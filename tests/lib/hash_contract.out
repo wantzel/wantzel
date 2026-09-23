@@ -1,0 +1,2 @@
+before the call
+hash.put wrong key length -> hash.put: key length does not match klen

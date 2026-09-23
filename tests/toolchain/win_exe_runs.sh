@@ -88,6 +88,34 @@ cmp -s "$T/h_from_win.elf" "$T/h_from_linux.elf" || bad "wantzel.exe emits a dif
 chmod +x "$T/h_from_win.elf"
 [ "$("$T/h_from_win.elf" 2>/dev/null)" = "hello, world" ] || bad "the ELF made by wantzel.exe does not run"
 
+# setlibdir must also split on '\', because on Windows argv[0] is the ONLY source it has
+# (there is no /proc/self/exe there, see the __wsys shim for syscall 89) -- a compiler
+# started as C:\tools\wantzel.exe has no '/' in argv[0] at all. Copy the compiler and its
+# lib/ into the Wine C: drive under a backslash-only path, run it from a directory with no
+# lib/ of its own, and compile a program that needs the library.
+mkdir -p "$WINEPREFIX/drive_c/libdirtest/lib" "$T/libdirtest_cwd"
+cp "$T/wantzel.exe" "$WINEPREFIX/drive_c/libdirtest/wantzel.exe"
+cp "$ROOT"/lib/*.wz "$WINEPREFIX/drive_c/libdirtest/lib/"
+cat > "$T/libdirtest_cwd/needs_io.wz" <<'EOF'
+include "io.wz";
+procedure main;
+begin
+  io.puts(1, "libdir ok\n");
+end;
+begin
+  main;
+end.
+EOF
+( cd "$T/libdirtest_cwd" && \
+  W "C:\\libdirtest\\wantzel.exe" needs_io.wz needs_io.exe --target=windows ) \
+  > "$T/libdirtest_compile.out" 2>&1
+if [ ! -f "$T/libdirtest_cwd/needs_io.exe" ]; then
+    bad "wantzel.exe started as C:\\libdirtest\\wantzel.exe does not find lib/io.wz: $(cat "$T/libdirtest_compile.out")"
+else
+    lo=$(W "$T/libdirtest_cwd/needs_io.exe")
+    [ "$lo" = "libdir ok" ] || bad "the program built via a backslash argv[0] does not run correctly: got '$lo'"
+fi
+
 # an MCP server over stdin, as a .exe (stat, getdents, ReadFile, scan)
 mkdir -p "$T/proj/sub"
 printf 'hello content\n' > "$T/proj/readme.txt"

@@ -1,3 +1,10 @@
+/* agent-permissions: read
+ *
+ * NOT because this file is finished, but because it has a COUNTERPART: src/compiler.wz is
+ * the same logic in Wantzel, and changing one without the other breaks the bootstrap fixed
+ * point -- which is discovered much later, by someone else. Change both, in one commit,
+ * under a ticket that asks for it.
+ */
 /* boot.c -- bootstrap compiler for the Wantzel language.
  *
  * This is the ONLY file that ever needs an external C compiler.  It is a
@@ -21,7 +28,7 @@
 /* limits                                                              */
 /* ------------------------------------------------------------------ */
 /* The release this compiler was built from; src/wantzel.wz has the same string. */
-#define VERSION "0.2.1"
+#define VERSION "0.3.0"
 #define SRCMAX  67108864
 #define CODEMAX 67108864
 #define DATMAX  33554432
@@ -38,6 +45,7 @@
 #define MAXL        2048
 #define MAXP          10
 #define MAXFIX   4194304
+#define DBGMAX  16777216   /* the debug sidecar, collected in memory; see docs/design.md */
 #define TBMAX       4096
 
 /* type codes */
@@ -226,8 +234,26 @@ long fdev[1024]; long fino[1024];
 
 /* misc */
 long trapaddr, argaddr, scanaddr, mainaddr, mainpatch, framepatch;
+/* THE PLACE OF THE LAST CHECK, so a line with several of them stores one copy.  Counterpart
+   of the same four variables in src/compiler.wz; see there for the measurement.  Measured in
+   bin/wantzel: 1016 place strings, 662 distinct -- a third were duplicates from lines holding
+   more than one check, and each copy costs its text plus an eight-byte length and padding. */
+/* -1 is belt and braces: tplastline starts at 0 and no source line is 0, so the guard in
+   trap() cannot match before a real place is written.  It says what is meant, and it keeps
+   the first check safe if line 0 ever becomes reachable. */
+long tplast = -1, tplastlen, tplastline, tplastfile;
 long winmode, sysrawaddr, entryoff;
 long tgiven;                        /* was --target= given? the output name never decides */
+/* DEBUG INFORMATION: --debug writes <output>.wzdbg, see docs/design.md.  The
+   binary is untouched; the sidecar is the only difference.  The records that come in
+   address order (line, func, param, local) are collected in dbg as they are produced,
+   because a routine's locals are gone by the time the file is written.  Counterpart of
+   the same variables in src/compiler.wz. */
+long dbgmode;                       /* was --debug given? */
+char dbg[DBGMAX]; long dbglen;
+long codebase;                      /* the address of code[0] in the image, known before parsing */
+long fend[MAXF], fhline[MAXF], fhfile[MAXF];   /* where a routine ends, and its header */
+long dbdata, dbbss;                 /* where the writer put the data and the bss */
 
 /* ------------------------------------------------------------------ */
 /* thin io layer (the Wantzel version calls sysN directly)                 */
@@ -312,6 +338,50 @@ long failtaken(char *m){
     }
     wrs(2,"\n");
     _exit(1);
+    return 0;
+}
+
+/* failkeyword -- a keyword where a NAME was expected, and the word is named.
+
+   A schema field called `type` used to be reported as "missing end of the schema" on its
+   own line: the field loop stops at the first token that is not an identifier, a keyword
+   is not one, and what the parser then found missing was the end.  The line was right and
+   the message was wrong -- the reader searches that line for an end that was never
+   missing while the word that IS the problem looks like an ordinary name.  A record
+   field, a tool and every "name expected" site had the same gap.  Counterpart of the
+   routine in src/wantzel.wz.  The repair is derivable for a schema field, so it is given. */
+long failkeyword(char *what, long jsonkey){
+    long i;
+    wrs(2,"wantzel: "); wrname(2); wrs(2,":"); wrnum(2,line); wrs(2,": ");
+    i = 0; while(obuf[i] != 0){ i = i + 1; }
+    wrbuf(2,(long)(size_t)&obuf[0],i);
+    wrs(2," is a keyword and cannot name "); wrs(2,what);
+    if(jsonkey){
+        wrs(2," -- name the field differently and keep the JSON key: kind \"");
+        wrbuf(2,(long)(size_t)&obuf[0],i);
+        wrs(2,"\": ...");
+    }
+    wrs(2,"\n");
+    _exit(1);
+    return 0;
+}
+
+/* iskw -- is the current token a keyword?  Every "name expected" site asks this first. */
+long iskw(void){
+    return tok >= KW_CONST && tok <= KW_TOOLS;
+}
+
+/* kwnamed -- is the current keyword standing where a NAME belongs, judged by the character
+   after it?  Counterpart of the routine in src/compiler.wz, which says why. */
+long kwnamed(long c1, long c2){
+    long p; long c;
+    if(!iskw()){ return 0; }
+    p = pos;
+    while(p < srcend){
+        c = srcb(p);
+        if(c != 32 && c != 9 && c != 13 && c != 10){ return c == c1 || c == c2; }
+        p = p + 1;
+    }
     return 0;
 }
 
@@ -429,6 +499,8 @@ long hexdig(long c){
     return -1;
 }
 
+#define HEXESC "a hex escape needs exactly two hex digits, as in x41 or xff after a backslash"
+
 /* The byte an escape stands for.  A hex escape reads two more characters here and
    advances pos past them itself.  EXACTLY TWO HEX DIGITS, never a variable number --
    that is where C put its own trap, where a hex escape keeps eating digits and a byte
@@ -443,10 +515,14 @@ long escape(long c){
     if(c == 39){ return 39; }    /* ' */
     if(c == 34){ return 34; }    /* " */
     if(c == 120 || c == 88){     /* x or X */
-        if(pos + 2 >= srcend){ fail("a hex escape needs two digits"); }
+        /* THE SAME MESSAGE AS BELOW, and on purpose: both mean "this escape has no two
+           hex digits".  Which fires depends on whether the source happens to end first,
+           and that is not a distinction the reader can act on.  src/compiler.wz keeps the
+           text in one constant; here it is a macro for the same reason. */
+        if(pos + 2 >= srcend){ fail(HEXESC); }
         h = hexdig(srcb(pos + 1));
         l = hexdig(srcb(pos + 2));
-        if(h < 0 || l < 0){ fail("a hex escape needs exactly two hex digits, as in x41 or xff after a backslash"); }
+        if(h < 0 || l < 0){ fail(HEXESC); }
         pos = pos + 2;
         return h * 16 + l;
     }
@@ -768,7 +844,14 @@ long makepath(long doff){
    is whatever the caller said: started through PATH it is the bare word "wantzel" with no
    '/' in it, cut stays 0, and the search path collapses to a relative "lib/" that depends
    on the working directory.  readlink answers where the process really came from; argv[0]
-   remains the fallback when it cannot (no /proc). */
+   remains the fallback when it cannot (no /proc).
+
+   ON WINDOWS THIS FALLBACK IS NOT RARE, IT IS THE ONLY CASE: there is no /proc/self/exe
+   there, so the Windows __wsys shim answers syscall 89 with -1 every time and the compiler
+   always falls back to argv[0]. Started as C:\tools\wantzel.exe, argv[0] then has no '/' at
+   all, only '\', so the loop below splits on '\' too -- on every platform, since this same
+   source also runs as the native Linux compiler, where a stray '\' in a real path is not a
+   realistic concern. Counterpart of src/wantzel.wz. */
 long setlibdir(char *a0){
     long i; long cut; long n;
     libdirlen = 0; i = 0; cut = 0;
@@ -777,14 +860,15 @@ long setlibdir(char *a0){
         i = 0; while(i < n){ if(selfbuf[i] == 47){ cut = i + 1; } i = i + 1; }
         i = 0; while(i < cut){ libdir[i] = selfbuf[i]; i = i + 1; }
     } else {
-        while(a0[i] != 0 && i < 900){ if(a0[i] == 47){ cut = i + 1; } i = i + 1; }
+        while(a0[i] != 0 && i < 900){ if(a0[i] == 47 || a0[i] == 92){ cut = i + 1; } i = i + 1; }
         i = 0; while(i < cut){ libdir[i] = a0[i]; i = i + 1; }
     }
     libdirlen = cut;
     /* If the compiler sits in .../bin/, its library belongs in .../lib/ beside it
-       (prefix/bin next to prefix/lib).  Counterpart of src/wantzel.wz. */
+       (prefix/bin next to prefix/lib, or prefix\bin next to prefix\lib on Windows).
+       Counterpart of src/wantzel.wz. */
     if(libdirlen >= 4 && libdir[libdirlen-4] == 'b' && libdir[libdirlen-3] == 'i'
-       && libdir[libdirlen-2] == 'n' && libdir[libdirlen-1] == 47){ libdirlen = libdirlen - 4; }
+       && libdir[libdirlen-2] == 'n' && (libdir[libdirlen-1] == 47 || libdir[libdirlen-1] == 92)){ libdirlen = libdirlen - 4; }
     libdir[libdirlen] = 'l'; libdir[libdirlen+1] = 'i';
     libdir[libdirlen+2] = 'b'; libdir[libdirlen+3] = 47;
     libdirlen = libdirlen + 4;
@@ -1401,6 +1485,51 @@ char *tname(long t){
     return "void";
 }
 
+/* ---- the debug sidecar: text into dbg, written by writedbg once the addresses are known */
+long dbc(long c){
+    if(dbglen >= DBGMAX){ fail("debug information overflow"); }
+    dbg[dbglen] = (char)band(c,255);
+    dbglen = dbglen + 1;
+    return 0;
+}
+long dbs(char *s){ long i; i = 0; while(sch(s,i) != 0){ dbc(sch(s,i)); i = i + 1; } return 0; }
+long dbnum(long v){ long n; long i; n = numstr(v); i = 0; while(i < n){ dbc((long)(unsigned char)nbuf[i]); i = i + 1; } return 0; }
+long dbnam(long off){ while(namesb(off) != 0){ dbc(namesb(off)); off = off + 1; } return 0; }
+/* a type word: int, char, bool, real, str, void, or the name of a record type */
+long dbtype(long t){ if(t >= T_REC){ dbnam(rtnam[t - T_REC]); } else { dbs(tname(t)); } return 0; }
+/* the six fields every variable-like record carries: name, where, type, arr, lo, hi */
+long dbvar(char *kind,long nam,long where,long t,long arr,long lo,long hi){
+    dbs(kind); dbc(32); dbnam(nam); dbc(32); dbnum(where); dbc(32); dbtype(t); dbc(32);
+    dbnum(arr); dbc(32);
+    if(arr == 1){ dbnum(lo); dbc(32); dbnum(hi); } else { dbs("0 0"); }
+    dbc(10);
+    return 0;
+}
+/* a line-table entry for the code about to be emitted: kind is 's', 'p' or 'e' */
+long dbline(long kind){
+    if(dbgmode == 0){ return 0; }
+    dbs("line "); dbnum(codebase + codelen); dbc(32); dbnum(curfile); dbc(32); dbnum(line);
+    dbc(32); dbc(kind); dbc(10);
+    return 0;
+}
+/* the func record of routine fi and its parameters and locals, while they still exist */
+long dbfunc(long fi,long np,long t){
+    long i;
+    if(dbgmode == 0){ return 0; }
+    dbs("func "); dbnam(fnam[fi]); dbc(32); dbnum(codebase + fadr[fi]); dbc(32);
+    dbnum(codebase + fend[fi]); dbc(32); dbnum(fhfile[fi]); dbc(32); dbnum(fhline[fi]);
+    dbc(32); dbnum(frame); dbc(32); dbtype(t); dbc(10);
+    i = 0;
+    while(i < nloc){
+        if(lkind[i] == SK_VAR){
+            if(i < np){ dbvar("param",lnam[i],loff[i],ltyp[i],larr[i],0,0); }
+            else { dbvar("local",lnam[i],loff[i],ltyp[i],larr[i],llo[i],lhi[i]); }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 long want(long got,long need,char *ctx){
     if(got != need){
         wrs(2,"wantzel: "); wrname(2); wrs(2,":"); wrnum(2,line);
@@ -1651,7 +1780,15 @@ long trap(char *msg){
     k = numstr(line);
     i = 0; while(i < k){ mbuf[mlen]=nbuf[i]; mlen=mlen+1; i=i+1; }
     mbuf[mlen] = 10; mlen = mlen + 1;
-    o = datstr(1,mlen);
+
+    /* THE SAME PLACE AS THE PREVIOUS CHECK?  Then reuse what is already stored. */
+    if(tplast >= 0 && tplastline == line && tplastfile == curfile){
+        o = tplast;
+        mlen = tplastlen;
+    } else {
+        o = datstr(1,mlen);
+        tplast = o; tplastlen = mlen; tplastline = line; tplastfile = curfile;
+    }
 
     if(h < 0){
         /* the table is full, which needs more kinds of check than exist; fall back to the
@@ -1676,6 +1813,10 @@ long trap(char *msg){
 long expr();
 long factor();
 long dowinapi();
+char *impname(long i);
+/* impargs -- the counterpart of the table in src/compiler.wz; see there for why the
+   compiler can know these counts and what -1 means. */
+long impargs(long i);
 long argint();
 long lparen();
 long rparen();
@@ -1963,6 +2104,7 @@ long pathaddr(long li,long gi){
         }
         if(tok == 46){                              /* . name  (after an index) */
             next();
+            if(iskw()){ failkeyword("a field", 0); }
             if(tok != TK_ID){ fail("field name expected after ."); }
             fplen = 0;
             while(tbuf[fplen] != 0){ fpath[fplen] = tbuf[fplen]; fplen = fplen + 1; }
@@ -2212,6 +2354,7 @@ long fnbyname2(void){
 }
 
 long dowinapi(){
+    long wantargs; long slotwanted;
     long n; long i;
     if(winmode == 0){ fail("winapi() is only available in a Windows executable"); }
     lparen();
@@ -2260,6 +2403,11 @@ long dowinapi(){
     if(tok == TK_INT){
         if(tval < 0 || tval >= NIMP){ fail("winapi(): that import slot does not exist"); }
     }
+    /* REMEMBER WHICH SLOT, so the argument count can be judged below.  A slot that is not
+       a literal leaves this at -1 and nothing is claimed.  Counterpart of the same block
+       in src/compiler.wz. */
+    wantargs = -1; slotwanted = 0;
+    if(tok == TK_INT){ wantargs = impargs(tval); slotwanted = tval; }
     argint(); push();
     n = 0;
     while(tok == 44){
@@ -2269,6 +2417,19 @@ long dowinapi(){
         n = n + 1;
     }
     rparen();
+    /* THE ARGUMENT COUNT, WHEN WE KNOW IT.  Win32 passes the first four in rcx/rdx/r8/r9,
+       so a call with too few leaves the callee reading a register nobody set. */
+    if(wantargs >= 0 && n != wantargs){
+        wrs(2,"wantzel: "); wrname(2); wrs(2,":"); wrnum(2,line);
+        wrs(2,": winapi(): ");
+        wrs(2,impname(slotwanted));
+        wrs(2," takes ");
+        wrnum(2,wantargs);
+        if(wantargs == 1) wrs(2," argument, not "); else wrs(2," arguments, not ");
+        wrnum(2,n);
+        wrs(2,"\n");
+        _exit(1);
+    }
     return winemit(n);
 }
 
@@ -2864,6 +3025,9 @@ long stmt(){
         next();
         return 0;
     }
+    /* a statement starts here -- not a begin, which only groups, and not an empty one */
+    if(tok == KW_IF || tok == KW_WHILE || tok == KW_RETURN || tok == KW_BREAK
+       || tok == KW_CONTINUE || tok == KW_FOR || tok == TK_ID){ dbline(115); }
     if(tok == KW_IF){
         next();
         lab = condition("if condition");
@@ -3100,6 +3264,7 @@ long partype(){
 long declvars(long islocal){
     long n; long i; long t; long sz; long nb;
     next();                                          /* skip 'var' */
+    if(iskw()){ failkeyword("a variable", 0); }
     if(tok != TK_ID){ fail("variable name expected"); }
     while(tok == TK_ID){
         n = 0;
@@ -3114,6 +3279,7 @@ long declvars(long islocal){
             next();
             if(tok != 44){ break; }
             next();
+            if(iskw()){ failkeyword("a variable", 0); }
             if(tok != TK_ID){ fail("variable name expected"); }
         }
         if(tok != 58){ fail("missing : in declaration"); }
@@ -3147,6 +3313,7 @@ long declvars(long islocal){
         if(tok != 59){ fail("missing ; after declaration"); }
         next();
     }
+    if(kwnamed(58, 44)){ failkeyword("a variable", 0); }
     return 0;
 }
 
@@ -3159,6 +3326,7 @@ long declschema(void);
 long decltypes(){
     long r; long n; long i; long t; long nb; long sz; long off; long al;
     next();                                          /* skip 'type' */
+    if(iskw()){ failkeyword("a type", 0); }
     if(tok != TK_ID){ fail("type name expected"); }
     while(tok == TK_ID){
         if(bicode() != 0){ fail("that name is built in"); }
@@ -3203,7 +3371,8 @@ long decltypes(){
                 next();
                 if(tok != 44){ break; }
                 next();
-                if(tok != TK_ID){ fail("field name expected"); }
+                if(iskw()){ failkeyword("a record field", 0); }
+                if(tok != TK_ID){ fail("field name expected in this record declaration"); }
             }
             if(tok != 58){ fail("missing : in field declaration"); }
             next();
@@ -3227,8 +3396,11 @@ long decltypes(){
             if(tok != 59){ fail("missing ; after a field"); }
             next();
         }
+        if(tok != KW_END && iskw()){ failkeyword("a record field", 0); }
         if(tok != KW_END){ fail("missing end of the record"); }
         next();
+        /* `end: int;` -- a field named end reads as the end of the record */
+        if(tok == 58){ failkeyword("a record field", 0); }
         if(tok != 59){ fail("missing ; after the type"); }
         next();
         while((off % 8) != 0){ off = off + 1; }
@@ -3236,12 +3408,14 @@ long decltypes(){
         rtsize[r] = off;
         nrt = nrt + 1;
     }
+    if(kwnamed(61, 61)){ failkeyword("a type", 0); }
     return 0;
 }
 
 long declconsts(long islocal){
     long o; long v; long t;
     next();                                          /* skip 'const' */
+    if(iskw()){ failkeyword("a constant", 0); }
     if(tok != TK_ID){ fail("constant name expected"); }
     while(tok == TK_ID){
         if(bicode() != 0){ fail("that name is built in"); }
@@ -3278,6 +3452,7 @@ long declconsts(long islocal){
         if(tok != 59){ fail("missing ; after constant declaration"); }
         next();
     }
+    if(kwnamed(61, 61)){ failkeyword("a constant", 0); }
     return 0;
 }
 
@@ -3443,6 +3618,11 @@ long genread(long f,long tgt){
 /* one "if json.eq(...) then <read the value> end else" arm */
 long genarm(long f){
     gen("    if json.eq(b, k0, k1, \""); genjs(f); gen("\") then\n    begin\n");
+    /* Name the field BEFORE reading it: every failure inside this arm is a plain
+       `return -1` and there are a dozen of them, so one line on the way in replaces a
+       dozen.  The successful '}' clears it, so it only survives a parse that failed.
+       An undeclared key no longer lands here, so this is always a DECLARED field. */
+    gen("      json.badkey0 := k0; json.badkey1 := k1;\n");
     gen("      if json.isnull(b, at, last) then\n      begin\n");
     gen("        at := json.ws(b, at, last) + 4;\n        "); genr(f); gen("_null := true;\n      end\n      else\n      begin\n");
     if(sfarr[f]){
@@ -3458,7 +3638,9 @@ long genarm(long f){
     } else {
         genread(f,0);
     }
-    gen("      end;\n      "); genr(f); gen("_ok := true;\n    end\n    else ");
+    /* read without complaint, so it is not the failing key after all */
+    gen("      end;\n      json.badkey0 := 0; json.badkey1 := 0;\n      ");
+    genr(f); gen("_ok := true;\n    end\n    else ");
     return 0;
 }
 
@@ -3568,6 +3750,7 @@ long genschema(){
     gen("): int;\nvar k0, k1, v0, v1, n: int;\nbegin\n  "); genname(); gen(".clear(r);\n");
     gen("  k0 := 0; k1 := 0; v0 := 0; v1 := 0; n := 0;\n");
     gen("  json.badkey0 := 0; json.badkey1 := 0;\n");
+    gen("  json.ignored0 := 0; json.ignored1 := 0; json.ignoredn := 0;\n");
     gen("  at := json.ws(b, at, last);\n");
     gen("  if at >= last then return -1;\n");
     gen("  if b[at] <> '{' then return -1;\n");
@@ -3592,10 +3775,17 @@ long genschema(){
     gen("    at := at + 1;\n");
     f = 0;
     while(f < nfld){ genarm(f); f = f + 1; }
-    /* An UNKNOWN KEY IS REFUSED; this chain used to end in a json.skip that swallowed
-       it, so a caller sending a renamed field got a normal answer computed with the
-       default.  json.badkey0/1 name the key. */
-    gen("\n    begin\n      json.badkey0 := k0; json.badkey1 := k1;\n      return -1;\n    end;\n");
+    /* An UNDECLARED KEY IS SKIPPED, BUT RECORDED.  A bare json.skip swallowed it, so a
+       caller sending a renamed field got a normal answer computed with the default;
+       refusing it outright broke every caller that sends a superset.  So: skip the
+       value and remember the key in json.ignored0/1 with a count in json.ignoredn, for
+       the layer above to report.  A declared key with a wrong type still returns -1,
+       and a missing required field still fails the presence check. */
+    gen("\n    begin\n");
+    gen("      if json.ignoredn = 0 then\n      begin\n        json.ignored0 := k0; json.ignored1 := k1;\n      end;\n");
+    gen("      json.ignoredn := json.ignoredn + 1;\n");
+    gen("      at := json.skip(b, at, last);\n      if at < 0 then return -1;\n");
+    gen("    end;\n");
     gen("  end;\n  return -1;\nend;\n");
     /* --- write --- */
     gen("\n// Returns the position after the object, or -1 when it does not fit in dst.\n");
@@ -3737,7 +3927,7 @@ long findschema(){                    /* the schema whose name is in tbuf, or -1
    'schema' are already read by decltypes, the only caller.  Counterpart of
    src/wantzel.wz:declschema. */
 long declschema(){
-    long i; long f; long fi; long lo; long hi;
+    long i; long j; long f; long fi; long lo; long hi;
     nfld = 0; nenum = 0;
     while(tok == TK_ID){
         if(nfld >= MAXFLD){ fail("too many fields in a schema"); }
@@ -3753,6 +3943,20 @@ long declschema(){
         sfopt[nfld] = 0; sfe0[nfld] = 0; sfen[nfld] = 0; sfarr[nfld] = 0;
         sfcount[nfld] = 0; sftlen[nfld] = 0; sfsub[nfld] = -1; sfdesc[nfld] = -1;
         next();
+
+        /* AN OPTIONAL JSON KEY, AS A STRING LITERAL, BEFORE THE COLON.  Counterpart of the
+           same block in src/compiler.wz; see there for why it is a literal and not a
+           keyword, and what it solves. */
+        if(tok == TK_STR){
+            j = datlen0(tval);
+            if(j == 0){ fail("an empty JSON key"); }
+            if(j > 62){ fail("that JSON key is too long"); }
+            i = 0;
+            while(i < j){ sfjson[nfld*64+i] = dat[tval+i]; i = i + 1; }
+            sfjson[nfld*64+i] = 0;
+            next();
+        }
+
         if(tok != 58){ fail("missing : after a schema field"); }
         next();
         if(tok == KW_ARRAY){
@@ -3822,8 +4026,10 @@ long declschema(){
         next();
         nfld = nfld + 1;
     }
+    if(tok != KW_END && iskw()){ failkeyword("a schema field", 1); }
     if(tok != KW_END){ fail("missing end of the schema"); }
     next();
+    if(tok == 58){ failkeyword("a schema field", 1); }
     if(tok != 59){ fail("missing ; after the schema"); }
     /* the JSON Schema text and its str constant */
     genjsonschema();
@@ -3860,16 +4066,16 @@ long declschema(){
 /* tools: a declared tool table becomes tools/list text and a dispatcher */
 /* ------------------------------------------------------------------ */
 #define MAXT 1024
-char tlnam[MAXT*64];
+char tlnam[MAXT*128];
 long tlin[MAXT], tlout[MAXT], tldesc[MAXT], tlro[MAXT], tlid[MAXT], tldes[MAXT];
 long ntl, tlseen;
 long tlline[MAXT], tlfile[MAXT];   /* where the tool was DECLARED, in the real source */
 long tlfwdfile;                    /* pseudo-file id of the generated <tools> text */
 long tlfwdn;                       /* forwards seen in it, in gentools order */
 
-long gentl(long i){ long j; j = 0; while(tlnam[i*64+j] != 0){ sput((long)(unsigned char)tlnam[i*64+j]); j = j + 1; } return 0; }
+long gentl(long i){ long j; j = 0; while(tlnam[i*128+j] != 0){ sput((long)(unsigned char)tlnam[i*128+j]); j = j + 1; } return 0; }
 long gensc(long k){ long j; j = 0; while(scnam[k*64+j] != 0){ sput((long)(unsigned char)scnam[k*64+j]); j = j + 1; } return 0; }
-long jstl(long i){ long j; j = 0; while(tlnam[i*64+j] != 0){ jsc((long)(unsigned char)tlnam[i*64+j]); j = j + 1; } return 0; }
+long jstl(long i){ long j; j = 0; while(tlnam[i*128+j] != 0){ jsc((long)(unsigned char)tlnam[i*128+j]); j = j + 1; } return 0; }
 
 long gentools(){
     long i;
@@ -3953,18 +4159,120 @@ long gentools(){
     return 0;
 }
 
+/* Does tool name slot i (in tlnam) equal the string s? */
+long tleqs(long i, char *s){
+    long j = 0;
+    while(1){
+        if((long)(unsigned char)tlnam[i*128+j] != sch(s,j)){ return 0; }
+        if(tlnam[i*128+j] == 0){ return 1; }
+        j = j + 1;
+    }
+}
+
+/* Do tool name slots a and b (both in tlnam) hold the same name? */
+long tlsameas(long a, long b){
+    long j = 0;
+    while(1){
+        if(tlnam[a*128+j] != tlnam[b*128+j]){ return 0; }
+        if(tlnam[a*128+j] == 0){ return 1; }
+        j = j + 1;
+    }
+}
+
+/* failtoolname -- a tool name that collides with something the tools block itself puts
+   into the tool. namespace, reported at the WRITER'S OWN line of that entry (tlfile[i]:
+   tlline[i]), never at a line of the generated <tools> text or of a library included
+   after it.
+
+   Before this, "count(A): R" was reported as "<tools>:19: name already used by a variable
+   or constant" (the generated 'const tool.count = ...' colliding with itself) or, for a
+   name a later include declares (tool.rest from lib/tools.wz), as an error deep inside
+   that library file. Neither line is one an agent -- or Floris -- can open and act on;
+   this is the same class of fix as the forward-declaration mapping below: map the
+   generated collision back to the source line that caused it.
+
+   'source' is what generates or declares tool.<name>, e.g. "the tools block generates" or
+   "lib/tools.wz declares" -- the message reads ...is reserved: <source> tool.<name>;
+   choose another name, with the name written once from tlnam and reused for both spots. */
+long failtoolname(long i, char *source){
+    long n = 0;
+    while(tlnam[i*128+n] != 0){ n = n + 1; }
+    wrs(2,"wantzel: "); wrfile(2,tlfile[i]); wrs(2,":"); wrnum(2,tlline[i]);
+    wrs(2,": tool name \""); wrbuf(2,(long)(size_t)&tlnam[i*128],n);
+    wrs(2,"\" is reserved: "); wrs(2,source); wrs(2," tool.");
+    wrbuf(2,(long)(size_t)&tlnam[i*128],n);
+    wrs(2,"; choose another name\n");
+    _exit(1);
+    return 0;
+}
+
+/* A duplicate tool name in the same block: reported at the SECOND entry's line (the one
+   that repeats a name already taken), naming the earlier line so the reader does not have
+   to search the block for it. Before this it surfaced as "<tools>:N: duplicate
+   declaration" -- a line of the generated text, naming neither tool. */
+long failtooldup(long i, long first){
+    long n = 0;
+    while(tlnam[i*128+n] != 0){ n = n + 1; }
+    wrs(2,"wantzel: "); wrfile(2,tlfile[i]); wrs(2,":"); wrnum(2,tlline[i]);
+    wrs(2,": tool name \""); wrbuf(2,(long)(size_t)&tlnam[i*128],n);
+    wrs(2,"\" is already used by the tool on line "); wrnum(2,tlline[first]);
+    wrs(2,"; choose another name\n");
+    _exit(1);
+    return 0;
+}
+
+/* Every name the tools block itself generates in the tool. namespace (see gentools
+   above): tool.count, tool.list, tool.err/errn, tool.vbuf/vn, tool.fail, tool.byname,
+   tool.run, and per tool tool.id_/in_/out_<name>. Kept as one list so a name added there
+   is added here in the same commit. */
+long toolgenclash(long i){
+    if(tleqs(i,"count") || tleqs(i,"list") || tleqs(i,"err") || tleqs(i,"errn")
+       || tleqs(i,"vbuf") || tleqs(i,"vn") || tleqs(i,"fail") || tleqs(i,"byname")
+       || tleqs(i,"run")){ return 1; }
+    if((long)(unsigned char)tlnam[i*128] == 105 && (long)(unsigned char)tlnam[i*128+1] == 100 && (long)(unsigned char)tlnam[i*128+2] == 95){ return 1; }   /* id_ */
+    if((long)(unsigned char)tlnam[i*128] == 105 && (long)(unsigned char)tlnam[i*128+1] == 110 && (long)(unsigned char)tlnam[i*128+2] == 95){ return 1; }   /* in_ */
+    if((long)(unsigned char)tlnam[i*128] == 111 && (long)(unsigned char)tlnam[i*128+1] == 117 && (long)(unsigned char)tlnam[i*128+2] == 116 && (long)(unsigned char)tlnam[i*128+3] == 95){ return 1; }   /* out_ */
+    return 0;
+}
+
+/* Names lib/tools.wz and lib/toolsmcp.wz declare in the tool. namespace, for a program
+   that includes one of them (always AFTER the tools block, so the collision is invisible
+   to findglob at this point -- the include has not been read yet). Read from those files,
+   not guessed: keep this list in step with them by hand, the same discipline as
+   toolgenclash above. */
+long toollibclash(long i){
+    /* lib/toolsmcp.wz */
+    if(tleqs(i,"out") || tleqs(i,"empty") || tleqs(i,"ign") || tleqs(i,"ignn")
+       || tleqs(i,"ignc") || tleqs(i,"takeignored")){ return 1; }
+    /* lib/tools.wz (REST half, on top of toolsmcp.wz) */
+    if(tleqs(i,"listend") || tleqs(i,"nmatched") || tleqs(i,"wascut") || tleqs(i,"numbuf")
+       || tleqs(i,"numn") || tleqs(i,"cutfields") || tleqs(i,"solelist")
+       || tleqs(i,"restbody") || tleqs(i,"rest")){ return 1; }
+    return 0;
+}
+
 /* tools  <name>(<InSchema>): <OutSchema> "<description>" [readonly] [idempotent] [destructive]; ... end; */
 long decltools(){
-    long i; long f; long fi;
+    long i; long f; long fi; long k;
     if(ntl > 0){ fail("tools are declared once"); }
     next();
     while(tok == TK_ID){
         if(ntl >= MAXT){ fail("too many tools"); }
         i = 0;
-        while(tbuf[i] != 0){ if(i >= 62){ fail("tool name too long"); } tlnam[ntl*64+i] = tbuf[i]; i = i + 1; }
-        tlnam[ntl*64+i] = 0;
+        while(tbuf[i] != 0){ if(i >= 126){ fail("tool name too long"); } tlnam[ntl*128+i] = tbuf[i]; i = i + 1; }
+        tlnam[ntl*128+i] = 0;
         tlro[ntl] = 0; tlid[ntl] = 0; tldes[ntl] = 0; tldesc[ntl] = -1;
         tlline[ntl] = line; tlfile[ntl] = curfile;   /* the writer's own line */
+        /* Check the name BEFORE gentools ever runs: a clash caught here is reported at
+           this tool's own line, not at a line of the generated <tools> text
+           (toolgenclash) or of a library included after the block (toollibclash). */
+        if(toolgenclash(ntl)){ failtoolname(ntl,"the tools block generates"); }
+        if(toollibclash(ntl)){ failtoolname(ntl,"lib/tools.wz or lib/toolsmcp.wz declares"); }
+        k = 0;
+        while(k < ntl){
+            if(tlsameas(ntl,k)){ failtooldup(ntl,k); }
+            k = k + 1;
+        }
         next();
         if(tok != 40){ fail("a tool is declared as name(InSchema): OutSchema \"description\""); }
         next();
@@ -3989,8 +4297,10 @@ long decltools(){
         next();
         ntl = ntl + 1;
     }
+    if(tok != KW_END && iskw()){ failkeyword("a tool", 0); }
     if(tok != KW_END){ fail("missing end of the tools"); }
     next();
+    if(tok == 40){ failkeyword("a tool", 0); }
     if(tok != 59){ fail("missing ; after the tools"); }
     if(ntl == 0){ fail("the tools block is empty"); }
     if(incdepth >= 16){ fail("includes nested too deeply"); }
@@ -4032,6 +4342,7 @@ long declroutine(long isproc){
     long fi; long known; long np; long t; long o; long i;
     long zlea; long zcnt; long ztop; long zdone; long parmbytes; long endline; long saveline; long pisarr; long nr;
     next();
+    if(iskw()){ failkeyword("a routine", 0); }
     if(tok != TK_ID){ fail("routine name expected"); }
     if(bicode() != 0){ fail("that name is built in"); }
     if(findglob() >= 0){ failtaken("name already used by a variable or constant"); }
@@ -4047,12 +4358,14 @@ long declroutine(long isproc){
         fvis[fi] = declloc;
         findex(fi);
     }
+    fhline[fi] = line; fhfile[fi] = curfile;
     next();
     nloc = 0; frame = 0;
     np = 0;
     if(tok == 40){
         next();
         while(1){
+            if(iskw()){ failkeyword("a parameter", 0); }
             if(tok != TK_ID){ fail("parameter name expected"); }
             o = 0;
             while(1){
@@ -4145,6 +4458,9 @@ long declroutine(long isproc){
     parmbytes = frame;
     fadr[fi] = codelen; fdef[fi] = 1;
     curfn = fi; curret = t;
+    saveline = line; line = fhline[fi];
+    dbline(112);
+    line = saveline;
     nbrk = 0; ncnt = 0; brkbase = -1; cntbase = -1;
     e(0x55);                                        /* push rbp    */
     e(0x48); e(0x89); e(0xE5);                      /* mov rbp,rsp */
@@ -4176,6 +4492,9 @@ long declroutine(long isproc){
     next();
     if(tok != 59){ fail("missing ; after routine body"); }
     next();
+    saveline = line; line = endline;
+    dbline(101);
+    line = saveline;
     if(t == T_VOID){
         e(0x48); e(0x31); e(0xC0);
         epilogue();
@@ -4189,6 +4508,8 @@ long declroutine(long isproc){
     e32at(zlea,0 - frame);
     i = (frame - parmbytes) / 8;
     e32at(zcnt,i); e32at(zcnt+4,i>>32);
+    fend[fi] = codelen;
+    dbfunc(fi,np,t);
     nloc = 0;                                       /* locals do not outlive the routine */
     return 0;
 }
@@ -4202,7 +4523,7 @@ long genwin(){
     gen("  // arguments and does the Windows equivalent; __winit turns the command line\n");
     gen("  // into an argc/argv block.  All of this is ordinary Wantzel, compiled into every\n");
     gen("  // .exe ahead of the program, so the code generator needs no Windows knowledge.\n");
-    gen("  // epoll is emulated over WSAPoll, with a small interest table kept here.\n");
+    gen("  // epoll is emulated over WSAPoll: up to __WMAXEP sets, each with its own interest table.\n");
     gen("const\n");
     gen("  __K_GETSTDHANDLE = 0;\n");
     gen("  __K_WRITEFILE = 1;\n");
@@ -4244,13 +4565,18 @@ long genwin(){
     gen("  __W_WSAPOLL = 38;\n");
     gen("  __A_RANDOM = 40;\n");
     gen("  __WMAXFD = 1024;\n");
+    gen("  __WMAXEP = 16;   // epoll sets at once; one more is EMFILE\n");
+    gen("  __WEPBASE = 1000000;   // the fd of epoll set k is __WEPBASE + k\n");
     gen("var\n");
     gen("  __wargv: array[0..63] of int;\n");
     gen("  __wargs: array[0..4095] of char;\n");
     gen("  __wdig: array[0..31] of char;\n");
     gen("  __wcount, __wdummy, __wstarted: int;\n");
     gen("  __wsh: array[0..__WMAXFD - 1] of int;   // socket handle for small fd, or 0\n");
-    gen("  __wev: array[0..__WMAXFD - 1] of int;   // epoll events requested for fd\n");
+    gen("  __wev: array[0..__WMAXEP * __WMAXFD - 1] of int;   // events per set and fd: [set * __WMAXFD + fd]\n");
+    gen("  __wepon: array[0..__WMAXEP - 1] of int;   // 1 = epoll set in use\n");
+    gen("  __wepin: array[0..__WMAXEP * __WMAXEP - 1] of int;   // events for a nested set: [outer * __WMAXEP + inner]\n");
+    gen("  __wepgo: array[0..__WMAXEP - 1] of int;   // during a wait: 1 = the set has something ready\n");
     gen("  __wpoll: array[0..__WMAXFD * 16 - 1] of char;   // WSAPOLLFD array\n");
     gen("  __wrow: array[0..__WMAXFD - 1] of int;   // poll row -> fd\n");
     gen("  __wsa: array[0..15] of char;   // a working sockaddr\n");
@@ -4298,6 +4624,16 @@ long genwin(){
     gen("  return (fd > 2) and (fd < __WMAXFD) and (__wdh[fd] <> 0);\n");
     gen("end;\n");
     gen("\n");
+    gen("// A Winsock call that failed: SOCKET_ERROR is a 32-bit -1, and the register does not\n");
+    gen("// sign-extend it, so it must be recognised by its low half -- as a plain 'r < 0' it\n");
+    gen("// looked like 4294967295 bytes received. Only a would-block is EAGAIN; anything else\n");
+    gen("// (a reset, a closed peer) is the error the caller gives us, which is what Linux\n");
+    gen("// reports and what makes an HTTP server drop the connection instead of parsing it.\n");
+    gen("function __wsockerr(other: int): int;\n");
+    gen("begin\n");
+    gen("  if band(winapi(\"ws2_32.dll\", \"WSAGetLastError\"), 0xFFFFFFFF) = 10035 then return 0 - 11;   // WSAEWOULDBLOCK -> EAGAIN\n");
+    gen("  return other;\n");
+    gen("end;\n");
     gen("\n");
     gen("function __wwrite(fd: int; a: int; n: int): int;\n");
     gen("var ok, r: int;\n");
@@ -4305,8 +4641,8 @@ long genwin(){
     gen("  if __wissock(fd) then\n");
     gen("  begin\n");
     gen("    r := winapi(__W_SEND, __wsh[fd], a, n, 0);\n");
-    gen("    if r < 0 then return 0 - 11;   // treat as EAGAIN-ish\n");
-    gen("    return r;\n");
+    gen("    if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then return __wsockerr(0 - 32);   // EPIPE\n");
+    gen("    return band(r, 0xFFFFFFFF);\n");
     gen("  end;\n");
     gen("  __wcount := 0;\n");
     gen("  ok := winapi(__K_WRITEFILE, __whandle(fd), a, n, addr(__wcount), 0);\n");
@@ -4320,8 +4656,8 @@ long genwin(){
     gen("  if __wissock(fd) then\n");
     gen("  begin\n");
     gen("    r := winapi(__W_RECV, __wsh[fd], a, n, 0);\n");
-    gen("    if r < 0 then return 0 - 11;\n");
-    gen("    return r;\n");
+    gen("    if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then return __wsockerr(0 - 104);  // ECONNRESET\n");
+    gen("    return band(r, 0xFFFFFFFF);\n");
     gen("  end;\n");
     gen("  __wcount := 0;\n");
     gen("  ok := winapi(__K_READFILE, __whandle(fd), a, n, addr(__wcount), 0);\n");
@@ -4415,8 +4751,55 @@ long genwin(){
     gen("  return 0;\n");
     gen("end;\n");
     gen("\n");
+    gen("// The epoll set behind fd, or -1 when fd is not an open epoll set.\n");
+    gen("function __wepset(fd: int): int;\n");
+    gen("var k: int;\n");
+    gen("begin\n");
+    gen("  k := fd - __WEPBASE;\n");
+    gen("  if (k < 0) or (k >= __WMAXEP) then return 0 - 1;\n");
+    gen("  if __wepon[k] = 0 then return 0 - 1;\n");
+    gen("  return k;\n");
+    gen("end;\n");
+    gen("\n");
+    gen("// A socket fd closed or reused: it leaves every set, as on Linux.\n");
+    gen("procedure __wepforget(fd: int);\n");
+    gen("var s: int;\n");
+    gen("begin\n");
+    gen("  s := 0;\n");
+    gen("  while s < __WMAXEP do\n");
+    gen("  begin\n");
+    gen("    __wev[s * __WMAXFD + fd] := 0;\n");
+    gen("    s := s + 1;\n");
+    gen("  end;\n");
+    gen("end;\n");
+    gen("\n");
+    gen("// An epoll set closed: its interest goes, and it leaves every set it was nested in.\n");
+    gen("procedure __wepfree(s: int);\n");
+    gen("var i: int;\n");
+    gen("begin\n");
+    gen("  i := 0;\n");
+    gen("  while i < __WMAXFD do\n");
+    gen("  begin\n");
+    gen("    __wev[s * __WMAXFD + i] := 0;\n");
+    gen("    i := i + 1;\n");
+    gen("  end;\n");
+    gen("  i := 0;\n");
+    gen("  while i < __WMAXEP do\n");
+    gen("  begin\n");
+    gen("    __wepin[s * __WMAXEP + i] := 0;\n");
+    gen("    __wepin[i * __WMAXEP + s] := 0;\n");
+    gen("    i := i + 1;\n");
+    gen("  end;\n");
+    gen("  __wepon[s] := 0;\n");
+    gen("end;\n");
+    gen("\n");
     gen("procedure __wclose(fd: int);\n");
     gen("begin\n");
+    gen("  if __wepset(fd) >= 0 then\n");
+    gen("  begin\n");
+    gen("    __wepfree(__wepset(fd));\n");
+    gen("    return;\n");
+    gen("  end;\n");
     gen("  if __wisdir(fd) then\n");
     gen("  begin\n");
     gen("    __wdummy := winapi(__K_FINDCLOSE, __wdh[fd]);\n");
@@ -4428,7 +4811,7 @@ long genwin(){
     gen("  begin\n");
     gen("    __wdummy := winapi(__W_CLOSESOCKET, __wsh[fd]);\n");
     gen("    __wsh[fd] := 0;\n");
-    gen("    __wev[fd] := 0;\n");
+    gen("    __wepforget(fd);\n");
     gen("  end\n");
     gen("  else __wdummy := winapi(__K_CLOSEHANDLE, fd);\n");
     gen("end;\n");
@@ -4471,7 +4854,7 @@ long genwin(){
     gen("    return 0 - 24;\n");
     gen("  end;\n");
     gen("  __wsh[fd] := h;\n");
-    gen("  __wev[fd] := 0;\n");
+    gen("  __wepforget(fd);\n");
     gen("  return fd;\n");
     gen("end;\n");
     gen("\n");
@@ -4483,7 +4866,7 @@ long genwin(){
     gen("begin\n");
     gen("  if not __wissock(fd) then return 0 - 9;\n");
     gen("  r := winapi(__W_BIND, __wsh[fd], sa, sln);\n");
-    gen("  if r < 0 then return 0 - 98;\n");
+    gen("  if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then return 0 - 98;\n");
     gen("  return 0;\n");
     gen("end;\n");
     gen("\n");
@@ -4492,7 +4875,7 @@ long genwin(){
     gen("begin\n");
     gen("  if not __wissock(fd) then return 0 - 9;\n");
     gen("  r := winapi(__W_LISTEN, __wsh[fd], backlog);\n");
-    gen("  if r < 0 then return 0 - 98;\n");
+    gen("  if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then return 0 - 98;\n");
     gen("  return 0;\n");
     gen("end;\n");
     gen("\n");
@@ -4509,7 +4892,7 @@ long genwin(){
     gen("    return 0 - 24;\n");
     gen("  end;\n");
     gen("  __wsh[nfd] := h;\n");
-    gen("  __wev[nfd] := 0;\n");
+    gen("  __wepforget(nfd);\n");
     gen("  nb := 1;\n");
     gen("  __wp32(__wsa, 0, nb);\n");
     gen("  __wdummy := winapi(__W_IOCTL, h, 0x8004667E, addr(__wsa[0]));   // FIONBIO\n");
@@ -4543,40 +4926,133 @@ long genwin(){
     gen("  poke(a + 3, band(v shr 24, 255));\n");
     gen("end;\n");
     gen("\n");
-    gen("// epoll_ctl: op 1=ADD, 2=DEL, 3=MOD.  The event mask sits at [ev+0].\n");
-    gen("function __wepctl(op: int; fd: int; ev: int): int;\n");
-    gen("var mask: int;\n");
+    gen("// epoll_create: a free set, or EMFILE when all __WMAXEP are in use.\n");
+    gen("function __wepnew: int;\n");
+    gen("var k: int;\n");
     gen("begin\n");
-    gen("  if (fd < 3) or (fd >= __WMAXFD) then return 0 - 9;\n");
-    gen("  if op = 2 then\n");
+    gen("  k := 0;\n");
+    gen("  while k < __WMAXEP do\n");
     gen("  begin\n");
-    gen("    __wev[fd] := 0;\n");
+    gen("    if __wepon[k] = 0 then\n");
+    gen("    begin\n");
+    gen("      __wepon[k] := 1;\n");
+    gen("      return __WEPBASE + k;\n");
+    gen("    end;\n");
+    gen("    k := k + 1;\n");
+    gen("  end;\n");
+    gen("  return 0 - 24;\n");
+    gen("end;\n");
+    gen("\n");
+    gen("// Every set reachable from set s through nested sets, s included, as a bit mask.\n");
+    gen("function __wepreach(s: int): int;\n");
+    gen("var r, prev, i, j: int;\n");
+    gen("begin\n");
+    gen("  r := 1 shl s;\n");
+    gen("  prev := 0;\n");
+    gen("  while r <> prev do\n");
+    gen("  begin\n");
+    gen("    prev := r;\n");
+    gen("    i := 0;\n");
+    gen("    while i < __WMAXEP do\n");
+    gen("    begin\n");
+    gen("      if band(r, 1 shl i) <> 0 then\n");
+    gen("      begin\n");
+    gen("        j := 0;\n");
+    gen("        while j < __WMAXEP do\n");
+    gen("        begin\n");
+    gen("          if __wepin[i * __WMAXEP + j] <> 0 then r := bor(r, 1 shl j);\n");
+    gen("          j := j + 1;\n");
+    gen("        end;\n");
+    gen("      end;\n");
+    gen("      i := i + 1;\n");
+    gen("    end;\n");
+    gen("  end;\n");
+    gen("  return r;\n");
+    gen("end;\n");
+    gen("\n");
+    gen("// epoll_ctl on set epfd: op 1=ADD, 2=DEL, 3=MOD.  The event mask sits at [ev+0].\n");
+    gen("  // fd may itself be an epoll set: it is then ready when one of its own fds is.\n");
+    gen("function __wepctl(epfd: int; op: int; fd: int; ev: int): int;\n");
+    gen("var s, t, mask: int;\n");
+    gen("begin\n");
+    gen("  s := __wepset(epfd);\n");
+    gen("  if s < 0 then return 0 - 9;   // EBADF\n");
+    gen("  mask := 0;\n");
+    gen("  if op <> 2 then\n");
+    gen("  begin\n");
+    gen("    mask := bor(peek(ev), peek(ev + 1) shl 8);\n");
+    gen("    mask := bor(mask, peek(ev + 2) shl 16);\n");
+    gen("    mask := bor(mask, peek(ev + 3) shl 24);\n");
+    gen("  end;\n");
+    gen("  t := __wepset(fd);\n");
+    gen("  if t >= 0 then\n");
+    gen("  begin\n");
+    gen("    if t = s then return 0 - 22;   // EINVAL: a set cannot watch itself\n");
+    gen("    if (op <> 2) and (band(__wepreach(t), 1 shl s) <> 0) then return 0 - 40;   // ELOOP\n");
+    gen("    __wepin[s * __WMAXEP + t] := mask;\n");
     gen("    return 0;\n");
     gen("  end;\n");
-    gen("  mask := bor(peek(ev), peek(ev + 1) shl 8);\n");
-    gen("  mask := bor(mask, peek(ev + 2) shl 16);\n");
-    gen("  mask := bor(mask, peek(ev + 3) shl 24);\n");
-    gen("  __wev[fd] := mask;\n");
+    gen("  if (fd < 3) or (fd >= __WMAXFD) then return 0 - 9;\n");
+    gen("  __wev[s * __WMAXFD + fd] := mask;\n");
     gen("  return 0;\n");
     gen("end;\n");
     gen("\n");
-    gen("// epoll_wait: build a WSAPOLLFD array from the interest table, poll it, then\n");
-    gen("  // write ready events into the caller's array (12 bytes each: events, fd).\n");
-    gen("function __wepwait(a: int; maxev: int; timeout: int): int;\n");
-    gen("var i, np, r, k, out, revents, ev, base, pe: int;\n");
+    gen("// The epoll events in the revents of WSAPOLLFD row base.\n");
+    gen("function __wrevents(base: int): int;\n");
+    gen("var revents, ev: int;\n");
     gen("begin\n");
+    gen("  revents := bor(ord(__wpoll[base + 10]), ord(__wpoll[base + 11]) shl 8);\n");
+    gen("  ev := 0;\n");
+    gen("  if band(revents, 0x0300) <> 0 then ev := bor(ev, 1);   // IN\n");
+    gen("  if band(revents, 0x0010) <> 0 then ev := bor(ev, 4);   // OUT\n");
+    gen("  if band(revents, 0x0001) <> 0 then ev := bor(ev, 8);   // ERR\n");
+    gen("  if band(revents, 0x0002) <> 0 then ev := bor(ev, 16);   // HUP\n");
+    gen("  return ev;\n");
+    gen("end;\n");
+    gen("\n");
+    gen("// epoll_wait on set epfd: build one WSAPOLLFD array from the interest of this set and\n");
+    gen("  // of every set nested in it, poll it, then write ready events into the caller's array\n");
+    gen("  // (12 bytes each: events, fd).  A ready nested set is reported first, as its own fd.\n");
+    gen("function __wepwait(epfd: int; a: int; maxev: int; timeout: int): int;\n");
+    gen("var i, j, s, t, nr, np, r, k, out, ev, want, m, fd, pass, base, pe: int;\n");
+    gen("    sets: array[0..__WMAXEP - 1] of int;\n");
+    gen("begin\n");
+    gen("  s := __wepset(epfd);\n");
+    gen("  if s < 0 then return 0 - 9;   // EBADF\n");
+    gen("  r := __wepreach(s);\n");
+    gen("  nr := 0;\n");
+    gen("  j := 0;\n");
+    gen("  while j < __WMAXEP do\n");
+    gen("  begin\n");
+    gen("    if band(r, 1 shl j) <> 0 then\n");
+    gen("    begin\n");
+    gen("      sets[nr] := j;\n");
+    gen("      nr := nr + 1;\n");
+    gen("    end;\n");
+    gen("    j := j + 1;\n");
+    gen("  end;\n");
     gen("  np := 0;\n");
     gen("  i := 3;\n");
     gen("  while i < __WMAXFD do\n");
     gen("  begin\n");
-    gen("    if (__wsh[i] <> 0) and (__wev[i] <> 0) then\n");
+    gen("    want := 0;\n");
+    gen("    if __wsh[i] <> 0 then\n");
+    gen("    begin\n");
+    gen("      j := 0;\n");
+    gen("      while j < nr do\n");
+    gen("      begin\n");
+    gen("        want := bor(want, __wev[sets[j] * __WMAXFD + i]);\n");
+    gen("        j := j + 1;\n");
+    gen("      end;\n");
+    gen("    end;\n");
+    gen("    if want <> 0 then\n");
     gen("    begin\n");
     gen("      base := np * 16;\n");
     gen("      __wp32(__wpoll, base, band(__wsh[i], 0xFFFFFFFF));\n");
     gen("      __wp32(__wpoll, base + 4, __wsh[i] shr 32);\n");
     gen("      ev := 0;\n");
-    gen("      if band(__wev[i], 1) <> 0 then ev := bor(ev, 0x0300);   // IN -> RDNORM|RDBAND\n");
-    gen("      if band(__wev[i], 4) <> 0 then ev := bor(ev, 0x0010);   // OUT -> WRNORM\n");
+    gen("      if band(want, 1) <> 0 then ev := bor(ev, 0x0300);   // IN -> RDNORM|RDBAND\n");
+    gen("      if band(want, 4) <> 0 then ev := bor(ev, 0x0010);   // OUT -> WRNORM\n");
     gen("      __wpoll[base + 8] := chr(band(ev, 255));\n");
     gen("      __wpoll[base + 9] := chr(band(ev shr 8, 255));\n");
     gen("      __wpoll[base + 10] := chr(0);\n");
@@ -4599,21 +5075,71 @@ long genwin(){
     gen("  if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then return 0 - 4;\n");
     gen("  if r = 0 then return 0;\n");
     gen("  out := 0;\n");
+    gen("  if nr > 1 then\n");
+    gen("  begin\n");
+    gen("    // which sets have a ready fd of their own, then which contain a ready set\n");
+    gen("    j := 0;\n");
+    gen("    while j < __WMAXEP do\n");
+    gen("    begin\n");
+    gen("      __wepgo[j] := 0;\n");
+    gen("      j := j + 1;\n");
+    gen("    end;\n");
+    gen("    k := 0;\n");
+    gen("    while k < np do\n");
+    gen("    begin\n");
+    gen("      ev := __wrevents(k * 16);\n");
+    gen("      fd := __wrow[k];\n");
+    gen("      j := 0;\n");
+    gen("      while j < nr do\n");
+    gen("      begin\n");
+    gen("        m := __wev[sets[j] * __WMAXFD + fd];\n");
+    gen("        if (m <> 0) and (band(ev, bor(m, 24)) <> 0) then __wepgo[sets[j]] := 1;\n");
+    gen("        j := j + 1;\n");
+    gen("      end;\n");
+    gen("      k := k + 1;\n");
+    gen("    end;\n");
+    gen("    pass := 0;\n");
+    gen("    while pass < nr do\n");
+    gen("    begin\n");
+    gen("      j := 0;\n");
+    gen("      while j < nr do\n");
+    gen("      begin\n");
+    gen("        t := 0;\n");
+    gen("        while t < __WMAXEP do\n");
+    gen("        begin\n");
+    gen("          if (band(__wepin[sets[j] * __WMAXEP + t], 1) <> 0) and (__wepgo[t] <> 0) then __wepgo[sets[j]] := 1;\n");
+    gen("          t := t + 1;\n");
+    gen("        end;\n");
+    gen("        j := j + 1;\n");
+    gen("      end;\n");
+    gen("      pass := pass + 1;\n");
+    gen("    end;\n");
+    gen("    t := 0;\n");
+    gen("    while t < __WMAXEP do\n");
+    gen("    begin\n");
+    gen("      if (band(__wepin[s * __WMAXEP + t], 1) <> 0) and (__wepgo[t] <> 0) then\n");
+    gen("      begin\n");
+    gen("        pe := a + out * 12;\n");
+    gen("        __wput32abs(pe, 1);   // EPOLLIN\n");
+    gen("        __wput32abs(pe + 4, __WEPBASE + t);\n");
+    gen("        __wput32abs(pe + 8, 0);\n");
+    gen("        out := out + 1;\n");
+    gen("        if out >= maxev then return out;\n");
+    gen("      end;\n");
+    gen("      t := t + 1;\n");
+    gen("    end;\n");
+    gen("  end;\n");
     gen("  k := 0;\n");
     gen("  while k < np do\n");
     gen("  begin\n");
-    gen("    base := k * 16;\n");
-    gen("    revents := bor(ord(__wpoll[base + 10]), ord(__wpoll[base + 11]) shl 8);\n");
-    gen("    if revents <> 0 then\n");
+    gen("    fd := __wrow[k];\n");
+    gen("    m := __wev[s * __WMAXFD + fd];\n");
+    gen("    ev := band(__wrevents(k * 16), bor(m, 24));   // what this set asked for, and ERR/HUP\n");
+    gen("    if (m <> 0) and (ev <> 0) then\n");
     gen("    begin\n");
-    gen("      ev := 0;\n");
-    gen("      if band(revents, 0x0300) <> 0 then ev := bor(ev, 1);   // IN\n");
-    gen("      if band(revents, 0x0010) <> 0 then ev := bor(ev, 4);   // OUT\n");
-    gen("      if band(revents, 0x0001) <> 0 then ev := bor(ev, 8);   // ERR\n");
-    gen("      if band(revents, 0x0002) <> 0 then ev := bor(ev, 16);   // HUP\n");
     gen("      pe := a + out * 12;\n");
     gen("      __wput32abs(pe, ev);\n");
-    gen("      __wput32abs(pe + 4, __wrow[k]);\n");
+    gen("      __wput32abs(pe + 4, fd);\n");
     gen("      __wput32abs(pe + 8, 0);\n");
     gen("      out := out + 1;\n");
     gen("      if out >= maxev then return out;\n");
@@ -4787,9 +5313,9 @@ long genwin(){
     gen("  if nr = 72 then return __wnonblock(a);   // fcntl F_SETFL\n");
     gen("  if nr = 44 then return __wwrite(a, b, c);   // sendto -> send\n");
     gen("  if nr = 48 then return 0;   // shutdown: no-op\n");
-    gen("  if nr = 291 then return 1000000;   // epoll_create -> token\n");
-    gen("  if nr = 233 then return __wepctl(b, c, d);   // epoll_ctl\n");
-    gen("  if nr = 232 then return __wepwait(b, c, d);   // epoll_wait\n");
+    gen("  if nr = 291 then return __wepnew;   // epoll_create1\n");
+    gen("  if nr = 233 then return __wepctl(a, b, c, d);   // epoll_ctl\n");
+    gen("  if nr = 232 then return __wepwait(a, b, c, d);   // epoll_wait\n");
     gen("  if nr = 228 then   // clock_gettime: fill the timespec\n");
     gen("  begin\n");
     gen("    t := __wnow;\n");
@@ -5059,7 +5585,7 @@ long emitprelude(){
 }
 
 long parseprogram(){
-    long i, nunres;
+    long i, nunres, mline, mfile, endline, saveline;
     emitprelude();
     /* The Windows runtime is injected BEFORE the first token is read. injectwin saves the
        read position and returns to it when the injected source ends, so anything already
@@ -5109,23 +5635,35 @@ long parseprogram(){
     }
     if(nunres > 0){ _exit(1); }
     if(tok != KW_BEGIN){ fail("missing begin of the main program"); }
+    mline = line; mfile = curfile;
     next();
     mainaddr = codelen;
     nloc = 0; frame = 0; curfn = -1; curret = T_VOID;
     nbrk = 0; ncnt = 0; brkbase = -1; cntbase = -1;
+    saveline = line; line = mline;
+    dbline(112);
+    line = saveline;
     e(0x55); e(0x48); e(0x89); e(0xE5);
     e(0x48); e(0x81); e(0xEC); framepatch = codelen; e32(0);   /* sub rsp,N: room for hidden slots */
     stmtlist();
     if(tok != KW_END){ fail("missing end of the main program"); }
+    endline = line;
     next();
     if(tok != 46){ fail("missing . after the final end"); }
     next();
     if(tok != TK_EOF){ fail("text after the end of the program"); }
+    saveline = line; line = endline;
+    dbline(101);
+    line = saveline;
     e(0x48); e(0x31); e(0xC0);
     epilogue();
     while((frame % 16) != 0){ frame = frame + 8; }
     e32at(framepatch,frame);
     e32at(mainpatch,mainaddr - (mainpatch+4));
+    if(dbgmode != 0){
+        dbs("main "); dbnum(codebase + mainaddr); dbc(32); dbnum(codebase + codelen); dbc(32);
+        dbnum(mfile); dbc(32); dbnum(mline); dbc(32); dbnum(frame); dbs(" void\n");
+    }
     return 0;
 }
 
@@ -5183,6 +5721,7 @@ long writeelf(){
     wrbuf(fd,(long)&dat[0],datlen);
     cls(fd);
     chm((long)&outname[0],493);
+    dbdata = datava; dbbss = bssva;
     return 0;
 }
 
@@ -5377,6 +5916,58 @@ long extcount(long e){
     n = 0; i = 0;
     while(i < next_){ if(extdll[i] == e){ n = n + 1; } i = i + 1; }
     return n;
+}
+
+long impargs(long i){
+    if(i == 0) return 1;   /* GetStdHandle(nStdHandle) */
+    if(i == 1) return 5;   /* WriteFile(h, buf, n, written, overlapped) */
+    if(i == 2) return 5;   /* ReadFile(h, buf, n, read, overlapped) */
+    if(i == 3) return 7;   /* CreateFileA(name, access, share, sa, disp, flags, tmpl) */
+    if(i == 4) return 1;   /* CloseHandle(h) */
+    if(i == 5) return 1;   /* ExitProcess(code) */
+    if(i == 6) return 0;   /* GetCommandLineA() */
+    if(i == 7) return 3;   /* lstrcpynA(dst, src, n) */
+    if(i == 8) return 1;   /* GetSystemTimeAsFileTime(out) */
+    if(i == 9) return 1;   /* Sleep(ms) */
+    if(i == 10) return 3;   /* GetFileAttributesExA(name, level, out) */
+    if(i == 11) return 2;   /* FindFirstFileA(name, out) */
+    if(i == 12) return 2;   /* FindNextFileA(h, out) */
+    if(i == 13) return 1;   /* FindClose(h) */
+    if(i == 14) return 6;   /* CreateFileMappingA(h, sa, prot, hi, lo, name) */
+    if(i == 15) return 5;   /* MapViewOfFile(h, access, hi, lo, bytes) */
+    if(i == 16) return 1;   /* UnmapViewOfFile(base) */
+    if(i == 17) return 2;   /* FlushViewOfFile(base, bytes) */
+    if(i == 18) return 1;   /* FlushFileBuffers(h) */
+    if(i == 19) return 3;   /* MoveFileExA(from, to, flags) */
+    if(i == 20) return 4;   /* SetFilePointerEx(h, dist, newpos, method) */
+    if(i == 21) return 1;   /* SetEndOfFile(h) */
+    if(i == 22) return 1;   /* DeleteFileA(name) */
+    if(i == 23) return 2;   /* CreateDirectoryA(name, sa) */
+    if(i == 24) return 1;   /* RemoveDirectoryA(name) */
+    if(i == 25) return 6;   /* LockFileEx(h, flags, res, lo, hi, overlapped) */
+    if(i == 26) return 5;   /* UnlockFileEx(h, res, lo, hi, overlapped) */
+    if(i == 27) return 2;   /* WSAStartup(version, data) */
+    if(i == 28) return 3;   /* socket(af, type, proto) */
+    if(i == 29) return 1;   /* closesocket(s) */
+    if(i == 30) return 5;   /* setsockopt(s, level, opt, val, len) */
+    if(i == 31) return 3;   /* ioctlsocket(s, cmd, argp) */
+    if(i == 32) return 3;   /* bind(s, addr, len) */
+    if(i == 33) return 2;   /* listen(s, backlog) */
+    if(i == 34) return 3;   /* accept(s, addr, len) */
+    if(i == 35) return 4;   /* send(s, buf, len, flags) */
+    if(i == 36) return 4;   /* recv(s, buf, len, flags) */
+    if(i == 37) return 3;   /* WSAPoll(fds, n, timeout) */
+    if(i == 38) return 2;   /* SystemFunction036(buf, len)  -- RtlGenRandom */
+    if(i == 39) return 1;   /* RegisterClassExA(wc) */
+    if(i == 40) return 12;   /* CreateWindowExA -- twelve */
+    if(i == 41) return 4;   /* DefWindowProcA(h, msg, w, l) */
+    if(i == 42) return 4;   /* GetMessageA(msg, h, min, max) */
+    if(i == 43) return 1;   /* TranslateMessage(msg) */
+    if(i == 44) return 1;   /* DispatchMessageA(msg) */
+    if(i == 45) return 1;   /* PostQuitMessage(code) */
+    if(i == 46) return 2;   /* ShowWindow(h, cmd) */
+    if(i == 47) return 4;   /* SendMessageA(h, msg, w, l) */
+    return -1;
 }
 
 char *impname(long i){
@@ -5614,6 +6205,60 @@ long writepe(){
     wrbuf(fd,(long)&dat[0],datlen);
     cls(fd);
     chm((long)&outname[0],493);
+    dbdata = datava; dbbss = bssva;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* the debug sidecar: <output>.wzdbg, see docs/design.md  */
+/* ------------------------------------------------------------------ */
+/* The header, the files, the record types and the globals are written from the tables;
+   the line table and the routines were collected in dbg while the code was generated.
+   They go to the end of that same buffer first, so one write path serves both parts. */
+long writedbg(){
+    long fd; long i; long k; long n; long g;
+    n = dbglen;
+    dbs("wzdbg 1\n");
+    if(winmode != 0){ dbs("target windows\n"); } else { dbs("target linux\n"); }
+    dbs("base "); dbnum(VBASE); dbc(10);
+    dbs("text "); dbnum(codebase); dbc(32); dbnum(codelen); dbc(10);
+    dbs("data "); dbnum(dbdata); dbc(32); dbnum(datlen); dbc(10);
+    dbs("bss "); dbnum(dbbss); dbc(32); dbnum(bsslen); dbc(10);
+    dbs("entry "); dbnum(codebase + entryoff); dbc(10);
+    i = 0;
+    while(i < nfiles){
+        dbs("file "); dbnum(i); dbc(32);
+        k = 0;
+        while(k < filelen[i]){ dbc((long)(unsigned char)fnpool[filenam[i] + k]); k = k + 1; }
+        dbc(10);
+        i = i + 1;
+    }
+    i = 0;
+    while(i < nrt){
+        dbs("record "); dbnam(rtnam[i]); dbc(32); dbnum(rtsize[i]); dbc(32); dbnum(rtnf[i]); dbc(10);
+        k = rtf0[i];
+        while(k < rtf0[i] + rtnf[i]){
+            dbvar("field",fdnam[k],fdoff[k],fdtyp[k],fdarr[k],fdlo[k],fdhi[k]);
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    g = 0;
+    while(g < ngl){
+        if(gkind[g] == SK_VAR){ dbvar("global",gnam[g],dbbss + gval[g],gtyp[g],garr[g],glo[g],ghi[g]); }
+        g = g + 1;
+    }
+    /* the name: the output name with .wzdbg appended, which never collides with the binary */
+    if(outnamelen + 7 > 255){ fail("output file name too long"); }
+    i = 0;
+    while(i < outnamelen){ mbuf[i] = outname[i]; i = i + 1; }
+    mbuf[i] = '.'; mbuf[i+1] = 'w'; mbuf[i+2] = 'z'; mbuf[i+3] = 'd';
+    mbuf[i+4] = 'b'; mbuf[i+5] = 'g'; mbuf[i+6] = 0;
+    fd = opn((long)&mbuf[0],577,420);
+    if(fd < 0){ fail("cannot create the debug file"); }
+    wrbuf(fd,(long)&dbg[n],dbglen - n);
+    wrbuf(fd,(long)&dbg[0],n);
+    cls(fd);
     return 0;
 }
 
@@ -5630,8 +6275,11 @@ long compile(){
     }
     pos = 0; srcend = n;
     bsslen = 8;                       /* reserve __argp at bss offset 0 */
+    dbglen = 0;
+    if(winmode != 0){ codebase = VBASE + 0x1000; } else { codebase = VBASE + HDRLEN; }
     parseprogram();
     if(winmode != 0){ writepe(); } else { writeelf(); }
+    if(dbgmode != 0){ writedbg(); }
     return 0;
 }
 
@@ -5650,12 +6298,34 @@ long argeqc(char *a,char *s){
 long argeqs(char *a,char *s){ long i = 0; while(1){ if(a[i] != s[i]){ return 0; } if(s[i] == 0){ return 1; } i = i + 1; } }
 
 int main(int argc,char **argv){
-    long i;
+    long i; long ai;
     /* --version before the argument count check: asking a compiler what it is should
        not require giving it a source file and an output name.  src/wantzel.wz carries
        the same string in its VERSION constant. */
     if(argc == 2 && (argeqs(argv[1],"--version") || argeqs(argv[1],"-v"))){
         wrs(1,"wantzel " VERSION "\n");
+        /* AND WHERE THE LIBRARY IS, the counterpart of the same block in src/wantzel.wz.
+           Since the standard library moved to disk, a compiler copied WITHOUT its lib/
+           beside it fails on `include "io.wz"` -- and the honest answer to "is my install
+           right?" is the path itself, plus whether anything is there. */
+        setlibdir(argv[0]);
+        wrs(1,"library ");
+        if(libdirlen > 0){
+            long fd; long n = libdirlen;
+            wrbuf(1,(long)&libdir[0],libdirlen);
+            /* io.wz is the probe: every program that includes anything includes it, so
+               its absence is what the user hits first.  The probe is undone again --
+               libdir is the real search path. */
+            if(n + 6 < (long)sizeof(libdir)){
+                libdir[n]='i'; libdir[n+1]='o'; libdir[n+2]='.';
+                libdir[n+3]='w'; libdir[n+4]='z'; libdir[n+5]=0;
+                fd = opn((long)&libdir[0],0,0);
+                libdir[n] = 0;
+                if(fd < 0) wrs(1,"   NOT FOUND -- copy lib/ next to the compiler");
+                else cls(fd);
+            }
+        } else wrs(1,"(unknown -- the compiler could not find its own path)");
+        wrs(1,"\n");
         return 0;
     }
     /* Run with no arguments at all, say what this program IS.  Someone who finds the
@@ -5664,12 +6334,12 @@ int main(int argc,char **argv){
     if(argc < 3){
         wrs(2,"wantzel " VERSION " -- a compiler for code that AI writes: strict, dependency-free, extremely fast.\n");
         wrs(2,"Copyright (c) 2026 Floris Knol.  MIT licence.  https://github.com/wantzel/wantzel\n\n");
-        wrs(2,"usage: wantzel <source.wz> <executable> [--target=linux|windows]\n");
+        wrs(2,"usage: wantzel <source.wz> <executable> [--target=linux|windows] [--debug]\n");
         wrs(2,"       wantzel --version\n");
         return 1;
     }
-    if(argc > 4){
-        wrs(2,"usage: wantzel <source.wz> <executable> [--target=linux|windows]\n");
+    if(argc > 5){
+        wrs(2,"usage: wantzel <source.wz> <executable> [--target=linux|windows] [--debug]\n");
         return 1;
     }
     setlibdir(argv[0]);
@@ -5683,13 +6353,20 @@ int main(int argc,char **argv){
        is refused rather than quietly built for Linux. */
     winmode = 0;
     tgiven = 0;
-    if(argc == 4){
-        if(argeqc(argv[3],"--target=windows") || argeqc(argv[3],"-twindows")){ winmode = 1; tgiven = 1; }
-        else if(argeqc(argv[3],"--target=linux") || argeqc(argv[3],"-tlinux")){ winmode = 0; tgiven = 1; }
+    dbgmode = 0;
+    /* The options, in any order after the two names: --target= and --debug.  The latter
+       writes the sidecar <executable>.wzdbg and changes nothing in the executable itself;
+       see docs/design.md. */
+    ai = 3;
+    while(ai < argc){
+        if(argeqc(argv[ai],"--target=windows") || argeqc(argv[ai],"-twindows")){ winmode = 1; tgiven = 1; }
+        else if(argeqc(argv[ai],"--target=linux") || argeqc(argv[ai],"-tlinux")){ winmode = 0; tgiven = 1; }
+        else if(argeqc(argv[ai],"--debug")){ dbgmode = 1; }
         else {
-            wrs(2,"wantzel: unknown option (use --target=linux or --target=windows)\n");
+            wrs(2,"wantzel: unknown option (use --target=linux, --target=windows or --debug)\n");
             return 1;
         }
+        ai = ai + 1;
     }
     if(tgiven == 0 && i >= 4){
         if(outname[i-4] == '.' && lower((long)(unsigned char)outname[i-3]) == 101

@@ -1,0 +1,284 @@
+// jsonget.wz -- read one field out of a JSON document, for use in a shell script.
+//
+//   jsonget name          < reply.json      a top-level field
+//   jsonget a.b           < reply.json      nested
+//   jsonget items.2.id    < reply.json      an array element, counted from zero
+//   jsonget --valid       < reply.json      say nothing; exit 0 if it parses
+//
+// WHY THIS EXISTS, and the number is the whole argument. A test suite that reads a field out
+// of a reply usually reaches for `python3 -c`, because it is three lines. The three lines are
+// not the cost: STARTING THE INTERPRETER is, and it does not show up until the helper runs in
+// a loop -- by which time it reads as "the suite is slow" rather than "the helper is slow".
+//
+//   MEASURED 22-09-2026 on this machine, twenty calls of each:
+//     python3 -c        36.7 ms per call
+//     this program       measured below, and the ratio is in tests/lib/jsonget.sh
+//
+// NOT jq EITHER: that is about a millisecond, but it trades one external dependency for
+// another, and having none is the point.
+//
+// WHAT IT PRINTS. The value, without quotes for a string, and a newline. A missing field is
+// exit 1 and nothing on stdout, so `v=$(jsonget x) || echo absent` works.
+include "io.wz";
+include "json.wz";
+
+const
+  MAXIN = 1048576;                      // a megabyte of reply is more than any test sends
+
+var
+  buf:  array[0..MAXIN-1] of char;
+  path: array[0..255] of char;
+  seg:  array[0..127] of char;
+  n, pathn: int;
+
+procedure die(m: str);
+begin
+  io.puts(STDERR, m);
+  io.puts(STDERR, "\n");
+  halt(1);
+end;
+
+// digits(a, from, n) -- is this path segment a number? Then it indexes an array.
+//
+// A KEY CAN BE A NUMBER TOO, and that ambiguity is resolved by what is THERE: in an object
+// "2" is looked up as a key, in an array it is an index. Deciding by the document rather
+// than by the path is the only rule that cannot surprise.
+function digits(a: array of char; from: int; upto: int): bool;
+var i: int;
+begin
+  if from >= upto then return false;
+  i := from;
+  while i < upto do
+  begin
+    if (a[i] < '0') or (a[i] > '9') then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+function num(a: array of char; from: int; upto: int): int;
+var v, i: int;
+begin
+  v := 0; i := from;
+  while i < upto do
+  begin
+    v := v * 10 + (ord(a[i]) - ord('0'));
+    i := i + 1;
+  end;
+  return v;
+end;
+
+// field(at, upto, key, keyn) -- the value of `key` in the object at `at`, or -1.
+function field(at: int; upto: int; key: array of char; keyn: int): int;
+var k, e, i: int;
+begin
+  at := json.ws(buf, at, upto);
+  if at >= upto then return 0 - 1;
+  if buf[at] <> '{' then return 0 - 1;
+  at := at + 1;
+  while true do
+  begin
+    at := json.ws(buf, at, upto);
+    if at >= upto then return 0 - 1;
+    if buf[at] = '}' then return 0 - 1;
+    if buf[at] = ',' then begin at := at + 1; continue; end;
+    if buf[at] <> '"' then return 0 - 1;
+    k := at + 1;
+    e := json.strend(buf, k, upto);
+    if e < 0 then return 0 - 1;
+    // THE KEY IS COMPARED RAW, escapes and all. A test that asks for a key with a quote in
+    // it is not a case worth the code; a key that does not match simply is not found.
+    if (e - k) = keyn then
+    begin
+      i := 0;
+      while (i < keyn) and (buf[k + i] = key[i]) do i := i + 1;
+      if i = keyn then
+      begin
+        at := json.ws(buf, e + 1, upto);
+        if at >= upto then return 0 - 1;
+        if buf[at] <> ':' then return 0 - 1;
+        return json.ws(buf, at + 1, upto);
+      end;
+    end;
+    at := json.ws(buf, e + 1, upto);
+    if (at >= upto) or (buf[at] <> ':') then return 0 - 1;
+    at := json.skip(buf, at + 1, upto);
+    if at < 0 then return 0 - 1;
+  end;
+  return 0 - 1;
+end;
+
+// element(at, upto, idx) -- element `idx` of the array at `at`, or -1.
+function element(at: int; upto: int; idx: int): int;
+var i: int;
+begin
+  at := json.ws(buf, at, upto);
+  if (at >= upto) or (buf[at] <> '[') then return 0 - 1;
+  at := at + 1;
+  i := 0;
+  while true do
+  begin
+    at := json.ws(buf, at, upto);
+    if at >= upto then return 0 - 1;
+    if buf[at] = ']' then return 0 - 1;
+    if buf[at] = ',' then begin at := at + 1; continue; end;
+    if i = idx then return at;
+    at := json.skip(buf, at, upto);
+    if at < 0 then return 0 - 1;
+    i := i + 1;
+  end;
+  return 0 - 1;
+end;
+
+// valid(at, upto) -- does one complete JSON value start at `at`? Returns where it ends, or -1.
+//
+// NOT json.skip, AND THAT IS THE POINT. json.skip walks a value by BALANCING brackets, which
+// is what a reader needs to step over a field it does not want -- and it is why `{oops}` gets
+// past it: the braces match. Measured, it returned 6 for that document.
+//
+// A validator has to look INSIDE. So this one descends: an object is a sequence of
+// "key" : value pairs, an array is a sequence of values, and anything else must be a string,
+// a number, or one of the three literals.
+function valid(at: int; upto: int): int;
+var e: int;
+begin
+  at := json.ws(buf, at, upto);
+  if at >= upto then return 0 - 1;
+
+  if buf[at] = chr(123) then                   // {
+  begin
+    at := json.ws(buf, at + 1, upto);
+    if at >= upto then return 0 - 1;
+    if buf[at] = chr(125) then return at + 1;  // {}
+    while true do
+    begin
+      at := json.ws(buf, at, upto);
+      if (at >= upto) or (buf[at] <> chr(34)) then return 0 - 1;   // a key is a string
+      e := json.strend(buf, at + 1, upto);
+      if e < 0 then return 0 - 1;
+      at := json.ws(buf, e + 1, upto);
+      if (at >= upto) or (buf[at] <> chr(58)) then return 0 - 1;   // :
+      at := valid(at + 1, upto);
+      if at < 0 then return 0 - 1;
+      at := json.ws(buf, at, upto);
+      if at >= upto then return 0 - 1;
+      if buf[at] = chr(125) then return at + 1;
+      if buf[at] <> chr(44) then return 0 - 1;                     // ,
+      at := at + 1;
+    end;
+  end;
+
+  if buf[at] = chr(91) then                    // [
+  begin
+    at := json.ws(buf, at + 1, upto);
+    if at >= upto then return 0 - 1;
+    if buf[at] = chr(93) then return at + 1;   // []
+    while true do
+    begin
+      at := valid(at, upto);
+      if at < 0 then return 0 - 1;
+      at := json.ws(buf, at, upto);
+      if at >= upto then return 0 - 1;
+      if buf[at] = chr(93) then return at + 1;
+      if buf[at] <> chr(44) then return 0 - 1;
+      at := at + 1;
+    end;
+  end;
+
+  if buf[at] = chr(34) then
+  begin
+    e := json.strend(buf, at + 1, upto);
+    if e < 0 then return 0 - 1;
+    return e + 1;
+  end;
+
+  if json.literal(buf, at, upto, "true")  > 0 then return at + 4;
+  if json.literal(buf, at, upto, "false") > 0 then return at + 5;
+  if json.literal(buf, at, upto, "null")  > 0 then return at + 4;
+
+  // A number is the only thing left, and json.number refuses what is not one.
+  return json.number(buf, at, upto);
+end;
+
+// emit(at, upto) -- print the value at `at`, a string without its quotes.
+procedure emit(at: int; upto: int);
+var e: int;
+begin
+  if buf[at] = '"' then
+  begin
+    e := json.strend(buf, at + 1, upto);
+    if e < 0 then die("jsonget: the string does not end");
+    // RAW, WITH ITS ESCAPES AS WRITTEN. Unescaping would be a second contract to keep, and
+    // a test comparing against what the server sent wants what the server sent.
+    io.out(STDOUT, addr(buf[at + 1]), e - at - 1);
+  end
+  else
+  begin
+    e := json.skip(buf, at, upto);
+    if e < 0 then die("jsonget: that value does not end");
+    io.out(STDOUT, addr(buf[at]), e - at);
+  end;
+  io.puts(STDOUT, "\n");
+end;
+
+var
+  at, upto, got, i, segn, want: int;
+
+begin
+  if argc() < 2 then die("usage: jsonget <path> < document     (or --valid)");
+
+  pathn := 0;
+  while (argch(1, pathn) <> chr(0)) and (pathn < len(path) - 1) do
+  begin path[pathn] := argch(1, pathn); pathn := pathn + 1; end;
+
+  // READ IT ALL FIRST. A document arrives over a pipe in pieces, and a single read returns
+  // whatever happened to be buffered -- which works on a short reply and truncates a long
+  // one, so the bug only appears once the data grows.
+  n := 0;
+  while true do
+  begin
+    got := io.read(STDIN, addr(buf[n]), MAXIN - n);
+    if got <= 0 then break;
+    n := n + got;
+    if n >= MAXIN then die("jsonget: that document is larger than a megabyte");
+  end;
+  if n = 0 then die("jsonget: nothing on standard input");
+
+  upto := n;
+  at := json.ws(buf, 0, upto);
+
+  // --valid: parse and say nothing. Exit 0 if the whole document is one value.
+  if (pathn = 7) and (path[0] = '-') and (path[1] = '-') then
+  begin
+    at := valid(at, upto);
+    if at < 0 then halt(1);
+    at := json.ws(buf, at, upto);
+    // TRAILING RUBBISH IS NOT VALID. "{} {}" parses as a value followed by something else,
+    // and a validator that accepts it would pass a reply that carries two.
+    if at < upto then halt(1);
+    halt(0);
+  end;
+
+  // Walk the path, one dot-separated segment at a time.
+  i := 0;
+  while i < pathn do
+  begin
+    segn := 0;
+    while (i < pathn) and (path[i] <> '.') do
+    begin seg[segn] := path[i]; segn := segn + 1; i := i + 1; end;
+    if i < pathn then i := i + 1;          // step over the dot
+    if segn = 0 then die("jsonget: an empty path segment");
+
+    at := json.ws(buf, at, upto);
+    if at >= upto then halt(1);
+    if buf[at] = '[' then
+    begin
+      if not digits(seg, 0, segn) then halt(1);
+      at := element(at, upto, num(seg, 0, segn));
+    end
+    else at := field(at, upto, seg, segn);
+    if at < 0 then halt(1);
+  end;
+
+  emit(at, upto);
+end.

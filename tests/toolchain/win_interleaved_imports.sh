@@ -43,14 +43,41 @@ fi
 # No call may target a null terminator. The three extra imports occupy the slots after the
 # built-in table; the terminator between the two groups is the one that must not be used.
 # Reading the emitted immediates is the direct check, and it needs no Windows to run.
-if command -v objdump >/dev/null 2>&1; then
-  slots=$(objdump -d "$T/inter.exe" 2>/dev/null | grep -oE 'mov +\$0x3[0-9a-f]+,%eax' | grep -oE '0x3[0-9a-f]+' | sort -u)
-  for s in $slots; do
-    dec=$((s))
-    # slot 54 is the terminator between the user32 and gdi32 groups in this program
-    [ "$dec" = "54" ] && { echo "a call targets slot 54, the null terminator between two DLL groups"; exit 1; }
+# The terminators come from the IAT in the file, not from a number written here: which
+# slot separates two groups moves whenever a DLL group is added in front -- the Windows
+# runtime itself imports one ws2_32 function by name, so that group comes first in every
+# executable -- and a fixed number then names a slot that is in use. Data directory 12 of
+# the optional header gives the IAT's RVA and size; the .rdata section header says where
+# that RVA sits in the file. Every zero entry is a terminator, and no call may target it.
+le32at() { od -An -t u4 -j "$1" -N 4 "$2" | tr -d ' '; }
+u64at()  { od -An -t u8 -j "$1" -N 8 "$2" | tr -d ' '; }
+opt=$(( $(le32at 60 "$T/inter.exe") + 24 ))                 # e_lfanew + PE signature + COFF header
+iatrva=$(le32at $(( opt + 112 + 12 * 8 )) "$T/inter.exe")
+iatsz=$(le32at $(( opt + 112 + 12 * 8 + 4 )) "$T/inter.exe")
+rdrva=$(le32at $(( opt + 240 + 40 + 12 )) "$T/inter.exe")   # second section header: .rdata
+rdraw=$(le32at $(( opt + 240 + 40 + 20 )) "$T/inter.exe")
+iatoff=$(( iatrva - rdrva + rdraw ))
+nslots=$(( iatsz / 8 ))
+terminators=""
+i=0
+while [ $i -lt $nslots ]; do
+  [ "$(u64at $(( iatoff + 8 * i )) "$T/inter.exe")" = "0" ] && terminators="$terminators $i"
+  i=$(( i + 1 ))
+done
+case "$terminators" in *" "*" "*" "*) ;; *) echo "expected at least three terminators in the IAT, found:$terminators"; exit 1 ;; esac
+
+# A slot is loaded with `mov eax, imm32` and pushed (b8 xx 00 00 00 50). The slots of this
+# program's imports all lie in 48..63, so only an immediate of that size is looked at: a
+# looser match once picked up an unrelated constant. The bytes are read directly, so this
+# needs no disassembler.
+slots=$(od -An -v -t x1 "$T/inter.exe" | tr -d ' \n' | grep -oE 'b83[0-9a-f]00000050' | cut -c3-4 | sort -u)
+[ -n "$slots" ] || { echo "no slot-loading mov found in the code"; exit 1; }
+for s in $slots; do
+  dec=$(( 0x$s ))
+  for t in $terminators; do
+    [ "$dec" = "$t" ] && { echo "a call targets slot $dec, a null terminator between two DLL groups"; exit 1; }
   done
-fi
+done
 
 # Both counterparts must agree, byte for byte: this bug lived in the slot arithmetic, and
 # a fix in only one of them would leave a fresh clone building the broken binary.

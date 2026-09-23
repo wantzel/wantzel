@@ -1,0 +1,8 @@
+// Must not compile: a field named `end` reads as the end of the schema, and the colon
+// after it is what does not fit. Named as the keyword problem it is, on the right line.
+type Range = schema
+  start: int;
+  end: int;
+end;
+begin
+end.

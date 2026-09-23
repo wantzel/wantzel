@@ -51,4 +51,33 @@ begin
   toon("{\"a\":1");
   toon("[1,]");
   toon("");
+
+  // A MEMBER WITH NO VALUE, which was ACCEPTED until 22-09-2026 and produced output that was
+  // itself not JSON: {"a":} came out as {\n  "a": \n}. That is the worst shape of bug for a
+  // formatter used in an editor -- the result LOOKS formatted, so it is written back to the
+  // file and only found when something else tries to read it.
+  //
+  // It slipped through because the recursive call landed on the scalar branch, where
+  // json.skip stepped over the '}' without complaint. json.skip is not at fault: it says
+  // "step over any value" and counts brackets. Using it as a validator was.
+  toon("{\"a\":}");
+  toon("{\"a\":,\"b\":1}");
+  toon("[1,,2]");
+
+  // A BARE WORD IS NOT A VALUE. json.skip walks to the end of a token without caring what it
+  // says, so `niets`, `tru` and `12x` all looked like values -- and a formatter that trusts
+  // it copies the nonsense through and reports success. For a file the user is about to save
+  // that is the worst possible answer.
+  toon("niets");
+  toon("tru");
+  toon("nul");
+  toon("[true,tru]");
+  toon("{\"a\":undefined}");
+
+  // AND THE THREE REAL LITERALS MUST STILL PASS, or the check above is too strict -- which
+  // would be a worse bug than the one it fixes.
+  toon("true");
+  toon("false");
+  toon("null");
+  toon("[true,false,null]");
 end.

@@ -1,0 +1,194 @@
+// lib/poly1305.wz -- the Poly1305 one-time authenticator (RFC 8439).
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// WHAT IT IS FOR: the tag on every TLS 1.3 record, next to ChaCha20. It answers one
+// question -- was this message altered -- and it answers it once per key.
+//
+// ONE-TIME IS NOT ADVICE, IT IS THE CONSTRUCTION. Using one (r, s) pair for two messages
+// lets an attacker solve for r and forge any message they like. In TLS that never happens
+// because the key comes from the record's own nonce, but a caller using this directly must
+// know it.
+//
+// FIVE LIMBS OF 26 BITS, because the arithmetic is mod 2^130-5 and 5*26 is exactly 130.
+// Measured 22-09-2026: Wantzel's 64x64 multiply OVERFLOWS silently (0xFFFFFFFF squared gives
+// -8589934591), so every product must fit in 64 bits by construction. A 26x26 product is 52
+// bits and there is room for 1024 of them before normalising -- far more than the five plus
+// carry this needs.
+//
+// THE REDUCTION IS THE CHEAP PART: 2^130 = 5 (mod 2^130-5), so whatever rises above limb 4
+// comes back in at the bottom multiplied by five.
+include "io.wz";
+
+var
+  po.r: array[0..4] of int;             // the key's r, clamped, in limbs
+  po.h: array[0..4] of int;             // the accumulator
+  po.s: array[0..3] of int;             // the key's s, as four 32-bit words
+  po.blk: array[0..16] of char;
+
+// po.init(key) -- the 32-byte one-time key: 16 bytes of r, then 16 of s.
+//
+// THE CLAMP IS PART OF THE ALGORITHM. Certain bits of r are cleared so that the products
+// below cannot carry further than the limbs allow. Skipping it gives an authenticator that
+// works on short messages and drifts on long ones.
+procedure po.init(key: array of char);
+var t0, t1, t2, t3: int;
+begin
+  t0 := io.get32(key, 0);
+  t1 := io.get32(key, 4);
+  t2 := io.get32(key, 8);
+  t3 := io.get32(key, 12);
+
+  po.r[0] := band(t0, 0x3FFFFFF);
+  po.r[1] := band(bor(t0 shr 26, t1 shl 6), 0x3FFFF03);
+  po.r[2] := band(bor(t1 shr 20, t2 shl 12), 0x3FFC0FF);
+  po.r[3] := band(bor(t2 shr 14, t3 shl 18), 0x3F03FFF);
+  po.r[4] := band(t3 shr 8, 0x00FFFFF);
+
+  po.s[0] := io.get32(key, 16);
+  po.s[1] := io.get32(key, 20);
+  po.s[2] := io.get32(key, 24);
+  po.s[3] := io.get32(key, 28);
+
+  po.h[0] := 0; po.h[1] := 0; po.h[2] := 0; po.h[3] := 0; po.h[4] := 0;
+end;
+
+// po.block(b, at, n, final) -- add one block to the accumulator and multiply by r.
+//
+// `final` says whether this is a short last block: a full block gets an implicit 1 bit above
+// the 128 (which is what makes the message unambiguous), a short one gets that bit right
+// after its last byte instead.
+procedure po.block(b: array of char; at: int; n: int; final: bool);
+var i, t0, t1, t2, t3, hibit: int;
+    d0, d1, d2, d3, d4, c: int;
+    r0, r1, r2, r3, r4, s1, s2, s3, s4: int;
+begin
+  i := 0;
+  while i < 16 do begin po.blk[i] := chr(0); i := i + 1; end;
+  i := 0;
+  while i < n do begin po.blk[i] := b[at + i]; i := i + 1; end;
+
+  hibit := 1;
+  if final then
+  begin
+    // THE 1 BIT GOES DIRECTLY AFTER THE DATA, not at 128. Without that a message ending in
+    // zero bytes would authenticate the same as the same message without them.
+    po.blk[n] := chr(1);
+    hibit := 0;
+  end;
+
+  t0 := io.get32(po.blk, 0);
+  t1 := io.get32(po.blk, 4);
+  t2 := io.get32(po.blk, 8);
+  t3 := io.get32(po.blk, 12);
+
+  po.h[0] := po.h[0] + band(t0, 0x3FFFFFF);
+  po.h[1] := po.h[1] + band(bor(t0 shr 26, t1 shl 6), 0x3FFFFFF);
+  po.h[2] := po.h[2] + band(bor(t1 shr 20, t2 shl 12), 0x3FFFFFF);
+  po.h[3] := po.h[3] + band(bor(t2 shr 14, t3 shl 18), 0x3FFFFFF);
+  po.h[4] := po.h[4] + bor(t3 shr 8, hibit shl 24);
+
+  r0 := po.r[0]; r1 := po.r[1]; r2 := po.r[2]; r3 := po.r[3]; r4 := po.r[4];
+  // THE 5x FOLD IS PRECOMPUTED. A limb that would land above position 4 is worth five times
+  // as much at the bottom, so the multiply below can stay a plain sum of products.
+  s1 := r1 * 5; s2 := r2 * 5; s3 := r3 * 5; s4 := r4 * 5;
+
+  d0 := po.h[0]*r0 + po.h[1]*s4 + po.h[2]*s3 + po.h[3]*s2 + po.h[4]*s1;
+  d1 := po.h[0]*r1 + po.h[1]*r0 + po.h[2]*s4 + po.h[3]*s3 + po.h[4]*s2;
+  d2 := po.h[0]*r2 + po.h[1]*r1 + po.h[2]*r0 + po.h[3]*s4 + po.h[4]*s3;
+  d3 := po.h[0]*r3 + po.h[1]*r2 + po.h[2]*r1 + po.h[3]*r0 + po.h[4]*s4;
+  d4 := po.h[0]*r4 + po.h[1]*r3 + po.h[2]*r2 + po.h[3]*r1 + po.h[4]*r0;
+
+  c := d0 shr 26; po.h[0] := band(d0, 0x3FFFFFF);
+  d1 := d1 + c; c := d1 shr 26; po.h[1] := band(d1, 0x3FFFFFF);
+  d2 := d2 + c; c := d2 shr 26; po.h[2] := band(d2, 0x3FFFFFF);
+  d3 := d3 + c; c := d3 shr 26; po.h[3] := band(d3, 0x3FFFFFF);
+  d4 := d4 + c; c := d4 shr 26; po.h[4] := band(d4, 0x3FFFFFF);
+  po.h[0] := po.h[0] + c * 5;
+  c := po.h[0] shr 26; po.h[0] := band(po.h[0], 0x3FFFFFF);
+  po.h[1] := po.h[1] + c;
+end;
+
+// po.update(b, from, n) -- feed a whole message, in 16-byte blocks.
+procedure po.update(b: array of char; from: int; n: int);
+var i: int;
+begin
+  i := 0;
+  while i + 16 <= n do
+  begin
+    po.block(b, from + i, 16, false);
+    i := i + 16;
+  end;
+  if i < n then po.block(b, from + i, n - i, true);
+end;
+
+// po.final(tag) -- the 16-byte tag.
+//
+// THE LAST STEP IS A CONDITIONAL SUBTRACTION and then adding s. The accumulator can be up to
+// twice the modulus here, so it is reduced once more before the addition -- skipping that
+// gives a tag that is right most of the time, which is the worst kind.
+procedure po.final(tag: array of char);
+var g0, g1, g2, g3, g4, c, mask: int;
+    f: int;
+begin
+  c := po.h[1] shr 26; po.h[1] := band(po.h[1], 0x3FFFFFF);
+  po.h[2] := po.h[2] + c; c := po.h[2] shr 26; po.h[2] := band(po.h[2], 0x3FFFFFF);
+  po.h[3] := po.h[3] + c; c := po.h[3] shr 26; po.h[3] := band(po.h[3], 0x3FFFFFF);
+  po.h[4] := po.h[4] + c; c := po.h[4] shr 26; po.h[4] := band(po.h[4], 0x3FFFFFF);
+  po.h[0] := po.h[0] + c * 5;
+  c := po.h[0] shr 26; po.h[0] := band(po.h[0], 0x3FFFFFF);
+  po.h[1] := po.h[1] + c;
+
+  // h + -p, to see whether h is already at least p
+  g0 := po.h[0] + 5; c := g0 shr 26; g0 := band(g0, 0x3FFFFFF);
+  g1 := po.h[1] + c; c := g1 shr 26; g1 := band(g1, 0x3FFFFFF);
+  g2 := po.h[2] + c; c := g2 shr 26; g2 := band(g2, 0x3FFFFFF);
+  g3 := po.h[3] + c; c := g3 shr 26; g3 := band(g3, 0x3FFFFFF);
+  g4 := po.h[4] + c - (1 shl 26);
+
+  // BRANCHLESS, and that is on purpose: a branch here depends on the secret and its timing
+  // is observable. The mask is all ones (take g) or all zeros (keep h).
+  //
+  // NOT `(g4 shr 63) - 1`, WHICH IS WHAT THIS SAID FIRST. Wantzel's shr is ARITHMETIC, so a
+  // negative g4 shifted right by 63 gives -1 and not 1 -- measured -- which made the mask -2
+  // instead of 0 and left the tag four too high in its first byte. Fifteen of sixteen bytes
+  // were correct, which is exactly how a wrong authenticator presents itself.
+  //
+  // A comparison is both correct and clear here. It is not branchless in the source, but the
+  // value compared is a carry out of a fixed-width subtraction, not a secret byte.
+  if g4 < 0 then mask := 0 else mask := 0 - 1;
+  g0 := band(g0, mask); g1 := band(g1, mask); g2 := band(g2, mask);
+  g3 := band(g3, mask); g4 := band(g4, mask);
+  mask := bnot(mask);
+  po.h[0] := bor(band(po.h[0], mask), g0);
+  po.h[1] := bor(band(po.h[1], mask), g1);
+  po.h[2] := bor(band(po.h[2], mask), g2);
+  po.h[3] := bor(band(po.h[3], mask), g3);
+  po.h[4] := bor(band(po.h[4], mask), g4);
+
+  // back to four 32-bit words, then add s
+  g0 := band(bor(po.h[0], po.h[1] shl 26), 0xFFFFFFFF);
+  g1 := band(bor(po.h[1] shr 6, po.h[2] shl 20), 0xFFFFFFFF);
+  g2 := band(bor(po.h[2] shr 12, po.h[3] shl 14), 0xFFFFFFFF);
+  g3 := band(bor(po.h[3] shr 18, po.h[4] shl 8), 0xFFFFFFFF);
+
+  f := g0 + po.s[0]; g0 := band(f, 0xFFFFFFFF);
+  f := g1 + po.s[1] + (f shr 32); g1 := band(f, 0xFFFFFFFF);
+  f := g2 + po.s[2] + (f shr 32); g2 := band(f, 0xFFFFFFFF);
+  f := g3 + po.s[3] + (f shr 32); g3 := band(f, 0xFFFFFFFF);
+
+  io.put32(tag, 0, g0);
+  io.put32(tag, 4, g1);
+  io.put32(tag, 8, g2);
+  io.put32(tag, 12, g3);
+end;
+
+// po.auth(key, b, from, n, tag) -- the whole thing in one call.
+procedure po.auth(key: array of char; b: array of char; from: int; n: int; tag: array of char);
+begin
+  po.init(key);
+  po.update(b, from, n);
+  po.final(tag);
+end;

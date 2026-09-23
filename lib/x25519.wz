@@ -1,0 +1,432 @@
+// lib/x25519.wz -- X25519 key agreement on Curve25519 (RFC 7748).
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// ONE PUBLIC ROUTINE: x.scalarmult(out, scalar, point). Both inputs are 32 bytes, the
+// result is 32 bytes, and that single operation is all TLS needs -- against the base
+// point it makes a public key, against the peer's public key it makes the shared secret.
+//
+// THE ARITHMETIC IS MOD 2^255 - 19, AND WANTZEL HAS NO BIGNUM. A number that size is held
+// as TEN LIMBS with alternating widths, 26 and 25 bits: 5*26 + 5*25 = 255 exactly. The
+// alternation is not decoration -- it is what keeps every limb under 2^26 after a carry
+// pass, so a product of two limbs stays far enough below 2^63 to accumulate.
+//
+// WHY TEN LIMBS AND NOT FIVE. Multiplying two 255-bit numbers means summing products of
+// limb pairs. With 26-bit limbs a single product is at most 2^52, and ten of them sum to
+// about 2^55.3 -- measured: there is room for over 1000 such sums before 2^63, and the
+// most any coefficient here takes is 10 plus the 19-fold reduction terms. With larger
+// limbs the products overflow silently, and a silent overflow in this file produces a
+// shared secret that is simply wrong, with nothing to catch it.
+//
+// CONSTANT TIME IS A CORRECTNESS REQUIREMENT HERE, not a nicety. The scalar is a private
+// key. A branch on one of its bits, or a table lookup indexed by one, leaks that bit
+// through timing -- and 255 leaked bits is the whole key. So the ladder does the same work
+// for every bit and swaps with a MASK rather than an `if`. Nothing in this file may branch
+// on scalar or key material.
+//
+// THE TEST VECTORS ARE RFC 7748's OWN, in tests/lib/x25519.wz: §5.2 for scalarmult and
+// §6.1 for the full Diffie-Hellman with Alice and Bob. Cryptography that is almost right
+// is indistinguishable from cryptography that is right until someone attacks it, so this
+// file is worth nothing without them.
+
+include "io.wz";
+
+const
+  X.LIMBS = 10;
+
+var
+  // Working registers for the ladder. They are module state rather than locals because a
+  // routine takes at most 10 arguments and an array counts as 2 -- a field multiply with
+  // three arrays plus a length does not fit otherwise.
+  x.a:  array[0..X.LIMBS-1] of int;
+  x.b:  array[0..X.LIMBS-1] of int;
+  x.c:  array[0..X.LIMBS-1] of int;
+  x.d:  array[0..X.LIMBS-1] of int;
+  x.e:  array[0..X.LIMBS-1] of int;
+  x.f:  array[0..X.LIMBS-1] of int;
+  x.g:  array[0..X.LIMBS-1] of int;
+  x.h:  array[0..X.LIMBS-1] of int;
+  x.t0: array[0..X.LIMBS-1] of int;
+  x.t1: array[0..X.LIMBS-1] of int;
+  x.px: array[0..X.LIMBS-1] of int;
+  x.sc: array[0..31] of char;
+  // The product before it is carried back into 26/25-bit limbs. Nineteen wide because the
+  // schoolbook product of two ten-limb numbers has 19 coefficients.
+  x.pr: array[0..18] of int;
+
+// ---- helpers ---------------------------------------------------------------------------
+
+procedure x.zero(r: array of int);
+var i: int;
+begin
+  i := 0;
+  while i < X.LIMBS do begin r[i] := 0; i := i + 1; end;
+end;
+
+procedure x.copy(dst: array of int; src: array of int);
+var i: int;
+begin
+  i := 0;
+  while i < X.LIMBS do begin dst[i] := src[i]; i := i + 1; end;
+end;
+
+procedure x.one(r: array of int);
+begin
+  x.zero(r);
+  r[0] := 1;
+end;
+
+// ---- carrying --------------------------------------------------------------------------
+//
+// Bring every limb back inside its width, alternating 26 and 25 bits, and fold the overflow
+// out of the top limb back into the bottom one. That fold is where 2^255 = 19 (mod p) is
+// used: a bit that runs off the top of limb 9 is worth 2^255, which is 19 down at limb 0.
+//
+// THE SHIFT MUST BE ARITHMETIC AND IS. Wantzel's shr propagates the sign bit, which is
+// exactly what a carry needs: a negative limb has to carry -1 upward, not a huge positive
+// number. A logical shift here would be a bug, and this is the one place in the file where
+// the arithmetic shift is relied on rather than worked around.
+procedure x.carry(r: array of int);
+var i, c: int;
+begin
+  i := 0;
+  while i < X.LIMBS do
+  begin
+    if band(i, 1) = 0 then
+    begin
+      c := r[i] shr 26;
+      r[i] := r[i] - (c shl 26);
+    end
+    else
+    begin
+      c := r[i] shr 25;
+      r[i] := r[i] - (c shl 25);
+    end;
+    if i < X.LIMBS - 1 then r[i + 1] := r[i + 1] + c
+    else r[0] := r[0] + c * 19;
+    i := i + 1;
+  end;
+  // One more pass across the bottom limb: the fold above may have pushed it over 2^26 again.
+  c := r[0] shr 26;
+  r[0] := r[0] - (c shl 26);
+  r[1] := r[1] + c;
+end;
+
+procedure x.add(r: array of int; a: array of int; b: array of int);
+var i: int;
+begin
+  i := 0;
+  while i < X.LIMBS do begin r[i] := a[i] + b[i]; i := i + 1; end;
+  x.carry(r);
+end;
+
+procedure x.sub(r: array of int; a: array of int; b: array of int);
+var i: int;
+begin
+  i := 0;
+  while i < X.LIMBS do begin r[i] := a[i] - b[i]; i := i + 1; end;
+  x.carry(r);
+end;
+
+// ---- multiplication --------------------------------------------------------------------
+//
+// Schoolbook, then reduce. The 19 coefficients of the product are folded with 2^255 = 19:
+// coefficient i+10 sits 255 bits above coefficient i, so it comes back multiplied by 19.
+//
+// THE ODD-ODD CASE IS DOUBLED, and it is the detail that makes a 25/26 split work at all.
+// Limb i carries weight 2^ceil(25.5*i). When both i and j are odd the weights of the two
+// limbs add up to one bit LESS than the weight of limb i+j, so the product has to be
+// doubled to line up. Getting this wrong gives a result that is wrong by a factor of two
+// in scattered places -- it still looks like a field element, and only the vectors catch it.
+procedure x.mul(r: array of int; a: array of int; b: array of int);
+var i, j, k: int;
+begin
+  i := 0;
+  while i < 19 do begin x.pr[i] := 0; i := i + 1; end;
+  i := 0;
+  while i < X.LIMBS do
+  begin
+    j := 0;
+    while j < X.LIMBS do
+    begin
+      k := a[i] * b[j];
+      if (band(i, 1) = 1) and (band(j, 1) = 1) then k := k * 2;
+      x.pr[i + j] := x.pr[i + j] + k;
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+  i := 0;
+  while i < X.LIMBS do
+  begin
+    // THE TOP COEFFICIENT DOES NOT EXIST, and pretending it does is an out-of-range read.
+    // A product of two ten-limb numbers has 19 coefficients, indices 0..18. For i = 9 the
+    // fold would want index 19; there is nothing there and it contributes nothing.
+    if i + X.LIMBS < 19 then r[i] := x.pr[i] + 19 * x.pr[i + X.LIMBS]
+    else r[i] := x.pr[i];
+    i := i + 1;
+  end;
+  // TWICE. One pass leaves limbs that are inside their width but whose carries have not
+  // settled through the 19-fold; the second pass is what makes the result canonical enough
+  // to multiply again. Measured: with a single pass the RFC vectors fail.
+  x.carry(r);
+  x.carry(r);
+end;
+
+procedure x.sq(r: array of int; a: array of int);
+begin
+  x.mul(r, a, a);
+end;
+
+// Multiply by a small constant that fits in a limb (used for a24 = 121665).
+procedure x.mulsmall(r: array of int; a: array of int; n: int);
+var i: int;
+begin
+  i := 0;
+  while i < X.LIMBS do begin r[i] := a[i] * n; i := i + 1; end;
+  x.carry(r);
+  x.carry(r);
+end;
+
+// ---- inversion -------------------------------------------------------------------------
+//
+// 1/z = z^(p-2) by Fermat, with p-2 = 2^255 - 21. The exponent is a fixed chain of squarings
+// and multiplies -- fixed because it depends only on p, never on the secret, so there is
+// nothing to leak.
+procedure x.invert(r: array of int; z: array of int);
+var i: int;
+begin
+  x.sq(x.t0, z);                       // z^2
+  x.sq(x.t1, x.t0); x.sq(x.t1, x.t1);  // z^8
+  x.mul(x.t1, z, x.t1);                // z^9
+  x.mul(x.t0, x.t0, x.t1);             // z^11
+  x.sq(x.e, x.t0);                     // z^22
+  x.mul(x.t1, x.t1, x.e);              // z^31 = z^(2^5-1)
+  x.copy(x.e, x.t1);
+  i := 0; while i < 5 do begin x.sq(x.e, x.e); i := i + 1; end;
+  x.mul(x.t1, x.e, x.t1);              // z^(2^10-1)
+  x.copy(x.e, x.t1);
+  i := 0; while i < 10 do begin x.sq(x.e, x.e); i := i + 1; end;
+  x.mul(x.e, x.e, x.t1);               // z^(2^20-1)
+  x.copy(x.f, x.e);
+  i := 0; while i < 20 do begin x.sq(x.f, x.f); i := i + 1; end;
+  x.mul(x.e, x.f, x.e);                // z^(2^40-1)
+  i := 0; while i < 10 do begin x.sq(x.e, x.e); i := i + 1; end;
+  x.mul(x.t1, x.e, x.t1);              // z^(2^50-1)
+  x.copy(x.e, x.t1);
+  i := 0; while i < 50 do begin x.sq(x.e, x.e); i := i + 1; end;
+  x.mul(x.e, x.e, x.t1);               // z^(2^100-1)
+  x.copy(x.f, x.e);
+  i := 0; while i < 100 do begin x.sq(x.f, x.f); i := i + 1; end;
+  x.mul(x.e, x.f, x.e);                // z^(2^200-1)
+  i := 0; while i < 50 do begin x.sq(x.e, x.e); i := i + 1; end;
+  x.mul(x.t1, x.e, x.t1);              // z^(2^250-1)
+  i := 0; while i < 5 do begin x.sq(x.t1, x.t1); i := i + 1; end;
+  x.mul(r, x.t1, x.t0);                // z^(2^255-21)
+end;
+
+// ---- encoding --------------------------------------------------------------------------
+
+// 32 little-endian bytes -> ten limbs. Bit 255 is ignored, as RFC 7748 §5 requires: the
+// top bit of a received u-coordinate is masked off rather than rejected.
+procedure x.unpack(r: array of int; b: array of char);
+var i, bit, want, v, got: int;
+begin
+  bit := 0;
+  i := 0;
+  while i < X.LIMBS do
+  begin
+    if band(i, 1) = 0 then want := 26 else want := 25;
+    v := 0;
+    got := 0;
+    while got < want do
+    begin
+      // The bit at position `bit`, taken from the byte that holds it.
+      v := bor(v, band(ord(b[bit shr 3]) shr band(bit, 7), 1) shl got);
+      bit := bit + 1;
+      got := got + 1;
+    end;
+    r[i] := v;
+    i := i + 1;
+  end;
+  // Bit 255 is the 256th and is dropped by construction: 5*26 + 5*25 = 255.
+end;
+
+// Ten limbs -> 32 little-endian bytes, fully reduced.
+//
+// THE FINAL REDUCTION IS THE PART THAT IS EASY TO SKIP. After the ladder a value can be
+// anywhere in [0, 2p), so it may be a legitimate field element that is nonetheless not the
+// canonical representative -- p+3 and 3 are the same number and must encode identically.
+// Adding 19 and checking whether that overflows bit 255 is the standard way to decide.
+procedure x.pack(b: array of char; a: array of int);
+var i, bit, want, v, got, c: int;
+begin
+  x.carry(a);
+  x.carry(a);
+  x.carry(a);
+  // THE CANONICAL REPRESENTATIVE, and getting here is the part that is easy to fake.
+  //
+  // After the ladder a value sits somewhere in [0, 2p). Two different limb patterns can
+  // mean the same field element -- p+3 and 3 are the same number -- and they MUST encode
+  // to the same 32 bytes, or two peers derive byte strings that differ while their
+  // mathematics agrees.
+  //
+  // MEASURED 22-09-2026: an earlier version compared top limbs after adding 19 and looked
+  // plausible; feeding it exactly p produced the encoding of 19 instead of 0. So the test
+  // is now done the explicit way -- add 19, and look at whether that carried out past bit
+  // 255. If it did, the value was at least p and the carried form IS the reduced one.
+  //
+  // The subtraction happens twice because one pass only removes one multiple of p.
+  i := 0;
+  while i < 2 do
+  begin
+    x.copy(x.t0, a);
+    x.t0[0] := x.t0[0] + 19;
+    // Carry WITHOUT the 2^255 = 19 fold, so an overflow past bit 255 stays visible in the
+    // top limb instead of being silently wrapped back into limb 0. That fold is exactly
+    // what hid the overflow before.
+    c := 0;
+    v := 0;
+    while v < X.LIMBS do
+    begin
+      x.t0[v] := x.t0[v] + c;
+      if band(v, 1) = 0 then
+      begin
+        c := x.t0[v] shr 26;
+        x.t0[v] := x.t0[v] - (c shl 26);
+      end
+      else
+      begin
+        c := x.t0[v] shr 25;
+        x.t0[v] := x.t0[v] - (c shl 25);
+      end;
+      v := v + 1;
+    end;
+    // c is now the bit that ran off the top: 1 means a + 19 >= 2^255, i.e. a >= p.
+    if c > 0 then x.copy(a, x.t0);
+    i := i + 1;
+  end;
+  i := 0;
+  while i < 32 do begin b[i] := chr(0); i := i + 1; end;
+  bit := 0;
+  i := 0;
+  while i < X.LIMBS do
+  begin
+    if band(i, 1) = 0 then want := 26 else want := 25;
+    v := a[i];
+    got := 0;
+    while got < want do
+    begin
+      c := band(v shr got, 1);
+      b[bit shr 3] := chr(bor(ord(b[bit shr 3]), c shl band(bit, 7)));
+      bit := bit + 1;
+      got := got + 1;
+    end;
+    i := i + 1;
+  end;
+end;
+
+// ---- the ladder ------------------------------------------------------------------------
+
+// Swap a and b when swap is 1, leave them when it is 0 -- WITHOUT BRANCHING ON swap.
+//
+// This is the routine that keeps the whole thing constant-time. `swap` is a bit of the
+// private scalar; an `if` here would let an observer time the difference and recover the
+// key one bit at a time. The mask turns the condition into arithmetic: 0 - 1 is all ones,
+// 0 - 0 is zero, and xor with a full mask is a swap while xor with zero is a no-op.
+procedure x.cswap(a: array of int; b: array of int; swap: int);
+var i, mask, t: int;
+begin
+  mask := 0 - swap;
+  i := 0;
+  while i < X.LIMBS do
+  begin
+    t := band(bxor(a[i], b[i]), mask);
+    a[i] := bxor(a[i], t);
+    b[i] := bxor(b[i], t);
+    i := i + 1;
+  end;
+end;
+
+// The Montgomery ladder of RFC 7748 §5: out = scalar * point, both 32 bytes.
+//
+// CLAMPING IS NOT OPTIONAL AND NOT COSMETIC. The low three bits are cleared so the scalar
+// is a multiple of the cofactor 8, which kills small-subgroup attacks; bit 255 is cleared
+// and bit 254 set so the scalar has a fixed bit length, which is what makes a fixed number
+// of ladder steps constant-time. RFC 7748 §5 spells it out, and an implementation that
+// skips it gets the right answer for some keys and the wrong one for others -- the worst
+// possible failure, because it looks like it works.
+procedure x.scalarmult(out: array of char; scalar: array of char; point: array of char);
+var i, bit, swap, k: int;
+begin
+  i := 0;
+  while i < 32 do begin x.sc[i] := scalar[i]; i := i + 1; end;
+  x.sc[0]  := chr(band(ord(x.sc[0]), 248));
+  x.sc[31] := chr(band(ord(x.sc[31]), 127));
+  x.sc[31] := chr(bor(ord(x.sc[31]), 64));
+
+  x.unpack(x.px, point);
+
+  x.one(x.a);          // x2 = 1
+  x.zero(x.b);         // z2 = 0
+  x.copy(x.c, x.px);   // x3 = u
+  x.one(x.d);          // z3 = 1
+
+  swap := 0;
+  bit := 254;
+  while bit >= 0 do
+  begin
+    k := band(ord(x.sc[bit shr 3]) shr band(bit, 7), 1);
+    swap := bxor(swap, k);
+    x.cswap(x.a, x.c, swap);
+    x.cswap(x.b, x.d, swap);
+    swap := k;
+
+    // THE NAMES ARE THE RFC'S, AND THE ORDER MATTERS. RFC 7748 §5 defines
+    //   A = x2 + z2,  B = x2 - z2,  C = x3 + z3,  D = x3 - z3,  E = AA - BB
+    // and swapping A with B is not a harmless relabelling. Written the wrong way round the
+    // ladder stays SELF-CONSISTENT -- both peers still agree on a shared secret and
+    // clamping still normalises -- so the structural checks all pass while every RFC vector
+    // fails. Measured 22-09-2026: that exact combination, and it survived one attempt to
+    // "fix" it by flipping E instead, which only made the agreement fail too.
+    x.add(x.e, x.a, x.b);      // A = x2 + z2
+    x.sub(x.f, x.a, x.b);      // B = x2 - z2
+    x.add(x.g, x.c, x.d);      // C = x3 + z3
+    x.sub(x.h, x.c, x.d);      // D = x3 - z3
+    x.mul(x.h, x.h, x.e);      // DA = D * A
+    x.mul(x.g, x.g, x.f);      // CB = C * B
+    x.add(x.c, x.h, x.g);      // x3 = (DA + CB)^2
+    x.sq(x.c, x.c);
+    x.sub(x.d, x.h, x.g);      // z3 = u * (DA - CB)^2
+    x.sq(x.d, x.d);
+    x.mul(x.d, x.d, x.px);
+    x.sq(x.t0, x.e);           // AA = A^2
+    x.sq(x.t1, x.f);           // BB = B^2
+    x.mul(x.a, x.t0, x.t1);    // x2 = AA * BB
+    x.sub(x.t1, x.t0, x.t1);   // E = AA - BB
+    x.mulsmall(x.b, x.t1, 121665);   // a24 * E
+    x.add(x.b, x.b, x.t0);           // AA + a24 * E
+    x.mul(x.b, x.b, x.t1);           // z2 = E * (AA + a24 * E)
+
+    bit := bit - 1;
+  end;
+  x.cswap(x.a, x.c, swap);
+  x.cswap(x.b, x.d, swap);
+
+  x.invert(x.t0, x.b);
+  x.mul(x.a, x.a, x.t0);
+  x.pack(out, x.a);
+end;
+
+// The public key for a private scalar: scalarmult against the base point u = 9.
+procedure x.base(out: array of char; scalar: array of char);
+var i: int;
+    nine: array[0..31] of char;
+begin
+  i := 0;
+  while i < 32 do begin nine[i] := chr(0); i := i + 1; end;
+  nine[0] := chr(9);
+  x.scalarmult(out, scalar, nine);
+end;

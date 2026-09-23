@@ -1,5 +1,9 @@
 // lib/base64.wz -- base64 encoding and decoding (RFC 4648).
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 // Two alphabets: the standard one ("+/", with '=' padding) and the URL-safe
 // one ("-_", without padding, as PKCE and JWT use it).  The decoder accepts
 // both, padded or not.  Nothing is skipped: whitespace or any other byte

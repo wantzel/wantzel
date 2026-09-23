@@ -1,0 +1,8 @@
+ok   a line opens with a timestamp
+ok   and a number follows it
+ok   an int field goes in as a number
+ok   and a str field between quotes
+ok   log.kv records that fields are present
+ok   a quote in a value is escaped
+ok   and so does NOT appear bare
+ok   and a quote in a KEY too

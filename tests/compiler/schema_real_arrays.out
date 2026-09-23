@@ -19,6 +19,12 @@ missing required = -1
 too many points = -1
 name too long = -1
 string for real = -1
-undeclared key = -1
-  refused key = extra
+undeclared key = 66
+  ignored key = extra count = 1
+  name after skip = x
+two undeclared = 62
+  ignored key = aaa count = 2
+undeclared plus bad type = -1
+clean again = 46
+  count = 0
 {"type":"object","properties":{"name":{"type":"string","maxLength":16,"description":"a short name"},"value":{"type":"number"},"count":{"type":"integer"},"flags":{"type":"array","items":{"type":"boolean"},"maxItems":4},"points":{"type":"array","items":{"type":"number"},"maxItems":10},"keys":{"type":"array","items":{"type":"string","maxLength":8},"maxItems":4},"note":{"type":"string","description":"free text"}},"required":["name","value","points","keys"]}

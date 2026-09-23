@@ -1,0 +1,10 @@
+// Must not compile: two files declaring the same global without `local` collide.
+//
+// THIS IS THE FAILURE `local` PREVENTS, pinned down so it cannot quietly change. A library
+// writer hits it the moment a second file wants a scratch variable of its own -- and the
+// message names the file and line of the SECOND declaration, which is the one to fix.
+include "progs/dup_helper_a.wz";
+include "progs/dup_helper_b.wz";
+begin
+  scratch.i := 1;
+end.

@@ -1,0 +1,92 @@
+// localhttps.wz -- HTTPS on 127.0.0.1, with a certificate this program makes itself.
+//
+//   localhttps <port>
+//
+// WHAT THIS DEMONSTRATES: the "1. Localhost" case in docs/howto.md. There is
+// no VPS, no public name and no Let's Encrypt here -- an authority cannot issue a
+// certificate for a name that everyone owns and nobody can prove control of. So the program
+// makes its own key and its own certificate, ten years out because there is no authority to
+// re-check anything, and serves HTTPS with it.
+//
+// ONE CONNECTION AT A TIME, on purpose. This is the smallest possible proof that
+// tls.setcert and tls.accept work end to end -- self-sign a certificate, hand it to the TLS
+// layer, and complete a real handshake -- without the multi-connection plumbing that
+// examples/serve.wz needs for a public listener. Fetch it, look at it, and it closes.
+//
+// BROWSERS WILL WARN, and the warning is correct: nothing vouches for this certificate.
+// A client told to trust this exact certificate (curl --cacert, for instance) is fine.
+
+include "io.wz";
+include "net.wz";
+include "csr.wz";
+include "tls.wz";
+
+const
+  BACKLOG = 16;
+  MAXBUF  = 4096;
+
+var
+  port: int;
+  lfd, fd, n: int;
+  cert.d:  array[0..P.N-1] of int;
+  cert.qx: array[0..P.N-1] of int;
+  cert.qy: array[0..P.N-1] of int;
+  host: array[0..63] of char;
+  hostn: int;
+  buf: array[0..MAXBUF-1] of char;
+  reply: str;
+
+procedure die(m: str);
+begin
+  io.puts(STDERR, "localhttps: ");
+  io.puts(STDERR, m);
+  io.puts(STDERR, "\n");
+  halt(1);
+end;
+
+begin
+  if argc() < 2 then die("usage: localhttps <port>");
+  port := io.argn(1);
+
+  p256.setup;
+  hostn := io.push(host, 0, "localhost");
+
+  // A FRESH KEY EVERY RUN. There is no reason to persist it: the certificate is only ever
+  // trusted by a client that was told to, and that client can be told again.
+  if not p256.genkey(cert.d, cert.qx, cert.qy) then die("could not generate a key");
+
+  // TEN YEARS. Renewal exists to satisfy an authority that is re-checking control of a
+  // name; nothing here is re-checking anything, so an expiry would only produce an outage
+  // on a machine talking to itself.
+  csr.setvalidity(io.realtime div 1000000000, 10);
+  if not csr.selfsign(host, hostn, cert.d, cert.qx, cert.qy) then die("could not make a certificate");
+  if not tls.setcert(csr.buf, csr.n, cert.d) then die("could not load the certificate we just made");
+
+  lfd := net.listen(port, BACKLOG, false);
+  if lfd < 0 then die("cannot listen");
+  io.puts(STDOUT, "listening on https://127.0.0.1:");
+  io.putn(STDOUT, port);
+  io.puts(STDOUT, "/ with a self-signed certificate\n");
+
+  while true do
+  begin
+    fd := net.accept(lfd);
+    if fd >= 0 then
+    begin
+      if tls.accept(fd) then
+      begin
+        // THE REQUEST IS READ AND DISCARDED. This example answers every request the same
+        // way regardless of method or path -- the point is the handshake, not routing.
+        n := tls.read(buf, MAXBUF);
+        if n > 0 then
+        begin
+          reply := "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 31\r\nConnection: close\r\n\r\nserved over locally-signed TLS\n";
+          n := io.push(buf, 0, reply);
+          if not tls.write(buf, n) then ;
+        end;
+      end;
+      tls.close;
+      net.close(fd);
+    end;
+  end;
+end.

@@ -23,8 +23,31 @@ include "compiler.wz";
 // point is exactly what would break quietly while that happened. A host that must survive
 // a failed compile calls this in a fork: the child may halt, the parent reads its exit
 // code. fork, shared descriptors and waiting are all measured -- see
-// docs/internals/what-the-system-can-already-do.md.
+// docs/design.md.
+// libhere -- is there a readable io.wz in the library directory?
+//
+// io.wz IS THE PROBE because every program that includes anything includes it, so its
+// absence is what the user will hit first. Opening one file is cheaper than listing a
+// directory and needs no readdir.
+function libhere: bool;
+var fd, n: int;
+begin
+  n := libdirlen;
+  if n <= 0 then return false;
+  if n + 6 >= len(libdir) then return false;
+  libdir[n] := 'i'; libdir[n + 1] := 'o'; libdir[n + 2] := '.';
+  libdir[n + 3] := 'w'; libdir[n + 4] := 'z'; libdir[n + 5] := chr(0);
+  fd := opn(addr(libdir[0]), 0, 0);
+  // THE PROBE IS UNDONE, always: libdir is the real search path and a stray "io.wz" on the
+  // end of it would break every include after this.
+  libdir[n] := chr(0);
+  if fd < 0 then return false;
+  cls(fd);
+  return true;
+end;
+
 procedure wzmain;
+var ai: int;
 begin
   // --version before the argument count check: asking a compiler what it is should not
   // require giving it a source file and an output name.
@@ -35,6 +58,27 @@ begin
       wrs(1, "wantzel ");
       wrs(1, VERSION);
       wrs(1, "\n");
+      // AND WHERE THE LIBRARY IS, because that is the one thing about an installation a
+      // user cannot look up and the one that breaks it. Since the standard library moved
+      // to disk, a compiler copied WITHOUT its lib/ beside it fails on `include "io.wz"`
+      // -- and the honest answer to "is my install right?" is the path itself, not a
+      // sentence about where it ought to be.
+      //
+      // IT REPORTS, IT DOES NOT CONFIGURE. There is deliberately no flag to point the
+      // include path somewhere else (docs/flags.md); printing where it already looks
+      // takes nothing away from that.
+      setlibdir;
+      wrs(1, "library ");
+      if libdirlen > 0 then
+      begin
+        wrbuf(1, addr(libdir[0]), libdirlen);
+        // AND WHETHER IT IS ACTUALLY THERE. A path alone still leaves the user guessing:
+        // the broken case prints a perfectly plausible directory that does not exist.
+        // Saying so turns "where should it be?" into "it is not where it should be".
+        if not libhere then wrs(1, "   NOT FOUND -- copy lib/ next to the compiler");
+      end
+      else wrs(1, "(unknown -- the compiler could not find its own path)");
+      wrs(1, "\n");
       halt(0);
     end;
   end;
@@ -44,13 +88,13 @@ begin
     wrs(2, VERSION);
     wrs(2, " -- a compiler for code that AI writes: strict, dependency-free, extremely fast.\n");
     wrs(2, "Copyright (c) 2026 Floris Knol.  MIT licence.  https://github.com/wantzel/wantzel\n\n");
-    wrs(2, "usage: wantzel <source.wz> <executable> [--target=linux|windows]\n");
+    wrs(2, "usage: wantzel <source.wz> <executable> [--target=linux|windows] [--debug]\n");
     wrs(2, "       wantzel --version\n");
     halt(1);
   end;
-  if argc() > 4 then
+  if argc() > 5 then
   begin
-    wrs(2, "usage: wantzel <source.wz> <executable> [--target=linux|windows]\n");
+    wrs(2, "usage: wantzel <source.wz> <executable> [--target=linux|windows] [--debug]\n");
     halt(1);
   end;
   mi := 0;
@@ -82,15 +126,22 @@ begin
   // contradict each other, and saying so costs nothing.
   winmode := 0;
   tgiven := false;
-  if argc() = 4 then
+  dbgmode := 0;
+  // The options, in any order after the two names: --target= and --debug. The latter
+  // writes the sidecar <executable>.wzdbg and changes nothing in the executable itself;
+  // see docs/design.md.
+  ai := 3;
+  while ai < argc() do
   begin
-    if argeq(3, "--target=windows") or argeq(3, "-twindows") then begin winmode := 1; tgiven := true; end
-    else if argeq(3, "--target=linux") or argeq(3, "-tlinux") then begin winmode := 0; tgiven := true; end
+    if argeq(ai, "--target=windows") or argeq(ai, "-twindows") then begin winmode := 1; tgiven := true; end
+    else if argeq(ai, "--target=linux") or argeq(ai, "-tlinux") then begin winmode := 0; tgiven := true; end
+    else if argeq(ai, "--debug") then dbgmode := 1
     else
     begin
-      wrs(2, "wantzel: unknown option (use --target=linux or --target=windows)\n");
+      wrs(2, "wantzel: unknown option (use --target=linux, --target=windows or --debug)\n");
       halt(1);
     end;
+    ai := ai + 1;
   end;
   if (not tgiven) and (mi >= 4) then
   begin

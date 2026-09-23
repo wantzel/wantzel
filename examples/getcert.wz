@@ -1,0 +1,483 @@
+// getcert.wz -- obtain a certificate from an ACME authority, and serve the challenge.
+//
+//   getcert <dir-ip-a.b.c.d> <dir-port> <listen-port> <hostname> [email]
+//
+// One program, one run: it makes a key, asks for a certificate, answers the challenge from
+// its own listener, and writes the certificate out. Nothing else is installed, nothing else
+// runs, no certbot and no cron.
+//
+// WHY THE CHALLENGE IS ANSWERED FROM THE SAME PROCESS. The authority fetches
+//     http://<host>/.well-known/acme-challenge/<token>
+// while the order is pending, so something has to be listening on port 80 at that moment.
+// The usual arrangement is a web server plus a separate ACME client plus a shared directory
+// for the token -- three things that can each be misconfigured. Here it is one accept loop
+// that answers the challenge and nothing else, which is the shape a long-running service
+// would use too: the listener it already has serves the token.
+//
+// PLAIN HTTP TO THE AUTHORITY IN THIS EXAMPLE. A real authority is reached over HTTPS, and
+// lib/tls.wz does that -- but the test fixture runs plain, and mixing the two in one example
+// would obscure the protocol. The one line that changes is the transport.
+//
+// THE ACCOUNT KEY AND THE CERTIFICATE KEY ARE DIFFERENT KEYS. The account key signs requests
+// to the authority; the certificate key is what the certificate is for. Using one key for
+// both works and is a bad habit: rotating either then means rotating both.
+
+include "io.wz";
+include "net.wz";
+include "acme.wz";
+include "proc.wz";
+
+const
+  GC.MAXREP = 8192;
+
+var
+  dirip: array[0..3] of int;
+  dirport, listenport: int;
+  host:  array[0..255] of char;
+  hostn: int;
+  email: array[0..255] of char;
+  emailn: int;
+
+  // the account key, and the key the certificate will be for
+  acct.d, acct.qx, acct.qy: array[0..P.N-1] of int;
+  cert.d, cert.qx, cert.qy: array[0..P.N-1] of int;
+
+  rep:   array[0..GC.MAXREP-1] of char;
+  repn:  int;
+  bodyat: int;
+  status: int;
+
+  keyauth: array[0..255] of char;
+  keyauthb: array[0..255] of char;
+  keyauthn: int;
+
+  lfd, fd, i, n: int;
+  certpath: array[0..511] of char;
+  certn: int;
+  ts: array[0..15] of char;
+
+procedure nap(ns: int);
+var k: int;
+begin
+  k := 0;
+  while k < 16 do begin ts[k] := chr(0); k := k + 1; end;
+  k := 8;
+  while k < 16 do begin ts[k] := chr(band(ns, 255)); ns := ns shr 8; k := k + 1; end;
+  sys2(SYS.nanosleep, addr(ts[0]), 0);
+end;
+
+procedure die(m: str);
+begin
+  io.puts(STDERR, "getcert: ");
+  io.puts(STDERR, m);
+  if slen(acme.err) > 0 then
+  begin
+    io.puts(STDERR, ": ");
+    io.puts(STDERR, acme.err);
+  end;
+  io.puts(STDERR, "\n");
+  halt(1);
+end;
+
+// ---- the pieces the main flow needs ------------------------------------------------------
+
+var
+  url:  array[0..255] of char;
+  urln: int;
+
+// The dotted address in argument k, as four octets.
+procedure parseip(k: int);
+var j, v, o: int;
+    c: char;
+begin
+  j := 0; o := 0; v := 0;
+  c := argch(k, j);
+  while (c <> chr(0)) and (o < 4) do
+  begin
+    if (c >= '0') and (c <= '9') then v := v * 10 + (ord(c) - ord('0'))
+    else if c = '.' then begin dirip[o] := v; o := o + 1; v := 0; end;
+    j := j + 1;
+    c := argch(k, j);
+  end;
+  if o < 4 then dirip[o] := v;
+end;
+
+// THE PATH OUT OF AN ABSOLUTE URL. The authority returns full URLs; this example talks to
+// one host, so only the path is needed -- and taking it rather than reconnecting by name is
+// what keeps the example free of a DNS resolver.
+function pathof(u: array of char; n: int; dst: array of char): int;
+var i, slashes, m: int;
+begin
+  i := 0;
+  slashes := 0;
+  while (i < n) and (slashes < 3) do
+  begin
+    if u[i] = '/' then slashes := slashes + 1;
+    i := i + 1;
+  end;
+  if slashes < 3 then
+  begin
+    // Not absolute: use it as-is.
+    m := 0;
+    while m < n do begin dst[m] := u[m]; m := m + 1; end;
+    return n;
+  end;
+  m := 0;
+  dst[m] := '/';
+  m := 1;
+  while i < n do begin dst[m] := u[i]; m := m + 1; i := i + 1; end;
+  return m;
+end;
+
+// ---- one HTTP request to the authority -----------------------------------------------------
+//
+// The whole reply is read, headers and all, because the Replay-Nonce is in a header and the
+// body is JSON. Connection: close makes the end of the body the end of the connection, so
+// there is no length to parse.
+//
+// url is given as a path here; the fixture and a real authority both return absolute URLs,
+// and taking only the path works because this example talks to one host.
+function request(path: array of char; pathn: int; body: array of char; bodyn: int): bool;
+var fd, n, i, got, tries: int;
+    req: array[0..4095] of char;
+begin
+  fd := net.connect(dirip[0], dirip[1], dirip[2], dirip[3], dirport);
+  if fd < 0 then return false;
+  if bodyn > 0 then n := io.push(req, 0, "POST ")
+  else n := io.push(req, 0, "GET ");
+  i := 0;
+  while i < pathn do begin req[n] := path[i]; n := n + 1; i := i + 1; end;
+  n := io.push(req, n, " HTTP/1.0\r\nHost: acme\r\nConnection: close\r\n");
+  if bodyn > 0 then
+  begin
+    n := io.push(req, n, "Content-Type: application/jose+json\r\nContent-Length: ");
+    n := io.pushnum(req, n, bodyn);
+    n := io.push(req, n, "\r\n");
+  end;
+  n := io.push(req, n, "\r\n");
+  i := 0;
+  while i < bodyn do begin req[n] := body[i]; n := n + 1; i := i + 1; end;
+
+  i := 0; tries := 0;
+  while (i < n) and (tries < 200000) do
+  begin
+    got := net.send(fd, addr(req[i]), n - i);
+    if got > 0 then begin i := i + got; tries := 0; end
+    else if got = EAGAIN then tries := tries + 1
+    else begin net.close(fd); return false; end;
+  end;
+
+  repn := 0; tries := 0;
+  while (repn < GC.MAXREP - 8) and (tries < 400000) do
+  begin
+    n := net.recv(fd, addr(rep[repn]), GC.MAXREP - 8 - repn);
+    if n > 0 then begin repn := repn + n; tries := 0; end
+    else if n = EAGAIN then tries := tries + 1
+    else break;
+  end;
+  net.close(fd);
+  if repn = 0 then return false;
+
+  // status and body position
+  status := 0;
+  if repn > 12 then
+    status := (ord(rep[9]) - ord('0')) * 100 + (ord(rep[10]) - ord('0')) * 10
+              + (ord(rep[11]) - ord('0'));
+  bodyat := 0;
+  i := 0;
+  while i + 3 < repn do
+  begin
+    if (rep[i] = chr(13)) and (rep[i+1] = chr(10))
+       and (rep[i+2] = chr(13)) and (rep[i+3] = chr(10)) then
+    begin
+      bodyat := i + 4;
+      i := repn;
+    end
+    else i := i + 1;
+  end;
+  // A NONCE IN EVERY REPLY, and a missing one is not fatal here: the next request simply
+  // reuses the previous, which the authority rejects with badNonce and a fresh nonce.
+  if acme.readnonce(rep, repn) then status := status;
+  return bodyat > 0;
+end;
+
+// The decoded body of the last reply, as a view.
+function replybody: int;
+begin
+  return repn - bodyat;
+end;
+
+// Sign acme.body and POST it to the given URL. kid selects the header shape: empty means the
+// jwk form, which only the account-creation request uses.
+function signpost(u: array of char; un: int; kidmode: str): bool;
+var i: int;
+begin
+  urln := pathof(u, un, url);
+  // JWS SIGNS THE URL AS THE AUTHORITY WROTE IT, not the path we connect to -- the url
+  // member of the protected header is checked, so it has to be the absolute form.
+  jws.setnonce(acme.nonce, acme.noncen);
+  jws.setkid(acme.kid, acme.kidn);
+  if not jws.signb(u, un, acme.body, acme.bodyn, slen(kidmode) > 0) then return false;
+  return request(url, urln, jws.buf, jws.n);
+end;
+
+// The Location header of the last reply.
+function findlocation(dst: array of char; max: int): int;
+var i, j, k, n: int;
+begin
+  i := 0;
+  while i + 9 < bodyat do
+  begin
+    if (i = 0) or (rep[i - 1] = chr(10)) then
+    begin
+      j := 0;
+      while (j < 9) and (acme.lower(rep[i + j]) = ord(schar("location:", j))) do j := j + 1;
+      if j = 9 then
+      begin
+        k := i + 9;
+        while (k < bodyat) and (rep[k] = ' ') do k := k + 1;
+        n := 0;
+        while (k < bodyat) and (rep[k] <> chr(13)) and (rep[k] <> chr(10)) and (n < max) do
+        begin
+          dst[n] := rep[k];
+          n := n + 1;
+          k := k + 1;
+        end;
+        return n;
+      end;
+    end;
+    i := i + 1;
+  end;
+  return 0 - 1;
+end;
+
+// The key authorization for the token the authority handed us.
+function buildkeyauth: int;
+begin
+  return jws.keyauthb(keyauth, 0, acme.token, acme.tokenn, acct.qx, acct.qy);
+end;
+
+// ---- serving the challenge -------------------------------------------------------------------
+//
+// One accept, one answer. The authority fetches the token once while the order is pending,
+// so a single-shot listener is enough here -- a long-running service would answer it from
+// the listener it already has.
+function servechallenge: bool;
+var fd, n, tries, i, sent: int;
+    buf: array[0..2047] of char;
+begin
+  // HOW LONG TO WAIT FOR THE AUTHORITY TO COME LOOKING, in milliseconds. Ten seconds is
+  // ample: a real authority fetches within a second or two of accepting the challenge, and
+  // waiting longer only delays the answer when something is wrong.
+  tries := 0;
+  while tries < 10000 do
+  begin
+    fd := net.accept(lfd);
+    if fd < 0 then begin nap(1000000); tries := tries + 1; end
+    else
+    begin
+      // Read the request; what it asks for is not examined, because this listener exists for
+      // exactly one path during exactly one order.
+      n := 0 - 1;
+      i := 0;
+      while (n < 0) and (i < 10000) do
+      begin
+        n := net.recv(fd, addr(buf[0]), 2048);
+        if n < 0 then begin nap(100000); i := i + 1; end;
+      end;
+      n := io.push(buf, 0, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ");
+      n := io.pushnum(buf, n, keyauthn);
+      n := io.push(buf, n, "\r\nConnection: close\r\n\r\n");
+      i := 0;
+      while i < keyauthn do begin buf[n] := keyauth[i]; n := n + 1; i := i + 1; end;
+      // A SHORT WRITE IS NORMAL on a non-blocking socket, and a send that returns -EAGAIN
+      // must not be added to the position -- that would walk the buffer backwards.
+      i := 0;
+      tries := 0;
+      while (i < n) and (tries < 100000) do
+      begin
+        sent := net.send(fd, addr(buf[i]), n - i);
+        if sent > 0 then begin i := i + sent; tries := 0; end
+        else if sent = EAGAIN then tries := tries + 1
+        else break;
+      end;
+      net.close(fd);
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// Tell the authority the token is in place, and answer its fetch WHILE THAT POST IS IN
+// FLIGHT. Those two things overlap, and that is the whole difficulty of http-01.
+//
+// A FORK, BECAUSE ONE THREAD CANNOT DO BOTH. The authority fetches the token before it
+// answers the POST, so a client that posts first and listens afterwards deadlocks: it is
+// blocked reading a reply that will never come, while the fetch it should be answering
+// times out. The first version of this example did exactly that.
+//
+// So the child serves the challenge and the parent posts. The listening socket was bound
+// before the fork, so both hold it and the child's accept is on a socket that is already
+// up -- no window where the port is unbound.
+//
+// A THREAD WOULD DO AS WELL and there are none; a state machine in one event loop would do
+// better still, and that is what a long-running service should use (its listener is already
+// there). For a program that runs once and exits, a fork is the smaller thing.
+function startvalidation: bool;
+var pid, ok: int;
+begin
+  pid := proc.fork;
+  if pid = 0 then
+  begin
+    // The child: answer exactly one fetch and leave. It must not return into the parent's
+    // flow, so it exits rather than returning.
+    if servechallenge then halt(0);
+    halt(1);
+  end;
+  if pid < 0 then
+  begin
+    acme.fail("cannot fork to serve the challenge");
+    return false;
+  end;
+  ok := 0;
+  if signpost(acme.chal, acme.chaln, "kid") then ok := 1;
+  // REAP THE CHILD, or it stays a zombie for as long as this process lives. Here that is
+  // seconds, but the habit belongs with the fork.
+  if proc.wait(pid) >= 0 then pid := pid;
+  return ok = 1;
+end;
+
+begin
+  if argc() < 5 then
+  begin
+    io.puts(STDERR, "usage: getcert <dir-ip> <dir-port> <listen-port> <hostname> [email]\n");
+    io.puts(STDERR, "   eg: getcert 127.0.0.1 14000 8080 example.com floris@wantzel.com\n");
+    halt(1);
+  end;
+  p256.setup;
+
+  // ---- the arguments ----
+  parseip(1);
+  dirport := io.argn(2);
+  listenport := io.argn(3);
+  hostn := io.argstr(4, host);
+  emailn := 0;
+  if argc() > 5 then emailn := io.argstr(5, email);
+  if (dirport = 0) or (listenport = 0) or (hostn = 0) then die("bad arguments");
+
+  // ---- two keys, and they are deliberately different ----
+  if not p256.genkey(acct.d, acct.qx, acct.qy) then die("cannot make an account key");
+  if not p256.genkey(cert.d, cert.qx, cert.qy) then die("cannot make a certificate key");
+  jws.setkey(acct.d, acct.qx, acct.qy);
+
+  // ---- the listener goes up BEFORE the order ----
+  //
+  // The authority fetches the token while the order is pending, and it may do so the instant
+  // the challenge is accepted. Binding afterwards is a race that fails intermittently, which
+  // is the worst way for this to break.
+  lfd := net.listen(listenport, 8, false);
+  if lfd < 0 then die("cannot listen for the challenge");
+
+  // ---- 1. the directory ----
+  urln := io.push(url, 0, "/directory");
+  if not request(url, urln, url, 0) then die("cannot reach the authority");
+  if not acme.readdir(view(addr(rep[bodyat]), replybody), replybody) then
+    die("the directory does not parse");
+
+  // ---- 2. a nonce ----
+  urln := io.push(url, 0, "/new-nonce");
+  if not request(url, urln, url, 0) then die("cannot get a nonce");
+  if acme.noncen = 0 then die("the authority sent no nonce");
+
+  // ---- 3. the account ----
+  acme.acctbody(email, emailn);
+  if not signpost(acme.newacct, acme.newacctn, "") then die("cannot create an account");
+  if (status <> 200) and (status <> 201) then die("the account was refused");
+  // The account URL comes back in Location, and every later request is signed with it as
+  // "kid" rather than carrying the key again.
+  acme.kidn := findlocation(acme.kid, ACME.MAXURL);
+  if acme.kidn <= 0 then die("no account URL came back");
+
+  // ---- 4. the order ----
+  acme.orderbody(host, hostn);
+  if not signpost(acme.neworder, acme.newordern, "kid") then die("cannot place an order");
+  if (status <> 200) and (status <> 201) then die("the order was refused");
+  if not acme.readorder(view(addr(rep[bodyat]), replybody), replybody) then
+    die("the order does not parse");
+
+  // ---- 5. the authorization, and the challenge it offers ----
+  acme.bodyn := 0;
+  if not signpost(acme.authz, acme.authzn, "kid") then die("cannot read the authorization");
+  if not acme.readauthz(view(addr(rep[bodyat]), replybody), replybody) then
+    die("no usable challenge");
+
+  // ---- 6. publish the token, THEN tell the authority to look ----
+  // THE TOKEN IS BUILT BEFORE THE FORK, so the child already has it: after a fork the two
+  // processes share nothing, and a child computing it afterwards would serve a different
+  // answer than the parent expects.
+  keyauthn := buildkeyauth;
+  if keyauthn <= 0 then die("cannot build the key authorization");
+  io.puts(STDOUT, "challenge ready\n");
+
+  // The POST that tells the authority to validate is sent FIRST and the listener answers
+  // while it is in flight -- so the token must already be in keyauth, which it is.
+  acme.bodyn := io.push(acme.body, 0, "{}");
+  if not startvalidation then die("cannot start validation");
+
+  if not acme.readstatus(view(addr(rep[bodyat]), replybody), replybody) then
+    die("the challenge was not accepted");
+
+  // ---- 7. finalize with a CSR for the certificate key ----
+  if not acme.csrbody(cert.d, cert.qx, cert.qy, host, hostn) then die("cannot build the CSR");
+  if not signpost(acme.finalize, acme.finalizen, "kid") then die("cannot finalize");
+  if status <> 200 then die("finalize was refused");
+  if not acme.readorder(view(addr(rep[bodyat]), replybody), replybody) then
+    die("the finalized order does not parse");
+  if acme.certurln <= 0 then die("no certificate URL came back");
+
+  // ---- 8. download ----
+  acme.bodyn := 0;
+  if not signpost(acme.certurl, acme.certurln, "kid") then die("cannot download the certificate");
+  if status <> 200 then die("the certificate download was refused");
+
+  // THE CERTIFICATE GOES TO A FILE, NOT TO STDOUT. It is DER -- arbitrary bytes including
+  // nulls and newlines -- and a shell that captures stdout mangles it: trailing newlines are
+  // stripped and the result no longer parses. Measured: openssl reported "Could not read
+  // certificate" on output that was perfectly correct coming out of the program.
+  //
+  // Named after the hostname, so two runs do not overwrite each other.
+  certn := 0;
+  while certn < hostn do begin certpath[certn] := host[certn]; certn := certn + 1; end;
+  certn := io.push(certpath, certn, ".der");
+  certpath[certn] := chr(0);
+  fd := sys3(SYS.open, addr(certpath[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 384);
+  if fd < 0 then die("cannot write the certificate");
+  if sys3(SYS.write, fd, addr(rep[bodyat]), replybody) <> replybody then
+    die("the certificate was not written completely");
+  sys1(SYS.close, fd);
+
+  // THE PUBLIC KEY WE ASKED FOR, printed so a test can check the certificate carries it.
+  // Without this the suite cannot tell a certificate issued for OUR key from one issued for
+  // any other valid P-256 key -- and an authority getting that wrong hands out a certificate
+  // whose private half we do not hold, which fails only at the first handshake.
+  p256.tobytes(certpath, 0, cert.qx);
+  io.puts(STDOUT, "PUBKEY ");
+  i := 0;
+  while i < 32 do
+  begin
+    n := ord(certpath[i]) shr 4;
+    if n < 10 then io.out(STDOUT, sadr("0123456789") + n, 1)
+    else io.out(STDOUT, sadr("abcdef") + n - 10, 1);
+    n := band(ord(certpath[i]), 15);
+    if n < 10 then io.out(STDOUT, sadr("0123456789") + n, 1)
+    else io.out(STDOUT, sadr("abcdef") + n - 10, 1);
+    i := i + 1;
+  end;
+  io.puts(STDOUT, "\n");
+
+  io.puts(STDOUT, "CERTIFICATE ");
+  io.putn(STDOUT, replybody);
+  io.puts(STDOUT, " bytes -> ");
+  io.out(STDOUT, addr(certpath[0]), certn);
+  io.puts(STDOUT, "\n");
+end.

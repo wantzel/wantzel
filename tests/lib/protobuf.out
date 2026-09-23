@@ -1,0 +1,26 @@
+ok   varint 0xAC 0x02 is 300
+ok   and it consumed two bytes
+ok   a one-byte varint
+ok   consumes one byte
+ok   and zero encodes as a single zero byte
+ok   a varint that runs off the end is refused
+ok   and pb.err says so
+ok   tag 0x08 is field 1
+ok   with wire type VARINT
+ok   and the value follows
+ok   tag 0x12 is field 2
+ok   with wire type LEN
+ok   the payload starts after the length
+ok   and ends where the field ends
+ok   and the field consumed everything
+ok   a length past the end of the buffer is refused
+ok   and that is flagged too
+ok   zigzag 0 is 0
+ok   zigzag 1 is -1
+ok   zigzag 2 is 1
+ok   zigzag 3 is -2
+ok   and the largest positive 32-bit value
+ok   and the smallest negative one
+ok   0xFFFFFFFF reads as -1
+ok   and 0x7FFFFFFF stays positive
+ok   a small value is untouched

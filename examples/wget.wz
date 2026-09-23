@@ -1,0 +1,361 @@
+// wget.wz -- fetch a URL over HTTP or HTTPS, and print it.
+//
+//   wget https://93.184.216.34/ example.com     the page, to stdout
+//   wget http://127.0.0.1:8080/hello            plain HTTP, no encryption
+//   wget https://10.0.0.1/ host.example --insecure
+//
+// THE ADDRESS IS NUMERIC AND THE HOSTNAME IS SEPARATE, which is unusual and deliberate:
+// there is no DNS resolver in lib/, because DNS is its own protocol over UDP and belongs in
+// its own file rather than inside a connect. So the URL carries the address to dial, and the
+// second argument is the name the certificate has to match. For a real client the two would
+// come from one hostname and a lookup.
+//
+// WHAT THIS DEMONSTRATES, and it is the reason the example exists: a static binary of a
+// couple of hundred kilobytes speaks TLS 1.3 to any modern server. No OpenSSL, no libcurl,
+// nothing installed, no shared library to find at startup. Every layer underneath -- the
+// cipher, the key exchange, the certificate parsing, the signature check -- is in this
+// repository and was measured against another implementation.
+//
+// IT REPORTS WHETHER THE CERTIFICATE WAS VERIFIED, and refuses to continue when it was not
+// unless --insecure is given. A tool that quietly accepts anything is worse than one with no
+// encryption at all, because it looks safe.
+
+include "io.wz";
+include "net.wz";
+include "tls.wz";
+
+const
+  MAXBODY = 1048576;
+
+var
+  url:   array[0..1023] of char;
+  host:  array[0..255] of char;
+  hostn: int;
+  path:  array[0..1023] of char;
+  pathn: int;
+  req:   array[0..2047] of char;
+  body:  array[0..MAXBODY-1] of char;
+  bodyn: int;
+  ip:    array[0..3] of int;
+  port:  int;
+  https: bool;
+  insecure: bool;
+  // THE SYSTEM BUNDLE, read whole. 262144 fits Debian's 182 kB with room to grow; a bundle
+  // larger than this loads what fits and the rest is reported as a warning rather than
+  // silently dropped.
+  rootbuf: array[0..262143] of char;
+  rootpath: array[0..255] of char;
+  cafile: int;          // >0 when --cafile named one; then rootpath already holds it
+  i2: int;              // scans a flag for its = sign
+  fd, n, i, at: int;
+
+procedure die(msg: str);
+begin
+  io.puts(STDERR, "wget: ");
+  io.puts(STDERR, msg);
+  io.puts(STDERR, "\n");
+  halt(1);
+end;
+
+procedure usage;
+begin
+  io.puts(STDERR, "usage: wget <url> [hostname] [--insecure]\n");
+  io.puts(STDERR, "   eg: wget https://93.184.216.34/ example.com\n");
+  io.puts(STDERR, "\n");
+  io.puts(STDERR, "The URL carries a numeric address: there is no DNS resolver here, so the\n");
+  io.puts(STDERR, "hostname is given separately and is what the certificate must match.\n");
+  halt(1);
+end;
+
+// Split the URL into scheme, address, port and path. Returns false on anything malformed --
+// a URL comes from the command line here, but the same parser on a redirect would see
+// attacker-controlled text, so it refuses rather than guesses.
+function parseurl(n: int): bool;
+var i, k, v, oct: int;
+begin
+  i := 0;
+  https := false;
+  port := 0;
+  // ---- scheme ----
+  if (n > 8) and (url[0] = 'h') and (url[1] = 't') and (url[2] = 't') and (url[3] = 'p') then
+  begin
+    if url[4] = 's' then
+    begin
+      https := true;
+      i := 5;
+    end
+    else i := 4;
+    if (url[i] <> ':') or (url[i + 1] <> '/') or (url[i + 2] <> '/') then return false;
+    i := i + 3;
+  end
+  else return false;
+
+  // ---- four numeric octets ----
+  k := 0;
+  while k < 4 do
+  begin
+    v := 0;
+    oct := 0;
+    while (i < n) and (url[i] >= '0') and (url[i] <= '9') do
+    begin
+      v := v * 10 + (ord(url[i]) - ord('0'));
+      i := i + 1;
+      oct := oct + 1;
+    end;
+    // EVERY OCTET MUST HAVE DIGITS AND FIT IN A BYTE. Without this "http://.../" parses as
+    // four zeros and connects to 0.0.0.0, which fails much later and confusingly.
+    if (oct = 0) or (v > 255) then return false;
+    ip[k] := v;
+    if k < 3 then
+    begin
+      if (i >= n) or (url[i] <> '.') then return false;
+      i := i + 1;
+    end;
+    k := k + 1;
+  end;
+
+  // ---- optional port ----
+  if (i < n) and (url[i] = ':') then
+  begin
+    i := i + 1;
+    v := 0;
+    oct := 0;
+    while (i < n) and (url[i] >= '0') and (url[i] <= '9') do
+    begin
+      v := v * 10 + (ord(url[i]) - ord('0'));
+      i := i + 1;
+      oct := oct + 1;
+    end;
+    if (oct = 0) or (v = 0) or (v > 65535) then return false;
+    port := v;
+  end
+  else
+  begin
+    if https then port := 443 else port := 80;
+  end;
+
+  // ---- the path, which is "/" when absent ----
+  pathn := 0;
+  if (i < n) and (url[i] = '/') then
+  begin
+    while i < n do
+    begin
+      path[pathn] := url[i];
+      pathn := pathn + 1;
+      i := i + 1;
+    end;
+  end
+  else if i < n then return false      // something after the address that is not a path
+  else
+  begin
+    path[0] := '/';
+    pathn := 1;
+  end;
+  return true;
+end;
+
+// Send the request, either through TLS or straight down the socket.
+function send(b: array of char; n: int): bool;
+var sent, r, tries: int;
+begin
+  if https then return tls.write(b, n);
+  sent := 0;
+  tries := 0;
+  while (sent < n) and (tries < 100000) do
+  begin
+    r := net.send(fd, addr(b[sent]), n - sent);
+    if r > 0 then begin sent := sent + r; tries := 0; end
+    else if r = EAGAIN then tries := tries + 1
+    else return false;
+  end;
+  return sent = n;
+end;
+
+function receive(b: array of char; max: int): int;
+var r, tries: int;
+begin
+  if https then return tls.read(b, max);
+  tries := 0;
+  while tries < 100000 do
+  begin
+    r := net.recv(fd, addr(b[0]), max);
+    if r >= 0 then return r;
+    if r <> EAGAIN then return 0 - 1;
+    tries := tries + 1;
+  end;
+  return 0;
+end;
+
+// loadroots -- read the system CA bundle into the trust store.
+//
+// THE PATH IS DEBIAN'S and it is the one this machine has. Other distributions put it
+// elsewhere; a tool that needs to be portable would try several, and that is a change for
+// when there is a second machine to test on rather than a guess made now.
+// loadrootsfrom -- read a PEM bundle from rootpath, which the caller has already filled and
+// terminated. Split out so --cafile and the system default share one implementation.
+procedure loadrootsfrom;
+var fd, n, got: int;
+begin
+  fd := sys3(SYS.open, addr(rootpath[0]), O_RDONLY, 0);
+  if fd < 0 then return;
+  n := 0;
+  while true do
+  begin
+    got := sys3(SYS.read, fd, addr(rootbuf[n]), len(rootbuf) - n);
+    if got <= 0 then break;
+    n := n + got;
+    if n >= len(rootbuf) then break;
+  end;
+  sys1(SYS.close, fd);
+  ch.clearroots;
+  if ch.addpem(rootbuf, 0, n) <= 0 then
+    io.puts(STDERR, "wget: warning: no roots were loaded from the bundle\n");
+end;
+
+// The system bundle, when no --cafile was given.
+// The trust store: the machine's own bundle when there is one, the built-in Let's Encrypt
+// roots when there is not. lib/chain.wz does both; this is one call because a tool should
+// not have to know the order.
+procedure loadroots;
+begin
+  if ch.addsystem <= 0 then
+    io.puts(STDERR, "wget: warning: no roots were loaded at all\n");
+end;
+
+begin
+  if argc() < 2 then usage;
+  n := io.argstr(1, url);
+  if not parseurl(n) then die("that URL does not parse; it needs a numeric address");
+
+  // The hostname: the second argument when given, otherwise the address itself, which will
+  // not match any certificate -- so https without a hostname needs --insecure.
+  hostn := 0;
+  insecure := false;
+  cafile := 0;
+  i := 2;
+  while i < argc() do
+  begin
+    n := io.argstr(i, req);
+    // --cafile=<path> NAMES THE TRUST STORE, which is what makes this usable against a
+    // private CA -- a deployment with its own root, or a test server. Without it the system
+    // bundle is used, and with --insecure nothing is checked at all.
+    if (n > 9) and (req[0] = '-') and (req[1] = '-') and (req[2] = 'c') and (req[3] = 'a') then
+    begin
+      i2 := 0;
+      while (i2 < n) and (req[i2] <> '=') do i2 := i2 + 1;
+      if i2 < n then
+      begin
+        i2 := i2 + 1;
+        cafile := 0;
+        while i2 < n do begin rootpath[cafile] := req[i2]; cafile := cafile + 1; i2 := i2 + 1; end;
+        rootpath[cafile] := chr(0);
+      end;
+    end
+    else if (n = 10) and (req[0] = '-') and (req[1] = '-') then insecure := true
+    else if (n > 2) and (req[0] = '-') and (req[1] = '-') then insecure := true
+    else hostn := io.argstr(i, host);
+    i := i + 1;
+  end;
+
+  fd := net.connect(ip[0], ip[1], ip[2], ip[3], port);
+  if fd < 0 then die("cannot connect");
+
+  if https then
+  begin
+    // THE CLOCK IS PASSED IN, so the certificate dates are checked. Leaving it zero skips
+    // that, which is a real case on a machine with no clock but must be a decision.
+    tls.now := io.realtime div 1000000000;
+    if hostn = 0 then
+    begin
+      // No hostname to match, so the name check cannot be done at all.
+      if not insecure then die("https needs a hostname to check the certificate against, or --insecure");
+      tls.now := 0;
+    end;
+    // LOAD THE SYSTEM ROOTS, or nothing can be verified. tls.verified means the chain
+    // reaches a root in the trust store, and the store starts empty -- deliberately, since
+    // a library that trusts something by default is a library you cannot audit. A tool,
+    // though, should behave like the other tools on the machine, so it reads the same
+    // bundle they do.
+    //
+    // A MISSING BUNDLE IS NOT FATAL HERE: the connection then fails at the verify step with
+    // a message about an untrusted root, which is the right outcome and a clearer one than
+    // refusing to start.
+    if not insecure then
+    begin
+      if cafile > 0 then loadrootsfrom else loadroots;
+    end;
+    // --insecure HAS TO REACH THE HANDSHAKE, not just the check after it. The name and date
+    // checks live INSIDE tls.connect and abort it, so a flag tested only afterwards never
+    // runs -- measured: --insecure did nothing at all, because the handshake had already
+    // failed with "not valid for this hostname". Passing an empty hostname is what turns
+    // the check off, and the date check goes with it.
+    if insecure then
+    begin
+      hostn := 0;
+      tls.now := 0;
+    end;
+    if not tls.connectb(fd, host, hostn) then
+    begin
+      io.puts(STDERR, "wget: TLS handshake failed: ");
+      io.puts(STDERR, tls.errmsg);
+      // THE ALERT CODE, because "an alert" says nothing about what went wrong. RFC 8446 §6.2
+      // numbers them and the number is usually the whole diagnosis: 40 is handshake_failure
+      // (no shared parameters), 70 is protocol_version, 112 is unrecognized_name (SNI), 47
+      // is illegal_parameter. Printing it turns "it does not work" into a place to look.
+      if tls.err <> 0 then
+      begin
+        io.puts(STDERR, " (alert ");
+        io.putn(STDERR, tls.err);
+        io.puts(STDERR, ")");
+      end;
+      io.puts(STDERR, "\n");
+      halt(1);
+    end;
+    if not tls.verified then
+    begin
+      if not insecure then
+      begin
+        // SAY WHICH HALF FAILED. "not verified" covers two very different situations -- the
+        // signature did not check out, or the chain did not reach a trusted root -- and they
+        // are fixed in different places.
+        if slen(tls.chainerr) > 0 then
+        begin
+          io.puts(STDERR, "wget: the certificate chain was refused: ");
+          io.puts(STDERR, tls.chainerr);
+          io.puts(STDERR, "\n");
+        end;
+        die("the certificate was not verified; refusing (use --insecure to continue)");
+      end;
+      io.puts(STDERR, "wget: warning: the certificate was NOT verified\n");
+    end;
+  end;
+
+  // ---- the request ----
+  //
+  // HTTP/1.0 with Connection: close, because that makes the end of the body the end of the
+  // connection -- no chunked encoding to decode and no keep-alive to manage. For an example
+  // that is exactly the right trade.
+  at := 0;
+  at := io.push(req, at, "GET ");
+  i := 0;
+  while i < pathn do begin req[at] := path[i]; at := at + 1; i := i + 1; end;
+  at := io.push(req, at, " HTTP/1.0\r\nHost: ");
+  i := 0;
+  while i < hostn do begin req[at] := host[i]; at := at + 1; i := i + 1; end;
+  at := io.push(req, at, "\r\nUser-Agent: wantzel-wget\r\nConnection: close\r\n\r\n");
+  if not send(req, at) then die("cannot send the request");
+
+  // ---- the answer ----
+  bodyn := 0;
+  while bodyn < MAXBODY do
+  begin
+    n := receive(body, MAXBODY - bodyn);
+    if n <= 0 then break;
+    bodyn := bodyn + n;
+  end;
+  if bodyn = 0 then die("the server sent nothing");
+
+  io.out(STDOUT, addr(body[0]), bodyn);
+  if https then tls.close;
+  net.close(fd);
+end.

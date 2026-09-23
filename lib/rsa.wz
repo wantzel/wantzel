@@ -1,0 +1,904 @@
+// rsa.wz -- RSA-2048 signature VERIFICATION, for certificate chains that are not ECDSA.
+//
+// WHY THIS EXISTS. A Let's Encrypt chain is not ECDSA all the way up: the intermediates and
+// roots are commonly RSA-2048. x509.wz already RECOGNISES those signatures -- it sets
+// x509.sigalg to 1 (PKCS#1 v1.5) or 3 (PSS) -- but nothing could check one, so a chain could
+// be parsed and never closed. Without this file "verified" stops one link short of a trust
+// anchor, which is the same as not verified at all.
+//
+// VERIFICATION ONLY, NEVER SIGNING, and that is what makes this file small. The public
+// exponent is tiny (65537 in practice), the modulus and the signature are public, and there
+// is no private key anywhere in here. So:
+//   - no constant-time requirement: there is no secret to leak by timing
+//   - no Montgomery form: 17 squarings and one multiply do not repay setting it up
+//   - no CRT, no blinding, no key generation
+//
+// THE NUMBERS ARE 32-BIT LIMBS IN 64-BIT INTS, little-endian, exactly as lib/p256.wz stores
+// them. That is not imitation for its own sake: it means the 16x16 splitting trick in the
+// multiply below is the same proven arithmetic, only wider, and anyone who has read p256.wz
+// can read this.
+//
+// WHAT IS DELIBERATELY DIFFERENT FROM p256.wz: the reduction. p256 reduces bit by bit, which
+// was MEASURED there at 10.4 us against 0.33 us for the multiply itself -- 31x the cost. At
+// 256 bits that is survivable. At 2048 bits, bit-by-bit over a 4096-bit product would run
+// 4096 iterations of a 64-limb shift for EVERY modular multiply, and a verification does
+// eighteen of them. So this file divides by WORDS instead: see rsa.redmod.
+
+include "io.wz";
+include "sha256.wz";
+include "sha384.wz";
+
+const
+  // 128 LIMBS = 4096 BITS, not 2048. Measured 22-09-2026: google.com's chain uses an
+  // RSA-4096 root, and a 2048-bit limit refused it with "modulus is wider than 2048 bits"
+  // -- a correct message about a certificate that is perfectly ordinary. 4096 is the
+  // largest size in common use; beyond that is refused rather than truncated.
+  //
+  // THE COST IS QUADRATIC AND IT IS PAID ONLY WHEN USED: the schoolbook multiply is
+  // O(n^2), so a 4096-bit verification costs four times a 2048-bit one. Both happen once
+  // per certificate, against a handshake that already did an elliptic-curve operation.
+  RSA.N    = 128;           // 128 limbs of 32 bits = 4096 bits
+  RSA.N2   = 256;           // room for a full product
+  RSA.MAXE = 8;             // the public exponent: 256 bits is far more than 65537 needs
+
+var
+  // THE WORKING REGISTERS ARE MODULE-LEVEL, not locals. A 128-limb array is 1 kB, and the
+  // recursion here is zero, so globals cost nothing and keep every routine's argument list
+  // inside the ten the language allows (an array counts as two).
+  rsa.pr:  array[0..RSA.N2-1] of int;    // the running product / dividend
+  rsa.t:   array[0..RSA.N-1] of int;     // scratch for mulmod
+  rsa.acc: array[0..RSA.N-1] of int;     // the accumulator in powm
+  rsa.q1:  array[0..RSA.N-1] of int;     // scratch for the quotient search in redmod
+  rsa.err: str;
+  rsa.bad: bool;        // set beside rsa.err: strings cannot be compared in this language
+
+procedure rsa.fail(m: str);
+begin
+  rsa.err := m;
+  rsa.bad := true;
+end;
+
+// ---- the plumbing: zero, copy, compare ---------------------------------------------------
+
+procedure rsa.zero(r: array of int; n: int);
+var i: int;
+begin
+  i := 0;
+  while i < n do begin r[i] := 0; i := i + 1; end;
+end;
+
+procedure rsa.copy(dst: array of int; src: array of int; n: int);
+var i: int;
+begin
+  i := 0;
+  while i < n do begin dst[i] := src[i]; i := i + 1; end;
+end;
+
+// -1, 0 or 1, comparing n limbs from the top down.
+function rsa.cmpn(a: array of int; b: array of int; n: int): int;
+var i: int;
+begin
+  i := n - 1;
+  while i >= 0 do
+  begin
+    if a[i] <> b[i] then
+    begin
+      if a[i] > b[i] then return 1;
+      return 0 - 1;
+    end;
+    i := i - 1;
+  end;
+  return 0;
+end;
+
+// r := a - b over n limbs, returning the borrow. Used only where a >= b is already known.
+function rsa.subn(r: array of int; a: array of int; b: array of int; n: int): int;
+var i, cur, borrow: int;
+begin
+  borrow := 0;
+  i := 0;
+  while i < n do
+  begin
+    cur := a[i] - b[i] - borrow;
+    if cur < 0 then
+    begin
+      cur := cur + 0x100000000;
+      borrow := 1;
+    end
+    else borrow := 0;
+    r[i] := band(cur, 0xFFFFFFFF);
+    i := i + 1;
+  end;
+  return borrow;
+end;
+
+// ---- the multiply ------------------------------------------------------------------------
+//
+// rsa.pr := a * b, schoolbook, 64x64 limbs into 128.
+//
+// THE 16x16 SPLIT IS THE SAME AS p256.mul512 AND FOR THE SAME REASON: a 32x32 product needs
+// 64 bits, and there is no 128-bit type to catch the carry out of an addition of those. So
+// each limb is split into two halves, the four partial products are formed in ints that
+// cannot overflow, and the middle term is folded in by hand.
+procedure rsa.mul(a: array of int; b: array of int);
+var i, j, carry, cur: int;
+    al, ah, bl, bh, lo, mid, hi: int;
+begin
+  rsa.zero(rsa.pr, RSA.N2);
+  i := 0;
+  while i < RSA.N do
+  begin
+    al := band(a[i], 0xFFFF);
+    ah := a[i] shr 16;
+    carry := 0;
+    j := 0;
+    while j < RSA.N do
+    begin
+      bl := band(b[j], 0xFFFF);
+      bh := b[j] shr 16;
+      lo  := al * bl;
+      mid := al * bh + ah * bl;
+      hi  := ah * bh;
+      lo := lo + band(mid, 0xFFFF) * 0x10000;
+      hi := hi + (mid shr 16);
+      hi := hi + (lo shr 32);
+      lo := band(lo, 0xFFFFFFFF);
+
+      cur := rsa.pr[i + j] + lo + carry;
+      rsa.pr[i + j] := band(cur, 0xFFFFFFFF);
+      carry := hi + (cur shr 32);
+      j := j + 1;
+    end;
+    j := i + RSA.N;
+    while (carry <> 0) and (j < RSA.N2) do
+    begin
+      cur := rsa.pr[j] + carry;
+      rsa.pr[j] := band(cur, 0xFFFFFFFF);
+      carry := cur shr 32;
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+end;
+
+// ---- the reduction: rsa.pr mod m, by WORDS and not by bits --------------------------------
+//
+// WHY NOT BIT BY BIT, the way p256.redc does it. That routine shifts the remainder left and
+// brings down one bit, 512 times. It is obviously correct and it was measured in p256.wz at
+// 10.4 us -- 31 times the multiply it follows. Scaled to here it would be 4096 iterations,
+// each shifting 64 limbs, for every one of the eighteen modular multiplies a verification
+// needs. That is the difference between a certificate check you can do and one you cannot.
+//
+// SO THIS DIVIDES BY WORDS: classical long division, one 32-bit quotient digit at a time.
+// The estimate for each digit comes from the top two words of the remainder over the top
+// word of the divisor, which is Knuth's algorithm D without the normalisation step.
+//
+// AND IT CORRECTS INSTEAD OF ESTIMATING PERFECTLY. A quotient estimate from two words can be
+// too large by at most two, so rather than proving a tight bound the loop simply adds the
+// divisor back while it has gone too far. Being wrong by one twice is cheaper than being
+// subtly wrong once -- and in a VERIFIER, subtly wrong means accepting a forged signature.
+//
+// m must have its top bit set in limb RSA.N-1, which every 2048-bit RSA modulus does by
+// definition: a 2048-bit number has bit 2047 set.
+
+// r := (r shl 32) + v, over n limbs. The word that falls off the top is returned.
+function rsa.shiftin(r: array of int; n: int; v: int): int;
+var i, top: int;
+begin
+  top := r[n - 1];
+  i := n - 1;
+  while i > 0 do
+  begin
+    r[i] := r[i - 1];
+    i := i - 1;
+  end;
+  r[0] := band(v, 0xFFFFFFFF);
+  return top;
+end;
+
+// r := r - (m * q), over RSA.N limbs, returning how much was borrowed out of the top.
+//
+// THE BORROW IS THE PART THAT WENT WRONG FIRST TIME. Each limb subtracts a 32-bit low word
+// plus whatever the previous limb owed, and produces a NEW debt made of two pieces: the high
+// word of m[i]*q, and one more if this limb itself went negative. Mixing those two in one
+// signed value is what broke it, so they are kept apart here and combined explicitly.
+//
+// The return value is a count of 2^(32*RSA.N) units still owed -- it fits easily in an int
+// because q < 2^32 and m has RSA.N limbs.
+function rsa.submul(r: array of int; m: array of int; q: int): int;
+var i, cur, owed, ml, mh, ql, qh, lo, mid, hi, paynow, carryup: int;
+begin
+  ql := band(q, 0xFFFF);
+  qh := q shr 16;
+  owed := 0;
+  i := 0;
+  while i < RSA.N do
+  begin
+    ml := band(m[i], 0xFFFF);
+    mh := m[i] shr 16;
+    lo  := ml * ql;
+    mid := ml * qh + mh * ql;
+    hi  := mh * qh;
+    lo := lo + band(mid, 0xFFFF) * 0x10000;
+    hi := hi + (mid shr 16);
+    hi := hi + (lo shr 32);
+    lo := band(lo, 0xFFFFFFFF);
+
+    // SUBTRACT THIS LIMB, and the debt bookkeeping is where this went wrong twice.
+    //
+    // `owed` can be WIDER THAN ONE WORD, because it accumulates the high halves of the limb
+    // products. So it is split here into the part that this limb pays (its low 32 bits) and
+    // the part that moves up (the rest) -- and the split must happen BEFORE the borrow from
+    // this limb is added, or the borrow lands in the wrong half.
+    //
+    // The first version added the borrow to `owed` AFTER already taking owed shr 32, which
+    // silently dropped one unit whenever the subtraction went negative at the same moment
+    // that owed crossed a word boundary. It was off by exactly one, 56 limbs in, on one
+    // input in many -- the kind of fault that a small hand-checked case never reaches.
+    paynow := band(owed, 0xFFFFFFFF);
+    carryup := owed shr 32;
+    cur := r[i] - lo - paynow;
+    // THE BORROW CAN BE TWO, NOT ONE, and that was the bug that survived two earlier
+    // attempts. `lo` and `paynow` are each up to 2^32-1, so their sum reaches almost 2^33:
+    // cur can land below -2^32 and a single correction leaves it still negative. Adding the
+    // borrow in a LOOP is the honest fix -- it runs at most twice and it cannot be wrong by
+    // construction, where "add 2^32 once" was wrong exactly when both words were large.
+    //
+    // It showed up 55 limbs into one modulus out of several: r[63] came out one too high,
+    // every other limb correct, and the final answer was still a plausible residue below n.
+    // That is the worst shape a fault can have in a verifier.
+    while cur < 0 do
+    begin
+      cur := cur + 0x100000000;
+      carryup := carryup + 1;
+    end;
+    owed := hi + carryup;
+    r[i] := band(cur, 0xFFFFFFFF);
+    i := i + 1;
+  end;
+  return owed;
+end;
+
+// r := r + m, over RSA.N limbs, returning the carry. Used to undo an overshoot.
+function rsa.addback(r: array of int; m: array of int): int;
+var i, cur, carry: int;
+begin
+  carry := 0;
+  i := 0;
+  while i < RSA.N do
+  begin
+    cur := r[i] + m[i] + carry;
+    r[i] := band(cur, 0xFFFFFFFF);
+    carry := cur shr 32;
+    i := i + 1;
+  end;
+  return carry;
+end;
+
+// r := rsa.pr mod m. The product is consumed; r gets RSA.N limbs.
+//
+// REWRITTEN AFTER THE FIRST VERSION HUNG, and the two faults are worth recording because
+// both are invisible until you run it:
+//
+//   1. THE ESTIMATE OVERFLOWED INTO THE SIGN BIT. hi2 was built as top*2^32 + r[N-1], which
+//      needs 64 bits when top is large -- and `int` is signed, so `hi2 div rem` went
+//      negative and the correction loop below could never terminate.
+//   2. THE BORROW OUT OF submul MIXED SIGNED AND UNSIGNED, so "did this go negative" was
+//      answered wrongly for exactly the values where it mattered.
+//
+// SO THIS USES A SIMPLER, SLOWER, OBVIOUSLY CORRECT SHAPE: estimate from ONE word, then
+// correct by conditional subtraction. One-word estimation can be off by more than two, so
+// the loop below is bounded by a shift-and-subtract fallback rather than by a proof.
+//
+// THE COST IS ACCEPTABLE because it is still WORDS and not BITS: 128 iterations of the outer
+// loop against 4096 for the bit-by-bit shape that p256.redc uses.
+
+// r := r - m, in place, over RSA.N limbs. Returns the borrow (0 or 1).
+// Used where r >= m may or may not hold; the caller checks first.
+
+// Does m*q fit inside the 2080-bit value (top : r)?  Compared WITHOUT subtracting, so an
+// overshoot cannot wrap around and look like a fit -- which is exactly what went wrong when
+// this was answered with a trial subtraction.
+//
+// It walks from the top limb down, comparing m*q limb by limb against (top : r) and stopping
+// at the first difference. The product's limbs are produced on the fly, so nothing 65 limbs
+// wide has to be stored.
+function rsa.fits(r: array of int; top: int; m: array of int; q: int): bool;
+var i, carry, cur, ml, mh, ql, qh, lo, mid, hi, rv: int;
+begin
+  // build m*q into rsa.q1 (RSA.N limbs) and keep the overflow word in `carry`
+  ql := band(q, 0xFFFF);
+  qh := q shr 16;
+  carry := 0;
+  i := 0;
+  while i < RSA.N do
+  begin
+    ml := band(m[i], 0xFFFF);
+    mh := m[i] shr 16;
+    lo  := ml * ql;
+    mid := ml * qh + mh * ql;
+    hi  := mh * qh;
+    lo := lo + band(mid, 0xFFFF) * 0x10000;
+    hi := hi + (mid shr 16);
+    hi := hi + (lo shr 32);
+    lo := band(lo, 0xFFFFFFFF);
+    cur := lo + carry;
+    rsa.q1[i] := band(cur, 0xFFFFFFFF);
+    carry := hi + (cur shr 32);
+    i := i + 1;
+  end;
+  // COMPARE (carry : rsa.q1) AGAINST (top : r).
+  //
+  // carry CAN EXCEED ONE WORD and that was the bug: it accumulates the high halves of every
+  // limb product, so for a large q it runs past 2^32. Comparing it against a masked `top`
+  // then said "fits" for a product that was in fact far too big -- and only for the large
+  // inputs, which is why the small hand-checked cases all passed.
+  if carry > 0xFFFFFFFF then return false;
+  if carry <> top then return carry < top;
+  i := RSA.N - 1;
+  while i >= 0 do
+  begin
+    rv := band(r[i], 0xFFFFFFFF);
+    if rsa.q1[i] <> rv then return rsa.q1[i] < rv;
+    i := i - 1;
+  end;
+  return true;          // exactly equal fits
+end;
+
+procedure rsa.redmod(r: array of int; m: array of int);
+var i, top, lo, hi, mid, guard: int;
+begin
+  rsa.zero(r, RSA.N);
+  i := RSA.N2 - 1;
+  while i >= 0 do
+  begin
+    // r := r*2^32 + pr[i]; `top` is the word that fell off the top of r.
+    top := band(rsa.shiftin(r, RSA.N, rsa.pr[i]), 0xFFFFFFFF);
+
+    // FIND THE LARGEST q WITH m*q <= (top : r), by halving the range.
+    //
+    // WHY THE SEARCH AND NOT A DIVISION. The obvious estimate is (top*2^32 + r[N-1]) div
+    // m[N-1], but that value needs 64 unsigned bits and `int` is signed, so it went negative
+    // for exactly the large inputs that matter -- and the correction loop then never
+    // terminated. Halving cannot run away: 32 comparisons, always.
+    //
+    // AND THE TEST MUST NOT SUBTRACT. rsa.fits compares without modifying anything, because
+    // submul wraps each limb mod 2^32: an overshoot wrapped around and still looked like it
+    // fitted, so the search picked a q that was too large.
+    lo := 0;
+    hi := 0xFFFFFFFF;
+    while lo < hi do
+    begin
+      mid := lo + (hi - lo + 1) div 2;
+      if rsa.fits(r, top, m, mid) then lo := mid else hi := mid - 1;
+    end;
+
+    // APPLY IT. Because q was chosen as the largest that fits, the subtraction cannot go
+    // negative and what remains is already less than m -- there is no correction loop, and
+    // that is the point: a loop here would be hiding a wrong q.
+    if lo <> 0 then
+    begin
+      guard := rsa.submul(r, m, lo);
+      if guard <> top then
+      begin
+        // CANNOT HAPPEN unless rsa.fits and rsa.submul disagree, which would mean one of
+        // them is wrong. Saying so beats returning a plausible wrong number: in a verifier
+        // that would mean accepting a signature that should be refused.
+        rsa.fail("internal: reduction lost track of the top word");
+        return;
+      end;
+    end
+    else if top <> 0 then
+    begin
+      rsa.fail("internal: a non-zero top word with a zero quotient");
+      return;
+    end;
+    i := i - 1;
+  end;
+end;
+
+// r := a * b mod m
+procedure rsa.mulmod(r: array of int; a: array of int; b: array of int; m: array of int);
+begin
+  rsa.mul(a, b);
+  rsa.redmod(r, m);
+end;
+
+// r := a^e mod m, square-and-multiply, MSB first. e is elen limbs.
+//
+// THE EXPONENT IS PUBLIC (65537 for every certificate in practice), so a plain conditional
+// on each bit is fine -- there is nothing to hide.
+procedure rsa.powmod(r: array of int; a: array of int; e: array of int; elen: int; m: array of int);
+var i, bit, started: int;
+begin
+  rsa.zero(r, RSA.N);
+  r[0] := 1;
+  started := 0;
+  i := elen * 32 - 1;
+  while i >= 0 do
+  begin
+    bit := band(e[i shr 5] shr band(i, 31), 1);
+    // SKIP THE LEADING ZEROS. 65537 is 17 bits inside a 256-bit field; squaring 239 times
+    // for nothing would be most of the work.
+    if started <> 0 then
+    begin
+      rsa.mulmod(rsa.t, r, r, m);
+      rsa.copy(r, rsa.t, RSA.N);
+    end;
+    if bit <> 0 then
+    begin
+      if started = 0 then
+      begin
+        // THE FIRST ONE-BIT SEEDS THE ACCUMULATOR WITH a ITSELF, and forgetting that was a
+        // real bug here: `started` was set but r stayed 1, so every later squaring squared
+        // one and the whole exponentiation collapsed to 1. It failed for e=2 as loudly as
+        // for e=65537, which is what made it findable.
+        started := 1;
+        rsa.copy(r, a, RSA.N);
+      end
+      else
+      begin
+        rsa.mulmod(rsa.t, r, a, m);
+        rsa.copy(r, rsa.t, RSA.N);
+      end;
+    end;
+    i := i - 1;
+  end;
+end;
+
+// ---- bytes in, bytes out -----------------------------------------------------------------
+//
+// A certificate carries its numbers as big-endian bytes; this file works in little-endian
+// 32-bit limbs. nbytes is how many bytes to take, which for a 2048-bit modulus is 256.
+
+// r := the big-endian number in b[at .. at+nbytes-1]. False if it does not fit.
+//
+// cap IS THE DESTINATION'S SIZE IN LIMBS, and it is a parameter rather than RSA.N because
+// the exponent lives in a much smaller array (RSA.MAXE). Assuming the full width here wrote
+// past the end of it -- caught by the test, at the very first call.
+function rsa.frombytes(r: array of int; cap: int; b: array of char; at: int; nbytes: int): bool;
+var i, limb, sh, v: int;
+begin
+  rsa.zero(r, cap);
+  if nbytes > cap * 4 then begin rsa.fail("number is wider than its destination"); return false; end;
+  i := 0;
+  while i < nbytes do
+  begin
+    // byte i counted from the END is byte (nbytes-1-i) of the buffer
+    v := ord(b[at + nbytes - 1 - i]);
+    limb := i shr 2;
+    sh := band(i, 3) * 8;
+    r[limb] := bor(r[limb], band(v shl sh, 0xFFFFFFFF));
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// How many bytes wide is m, counting from its top non-zero byte? For a proper RSA modulus
+// this is the key size -- 256 for RSA-2048.
+function rsa.bytelen(m: array of int): int;
+var i, v, n: int;
+begin
+  i := RSA.N - 1;
+  while i >= 0 do
+  begin
+    if m[i] <> 0 then
+    begin
+      v := m[i];
+      n := i * 4;
+      while v <> 0 do begin n := n + 1; v := v shr 8; end;
+      return n;
+    end;
+    i := i - 1;
+  end;
+  return 0;
+end;
+
+// byte k of r, counted from the top of a klen-byte big-endian rendering
+function rsa.byteat(r: array of int; klen: int; k: int): int;
+var i, limb, sh: int;
+begin
+  i := klen - 1 - k;
+  limb := i shr 2;
+  sh := band(i, 3) * 8;
+  if limb >= RSA.N then return 0;
+  return band(r[limb] shr sh, 0xFF);
+end;
+
+// ---- PKCS#1 v1.5 -------------------------------------------------------------------------
+//
+// WHAT THE PADDING LOOKS LIKE, and every byte of it is checked below:
+//
+//     00 01 FF FF ... FF 00 <DigestInfo>
+//
+// DigestInfo for SHA-256 is a fixed 19-byte DER prelude followed by the 32-byte hash. Since
+// it never varies, it is compared byte for byte rather than parsed -- a parser here would be
+// a second place for a bug with nothing to gain.
+//
+// THE CHECK IS STRICT BY DESIGN, and this is the part that has historically gone wrong in
+// real libraries. Bleichenbacher's 2006 attack worked against verifiers that found the hash
+// and stopped looking: they accepted forged signatures with garbage after the digest. So:
+//   - the length must be EXACTLY the key size
+//   - the padding must be at least 8 FF bytes (the standard's minimum)
+//   - EVERY byte from 02 to the 00 separator must be FF, not merely the first few
+//   - the digest must end EXACTLY at the end of the block, with nothing following
+var
+  rsa.di: array[0..18] of int;
+
+procedure rsa.setdi;
+begin
+  // 30 31 30 0d 06 09 60 86 48 01 65 03 04 02 01 05 00 04 20
+  rsa.di[0]  := 0x30; rsa.di[1]  := 0x31; rsa.di[2]  := 0x30; rsa.di[3]  := 0x0d;
+  rsa.di[4]  := 0x06; rsa.di[5]  := 0x09; rsa.di[6]  := 0x60; rsa.di[7]  := 0x86;
+  rsa.di[8]  := 0x48; rsa.di[9]  := 0x01; rsa.di[10] := 0x65; rsa.di[11] := 0x03;
+  rsa.di[12] := 0x04; rsa.di[13] := 0x02; rsa.di[14] := 0x01; rsa.di[15] := 0x05;
+  rsa.di[16] := 0x00; rsa.di[17] := 0x04; rsa.di[18] := 0x20;
+end;
+
+// Check the decrypted block in r against a SHA-256 digest. klen is the key size in bytes.
+function rsa.checkpkcs1(r: array of int; klen: int; digest: array of char; dat: int): bool;
+var i, k, sep: int;
+begin
+  rsa.setdi;
+  // 00 01
+  if rsa.byteat(r, klen, 0) <> 0x00 then begin rsa.fail("padding does not start with 00"); return false; end;
+  if rsa.byteat(r, klen, 1) <> 0x01 then begin rsa.fail("not a type-1 block"); return false; end;
+  // FF... up to a 00
+  k := 2;
+  while (k < klen) and (rsa.byteat(r, klen, k) = 0xFF) do k := k + 1;
+  if k >= klen then begin rsa.fail("padding never ends"); return false; end;
+  if rsa.byteat(r, klen, k) <> 0x00 then begin rsa.fail("padding contains a byte that is not FF"); return false; end;
+  if k - 2 < 8 then begin rsa.fail("padding is shorter than the required 8 bytes"); return false; end;
+  sep := k + 1;
+  // the DigestInfo must fill the block EXACTLY: 19 + 32 bytes to the end
+  if sep + 19 + 32 <> klen then begin rsa.fail("the digest does not end at the end of the block"); return false; end;
+  i := 0;
+  while i < 19 do
+  begin
+    if rsa.byteat(r, klen, sep + i) <> rsa.di[i] then begin rsa.fail("not a SHA-256 DigestInfo"); return false; end;
+    i := i + 1;
+  end;
+  i := 0;
+  while i < 32 do
+  begin
+    if rsa.byteat(r, klen, sep + 19 + i) <> ord(digest[dat + i]) then
+      begin rsa.fail("the hash does not match"); return false; end;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// ---- the one routine a caller needs ------------------------------------------------------
+//
+// rsa.verify -- does `sig` verify as an RSA PKCS#1 v1.5 SHA-256 signature over `digest`,
+// under the public key (n, e)?
+//
+// ALL FOUR INPUTS ARE BIG-ENDIAN BYTES straight out of the certificate, because that is the
+// form x509.wz already has them in. Converting here rather than at the call site keeps the
+// awkward direction change in one place.
+//
+// THE ARGUMENT COUNT IS AT THE LIMIT the language allows: an array counts as two, so four
+// arrays plus their offsets and lengths is what fits. That is why the digest is passed as a
+// buffer-and-offset rather than as its own type.
+var
+  rsa.mod:  array[0..RSA.N-1] of int;
+  rsa.exp:  array[0..RSA.MAXE-1] of int;
+  rsa.sg:  array[0..RSA.N-1] of int;
+  rsa.out: array[0..RSA.N-1] of int;
+  rsa.klen: int;
+
+// SPLIT IN TWO BECAUSE OF THE ARGUMENT LIMIT, and it turns out to be the better shape.
+// A routine takes at most ten arguments and an array counts as two, so key + signature +
+// digest in one call does not fit. Loading the key separately also matches how a chain is
+// checked: the issuer's key is set once and then several signatures are tested against it.
+
+// rsa.setkey -- load the public key (n, e) from big-endian bytes, as DER carries them.
+//
+// THE LEADING ZERO IS STRIPPED HERE. DER encodes a positive INTEGER whose top bit is set
+// with an extra 00 in front, so a 2048-bit modulus arrives as 257 bytes. Not handling that
+// is the most common way this goes wrong, and it fails confusingly: the number is right but
+// shifted one byte.
+function rsa.setkey(nb: array of char; nat: int; nlen: int;
+                    ex: array of char; exat: int; exlen: int): bool;
+begin
+  rsa.err := ""; rsa.bad := false;
+  while (nlen > 0) and (ord(nb[nat]) = 0) do begin nat := nat + 1; nlen := nlen - 1; end;
+  while (exlen > 0) and (ord(ex[exat]) = 0) do begin exat := exat + 1; exlen := exlen - 1; end;
+
+  if nlen > RSA.N * 4 then begin rsa.fail("modulus is wider than 4096 bits"); return false; end;
+  if exlen > RSA.MAXE * 4 then begin rsa.fail("exponent is implausibly large"); return false; end;
+  if nlen < 64 then begin rsa.fail("modulus is too small to be a real key"); return false; end;
+
+  if not rsa.frombytes(rsa.mod, RSA.N, nb, nat, nlen) then return false;
+  rsa.zero(rsa.exp, RSA.MAXE);
+  if not rsa.frombytes(rsa.exp, RSA.MAXE, ex, exat, exlen) then return false;
+  rsa.klen := rsa.bytelen(rsa.mod);
+  return true;
+end;
+
+// rsa.verify -- does `sb` verify as a PKCS#1 v1.5 SHA-256 signature over `digest`, under
+// the key loaded by rsa.setkey? digest is 32 bytes at digest[0].
+function rsa.verify(sb: array of char; sat: int; siglen: int; digest: array of char): bool;
+begin
+  rsa.err := ""; rsa.bad := false;
+  if rsa.klen = 0 then begin rsa.fail("no key loaded"); return false; end;
+  while (siglen > 0) and (ord(sb[sat]) = 0) do begin sat := sat + 1; siglen := siglen - 1; end;
+  if not rsa.frombytes(rsa.sg, RSA.N, sb, sat, siglen) then return false;
+
+  // THE SIGNATURE MUST FIT THE KEY. A shorter one is not merely unusual, it is the shape of
+  // a forgery attempt against a verifier that pads silently.
+  if siglen > rsa.klen then begin rsa.fail("signature is wider than the key"); return false; end;
+  if rsa.cmpn(rsa.sg, rsa.mod, RSA.N) >= 0 then begin rsa.fail("signature is not less than the modulus"); return false; end;
+
+  rsa.powmod(rsa.out, rsa.sg, rsa.exp, RSA.MAXE, rsa.mod);
+  if rsa.bad then return false;
+
+  return rsa.checkpkcs1(rsa.out, rsa.klen, digest, 0);
+end;
+
+// ---- RSASSA-PSS, RFC 8017 §9.1.2 ----------------------------------------------------------
+//
+// WHY THIS IS HERE AND NOT SKIPPED. It was skipped, deliberately, on the grounds that none
+// of four measured certificate chains used it. That measurement looked at CERTIFICATE
+// signatures and missed where PSS actually turns up: a TLS 1.3 server signs its
+// CertificateVerify with it. wantzel.com does, so the project's own site was unreachable
+// from the project's own client. Measured 22-09-2026.
+//
+// THE SPEC IS KEPT VERBATIM in localfiles/research/sources/rfc8017-pss-verify.md, and the
+// step numbers below refer to it. Three of those steps -- 4, 6 and 10 -- are cheap, easy to
+// leave out, and each catches a forgery that the rest of the check passes. They are the
+// reason this is transcribed rather than written from memory.
+//
+// TWO HASHES, CHOSEN BY THE CALLER. PSS appears with SHA-256 and with SHA-384 and the hash
+// is part of the signature's meaning, not a detail: verifying an rsa_pss_rsae_sha384
+// signature with SHA-256 gives a digest of the right shape and the wrong value.
+//
+// hid: 0 = SHA-256 (hLen 32), 1 = SHA-384 (hLen 48).
+
+var
+  rsa.mask: array[0..511] of char;     // dbMask / DB
+  rsa.mh:   array[0..63] of char;      // mHash
+  rsa.hh:   array[0..63] of char;      // H', the recomputed hash
+  rsa.mp:   array[0..191] of char;     // M' = 8 zeroes || mHash || salt
+  rsa.seed: array[0..63] of char;      // H, the seed for MGF1
+  rsa.ctr:  array[0..67] of char;      // mgfSeed || C, for one MGF1 round
+
+function rsa.hlen(hid: int): int;
+begin
+  if hid = 1 then return 48;
+  return 32;
+end;
+
+// One hash of b[0..n-1] into out, choosing the algorithm by hid.
+procedure rsa.hash(hid: int; b: array of char; n: int; out: array of char);
+begin
+  if hid = 1 then
+  begin
+    sha384.init;
+    sha384.updateat(b, 0, n);
+    sha384.final(out);
+  end
+  else
+  begin
+    sha256.init;
+    sha256.updateat(b, 0, n);
+    sha256.final(out);
+  end;
+end;
+
+// MGF1 (RFC 8017 B.2.1): fill mask[0..masklen-1] from seed[0..seedlen-1].
+//
+// THE COUNTER IS FOUR BYTES, BIG-ENDIAN, and it is appended to the seed for every round --
+// the hash is computed on seed||C, not on the previous output. Chaining the output instead
+// is the usual mistake and it produces a mask that looks random and is wrong.
+procedure rsa.mgf1(hid: int; seed: array of char; seedlen: int; masklen: int);
+var counter, hl, at, i, take: int;
+    h: array[0..63] of char;
+begin
+  hl := rsa.hlen(hid);
+  counter := 0;
+  at := 0;
+  while at < masklen do
+  begin
+    i := 0;
+    while i < seedlen do begin rsa.ctr[i] := seed[i]; i := i + 1; end;
+    rsa.ctr[seedlen]     := chr(band(counter shr 24, 0xFF));
+    rsa.ctr[seedlen + 1] := chr(band(counter shr 16, 0xFF));
+    rsa.ctr[seedlen + 2] := chr(band(counter shr 8, 0xFF));
+    rsa.ctr[seedlen + 3] := chr(band(counter, 0xFF));
+    rsa.hash(hid, rsa.ctr, seedlen + 4, h);
+    take := masklen - at;
+    if take > hl then take := hl;
+    i := 0;
+    while i < take do begin rsa.mask[at + i] := h[i]; i := i + 1; end;
+    at := at + take;
+    counter := counter + 1;
+  end;
+end;
+
+// rsa.checkpss -- steps 3 to 14 of EMSA-PSS-VERIFY, over the block already in rsa.out.
+//
+// SPLIT OUT so that rsa.pssblock can reach it with a hand-built block. The steps and their
+// numbers are RFC 8017 section 9.1.2, kept verbatim in the research sources.
+function rsa.checkpss(hid: int; digest: array of char): bool;
+var hl, emlen, embits, dblen, i, shift, top: int;
+begin
+  hl := rsa.hlen(hid);
+  // emBits = modBits - 1, so emLen can be one byte SHORTER than the key when the modulus
+  // has its top bit set -- which every real modulus does. That one bit is the whole reason
+  // steps 6 and 9 exist.
+  embits := rsa.klen * 8 - 1;
+  emlen := (embits + 7) div 8;
+
+  // STEP 3: is there room for everything?
+  if emlen < hl + hl + 2 then begin rsa.fail("the encoded message is too short for this hash"); return false; end;
+
+  // STEP 4: the trailer must be 0xbc.
+  if rsa.byteat(rsa.out, emlen, emlen - 1) <> 0xBC then
+    begin rsa.fail("the PSS block does not end in 0xbc"); return false; end;
+
+  // STEP 5: maskedDB is the leftmost emLen-hLen-1 octets, H the next hLen.
+  dblen := emlen - hl - 1;
+  i := 0;
+  while i < hl do begin rsa.seed[i] := chr(rsa.byteat(rsa.out, emlen, dblen + i)); i := i + 1; end;
+
+  // STEP 6: the leftmost 8*emLen - emBits bits of maskedDB must be zero.
+  //
+  // CHEAP AND NECESSARY. Without it a forger has those bits free, and they are exactly the
+  // slack that makes a signature forgeable for a badly chosen exponent.
+  shift := 8 * emlen - embits;
+  top := rsa.byteat(rsa.out, emlen, 0);
+  if band(top, band(0xFF shl (8 - shift), 0xFF)) <> 0 then
+    begin rsa.fail("the top bits of the PSS block are not zero"); return false; end;
+
+  // STEPS 7 and 8: DB = maskedDB xor MGF1(H, dblen)
+  rsa.mgf1(hid, rsa.seed, hl, dblen);
+  i := 0;
+  while i < dblen do
+  begin
+    rsa.mask[i] := chr(bxor(ord(rsa.mask[i]), rsa.byteat(rsa.out, emlen, i)));
+    i := i + 1;
+  end;
+
+  // STEP 9: clear the same leftmost bits in DB.
+  rsa.mask[0] := chr(band(ord(rsa.mask[0]), band(0xFF shr shift, 0xFF)));
+
+  // STEP 10: the padding before the salt must be zeroes then a single 0x01.
+  //
+  // THIS IS THE STEP THAT PINS THE SALT LENGTH. We expect sLen = hLen, so the 0x01 sits at
+  // dblen - hl - 1. A signature with another salt length reaches here and fails, which is
+  // the intended outcome: refusing is right, guessing the length is not.
+  i := 0;
+  while i < dblen - hl - 1 do
+  begin
+    if ord(rsa.mask[i]) <> 0 then begin rsa.fail("the PSS padding is not zero"); return false; end;
+    i := i + 1;
+  end;
+  if ord(rsa.mask[dblen - hl - 1]) <> 1 then
+    begin rsa.fail("the PSS padding has no 0x01 separator"); return false; end;
+
+  // STEPS 11 and 12: M' = eight zero octets || mHash || salt
+  i := 0;
+  while i < 8 do begin rsa.mp[i] := chr(0); i := i + 1; end;
+  i := 0;
+  while i < hl do begin rsa.mp[8 + i] := digest[i]; i := i + 1; end;
+  i := 0;
+  while i < hl do begin rsa.mp[8 + hl + i] := rsa.mask[dblen - hl + i]; i := i + 1; end;
+
+  // STEPS 13 and 14: H' = Hash(M'), and it must equal H.
+  rsa.hash(hid, rsa.mp, 8 + hl + hl, rsa.hh);
+  i := 0;
+  while i < hl do
+  begin
+    if rsa.hh[i] <> rsa.seed[i] then begin rsa.fail("the PSS hash does not match"); return false; end;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// rsa.verifypss -- is sb[sat..sat+siglen-1] a valid PSS signature over `digest`, under the
+// key loaded by rsa.setkey?
+//
+// `digest` is the hash of the MESSAGE, already computed by the caller, hLen bytes long.
+// That is a departure from the spec's shape (which takes M and hashes it at step 2) and it
+// is deliberate: in TLS the signed data is assembled from several pieces and never exists
+// as one buffer, so hashing it here would mean copying it first.
+//
+// THE SALT LENGTH IS TAKEN AS hLen, which is what every modern user of PSS does -- TLS 1.3
+// requires it (RFC 8446 §4.2.3) and certificates in practice follow. A signature made with
+// a different salt length is refused rather than guessed at: step 10 finds it, because the
+// 0x01 marker then sits in the wrong place.
+function rsa.verifypss(hid: int; sb: array of char; sat: int; siglen: int; digest: array of char): bool;
+var hl, emlen, embits, dblen, i, shift, top: int;
+begin
+  rsa.err := ""; rsa.bad := false;
+  if rsa.klen = 0 then begin rsa.fail("no key loaded"); return false; end;
+  hl := rsa.hlen(hid);
+
+  while (siglen > 0) and (ord(sb[sat]) = 0) do begin sat := sat + 1; siglen := siglen - 1; end;
+  if siglen > rsa.klen then begin rsa.fail("signature is wider than the key"); return false; end;
+  if not rsa.frombytes(rsa.sg, RSA.N, sb, sat, siglen) then return false;
+  if rsa.cmpn(rsa.sg, rsa.mod, RSA.N) >= 0 then begin rsa.fail("signature is not less than the modulus"); return false; end;
+
+  rsa.powmod(rsa.out, rsa.sg, rsa.exp, RSA.MAXE, rsa.mod);
+  if rsa.bad then return false;
+
+  // THE PADDING IS CHECKED BY rsa.checkpss, which is shared with rsa.pssblock so that the
+  // structural rules have exactly one implementation. Two copies would drift, and a drifted
+  // copy in a test proves something other than it claims.
+  return rsa.checkpss(hid, digest);
+end;
+
+
+// rsa.pssblock -- assemble a PSS-encoded message by hand and run the padding checks on it.
+//
+// WHY THIS IS IN THE LIBRARY AND NOT IN THE TEST. The structural rules of PSS -- the 0xbc
+// trailer, the zeroed top bits, the 0x01 separator -- can only be exercised by a block that
+// is correct except in one place. Building such a block needs the same MGF1 and the same
+// layout as the verifier, so writing it in the test would mean a second copy of both, and
+// a copy that drifts is a test that proves something other than it claims.
+//
+// MEASURED, AND THAT IS WHY IT EXISTS: with only real signatures to work from, removing the
+// 0xbc check, the top-bit check or the 0x01 check left the test suite green. Those rules
+// were untested code in a verifier -- which is where untested code does the most harm.
+//
+// flaw: 0 = correct, 1 = trailer is not 0xbc, 2 = top bits not zero, 3 = no 0x01 separator,
+// 4 = the zero padding is not zero. Returns what the padding check says about it.
+//
+// IT DOES NOT TOUCH THE KEY. The block is checked directly, so this says nothing about the
+// modular exponentiation -- the real signatures above cover that.
+var
+  rsa.blk: array[0..511] of char;
+
+function rsa.pssblock(hid: int; digest: array of char; flaw: int): bool;
+var hl, emlen, embits, dblen, i, shift: int;
+    saved: array[0..RSA.N-1] of int;
+begin
+  rsa.err := ""; rsa.bad := false;
+  hl := rsa.hlen(hid);
+  embits := rsa.klen * 8 - 1;
+  emlen := (embits + 7) div 8;
+  dblen := emlen - hl - 1;
+  shift := 8 * emlen - embits;
+
+  // M' = eight zeroes || mHash || salt, with a fixed salt so the block is reproducible.
+  i := 0;
+  while i < 8 do begin rsa.mp[i] := chr(0); i := i + 1; end;
+  i := 0;
+  while i < hl do begin rsa.mp[8 + i] := digest[i]; i := i + 1; end;
+  i := 0;
+  while i < hl do begin rsa.mp[8 + hl + i] := chr(band(i * 7 + 3, 255)); i := i + 1; end;
+  rsa.hash(hid, rsa.mp, 8 + hl + hl, rsa.hh);
+
+  // DB = zeroes || 0x01 || salt
+  i := 0;
+  while i < dblen do begin rsa.blk[i] := chr(0); i := i + 1; end;
+  rsa.blk[dblen - hl - 1] := chr(1);
+  i := 0;
+  while i < hl do begin rsa.blk[dblen - hl + i] := chr(band(i * 7 + 3, 255)); i := i + 1; end;
+  if flaw = 3 then rsa.blk[dblen - hl - 1] := chr(0);
+  if flaw = 4 then rsa.blk[0] := chr(0xFF);
+
+  // maskedDB = DB xor MGF1(H, dblen), then the top bits cleared
+  rsa.mgf1(hid, rsa.hh, hl, dblen);
+  i := 0;
+  while i < dblen do
+  begin
+    rsa.blk[i] := chr(bxor(ord(rsa.blk[i]), ord(rsa.mask[i])));
+    i := i + 1;
+  end;
+  rsa.blk[0] := chr(band(ord(rsa.blk[0]), band(0xFF shr shift, 0xFF)));
+  if flaw = 2 then rsa.blk[0] := chr(bor(ord(rsa.blk[0]), band(0xFF shl (8 - shift), 0xFF)));
+
+  // EM = maskedDB || H || 0xbc
+  i := 0;
+  while i < hl do begin rsa.blk[dblen + i] := rsa.hh[i]; i := i + 1; end;
+  rsa.blk[emlen - 1] := chr(0xBC);
+  if flaw = 1 then rsa.blk[emlen - 1] := chr(0xBD);
+
+  // Load it into rsa.out as a number, which is what the checker reads.
+  i := 0;
+  while i < RSA.N do begin saved[i] := rsa.out[i]; i := i + 1; end;
+  if not rsa.frombytes(rsa.out, RSA.N, rsa.blk, 0, emlen) then return false;
+  return rsa.checkpss(hid, digest);
+end;

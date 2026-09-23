@@ -1,0 +1,24 @@
+// lib/hash.wz: hash.put/hash.del/hash.putpad/hash.delpad used to answer "false" for a
+// key of the wrong length or a negative value exactly the same way they answer "false" for
+// a table that is genuinely full or a key that is genuinely absent. A caller reading only
+// the bool could not tell "there was no room" from "you called me with a key of the wrong
+// width" -- and the first is something the caller can act on (grow the table, evict an
+// entry), the second is a bug that acting on the first answer only hides.
+//
+// This pins the fix: such a call now stops the program with io.fatal instead of returning
+// a plausible false. Only one violation can be shown per run (the process halts on the
+// first), so this exercises hash.put's "key length does not match klen" branch; the other
+// three guards (hash.put's negative value, hash.del's wrong length, hash.putpad/
+// hash.delpad's oversized key) follow the identical one-line shape.
+include "hash.wz";
+var
+  keys: array[0..4 * 8 - 1] of char;   // 4 slots of 8-byte keys
+  rows: array[0..3] of int;
+begin
+  hash.clear(rows);
+  io.puts(STDOUT, "before the call\n");
+  // klen is 8; a 3-byte key does not match it.
+  io.puts(STDOUT, "hash.put wrong key length -> ");
+  if hash.put(keys, rows, 8, "abc", 1) then io.puts(STDOUT, "1\n") else io.puts(STDOUT, "0\n");
+  io.puts(STDOUT, "unreachable\n");
+end.

@@ -1,0 +1,34 @@
+// Two library files can each have their own `i` and `buf`.
+//
+// THIS IS THE CASE A LIBRARY WRITER HITS, and it is sharper than "two names collided":
+// a file cannot have a scratch variable at all if any other file uses that name. `i` and
+// `buf` are what a loop counter and a buffer get called, so the second file to want one
+// fails with "duplicate global declaration" -- and the writer renames to a.i, b.buf, which
+// is a workaround for a flat namespace rather than a name anyone chose.
+//
+// What is checked here is that the two are genuinely SEPARATE: b.sum must not disturb the
+// `i` that a.sum left behind. Two files that merely compile would pass a weaker test.
+//
+// AND A ROUTINE MAY REUSE THE NAME TOO: local_two_libs_a declares a file-level `i` while
+// a routine below could declare its own -- see rt_local_bounds for that direction.
+include "io.wz";
+include "progs/local_two_libs_a.wz";
+include "progs/local_two_libs_b.wz";
+
+begin
+  io.puts(STDOUT, "a.sum(5) = ");
+  io.putn(STDOUT, a.sum(5));          // 0+1+2+3+4 = 10
+  io.puts(STDOUT, ", a's i = ");
+  io.putn(STDOUT, a.lasti);           // 5
+
+  io.puts(STDOUT, "\nb.sum(3) = ");
+  io.putn(STDOUT, b.sum(3));          // 1+1+1 = 3
+  io.puts(STDOUT, ", b's i = ");
+  io.putn(STDOUT, b.lasti);           // 3
+
+  // AND a's COUNTER IS UNTOUCHED. This is the check that matters: if the two files shared
+  // one variable, this would now read 3.
+  io.puts(STDOUT, "\na's i is still ");
+  io.putn(STDOUT, a.lasti);           // 5
+  io.puts(STDOUT, "\n");
+end.

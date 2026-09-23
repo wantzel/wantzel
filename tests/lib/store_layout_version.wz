@@ -1,0 +1,219 @@
+// lib/store.wz: a layout version per table, in the snapshot and in every log record.
+//
+// A store of an older layout opens only when the program registers the step with
+// store.upgrade (and, for moved fields, store.carry); otherwise, and for a NEWER layout,
+// store.opendir refuses and names the table and both versions.  A snapshot from before
+// layout versions ('PHS1', written here by hand) reads as layout 0.
+//
+// What is asserted is the bytes that land in the rows, not just the counts: a conversion
+// that copies the wrong range or forgets to zero the new field still counts every row.
+//
+// The working directories carry the process id, so two runs never share a file.
+include "store.wz";
+var
+  tab, i, n, fd: int;
+  dir: array[0..31] of char;
+  dirn: int;
+  dirb: array[0..31] of char;
+  dirbn: int;
+  path: array[0..63] of char;
+  rec: array[0..31] of char;
+  buf: array[0..255] of char;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+function inwork(d: array of char; suffix: str): int;
+var n: int;
+begin
+  for n := 0 to len(d) - 1 do path[n] := d[n];
+  n := io.push(path, len(d), "/");
+  n := io.push(path, n, suffix);
+  path[n] := chr(0);
+  return n;
+end;
+procedure reason;
+begin
+  io.puts(STDOUT, store.err);
+  if store.detn > 0 then
+  begin
+    io.puts(STDOUT, ": ");
+    io.out(STDOUT, addr(store.det[0]), store.detn);
+  end;
+  io.puts(STDOUT, "\n");
+end;
+// the bytes of one row at the given offsets (-1 ends the list)
+procedure bytes(t: int; row: int; a: int; b: int; c: int; d: int; e: int);
+begin
+  io.puts(STDOUT, "  row "); io.putn(STDOUT, row); io.puts(STDOUT, ":");
+  io.puts(STDOUT, " "); io.putn(STDOUT, peek(store.rowaddr(t, row) + a));
+  io.puts(STDOUT, " "); io.putn(STDOUT, peek(store.rowaddr(t, row) + b));
+  io.puts(STDOUT, " "); io.putn(STDOUT, peek(store.rowaddr(t, row) + c));
+  io.puts(STDOUT, " "); io.putn(STDOUT, peek(store.rowaddr(t, row) + d));
+  if e >= 0 then begin io.puts(STDOUT, " "); io.putn(STDOUT, peek(store.rowaddr(t, row) + e)); end;
+  io.puts(STDOUT, "\n");
+end;
+procedure put64(at: int; v: int);
+var i: int;
+begin
+  for i := 0 to 7 do buf[at + i] := chr(band(v shr (8 * i), 255));
+end;
+// a row of layout 0 (16 bytes): byte n of row r is r*16 + n + 1
+procedure fill0(r: int);
+var n: int;
+begin
+  for n := 0 to 15 do rec[n] := chr(r * 16 + n + 1);
+end;
+function open0(d: array of char): bool;
+begin
+  tab := store.table("readings", 16, 100);
+  return store.opendir(d);
+end;
+function open1(d: array of char; up: bool): bool;
+begin
+  tab := store.table("readings", 24, 100);
+  store.layout(tab, 1);
+  if up then store.upgrade(tab, 0, 16);            // fields added at the end: that is all
+  return store.opendir(d);
+end;
+// layout 2 (32 bytes): the old bytes 8..23 move to the front, 0..7 to the back
+function open2(d: array of char; up0: bool): bool;
+begin
+  tab := store.table("readings", 32, 100);
+  store.layout(tab, 2);
+  if up0 then store.upgrade(tab, 0, 16);
+  store.upgrade(tab, 1, 24);
+  store.carry(tab, 1, 8, 16, 0);
+  store.carry(tab, 1, 0, 8, 24);
+  return store.opendir(d);
+end;
+procedure clean(d: array of char);
+begin
+  n := inwork(d, "store.log"); sys1(SYS.unlink, addr(path[0]));
+  n := inwork(d, "store.snap"); sys1(SYS.unlink, addr(path[0]));
+end;
+begin
+  dirn := io.push(dir, 0, "st_ver_");
+  dirn := io.pushnum(dir, dirn, sys1(SYS.getpid, 0));
+  dirn := io.push(dir, dirn, ".d");
+  dirbn := io.push(dirb, 0, "st_verb_");
+  dirbn := io.pushnum(dirb, dirbn, sys1(SYS.getpid, 0));
+  dirbn := io.push(dirb, dirbn, ".d");
+  clean(dir[0..dirn - 1]);
+  clean(dirb[0..dirbn - 1]);
+
+  // 1. a snapshot as it was written before layout versions: 'PHS1', three rows of 16 bytes
+  for n := 0 to dirn - 1 do path[n] := dir[n];
+  path[dirn] := chr(0);
+  sys2(SYS.mkdir, addr(path[0]), 493);
+  io.put32(buf, 0, 0x31534850);
+  io.put32(buf, 4, 1);
+  put64(8, 0);
+  for n := 0 to 31 do buf[16 + n] := chr(0);
+  n := io.push(buf, 16, "readings");
+  put64(48, 16); put64(56, 100); put64(64, 3);
+  for i := 0 to 2 do buf[72 + i] := chr(1);
+  for i := 0 to 2 do for n := 0 to 15 do buf[75 + i * 16 + n] := chr(i * 16 + n + 1);
+  n := inwork(dir[0..dirn - 1], "store.snap");
+  fd := sys3(SYS.open, addr(path[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
+  show("phs1 written = ", sys3(SYS.write, fd, addr(buf[0]), 75 + 48));
+  sys1(SYS.close, fd);
+
+  io.puts(STDOUT, "layout 0 reads the old snapshot:\n");
+  if not open0(dir[0..dirn - 1]) then begin reason; halt(1); end;
+  show("  rows = ", store.count(tab));
+  show("  upgraded = ", store.upgraded(tab));
+  for i := 3 to 4 do                               // two more through the log, at layout 0
+  begin
+    fill0(i);
+    if not store.set(tab, store.alloc(tab), rec[0..15]) then begin reason; halt(1); end;
+  end;
+  bytes(tab, 4, 0, 15, 0, 15, -1);
+  store.close;
+
+  io.puts(STDOUT, "layout 1 without an upgrade:\n  ");
+  if open1(dir[0..dirn - 1], false) then begin show("opened anyway, rows = ", store.count(tab)); halt(1); end;
+  reason;
+  store.close;
+
+  io.puts(STDOUT, "layout 1 with store.upgrade(t, 0, 16):\n");
+  if not open1(dir[0..dirn - 1], true) then begin reason; halt(1); end;
+  show("  rows = ", store.count(tab));
+  show("  upgraded = ", store.upgraded(tab));
+  bytes(tab, 0, 0, 15, 16, 23, -1);                // from the snapshot
+  bytes(tab, 4, 0, 15, 16, 23, -1);                // from a layout-0 log record
+  for n := 0 to 15 do rec[n] := chr(200);
+  for n := 16 to 23 do rec[n] := chr(0x77);
+  if not store.set(tab, store.alloc(tab), rec[0..23]) then begin reason; halt(1); end;
+  store.close;
+
+  io.puts(STDOUT, "again, a log of layout 0 and layout 1 records, then a snapshot:\n");
+  if not open1(dir[0..dirn - 1], true) then begin reason; halt(1); end;
+  show("  rows = ", store.count(tab));
+  show("  upgraded = ", store.upgraded(tab));
+  bytes(tab, 5, 0, 15, 16, 23, -1);
+  if not store.snapshot then begin reason; halt(1); end;
+  store.close;
+  n := inwork(dir[0..dirn - 1], "store.snap");
+  fd := sys3(SYS.open, addr(path[0]), O_RDONLY, 0);
+  n := sys3(SYS.read, fd, addr(buf[0]), 80);
+  sys1(SYS.close, fd);
+  io.puts(STDOUT, "  snapshot magic = "); io.out(STDOUT, addr(buf[0]), 4); io.puts(STDOUT, "\n");
+  show("  snapshot layout = ", io.get64(buf, 16 + 32 + 24));
+
+  io.puts(STDOUT, "layout 1, no upgrade needed any more:\n");
+  if not open1(dir[0..dirn - 1], false) then begin reason; halt(1); end;
+  show("  rows = ", store.count(tab));
+  show("  upgraded = ", store.upgraded(tab));
+  store.close;
+
+  io.puts(STDOUT, "layout 0 on a layout-1 store:\n  ");
+  if open0(dir[0..dirn - 1]) then begin show("opened anyway, rows = ", store.count(tab)); halt(1); end;
+  reason;
+  store.close;
+
+  io.puts(STDOUT, "layout 2 with a carry, from the layout-1 snapshot:\n");
+  if not open2(dir[0..dirn - 1], false) then begin reason; halt(1); end;
+  show("  rows = ", store.count(tab));
+  show("  upgraded = ", store.upgraded(tab));
+  bytes(tab, 0, 0, 15, 16, 24, 31);
+  bytes(tab, 5, 0, 8, 16, 24, 31);
+  store.close;
+
+  // 2. a second directory with only a log, at layout 0: the chain 0 -> 1 -> 2 per record
+  if not open0(dirb[0..dirbn - 1]) then begin reason; halt(1); end;
+  for i := 0 to 1 do
+  begin
+    fill0(i);
+    if not store.set(tab, store.alloc(tab), rec[0..15]) then begin reason; halt(1); end;
+  end;
+  store.close;
+
+  io.puts(STDOUT, "layout 2 without the step from 0:\n  ");
+  if open2(dirb[0..dirbn - 1], false) then begin show("opened anyway, rows = ", store.count(tab)); halt(1); end;
+  reason;
+  store.close;
+
+  io.puts(STDOUT, "layout 2 with both steps, from layout-0 log records:\n");
+  if not open2(dirb[0..dirbn - 1], true) then begin reason; halt(1); end;
+  show("  rows = ", store.count(tab));
+  show("  upgraded = ", store.upgraded(tab));
+  bytes(tab, 1, 0, 15, 16, 24, 31);
+  for n := 0 to 31 do rec[n] := chr(9);
+  if not store.set(tab, store.alloc(tab), rec[0..31]) then begin reason; halt(1); end;
+  store.close;
+
+  io.puts(STDOUT, "layout 1 on a log that holds a layout-2 record:\n  ");
+  if open1(dirb[0..dirbn - 1], true) then begin show("opened anyway, rows = ", store.count(tab)); halt(1); end;
+  reason;
+  store.close;
+
+  clean(dir[0..dirn - 1]);
+  clean(dirb[0..dirbn - 1]);
+  for n := 0 to dirn - 1 do path[n] := dir[n];
+  path[dirn] := chr(0);
+  show("rmdir = ", sys1(SYS.rmdir, addr(path[0])));
+  for n := 0 to dirbn - 1 do path[n] := dirb[n];
+  path[dirbn] := chr(0);
+  show("rmdir b = ", sys1(SYS.rmdir, addr(path[0])));
+end.

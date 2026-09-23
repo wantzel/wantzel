@@ -1,5 +1,9 @@
 // lib/json.wz -- JSON scanning primitives.
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 // Nothing here builds a tree.  Values stay where they are, in the input
 // buffer, and are described by (offset, length) pairs.  The parsers that the
 // compiler generates from a `schema` declaration are built on these.
@@ -10,11 +14,26 @@ var
   json.ival: int;          // last number scanned
   json.bval: bool;         // last true/false scanned
   json.sat, json.send: int;  // last string: text runs from sat up to send
-  // The key a generated <Schema>.parse refused, as b[json.badkey0..json.badkey1).
-  // A parse returns -1 for every kind of failure, so without this the caller cannot say
-  // WHICH field was wrong and has to guess -- and an unknown key is the one failure the
-  // caller can actually fix.  badkey1 = 0 means the last failure was something else.
+  // The DECLARED key a generated <Schema>.parse refused, as
+  // b[json.badkey0..json.badkey1).  A parse returns -1 for every kind of failure, so
+  // without this the caller cannot say WHICH field was wrong and has to guess.  An
+  // undeclared key no longer appears here -- that is not a failure any more, see
+  // json.ignored0 below -- so this is a field the schema knows, given a value it cannot
+  // hold.  badkey1 = 0 means the last failure was not tied to one field (a missing
+  // required field, or text that is not an object at all).
   json.badkey0, json.badkey1: int;
+  // An UNDECLARED key is not refused: it is skipped, and recorded here.  The FIRST one
+  // is kept as b[json.ignored0..json.ignored1) and json.ignoredn counts them all, so a
+  // reply can name one and say how many there were without holding a list.
+  //
+  // Recording it is the whole point.  A parser that only skips lets a caller send a
+  // renamed or misspelt OPTIONAL field and get a normal answer computed with the
+  // default in its place: nothing refused, nothing warned, and the wrong value travels
+  // on.  A required field still fails the presence check, so this is the only hole --
+  // and keeping the key closes it, because the layer above can say what it dropped.
+  //
+  // ignoredn = 0 means the last parse declared every key it was given.
+  json.ignored0, json.ignored1, json.ignoredn: int;
 
 function json.ws(b: array of char; at: int; last: int): int;
 var c: char;
@@ -847,6 +866,12 @@ begin
         // is output that is not valid JSON either.  Refusing is the honest answer:
         // this function formats JSON, it does not repair it.
         if (src[from] = '}') or (src[from] = ']') then return -1;
+        // AND NOT A SECOND COMMA EITHER. [1,,2] has a MISSING element, which is no more JSON
+        // than a trailing one -- and it slipped through the same way: the recursive call
+        // reached the scalar branch and json.skip stepped over the ',' without complaint,
+        // producing output with an empty line where a value should be. Measured 22-09-2026,
+        // alongside the {"a":} case in the object branch below.
+        if src[from] = ',' then return -1;
       end;
       first := 0;
       at := json.indent(dst, at, depth + 1);
@@ -865,6 +890,19 @@ begin
         at := json.putb(dst, at, ':');
         at := json.putb(dst, at, ' ');
         from := from + 1;
+        // AND A VALUE MUST FOLLOW THE COLON.  {"a":} is not JSON, and without this it was
+        // ACCEPTED: the recursive call below fell through to the scalar branch, where
+        // json.skip stepped over the '}' without complaint and the output became
+        //     {\n  "a": \n}
+        // which is not JSON either.  Measured 22-09-2026 -- and it is the worst shape of bug
+        // for a formatter in an editor, because the result LOOKS formatted and is broken, so
+        // it is only discovered when something else tries to read the file.
+        //
+        // json.skip is not at fault: it says what it does, "step over any value", and counts
+        // brackets.  Using it as a validator is what was wrong.
+        from := json.ws(src, from, upto);
+        if from >= upto then return -1;
+        if (src[from] = '}') or (src[from] = ']') or (src[from] = ',') then return -1;
       end;
 
       at := json.pretty(src, from, upto, dst, at, depth + 1);
@@ -873,10 +911,71 @@ begin
     end;
   end;
 
-  // A scalar: string, number, true, false or null.  Copied byte for byte.
+  // A scalar: string, number, true, false or null.  Copied byte for byte once it is one of
+  // those -- and CHECKING THAT IT IS is this function's job, not json.skip's.
+  //
+  // json.skip walks to the end of a token and does not care what the token says: `niets`,
+  // `tru` and `12x` all come back as accepted, because it is a skipper and says so ("step
+  // over any value"). A formatter that trusts it copies the nonsense through and reports
+  // success, which for a file the user is about to save is the worst possible answer.
+  // Measured 22-09-2026: {"a":}, [1,,2] and a bare `niets` were all accepted.
+  if (c <> '"') and (c <> '-') and ((c < '0') or (c > '9')) then
+  begin
+    if json.literal(src, from, upto, "true") < 0 then
+      if json.literal(src, from, upto, "false") < 0 then
+        if json.literal(src, from, upto, "null") < 0 then return -1;
+  end;
   eind := json.skip(src, from, upto);
   if eind < 0 then return -1;
   at := json.putraw(dst, at, src, from, eind);
   json.pread := eind;
   return at;
 end;
+
+// json.wellformed(b, at, upto) -- is this exactly one valid JSON value and nothing else?
+//
+// THE QUESTION json.skip DOES NOT ANSWER. json.skip walks to the end of a value by counting
+// brackets and says so in its own line -- "step over any value, however nested". It does not
+// judge what it stepped over, which is right for its callers: they want to know where a
+// value ENDS. Measured: it accepts {"a" 1} with no colon, [,] and a bare `tru`.
+//
+// So anything that needs to ASK whether a document is JSON needs this instead. Without it a
+// schema validator reports "valid" about text that is not JSON at all, which is the worst
+// answer it can give -- measured 22-09-2026, three of five malformed documents passed.
+//
+// IT REUSES json.pretty RATHER THAN PARSING AGAIN. That routine already visits every
+// character and already refuses malformed input, so a second parser would only be a second
+// thing to keep in step -- and two parsers that drift apart are worse than the gap they
+// filled. The formatted output is written to a scratch buffer and thrown away; the cost is
+// one pass and some bytes, against a correctness guarantee shared with the formatter.
+//
+// AND TRAILING CONTENT IS REFUSED: "{} {}" is two values, and "1 2" is not a number. Both
+// are things a caller means to be told about.
+//
+// json.toolarge says WHICH kind of false this was. "too large to answer" is not the same
+// statement as "not valid JSON" -- the first says nothing at all about whether the bytes
+// are well-formed, the second says they are not -- and a caller that reports the second
+// message for the first reason (this routine's own doc comment above promised only a
+// judgement, and quietly returning the wrong REASON for one is the same kind of gap this
+// file exists to close for others). It is reset at the top of every call, so a stale
+// true from an earlier call never survives into one that fails for an ordinary reason.
+var
+  json.wfbuf: array[0..8191] of char;
+  json.toolarge: bool;
+
+function json.wellformed(b: array of char; at: int; upto: int): bool;
+var e: int;
+begin
+  json.toolarge := false;
+  at := json.ws(b, at, upto);
+  if at >= upto then return false;                 // nothing at all is not a value
+  // A DOCUMENT LARGER THAN THE SCRATCH BUFFER cannot be answered rather than answered
+  // wrongly. Formatting adds a newline and two spaces per level, so the output can be
+  // several times the input -- the same factor the formatter itself guards against.
+  if upto - at > len(json.wfbuf) div 3 then begin json.toolarge := true; return false; end;
+  e := json.pretty(b, at, upto, json.wfbuf, 0, 0);
+  if e < 0 then return false;
+  // json.pread is where the value ended; only whitespace may follow.
+  return json.ws(b, json.pread, upto) >= upto;
+end;
+

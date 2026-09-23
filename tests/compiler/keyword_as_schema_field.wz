@@ -1,0 +1,10 @@
+// Must not compile: a keyword cannot name a schema field, and the message says WHICH word
+// and offers the repair. This used to be "missing end of the schema" on the same line,
+// which sent the reader looking for an end that was never missing.
+type FridgeArgs = schema
+  purchase_period: text;
+  type: text of ("tabletop", "one_door") "The kind of fridge.";
+  built_in: bool;
+end;
+begin
+end.

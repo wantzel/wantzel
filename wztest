@@ -75,14 +75,32 @@ bad() { fail=$((fail+1)); failed="$failed
 limit() { if [ $verbose -eq 1 ]; then cat; else head -40; fi; }
 run() { secs="$1"; shift; if [ $have_timeout -eq 1 ]; then timeout "$secs" "$@"; else "$@"; fi; }
 
+# A NAMED TARGET THAT DOES NOT EXIST IS A FAILURE, NOT A NOTE.
+#
+# It printed to stderr and was dropped, so `wztest nosuchtest` exited 0 -- a green report
+# for a test that never ran. Measured 22-09-2026: a ticket closed green while the test it
+# named was deliberately broken, because the name reached this runner in a form it could
+# not find and nothing said so in the exit code.
+#
+# That is the same trap the demo runner carries a comment about (P-0000-0037), from the
+# other side: there it was an empty match, here a missing file.
+missing=0
 list=$(for t in $targets; do
   if [ -d "$t" ]; then find "$t" -type f \( -name '*.wz' -o -name '*.sh' \) | sort
   elif [ -f "$t" ]; then echo "$t"
-  else echo "wztest: $t does not exist" >&2; fi
+  else echo "wztest: $t does not exist" >&2; echo "__MISSING__"; fi
 done)
+case "$list" in *__MISSING__*) missing=1 ;; esac
+list=$(printf '%s\n' "$list" | grep -v '^__MISSING__$' || true)
 
 for f in $list; do
   case "$f" in tests/helpers.sh) continue ;; esac      # shared functions, not a test
+  # AND NOTHING UNDER tests/helpers/ EITHER. What lives there is a FIXTURE -- a program a
+  # test starts and talks to, such as the ACME authority in acmesrv.wz. Running one as a
+  # test means starting a server that listens until it is killed, which the runner then
+  # reports as a failure. Measured 22-09-2026: 152 passed, 1 failed, and the failure was a
+  # server doing exactly its job.
+  case "$f" in tests/helpers/*) continue ;; esac
   case "$f" in tests/toolchain/*) [ $toolchain -eq 1 ] || { toolskipped=$((toolskipped+1)); continue; } ;; esac
   # The Windows tests need Wine and are the slowest thing in the suite; --windows asks
   # for them.  Only tests that actually START Wine belong here: win_backend_bytes.sh
@@ -94,7 +112,7 @@ for f in $list; do
   # wine processes later, the call is gone from it. A name in this list is
   # only as good as the file it names: check it after a rename.
   case "$f" in
-    tests/toolchain/win_syscalls.sh|tests/toolchain/win_exe_runs.sh|tests/toolchain/win_same_output.sh|tests/toolchain/win_getprocaddress.sh|tests/toolchain/win_winproc.sh)
+    tests/toolchain/win_syscalls.sh|tests/toolchain/win_exe_runs.sh|tests/toolchain/win_same_output.sh|tests/toolchain/win_getprocaddress.sh|tests/toolchain/win_winproc.sh|tests/toolchain/win_recv_reset.sh)
       [ $windows -eq 1 ] || { winskipped=$((winskipped+1)); continue; } ;;
   esac
   case "$f" in tests/bench/*) [ $bench -eq 1 ] || continue ;; esac
@@ -203,4 +221,8 @@ if [ $updated -gt 0 ]; then echo "$updated expected-output files updated; check 
 if [ $toolchain -eq 0 ]; then echo "(the toolchain tests were not run; use --toolchain)"; fi
 printf '%d passed, %d failed, %d skipped\n' $pass $fail $skip
 [ $fail -eq 0 ] || { printf 'failed:%s\n' "$failed"; exit 1; }
+# A NAMED TEST THAT WAS NOT FOUND MAKES THIS A FAILURE, even with everything else green.
+# Otherwise `wztest nosuchtest` prints "0 passed, 0 failed" and exits 0 -- success for
+# something that never ran.
+[ $missing -eq 0 ] || { echo "wztest: a named test could not be found; see above" >&2; exit 1; }
 exit 0

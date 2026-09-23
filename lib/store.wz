@@ -1,4 +1,8 @@
 // lib/store.wz -- durable tables of fixed-size records: an append-only log
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
 // as the source of truth, a snapshot for fast starts, and the rows in memory
 // as one anonymous mapping per table so a row is read through a view.
 //
@@ -11,7 +15,7 @@
 //   store.snapshot;                                    // atomic; then the log is truncated
 //
 // The log (<dir>/store.log) holds one record per set/del:
-//   magic 'PXL1' u32 | len u32 | table u16 | op u8 (1 set, 2 del) | pad u8 | row u32 | payload | crc32 u32
+//   magic 'PXL1' u32 | len u32 | table u16 | op u8 (1 set, 2 del) | layout u8 | row u32 | payload | crc32 u32
 // A torn or corrupted tail (crash mid-write) stops the replay at the last
 // good record.  The snapshot (<dir>/store.snap) is written to a temporary
 // file, fsynced and renamed; its header names the tables and their sizes,
@@ -22,6 +26,33 @@
 // table and both sizes -- skipping it would drop every record behind it
 // without a word.  One process writes; readers of a shared directory are
 // not supported (there is nothing to lock yet but the log, see flock).
+//
+// LAYOUT VERSIONS.  Every table carries a layout version, 0 unless the program says
+// otherwise, and it is written into the snapshot (per table) and into every log record.
+// When the record layout of a table changes, raise its version and say how the previous
+// layout becomes the new one:
+//
+//   t := store.table("readings", 24, 10000);
+//   store.layout(t, 1);                        // records are now layout 1, 24 bytes
+//   store.upgrade(t, 0, 16);                   // layout 0 had 16 bytes: copy them, zero the rest
+//
+// That is the whole registration for the common change -- fields added at the END, with
+// zero as their value in old rows.  When fields move, shrink or disappear, name the bytes
+// that survive; everything not named is zero in the new record:
+//
+//   store.upgrade(t, 1, 24);                   // layout 1 -> 2
+//   store.carry(t, 1, 0, 8, 16);               // old bytes 0..7 land at 16..23
+//   store.carry(t, 1, 8, 16, 0);               // old bytes 8..23 land at 0..15
+//
+// Steps chain: a program at layout 2 with upgrades from 0 and from 1 opens a store of
+// either.  A store of an OLDER layout without a registered step, or of a NEWER layout
+// than the program's, is refused: store.opendir returns false and store.err/store.det
+// name the table and both versions.  Nothing on disk is touched until the program writes.
+// store.upgraded(t) tells which layout was converted (-1: none), so a program can fix up
+// a field that needs code rather than a byte copy -- an int that became a real -- before
+// it calls store.snapshot, which is what puts the store on disk at the new layout.
+// Until that snapshot, the old records stay in the log and are converted at every open.
+// A store written before layout versions existed (snapshot 'PHS1') reads as layout 0.
 
 include "io.wz";
 
@@ -32,7 +63,10 @@ const
   STORE.OPDEL = 2;
   STORE.HDR = 20;                        // log record header bytes before the payload
   STORE.MAGIC = 0x314C5850;              // 'PXL1' little-endian
-  STORE.SNAPMAGIC = 0x31534850;          // 'PHS1'
+  STORE.SNAPMAGIC = 0x31534850;          // 'PHS1': no layout versions, every table is layout 0
+  STORE.SNAPMAGIC2 = 0x32534850;         // 'PHS2': a layout version per table
+  STORE.MAXVER = 255;                    // a layout version is one byte in the log
+  STORE.MAXCARRY = 256;                  // store.carry registrations, all tables together
 
 var
   store.nt: int;
@@ -56,6 +90,18 @@ var
   store.err: str;                                  // the reason of the last failure
   store.det: array[0..255] of char;                // the detail beside it (names, sizes)
   store.detn: int;                                 // 0 when there is no detail
+  store.ver:  array[0..STORE.MAXT - 1] of int;     // layout version of each table
+  store.from: array[0..STORE.MAXT - 1] of int;     // oldest layout converted at open, -1 none
+  store.oldsz: array[0..STORE.MAXT * 256 - 1] of int;  // [t*256+k]: record size of layout k, 0 = no upgrade from k
+  store.ncarry: int;
+  store.cyt:  array[0..STORE.MAXCARRY - 1] of int; // table
+  store.cyv:  array[0..STORE.MAXCARRY - 1] of int; // the old layout the step starts from
+  store.cyat: array[0..STORE.MAXCARRY - 1] of int; // first byte in the old record
+  store.cyn:  array[0..STORE.MAXCARRY - 1] of int; // bytes
+  store.cyto: array[0..STORE.MAXCARRY - 1] of int; // first byte in the new record
+  store.cva: int;                                  // two conversion buffers (mmap), 0 when none
+  store.cvb: int;
+  store.cvsz: int;                                 // bytes in each
 
 // ------------------------------------------------------------- crc32
 
@@ -98,8 +144,102 @@ begin
     else store.name[t * STORE.NAMELEN + i] := chr(0);
   store.rs[t] := recsize;
   store.cap[t] := cap;
+  store.ver[t] := 0;
+  store.from[t] := -1;
+  for i := 0 to 255 do store.oldsz[t * 256 + i] := 0;
   store.nt := store.nt + 1;
   return t;
+end;
+
+// the layout version of table t's records (0..255; 0 when never called)
+procedure store.layout(t: int; ver: int);
+begin
+  if store.open then io.fatal("store.layout after store.open");
+  if (t < 0) or (t >= store.nt) then io.fatal("store.layout of an undeclared table");
+  if (ver < 0) or (ver > STORE.MAXVER) then io.fatal("store.layout needs a version from 0 to 255");
+  store.ver[t] := ver;
+end;
+
+// register the step from layout oldver to oldver + 1 of table t, whose records had
+// oldsize bytes at oldver.  Without store.carry for this step the first bytes are copied
+// (as many as both layouts have) and the rest of the new record is zero.
+procedure store.upgrade(t: int; oldver: int; oldsize: int);
+begin
+  if store.open then io.fatal("store.upgrade after store.open");
+  if (t < 0) or (t >= store.nt) then io.fatal("store.upgrade of an undeclared table");
+  if (oldver < 0) or (oldver >= STORE.MAXVER) then io.fatal("store.upgrade needs an old version from 0 to 254");
+  if oldsize <= 0 then io.fatal("store.upgrade needs the old record size");
+  store.oldsz[t * 256 + oldver] := oldsize;
+end;
+
+// in the step from layout oldver of table t: old bytes oldat..oldat+n-1 go to newat..newat+n-1.
+// Once a step has a carry, only carried bytes survive it; the rest of the new record is zero.
+procedure store.carry(t: int; oldver: int; oldat: int; n: int; newat: int);
+var k: int;
+begin
+  if store.open then io.fatal("store.carry after store.open");
+  if (t < 0) or (t >= store.nt) then io.fatal("store.carry of an undeclared table");
+  if store.ncarry >= STORE.MAXCARRY then io.fatal("too many store.carry registrations");
+  if (oldat < 0) or (newat < 0) or (n <= 0) then io.fatal("store.carry needs offsets and a length");
+  k := store.ncarry;
+  store.cyt[k] := t; store.cyv[k] := oldver; store.cyat[k] := oldat;
+  store.cyn[k] := n; store.cyto[k] := newat;
+  store.ncarry := k + 1;
+end;
+
+// the oldest layout of table t that store.opendir converted, or -1 when it converted nothing
+function store.upgraded(t: int): int;
+begin
+  return store.from[t];
+end;
+
+// the record size of layout k of table t: the declared one, or the one store.upgrade named
+function store.size(t: int; k: int): int;
+begin
+  if k = store.ver[t] then return store.rs[t];
+  if (k < 0) or (k > STORE.MAXVER) then return 0;
+  return store.oldsz[t * 256 + k];
+end;
+
+// -1 when every step from layout k up to the declared one is registered, else the first
+// layout that has no upgrade
+function store.missing(t: int; k: int): int;
+var v: int;
+begin
+  for v := k to store.ver[t] - 1 do
+    if store.oldsz[t * 256 + v] = 0 then return v;
+  return -1;
+end;
+
+// convert one record of layout k of table t at address src, step by step, into a
+// conversion buffer; returns the address of the result (store.rs[t] bytes)
+function store.convert(t: int; k: int; src: int): int;
+var a, d, v, i, j, n, m: int;
+    carried: bool;
+begin
+  a := src;
+  for v := k to store.ver[t] - 1 do
+  begin
+    d := store.cva;
+    if a = store.cva then d := store.cvb;
+    m := store.size(t, v + 1);
+    for i := 0 to m - 1 do poke(d + i, 0);
+    carried := false;
+    for j := 0 to store.ncarry - 1 do
+      if (store.cyt[j] = t) and (store.cyv[j] = v) then
+      begin
+        carried := true;
+        for i := 0 to store.cyn[j] - 1 do poke(d + store.cyto[j] + i, peek(a + store.cyat[j] + i));
+      end;
+    if not carried then
+    begin
+      n := store.size(t, v);
+      if m < n then n := m;
+      for i := 0 to n - 1 do poke(d + i, peek(a + i));
+    end;
+    a := d;
+  end;
+  return a;
 end;
 
 function store.rowaddr(t: int; row: int): int;
@@ -195,13 +335,73 @@ begin
   store.detn := n;
 end;
 
+// record why a stored layout version cannot be opened: `where` is "the snapshot" or
+// "a log record", `found` the version it holds.  A newer version is refused outright; an
+// older one names the first step that has no store.upgrade.
+procedure store.sayversion(t: int; found: int; where: str);
+var n, gap: int;
+begin
+  if found > store.ver[t] then store.err := "the store was written with a newer layout version"
+  else store.err := "layout version differs and no conversion is registered";
+  n := io.push(store.det, 0, "table ");
+  n := store.putname(n, t);
+  n := io.push(store.det, n, " is version ");
+  n := io.pushnum(store.det, n, store.ver[t]);
+  n := io.push(store.det, n, ", ");
+  n := io.push(store.det, n, where);
+  n := io.push(store.det, n, " holds version ");
+  n := io.pushnum(store.det, n, found);
+  if found < store.ver[t] then
+  begin
+    gap := store.missing(t, found);
+    n := io.push(store.det, n, "; no store.upgrade from version ");
+    n := io.pushnum(store.det, n, gap);
+  end;
+  store.detn := n;
+end;
+
+// record that a snapshot table does not have the record size or capacity that its
+// layout version should have
+procedure store.saysnapsize(t: int; k: int; wantrs: int; foundrs: int; foundcap: int);
+var n: int;
+begin
+  store.err := "snapshot record size or capacity differs";
+  n := io.push(store.det, 0, "table ");
+  n := store.putname(n, t);
+  n := io.push(store.det, n, " version ");
+  n := io.pushnum(store.det, n, k);
+  n := io.push(store.det, n, " expects ");
+  n := io.pushnum(store.det, n, wantrs);
+  n := io.push(store.det, n, " bytes and ");
+  n := io.pushnum(store.det, n, store.cap[t]);
+  n := io.push(store.det, n, " rows, the snapshot holds ");
+  n := io.pushnum(store.det, n, foundrs);
+  n := io.push(store.det, n, " and ");
+  n := io.pushnum(store.det, n, foundcap);
+  store.detn := n;
+end;
+
 // apply one record to memory (no logging); false means the record does NOT fit the
 // declared layout and nothing was applied -- the caller must stop rather than skip it.
 function store.apply(t: int; op: int; row: int; payload: array of char): bool;
-var a, i: int;
+var a, i, n: int;
 begin
-  if (t < 0) or (t >= store.nt) then return false;
-  if (row < 0) or (row >= store.cap[t]) then return false;
+  if (t < 0) or (t >= store.nt) then
+  begin
+    store.err := "store.apply: table out of range";
+    n := io.push(store.det, 0, "table ");
+    store.detn := io.pushnum(store.det, n, t);
+    return false;
+  end;
+  if (row < 0) or (row >= store.cap[t]) then
+  begin
+    store.err := "store.apply: row out of range";
+    n := io.push(store.det, 0, "table ");
+    n := store.putname(n, t);
+    n := io.push(store.det, n, " row ");
+    store.detn := io.pushnum(store.det, n, row);
+    return false;
+  end;
   if op = STORE.OPSET then
   begin
     if len(payload) <> store.rs[t] then
@@ -231,7 +431,7 @@ var
 // size.  A record that does not fit the declared layout is NOT skipped: store.err is set
 // and replay stops there, so the caller can refuse to open rather than lose the rest.
 function store.replay(from: int): int;
-var fd, got, n, plen, t, op, row, crc, want, at: int;
+var fd, got, n, plen, t, op, lv, row, crc, want, at, cv: int;
     ok: bool;
 begin
   store.mkpath("store.log");
@@ -253,8 +453,31 @@ begin
     if crc <> want then break;
     t := io.get16(store.rd, 8);
     op := ord(store.rd[10]);
+    lv := ord(store.rd[11]);                       // layout version; 0 in a log from before versions
     row := io.get32(store.rd, 12);
-    if plen > 0 then ok := store.apply(t, op, row, store.rd[STORE.HDR..STORE.HDR + plen - 1])
+    if (t >= 0) and (t < store.nt) and (lv <> store.ver[t]) then
+    begin
+      if lv > store.ver[t] then begin store.sayversion(t, lv, "a log record"); break; end;
+      if op = STORE.OPSET then
+      begin
+        if store.missing(t, lv) >= 0 then begin store.sayversion(t, lv, "a log record"); break; end;
+        if plen <> store.size(t, lv) then
+        begin
+          store.saylayout(t, plen);
+          n := io.push(store.det, store.detn, " (layout version ");
+          n := io.pushnum(store.det, n, lv);
+          n := io.push(store.det, n, " has ");
+          n := io.pushnum(store.det, n, store.size(t, lv));
+          store.detn := io.push(store.det, n, ")");
+          break;
+        end;
+        cv := store.convert(t, lv, addr(store.rd[STORE.HDR]));
+        ok := store.apply(t, op, row, view(cv, store.rs[t]));
+        if (store.from[t] < 0) or (lv < store.from[t]) then store.from[t] := lv;
+      end
+      else ok := store.apply(t, op, row, store.rd[0..-1]);
+    end
+    else if plen > 0 then ok := store.apply(t, op, row, store.rd[STORE.HDR..STORE.HDR + plen - 1])
     else ok := store.apply(t, op, row, store.rd[0..-1]);
     if not ok then break;
     at := at + STORE.HDR + plen + 4;
@@ -268,13 +491,17 @@ var
 
 // load <dir>/store.snap if it matches the declared tables; returns the log offset it covers
 function store.loadsnap: int;
-var fd, n, t, i, k, off, cnt: int;
+var fd, n, t, i, k, off, cnt, ent, sv, osz, per, got, j, cv: int;
+    versioned: bool;
 begin
   store.mkpath("store.snap");
   fd := sys3(SYS.open, addr(store.path[0]), O_RDONLY, 0);
   if fd < 0 then return 0;
   n := sys3(SYS.read, fd, addr(store.sh[0]), 16);
-  if (n < 16) or (io.get32(store.sh, 0) <> STORE.SNAPMAGIC) or (io.get32(store.sh, 4) <> store.nt) then
+  versioned := (n >= 16) and (io.get32(store.sh, 0) = STORE.SNAPMAGIC2);
+  ent := STORE.NAMELEN + 24;
+  if versioned then ent := STORE.NAMELEN + 32;
+  if (n < 16) or ((io.get32(store.sh, 0) <> STORE.SNAPMAGIC) and not versioned) or (io.get32(store.sh, 4) <> store.nt) then
   begin
     sys1(SYS.close, fd);
     store.err := "snapshot does not match the declared tables";
@@ -283,21 +510,55 @@ begin
   off := io.get64(store.sh, 8);
   for t := 0 to store.nt - 1 do
   begin
-    n := sys3(SYS.read, fd, addr(store.sh[0]), STORE.NAMELEN + 24);
-    if n < STORE.NAMELEN + 24 then begin sys1(SYS.close, fd); store.err := "snapshot truncated"; return -1; end;
+    n := sys3(SYS.read, fd, addr(store.sh[0]), ent);
+    if n < ent then begin sys1(SYS.close, fd); store.err := "snapshot truncated"; return -1; end;
     for i := 0 to STORE.NAMELEN - 1 do
       if store.sh[i] <> store.name[t * STORE.NAMELEN + i] then begin sys1(SYS.close, fd); store.err := "snapshot table names differ"; return -1; end;
-    if (io.get64(store.sh, STORE.NAMELEN) <> store.rs[t]) or (io.get64(store.sh, STORE.NAMELEN + 8) <> store.cap[t]) then
+    sv := 0;                                               // a 'PHS1' snapshot: layout 0
+    if versioned then sv := io.get64(store.sh, STORE.NAMELEN + 24);
+    if (sv < 0) or (sv > store.ver[t]) or ((sv < store.ver[t]) and (store.missing(t, sv) >= 0)) then
     begin
-      sys1(SYS.close, fd); store.err := "snapshot record size or capacity differs"; return -1;
+      sys1(SYS.close, fd); store.sayversion(t, sv, "the snapshot"); return -1;
+    end;
+    osz := store.size(t, sv);
+    if (io.get64(store.sh, STORE.NAMELEN) <> osz) or (io.get64(store.sh, STORE.NAMELEN + 8) <> store.cap[t]) then
+    begin
+      sys1(SYS.close, fd);
+      store.saysnapsize(t, sv, osz, io.get64(store.sh, STORE.NAMELEN), io.get64(store.sh, STORE.NAMELEN + 8));
+      return -1;
     end;
     cnt := io.get64(store.sh, STORE.NAMELEN + 16);        // rows written = high-water mark
     if (cnt < 0) or (cnt > store.cap[t]) then begin sys1(SYS.close, fd); store.err := "snapshot row count invalid"; return -1; end;
     if cnt > 0 then
     begin
       if sys3(SYS.read, fd, store.lv[t], cnt) <> cnt then begin sys1(SYS.close, fd); store.err := "snapshot truncated"; return -1; end;
-      k := cnt * store.rs[t];
-      if sys3(SYS.read, fd, store.base[t], k) <> k then begin sys1(SYS.close, fd); store.err := "snapshot truncated"; return -1; end;
+      if sv = store.ver[t] then
+      begin
+        k := cnt * store.rs[t];
+        if sys3(SYS.read, fd, store.base[t], k) <> k then begin sys1(SYS.close, fd); store.err := "snapshot truncated"; return -1; end;
+      end
+      else
+      begin
+        // an older layout: read as many old rows as fit in store.rd, convert each into place
+        per := len(store.rd) div osz;
+        if per = 0 then begin sys1(SYS.close, fd); store.err := "snapshot record too large to convert"; return -1; end;
+        i := 0;
+        while i < cnt do
+        begin
+          got := cnt - i;
+          if got > per then got := per;
+          k := got * osz;
+          if sys3(SYS.read, fd, addr(store.rd[0]), k) <> k then begin sys1(SYS.close, fd); store.err := "snapshot truncated"; return -1; end;
+          for j := 0 to got - 1 do
+          begin
+            cv := store.convert(t, sv, addr(store.rd[j * osz]));
+            k := store.base[t] + (i + j) * store.rs[t];
+            for n := 0 to store.rs[t] - 1 do poke(k + n, peek(cv + n));
+          end;
+          i := i + got;
+        end;
+        store.from[t] := sv;
+      end;
     end;
     store.hi[t] := cnt;
     store.n[t] := 0;
@@ -305,6 +566,42 @@ begin
   end;
   sys1(SYS.close, fd);
   return off;
+end;
+
+// check the registered upgrades and carries against the declared layouts, and map the two
+// conversion buffers when any table has an upgrade.  A registration that cannot be right
+// is a mistake in the program, not in the data, so it is fatal like store.table's checks.
+procedure store.setupconvert;
+var t, k, j, big, m: int;
+begin
+  big := 0;
+  for t := 0 to store.nt - 1 do
+  begin
+    store.from[t] := -1;
+    for k := 0 to 255 do
+      if store.oldsz[t * 256 + k] > 0 then
+      begin
+        if k >= store.ver[t] then io.fatal("store.upgrade from a layout that is not older than the table's");
+        if store.oldsz[t * 256 + k] > big then big := store.oldsz[t * 256 + k];
+        if store.rs[t] > big then big := store.rs[t];
+      end;
+  end;
+  for j := 0 to store.ncarry - 1 do
+  begin
+    t := store.cyt[j]; k := store.cyv[j];
+    if (k < 0) or (k >= store.ver[t]) or (store.oldsz[t * 256 + k] = 0) then
+      io.fatal("store.carry for a step without store.upgrade");
+    m := store.size(t, k + 1);
+    if m = 0 then io.fatal("store.carry into a layout of unknown size: register its store.upgrade too");
+    if (store.cyat[j] + store.cyn[j] > store.oldsz[t * 256 + k]) or (store.cyto[j] + store.cyn[j] > m) then
+      io.fatal("store.carry outside a record");
+  end;
+  store.cvsz := big;
+  if big > 0 then
+  begin
+    store.cva := store.mapzero(big);
+    store.cvb := store.mapzero(big);
+  end;
 end;
 
 // open the store in dir: map the tables, load the snapshot, replay the log tail
@@ -329,6 +626,7 @@ begin
   store.mapped := true;
   store.err := "";
   store.detn := 0;
+  store.setupconvert;
   off := store.loadsnap;
   if off < 0 then return false;
   store.logsize := store.replay(off);
@@ -352,13 +650,36 @@ function store.write(t: int; op: int; row: int; payload: array of char): bool;
 var n, crc: int;
 begin
   if not store.open then io.fatal("store not open");
-  if (t < 0) or (t >= store.nt) then return false;
-  if (row < 0) or (row >= store.cap[t]) then return false;
-  if len(payload) + STORE.HDR + 4 > len(store.wr) then return false;
+  if (t < 0) or (t >= store.nt) then
+  begin
+    store.err := "store.write: table out of range";
+    n := io.push(store.det, 0, "table ");
+    store.detn := io.pushnum(store.det, n, t);
+    return false;
+  end;
+  if (row < 0) or (row >= store.cap[t]) then
+  begin
+    store.err := "store.write: row out of range";
+    n := io.push(store.det, 0, "table ");
+    n := store.putname(n, t);
+    n := io.push(store.det, n, " row ");
+    store.detn := io.pushnum(store.det, n, row);
+    return false;
+  end;
+  if len(payload) + STORE.HDR + 4 > len(store.wr) then
+  begin
+    store.err := "store.write: record too large for the write buffer";
+    n := io.push(store.det, 0, "table ");
+    n := store.putname(n, t);
+    n := io.push(store.det, n, " payload ");
+    n := io.pushnum(store.det, n, len(payload));
+    store.detn := io.push(store.det, n, " bytes");
+    return false;
+  end;
   io.put32(store.wr, 0, STORE.MAGIC);
   io.put32(store.wr, 4, len(payload));
   store.wr[8] := chr(band(t, 255)); store.wr[9] := chr(band(t shr 8, 255));
-  store.wr[10] := chr(op); store.wr[11] := chr(0);
+  store.wr[10] := chr(op); store.wr[11] := chr(store.ver[t]);
   io.put32(store.wr, 12, row);
   io.put32(store.wr, 16, 0);
   for n := 0 to len(payload) - 1 do store.wr[STORE.HDR + n] := payload[n];
@@ -392,33 +713,55 @@ begin
   store.mkpath("store.snap.tmp");
   fd := sys3(SYS.open, addr(store.path[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
   if fd < 0 then begin store.err := "cannot create the snapshot"; return false; end;
-  io.put32(store.sh, 0, STORE.SNAPMAGIC);
+  io.put32(store.sh, 0, STORE.SNAPMAGIC2);
   io.put32(store.sh, 4, store.nt);
   for i := 0 to 7 do store.sh[8 + i] := chr(0);      // the log is truncated after the snapshot: replay from 0
-  if sys3(SYS.write, fd, addr(store.sh[0]), 16) <> 16 then begin sys1(SYS.close, fd); return false; end;
+  if sys3(SYS.write, fd, addr(store.sh[0]), 16) <> 16 then begin sys1(SYS.close, fd); store.err := "cannot write the snapshot header"; return false; end;
   for t := 0 to store.nt - 1 do
   begin
     for i := 0 to STORE.NAMELEN - 1 do store.sh[i] := store.name[t * STORE.NAMELEN + i];
     for i := 0 to 7 do store.sh[STORE.NAMELEN + i] := chr(band(store.rs[t] shr (8 * i), 255));
     for i := 0 to 7 do store.sh[STORE.NAMELEN + 8 + i] := chr(band(store.cap[t] shr (8 * i), 255));
     for i := 0 to 7 do store.sh[STORE.NAMELEN + 16 + i] := chr(band(store.hi[t] shr (8 * i), 255));
-    n := STORE.NAMELEN + 24;
-    if sys3(SYS.write, fd, addr(store.sh[0]), n) <> n then begin sys1(SYS.close, fd); return false; end;
+    for i := 0 to 7 do store.sh[STORE.NAMELEN + 24 + i] := chr(band(store.ver[t] shr (8 * i), 255));
+    n := STORE.NAMELEN + 32;
+    if sys3(SYS.write, fd, addr(store.sh[0]), n) <> n then
+    begin
+      sys1(SYS.close, fd);
+      store.err := "cannot write the snapshot table header";
+      n := io.push(store.det, 0, "table ");
+      store.detn := store.putname(n, t);
+      return false;
+    end;
     if store.hi[t] > 0 then
     begin
-      if sys3(SYS.write, fd, store.lv[t], store.hi[t]) <> store.hi[t] then begin sys1(SYS.close, fd); return false; end;
+      if sys3(SYS.write, fd, store.lv[t], store.hi[t]) <> store.hi[t] then
+      begin
+        sys1(SYS.close, fd);
+        store.err := "cannot write the snapshot liveness bytes";
+        n := io.push(store.det, 0, "table ");
+        store.detn := store.putname(n, t);
+        return false;
+      end;
       k := store.hi[t] * store.rs[t];
-      if sys3(SYS.write, fd, store.base[t], k) <> k then begin sys1(SYS.close, fd); return false; end;
+      if sys3(SYS.write, fd, store.base[t], k) <> k then
+      begin
+        sys1(SYS.close, fd);
+        store.err := "cannot write the snapshot rows";
+        n := io.push(store.det, 0, "table ");
+        store.detn := store.putname(n, t);
+        return false;
+      end;
     end;
   end;
-  if sys1(SYS.fsync, fd) < 0 then begin sys1(SYS.close, fd); return false; end;
+  if sys1(SYS.fsync, fd) < 0 then begin sys1(SYS.close, fd); store.err := "cannot fsync the snapshot"; return false; end;
   sys1(SYS.close, fd);
   store.mkpath("store.snap");
   for i := 0 to 1099 do store.rd[i] := store.path[i];          // the final name, NUL-terminated
   store.mkpath("store.snap.tmp");
   if sys2(SYS.rename, addr(store.path[0]), addr(store.rd[0])) < 0 then begin store.err := "rename failed"; return false; end;
   // the log is now fully covered by the snapshot: start it afresh
-  if sys2(SYS.ftruncate, store.logfd, 0) < 0 then return false;
+  if sys2(SYS.ftruncate, store.logfd, 0) < 0 then begin store.err := "cannot truncate the log after the snapshot"; return false; end;
   store.logsize := 0;
   return true;
 end;
@@ -436,6 +779,13 @@ begin
       sys2(SYS.munmap, store.base[t], store.rs[t] * store.cap[t]);
       sys2(SYS.munmap, store.lv[t], store.cap[t]);
     end;
+  if store.cvsz > 0 then
+  begin
+    sys2(SYS.munmap, store.cva, store.cvsz);
+    sys2(SYS.munmap, store.cvb, store.cvsz);
+  end;
+  store.cva := 0; store.cvb := 0; store.cvsz := 0;
+  store.ncarry := 0;
   store.mapped := false;
   store.open := false;
   store.nt := 0;

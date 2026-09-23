@@ -27,7 +27,8 @@ begin
   r[0].sum := a[0].a + a[0].b;
   return 0;
 end;
-// lib/tools.wz includes http.wz, so even a stdio-only server needs this
+// lib/tools.wz brings http.wz for its REST half, so it needs this; the stdio-only
+// lib/toolsmcp.wz does not (tests/lib/tools_stdio_only.sh)
 procedure app.request;
 begin
 end;

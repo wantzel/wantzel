@@ -1,62 +1,80 @@
 # Command line
 
+**Two arguments and two options — the whole interface.**
+
+[README](../README.md) · [Language](language.md) · [Syntax](syntax.md) · [Library](library.md) · [Writing Wantzel](writing-wantzel.md) · [How-to](howto.md) · [Design](design.md) · [Changelog](changelog.md)
+
+---
+
 ```
-wantzel <source.wz> <executable> [--target=linux|windows]
+wantzel <source.wz> <executable> [--target=linux|windows] [--debug]
 wantzel --version
 ```
 
-Two arguments and one option. That is the whole interface, and it is short on purpose: a compiler with thirty switches is thirty things to get wrong, and an agent in a
-loop should not have to choose.
+Short on purpose: a compiler with thirty switches is thirty things to get wrong, and an
+agent in a loop should not have to choose. Options go **after** the two file names.
 
-## The options
+## `--target`
 
-### `--target=linux` | `--target=windows`
-
-Which operating system the executable is for. **The default is Linux.**
+`--target=linux` (default) or `--target=windows` (short: `-tlinux`, `-twindows`).
 
 ```bash
 wantzel prog.wz bin/prog                      # an ELF
 wantzel prog.wz bin/prog.exe --target=windows # a PE32+
 ```
 
-**The output name decides nothing.** A name ending in `.exe` used to select Windows on its
-own, so `wantzel x.wz backup.exe` handed back a Windows binary nobody asked for — a second
-way to choose the target, and an invisible one. A `.exe` name without `--target` is now
-refused rather than quietly built:
+**The output name decides nothing.** A `.exe` name with no `--target` used to select
+Windows on its own — a second, invisible way to choose the target — so it is now refused:
 
 ```
 wantzel: the output name ends in .exe but no target was given; add --target=windows
          (or --target=linux to build an ELF under that name)
 ```
 
-### `--version`
+## `--debug`
 
-Prints the version and exits.
-
-```
-$ wantzel --version
-wantzel 0.2.1
-```
-
-## Where the options go
-
-**After the two file names.** The compiler reads the source and the output first:
+Writes `<executable>.wzdbg` beside the binary: which address belongs to which source
+line, and where every routine, parameter, local and global lives, with its type.
 
 ```bash
-wantzel prog.wz bin/prog --target=windows     # right
-wantzel --target=windows prog.wz bin/prog     # refused
+wantzel prog.wz bin/prog --debug                       # bin/prog and bin/prog.wzdbg
+wantzel prog.wz bin/prog.exe --target=windows --debug  # bin/prog.exe and bin/prog.exe.wzdbg
 ```
 
-## What there is no flag for, and why
+**The executable is byte-identical with and without the flag** — the sidecar is the whole
+difference, so the build you debug is the build you ship. Plain text, one record per
+line; format in [design.md](design.md).
 
-| | |
+## `--version`
+
+Prints the version and where the library is, then exits.
+
+```console
+$ wantzel --version
+wantzel 0.2.1
+library /opt/wantzel-0.2.1-linux-x86_64/lib/
+```
+
+The second line is a diagnosis, not a setting: the standard library is read from disk, so
+a compiler copied away from its `lib/` cannot resolve `include "io.wz"`. If the directory
+is missing, the line says so instead of the path:
+
+```
+library /home/you/bin/lib/   NOT FOUND -- copy lib/ next to the compiler
+```
+
+There is no flag to point the include path elsewhere (see below).
+
+## What has no flag, and why
+
+| | why not |
 |---|---|
-| **optimisation level** | there is no optimiser. Straightforward code generation keeps what runs recognisable as what you read, and it is a large part of why compiling takes milliseconds. See [`design.md`](design.md) |
-| **include paths** | there is one, and it is not configurable: `lib/` beside the compiler's own executable. `include "io.wz"` is looked for there first, then beside the source file; a name with a `/` in it is a path and is only looked for beside the source. Point it somewhere else by putting the compiler somewhere else |
-| **warnings** | there are none. Something is an error or it is fine — a warning is a thing you learn to scroll past |
-| **debug information** | a binary carries the file and line of every runtime check, always. That is what an agent needs to fix its own mistake, so it is not something to switch on. The file is named relative to the project, never by its path on the build machine — see below |
-| **stripping the build path** | nothing to strip. A runtime message carries at most the last two directory segments (`src/win32/main.wz:412`), so the same source gives the same binary whether you name it relatively or absolutely, and no executable carries the layout of the machine that built it |
-| **linking** | there is no linker and nothing to link. No libc, no runtime, no shared libraries |
+| **optimisation level** | there is no optimiser; straightforward code generation keeps output recognisable as source, and is why compiling takes milliseconds |
+| **include paths** | one fixed path: `lib/` beside the compiler binary. `include "io.wz"` looks there first, then beside the source file; a name with `/` is a path and is only looked for beside the source. Move the include target by moving the compiler |
+| **warnings** | none — something is an error or it is fine |
+| **debug info in the binary** | every runtime check already carries its file and line, always, in the executable itself; `--debug` adds a *separate* file for a step-by-step debugger, never bytes in the binary |
+| **stripping the build path** | nothing to strip — a runtime message carries at most the last two path segments (`src/win32/main.wz:412`), so the same source gives the same binary built from any path |
+| **linking** | no linker, nothing to link: no libc, no runtime, no shared libraries |
 
-Each of those is a decision rather than a gap. If one of them turns out to be wrong it
-changes here, with a count behind it.
+Each is a decision, not a gap. If one turns out wrong, it changes here, with a count
+behind it.

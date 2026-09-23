@@ -1,0 +1,85 @@
+// lib/fs.wz: fs.map and fs.unmap -- one call for "map this file".
+//
+// WHAT IS CHECKED, and the third is the reason the routine exists at all:
+//   1. a real file maps, and fs.size reports its length
+//   2. an empty file and a missing one are refused, with -1 rather than a bad mapping
+//   3. NO DESCRIPTOR IS LEAKED. A mapping keeps its own reference, so the descriptor is
+//      finished the moment mmap returns -- but a caller who does not know that leaks one
+//      per file, and that is invisible until something long-running runs out.
+//
+// HOW THE LEAK IS MEASURED, because the obvious way does not work: a loop of a thousand
+// maps passes WITH the leak, since ulimit -n is 1048576 here. Instead this counts: a
+// descriptor is the lowest free number, so after fifty maps the next open still has to
+// come back low. Measured: 3 without the leak, 53 with it.
+include "io.wz";
+include "fs.wz";
+
+var
+  pad: array[0..511] of char;
+  base, i, fd, failures: int;
+
+procedure setpath(s: str);
+var k: int;
+begin
+  k := 0;
+  while (k < slen(s)) and (k < len(pad) - 1) do begin pad[k] := schar(s, k); k := k + 1; end;
+  pad[k] := chr(0);
+end;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ") else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+begin
+  failures := 0;
+
+  // ---- 1. A REAL FILE ------------------------------------------------------------------
+  //
+  // WRITTEN HERE, not this test's own source. A program RUNS in its own temporary directory
+  // and not in tests/lib -- deliberately, so two tests cannot see each other's files. A test
+  // that opens its own source therefore passes alone and fails in the suite.
+  setpath("fs_map_proef.txt");
+  fd := sys3(SYS.open, addr(pad[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
+  if fd < 0 then begin io.puts(STDOUT, "FAIL cannot create the sample file\n"); halt(1); end;
+  i := sys3(SYS.write, fd, sadr("/ written by the test itself, and not empty.\n"), 46);
+  sys1(SYS.close, fd);
+  base := fs.map(addr(pad[0]));
+  expect(base >= 0, "a file that exists maps");
+  expect(fs.size = 46, "and fs.size carries its length");
+  if base >= 0 then
+  begin
+    // THE FIRST BYTE IS THE FILE'S. Without this a mapping that points somewhere else would
+    // pass just as well.
+    expect(peek(base) = ord('/'), "and the first byte is the file's");
+    fs.unmap(base, fs.size);
+  end;
+
+  // ---- 2. WHAT MUST BE REFUSED ---------------------------------------------------------
+  setpath("does-not-exist-at-all.wz");
+  expect(fs.map(addr(pad[0])) < 0, "a file that does not exist is refused");
+
+  // ---- 3. NO LEAK ----------------------------------------------------------------------
+  //
+  // THE SAMPLE FILE, not this test's source: that is not here. With a path that does not
+  // exist fs.map fails on the stat, before it ever opens a descriptor -- and then the loop
+  // measures nothing. That is exactly what happened while this line said "fs_map.wz": the
+  // sabotage (removing the close) stayed green, because nothing was mapped.
+  setpath("fs_map_proef.txt");
+  i := 0;
+  while i < 50 do
+  begin
+    base := fs.map(addr(pad[0]));
+    if base >= 0 then fs.unmap(base, fs.size);
+    i := i + 1;
+  end;
+  fd := fs.open(addr(pad[0]));
+  // FIVE IS GENEROUS: 0/1/2 are stdin/stdout/stderr, so 3 or 4 is normal. With a leak it
+  // sits at 53.
+  expect(fd < 5, "fifty maps leak no descriptor");
+  if fd >= 0 then fs.close(fd);
+
+  if failures > 0 then halt(1);
+end.

@@ -1,18 +1,20 @@
-# Wantzel — language specification
+# Language specification
 
-This is the living reference of what the compiler (and `bootstrap/boot.c`) supports
-**today**. Everything written here is tested in `test.sh` or `tests/`. Planned extensions
-are kept separately in §9 and are only valid once they move here. Whoever implements
-something reads this file first; whoever changes the language updates this file in the same
-commit.
+**The binding reference: what the compiler supports today.**
 
-Last updated: 2026-09-17 (phase 1 complete: real, record, slices, view, for, local const, schema v2, tools; a schema is declared as `type X = schema ... end;`).
+[README](../README.md) · [Language](language.md) · [Syntax](syntax.md) · [Library](library.md) · [Writing Wantzel](writing-wantzel.md) · [How-to](howto.md) · [Design](design.md) · [Changelog](changelog.md)
 
-## The language in brief
+---
 
-A tour before the specification: what Wantzel is and why. Everything here is stated precisely
-in the numbered sections that follow; where the two seem to differ, the numbered section
-is the one that binds.
+Everything here is tested in `test.sh` or `tests/`. Planned extensions live in §9 and are
+only valid once they move here. Whoever implements something reads this file first;
+whoever changes the language updates this file in the same commit. Where the tour below
+and a numbered section seem to differ, the numbered section binds.
+
+Last updated: 2026-09-17 (phase 1 complete: real, record, slices, view, for, local const,
+schema v2, tools; a schema is `type X = schema ... end;`).
+
+## A tour
 
 ```pascal
 include "lib/json.wz";
@@ -52,56 +54,39 @@ begin
 end.
 ```
 
-### Types, in brief
+**Types.** `int` (64-bit), `real` (64-bit IEEE), `char` (0..255), `bool`, `str`
+(literals), `array[lo..hi] of T` and `record`. No implicit conversions: `ord()`/`chr()`
+are required, an `int` is not a condition, `and`/`or`/`not` work only on `bool` (bits go
+through `band`/`bor`/`bxor`/`bnot`). No pointers, no pointer arithmetic — indirection goes
+through arrays whose bounds the compiler knows. Routines take up to ten arguments; an
+`array of T` parameter counts as two (address and length) and keeps its bounds check.
 
-`int` (64-bit), `real` (64-bit IEEE), `char` (0..255), `bool`, `str` (literals),
-`array[lo..hi] of T` and `record`. No implicit conversions: `ord()`/`chr()` are required,
-an `int` is not a condition, and `and`/`or`/`not` work only on `bool` (bits go through
-`band`/`bor`/`bxor`/`bnot`). No pointers and no pointer arithmetic — all indirection goes
-through arrays whose bounds the compiler knows.
-
-Routines take up to ten arguments; an `array of T` parameter counts as two (address and
-length) and keeps its bounds check.
-
-### Safety, in brief
-
-What the compiler enforces while translating: declarations are mandatory, a `forward` has
-to be fulfilled, signatures are compared, a function result may not be discarded, and a
-`procedure` may not return a value.
-
-What is in the generated code, with file name and line number:
+**Safety.** The compiler enforces, while translating: mandatory declarations, every
+`forward` fulfilled, signatures compared, a function result never discarded, a
+`procedure` never returning a value. In the generated code, checked with file and line:
 
 ```
 runtime error: array index out of range at examples/httpd.wz:42
 ```
 
-* every array index against both bounds (three instructions: `sub`/`cmp`/`ja`);
-* division and `mod` by zero;
-* `chr()` outside 0..255, `schar()` and `scan()` outside the string or array;
-* a `function` that ends without a `return`;
-* local variables and arrays are zeroed on every call — no undefined initial values.
+- every array index against both bounds;
+- division and `mod` by zero;
+- `chr()` outside 0..255, `schar()` and `scan()` outside the string or array;
+- a `function` that ends without `return`;
+- locals and arrays zeroed on every call — no undefined initial values.
 
-Not checked: integer overflow, and anything that goes through `addr`/`sysN`.
+Not checked: integer overflow, and anything through `addr`/`sysN`. A guard only protects
+you if it can reach its verdict without trusting the value it inspects: every bound above
+compares against a compile-time constant or a length in the call frame, neither of which
+the caller can corrupt. The one bound read *from* the value is a `str`'s length (the eight
+bytes before its text), so an unassigned `str` is address 0, length 0, and `slen` answers
+0 for it. Rule of thumb: **a zeroed variable is valid everywhere** — `int` 0, array all
+zero, `str` empty. Anything reached through `addr`, `view` or `sys*` is checked by
+nothing.
 
-**Where the boundary actually runs.** That last sentence is the one to read carefully,
-because it is the whole of what is *not* guaranteed — and it is easier to get wrong than
-it looks. A guard protects you only if it can reach its verdict without first trusting
-the value it is inspecting. Every bound above is compared against either a constant known
-at compile time or a length held in the call frame, neither of which the caller can
-corrupt; that is why they cannot fail on a hostile input. The one case where a bound is
-read *from the value itself* is a `str`, whose length sits in the eight bytes before its
-text — so an unassigned `str` (address 0, length 0) is the edge worth knowing about, and
-`slen` answers 0 for it rather than reading anything.
-
-The practical rule, if you only remember one: **a zeroed variable is a valid value
-everywhere** — an `int` is 0, an array is all zeroes, and a `str` is empty. Anything
-reached through `addr`, `view` or `sys*` is outside all of this and is checked by nothing.
-
-### Compiled JSON schemas, in brief
-
-This is where a strictly typed compiled language beats a dynamic stack. You describe the
-shape of a message, and the compiler makes a record type, a parser, a writer and a JSON
-Schema out of it; there is no DOM, no reflection and no allocation:
+**Compiled JSON schemas.** A strictly typed compiled language can do this where a dynamic
+stack cannot: describe a message shape, and the compiler makes a record type, a parser, a
+writer and a JSON Schema from it — no DOM, no reflection, no allocation.
 
 ```pascal
 type Rpc = schema
@@ -118,23 +103,33 @@ if msg.method = Rpc.method.tools_call then ... // the enum is an integer
 if msg.id_ok then ...                          // was the field there?
 ```
 
-Field types: `int`, `real`, `bool`, `text` (a view into the buffer), `text[N]` (a copy),
-`text of (...)`, `json`, arrays of those and nested schemas, each with `?` for optional and
-a `"description"` that ends up in `Rpc.jsonschema`. A `tools` block builds a complete MCP
-tool table on top of that: `tools/list`, argument parsing, dispatch and `structuredContent`
-all come from one declaration (see `examples/mcptools.wz`, and §7b below).
+A field can carry the JSON key it corresponds to, as a string literal before the colon —
+needed because identifiers are case-insensitive (`rdX`/`rdx` are one name in Wantzel, two
+on the wire) and a key like `content-type` or `$schema` is not a valid identifier at all:
+
+```pascal
+type Reg = schema
+  rdx:          int;
+  rdxcap "rdX": int;                  // the same letters, a different key
+  ctype "content-type": text;         // not a name any language would accept
+end;
+```
+
+Field types: `int`, `real`, `bool`, `text` (view), `text[N]` (copy), `text of (...)`,
+`json`, arrays of those and nested schemas, each with `?` for optional and a
+`"description"` for `Rpc.jsonschema`. A `tools` block turns a declaration into a complete
+MCP tool table — `tools/list`, argument parsing, dispatch, `structuredContent` — all from
+one place (see `examples/mcptools.wz` and §7b).
 
 ## 0. What kind of language is this?
 
-Small, strictly typed and procedural, with a syntax that reads almost like prose:
-`begin`, `end`, `procedure`, `:=`. If you have written Pascal you will read Wantzel
-without explanation, but this is not an ISO-7185 or Free Pascal dialect and does not
-try to be -- the deviations are deliberate, and §8 lists them.
+Small, strictly typed, procedural, reading almost like prose: `begin`, `end`,
+`procedure`, `:=`. A Pascal reader needs no introduction, but this is not an ISO-7185 or
+Free Pascal dialect — the deviations are deliberate (§8).
 
-The design rule is **one clear choice per concept, nothing exotic**. A familiar
-spelling is kept where it costs nothing, and where the older languages offer several
-ways to say a thing, Wantzel picks one. That is what makes the language predictable
-for people *and* for a model that generates code.
+Design rule: **one clear choice per concept, nothing exotic.** Familiar spelling where it
+costs nothing; where older languages offer several ways to say a thing, Wantzel picks
+one. Predictable for people and for a model generating code.
 
 ## 1. Program
 
@@ -157,57 +152,50 @@ begin                       // main program
 end.                        // the dot is required
 ```
 
-Escapes in a `char` or `str` literal: `\n` `\t` `\r` `\0` `\\` `\'` `\"`, and `\xHH`
-— **exactly two** hex digits, one byte, upper or lower case. Two and not a variable
-number, deliberately: a hex escape that keeps eating digits (as in C) means a generator
-cannot write a byte and then a literal hex character without changing what it wrote, so
-`"\x41BC"` is three characters here. Anything else after a backslash is refused.
+Escapes in a `char`/`str` literal: `\n` `\t` `\r` `\0` `\\` `\'` `\"`, and `\xHH` —
+**exactly two** hex digits, upper or lower case. Two and not a variable number,
+deliberately: a hex escape that keeps eating digits (as in C) means a generator cannot
+write a byte then a literal hex character without changing what it wrote, so `"\x41BC"`
+is three characters. Anything else after a backslash is refused.
 
-Comments: `// to end of line`, and that is the only form. Identifiers are
-**case-insensitive** (`Point` and `point` are the same name, as in
-Pascal); keywords too. Identifiers: letters, digits, `_`, and a **dot**
-as a namespace separator (`io.puts`, `mcp.buf`): the dot is cosmetic, there
-are no modules. The first character must be a letter or `_`; a part **after**
-a dot may also start with a digit (`Reading.level.1`), which is what a schema
-enum whose value is `"1"` generates. A real literal still reads as one number:
-`3.5` is a value, never a name.
+Comments: `// to end of line`, the only form. Identifiers and keywords are
+**case-insensitive** (`Point` and `point` are the same name). Identifiers: letters,
+digits, `_`, and a **dot** as a namespace separator (`io.puts`, `mcp.buf`) — cosmetic,
+there are no modules. First character must be a letter or `_`; a part **after** a dot may
+start with a digit (`Reading.level.1`, from a schema enum whose value is `"1"`). A real
+literal still reads as one number: `3.5` is a value, never a name.
 
 ## 2. Types
 
-There are exactly five scalar types and one composite type.
+Five scalar types, one composite type.
 
 | type | meaning | literal |
 |---|---|---|
 | `int` | 64-bit two's complement | `42`, `-7`, `0xFF` |
 | `char` | one byte, 0..255 | `'a'`, `'\n'`, `'\\'`, `'\''`, `'\x41'` |
 | `bool` | `true` / `false` | |
-| `real` | 64-bit IEEE-754 (what C calls `double` and Python `float`); the only decimal type | `1.5`, `0.25`, `2e-3`, `6.02e23` (a dot or an exponent makes a literal `real`; `1.` and `.5` are not literals) |
+| `real` | 64-bit IEEE-754 (C `double`, Python `float`); the only decimal type | `1.5`, `0.25`, `2e-3`, `6.02e23` (a dot or exponent makes a `real` literal; `1.` and `.5` are not literals) |
 | `str` | an **immutable string literal** (address + length); not a value you build up | `"text\n"`, `"caf\xc3\xa9"` |
 | `array[lo..hi] of T` | fixed array of `int`, `char`, `bool` or `real`; `lo`/`hi` constant ints; `lo` may be ≠ 0 | |
 
-**No implicit conversions.** `int` ↔ `char` via `ord()`/`chr()`;
-`int` → `real` via `real(i)`; `real` → `int` via `trunc(r)` (towards zero) or
-`round(r)` (to nearest, halves to even). An `int` is not a
-condition. `and`/`or`/`not` work only on `bool`; bits are done with
-`band`/`bor`/`bxor`/`bnot`/`shl`/`shr`.
+**No implicit conversions.** `int` ↔ `char` via `ord()`/`chr()`; `int` → `real` via
+`real(i)`; `real` → `int` via `trunc(r)` (towards zero) or `round(r)` (nearest, halves to
+even). An `int` is not a condition. `and`/`or`/`not` work only on `bool`; bits are done
+with `band`/`bor`/`bxor`/`bnot`/`shl`/`shr`.
 
-**`real`** computes with `+ - * /` and unary `-`; `/` exists only for
-reals (`int` uses `div`), `div`/`mod`/`shl`/`shr` exist only for
-ints. Comparison with `= <> < <= > >=`; a NaN is equal to nothing and
-orders nowhere. Division by zero gives `inf`/NaN as IEEE prescribes, not a
-runtime error. A literal with at most 18 significant digits and an
-exponent up to ±22 is rounded correctly; beyond that the last bit may
-differ. Constants: `const PI = 3.14159; NEG = -2.5;`. There is no
-32-bit type: `pack32(r): int` gives the IEEE single bits (for compact
-storage), `unpack32(i): real` gets them back. Text ↔ real is library.
+`real` computes with `+ - * /` and unary `-`; `/` exists only for reals (`int` uses
+`div`), `div`/`mod`/`shl`/`shr` exist only for ints. Comparison with `= <> < <= > >=`; NaN
+equals nothing and orders nowhere. Division by zero gives `inf`/NaN as IEEE prescribes,
+not a runtime error. A literal with at most 18 significant digits and an exponent up to
+±22 rounds correctly; beyond that the last bit may differ. Constants: `const PI =
+3.14159; NEG = -2.5;`. No 32-bit type: `pack32(r): int` gives the IEEE single bits (for
+compact storage), `unpack32(i): real` gets them back. Text ↔ real is library.
 
-**Text as a value** is always an `array of char` (with `len()` as
-length, or a separate `int` for the filled part). A routine that takes text
-declares `s: array of char` and can then be given a literal, an array,
-a slice or a view (§4). `str` is solely the type of a
-literal itself, for the builtins `slen`/`schar`/`sadr` and for existing
-library routines; new code does not need it. Strings cannot be
-compared with `=`; compare per `char` or with `json.eq`.
+**Text as a value** is always an `array of char` (with `len()` as length, or a separate
+`int` for the filled part). A routine that takes text declares `s: array of char` and
+accepts a literal, an array, a slice or a view (§4). `str` is solely the type of a
+literal itself, for `slen`/`schar`/`sadr` and existing library routines; new code does
+not need it. Strings cannot be compared with `=`; compare per `char` or with `json.eq`.
 
 ### Records
 
@@ -230,42 +218,38 @@ var
 
 - Fields via the dot: `b.pos.x`, `bodies[i].tags[0]`, `bodies[i].pos.y := 1.0`.
 - Copying a record as a whole: `b := bodies[2]` (both of the same type).
-- A record has no value of its own: it cannot appear in an expression,
-  not as a parameter and not as a function result. Pass records as
-  `array of T` (a slice of one element is enough, see §4) and let a
-  routine fill a record through such an array.
-- `addr(b.pos)` and `len(b.tags)` work; `addr(bodies[2]) - addr(bodies[1])`
-  is the record size.
-- Memory layout: fields are in declaration order; `char`/`bool` fields
-  and arrays lie on byte boundaries, everything else on 8 bytes; the total
-  size is a multiple of 8. A record may not contain itself.
-- `type` appears only at program level, before the routines that use it.
-  A type name is an ordinary identifier (case-insensitive) and may not
-  coincide with a variable or routine.
+- A record has no value of its own: not in an expression, not as a parameter, not as a
+  function result. Pass records as `array of T` (a one-element slice suffices, §4) and
+  let a routine fill a record through such an array.
+- `addr(b.pos)` and `len(b.tags)` work; `addr(bodies[2]) - addr(bodies[1])` is the record
+  size.
+- Layout: fields in declaration order; `char`/`bool` fields and arrays lie on byte
+  boundaries, everything else on 8 bytes; total size is a multiple of 8. A record may not
+  contain itself.
+- `type` appears only at program level, before the routines using it. A type name is an
+  ordinary identifier (case-insensitive) and may not coincide with a variable or routine.
 
-There are **no** pointers, sets, enumerations, strings with content, or nested
-arrays (`array of array`). See §9.
+No pointers, sets, enumerations, strings with content, or nested arrays (`array of
+array`). See §9.
 
 ## 3. Expressions and operators
 
-Precedence from high to low, as in Pascal:
+Precedence, high to low, as in Pascal:
 
 1. `not`, unary `-`
 2. `*` `/` `div` `mod` `and` `shl` `shr`
 3. `+` `-` `or`
 4. `=` `<>` `<` `<=` `>` `>=`
 
-`div` and `mod` are Pascal semantics (truncation towards zero: `-7 div 2 = -3`,
-`-7 mod 2 = -1`), with a runtime check on division by zero. `and`/`or` on
-`bool` are **short-circuit**: the right-hand side is only evaluated if
-the left-hand side does not already determine the result (`false and f()` does not call
-`f`). Ordering (`<` etc.) only
-on `int`, `char` and `real`. Overflow of `int` is not checked.
+`div`/`mod` are Pascal semantics (truncation towards zero: `-7 div 2 = -3`, `-7 mod 2 =
+-1`), checked against division by zero. `and`/`or` on `bool` are **short-circuit**
+(`false and f()` does not call `f`). Ordering (`<` etc.) only on `int`, `char`, `real`.
+Overflow of `int` is not checked.
 
 ## 3b. Visibility: `local`
 
 Every name is global and the namespace is shared, so two files cannot both declare
-`hidden.n`. Put `local` in front of a top-level declaration and the name is visible **only in
+`hidden.n`. `local` in front of a top-level declaration makes the name visible **only in
 the file that declares it**:
 
 ```pascal
@@ -277,17 +261,17 @@ local function hidden.count: int;
 var   shared.seen: int;             // public, as before
 ```
 
-- `local` applies to `var`, `const`, `procedure` and `function` at the top level. Not to
-  `type` or `schema`.
-- **Public is the default.** A declaration without `local` behaves exactly as it always did,
-  so existing source needs no change.
-- The unit is the **file**. There is no module system, no separate compilation and no
-  nesting: `local` means "this file", and nothing else.
-- Naming a local from another file is `undeclared identifier`, the same as a name that does
+- Applies to `var`, `const`, `procedure`, `function` at the top level; not to `type` or
+  `schema`.
+- **Public is the default** — a declaration without `local` behaves as before, so
+  existing source needs no change.
+- The unit is the **file**. No module system, no separate compilation, no nesting:
+  `local` means "this file", nothing else.
+- Naming a local from another file is `undeclared identifier`, same as a name that does
   not exist — because from there, it does not.
 
-Note that `local` in front of a `const` block **inside** a routine is a different thing: that
-one is local to the call, and it predates this. The place you write it decides which is meant.
+A `local` in front of a `const` block **inside** a routine is different and predates
+this: that one scopes to the call. Where you write it decides which is meant.
 
 ## 4. Routines
 
@@ -311,31 +295,27 @@ end;
 function later(x: int): int; forward;               // declare, define later
 ```
 
-- Arguments are passed **by value**; an `array of T` parameter is
-  a *view* (address + length) and writing into it is visible to the caller.
-  There are no `var` parameters: use an array or a global.
-- A record variable may appear where `array of <that record>` is
-  expected; it arrives as a view of one element (`Point.parse(buf, 0, n, p)`).
-- Where an `array of T` is expected, you may give: a whole array
-  (`p(buf)`), a **slice** `p(buf[lo..hi])` (inclusive, like a
-  declaration; `buf[3..2]` is empty; the bounds are checked), an
-  array field of a record (`p(r.tags)`), an element slice of an array
-  of records (`p(items[i..i])`, the way to pass one record), a
-  **string literal** as `array of char` (`p("text")`), or `view(addr, n)`:
-  `n` elements of type `T` at an arbitrary address (for `mmap`, kernel
-  buffers, byte reinterpretation). `view` and slices exist only in that
+- Arguments are passed **by value**; an `array of T` parameter is a *view* (address +
+  length) and writing into it is visible to the caller. No `var` parameters: use an array
+  or a global.
+- A record variable may appear where `array of <that record>` is expected — it arrives as
+  a view of one element (`Point.parse(buf, 0, n, p)`).
+- Where `array of T` is expected, you may give: a whole array (`p(buf)`), a **slice**
+  `p(buf[lo..hi])` (inclusive, like a declaration; `buf[3..2]` is empty; bounds checked),
+  an array field of a record (`p(r.tags)`), an element slice of an array of records
+  (`p(items[i..i])`, the way to pass one record), a **string literal** as `array of char`
+  (`p("text")`), or `view(addr, n)`: `n` elements of type `T` at an arbitrary address (for
+  `mmap`, kernel buffers, byte reinterpretation). `view` and slices exist only in that
   position; they are not values.
 - At most ten arguments; an array counts for two.
-- No nested routines, no recursion limit (recursion is allowed).
-- `function` must execute `return` on every path (runtime error otherwise);
-  `procedure` may not return a value; a function result may not be
-  discarded.
+- No nested routines; no recursion limit (recursion is allowed).
+- `function` must execute `return` on every path (runtime error otherwise); `procedure`
+  may not return a value; a function result may not be discarded.
 - Local variables and arrays are **always zeroed** on entry.
-- A routine may have `const` and `var` blocks after the header, in any
-  order; local constants have the same forms as global ones.
-- Callbacks: declare a routine `forward` in a library and define
-  it in the application (`procedure app.request; forward;`). There are no
-  function pointers.
+- A routine may have `const` and `var` blocks after the header, in any order; local
+  constants have the same forms as global ones.
+- Callbacks: declare a routine `forward` in a library, define it in the application
+  (`procedure app.request; forward;`). No function pointers.
 
 ## 5. Statements
 
@@ -352,10 +332,9 @@ return;  return e;
 halt(code);                          // terminate the program
 ```
 
-`for` counts with step 1; after `break` the variable keeps the value it
-stopped on, after a complete loop it is one past the end value. There is no
-`case`: write an if-chain, and note that an `else` binds to the nearest
-unclosed `if`. No `with`, no `goto`.
+`for` counts with step 1; after `break` the variable keeps the value it stopped on, after
+a complete loop it is one past the end value. No `case`: write an if-chain, and note that
+`else` binds to the nearest unclosed `if`. No `with`, no `goto`.
 
 ## 6. Built-in routines
 
@@ -371,38 +350,36 @@ unclosed `if`. No `with`, no `goto`.
 | `scan(a, from, upto, c)` | index of the first `c` in `a[from..upto)`, or `upto`; SIMD |
 | `view(addr, n)` | only as an array argument: `n` elements at address `addr` (§4); the only unsafe primitive besides `sys*` |
 | `band bor bxor bnot`, `shl shr` | bits |
-| `argc()`, `argch(k, i)` | number of arguments; i-th byte of argument k (`chr(0)` at the end, and `chr(0)` for any `k` or `i` out of range — it answers rather than traps) |
+| `argc()`, `argch(k, i)` | number of arguments; i-th byte of argument `k` (`chr(0)` at the end, and for any `k`/`i` out of range — it answers rather than traps) |
 | `halt(code)` | exit |
-| `sys1(nr, a)` … `sys6(nr, a..f)` | raw Linux syscall (on Windows translated by the runtime) |
+| `sys1(nr, a)` … `sys6(nr, a..f)` | raw Linux syscall (translated by the runtime on Windows) |
 
-Library routines (`lib/`) are ordinary Wantzel: `io.*`, `net.*`, `http.*`,
-`json.*`, `mcp.*`, `fs.*`. See `README.md`.
+Library routines (`lib/`) are ordinary Wantzel: `io.*`, `net.*`, `http.*`, `json.*`,
+`mcp.*`, `fs.*` — see [`library.md`](library.md).
 
 ### The syscall number is the contract
 
-`sys1`..`sys6` are builtins the compiler translates straight to machine code. There is
-nothing in between: no wrapper, no error handling, no errno translation. The arguments go
-into the registers of the System V convention, and the compiler then emits the two bytes
-of the x86-64 `SYSCALL` instruction literally. On Windows a call to a shim stands there
-instead; that is the only place the two platforms differ.
+`sys1`..`sys6` are builtins the compiler translates straight to machine code: no wrapper,
+no error handling, no errno translation. Arguments go into the System V registers, and
+the compiler emits the two bytes of the x86-64 `SYSCALL` instruction literally (on
+Windows a shim call stands there instead — the only place the two platforms differ).
 
-The number itself is an ordinary constant — `SYS.fork = 57` and `SYS.wait4 = 61` live in
-`lib/io.wz`, and the compiler knows no syscall by name. **Everything the operating system
-offers is therefore reachable without touching the language**, which is why a new
-capability is a constant plus a call rather than a compiler change, and needs no language
-change at all. `fork`, shared memory and `flock` were each called impossible here before someone
-looked.
+The syscall number is an ordinary constant (`SYS.fork = 57`, `SYS.wait4 = 61` in
+`lib/io.wz`); the compiler knows no syscall by name. **Everything the operating system
+offers is reachable without touching the language** — a new capability is a constant plus
+a call, not a compiler change. `fork`, shared memory and `flock` were each called
+impossible here before someone checked.
 
-The other side of that: nothing is checked. A wrong number or a wrong argument gives a
-negative return value (`-errno`) or, worse, something that appears to work. Like `addr`
-and `view`, this is an unsafe primitive: none of the runtime checks apply to it.
+Nothing is checked on the other side: a wrong number or argument gives a negative return
+(`-errno`) or, worse, something that appears to work. Like `addr` and `view`, this is
+unsafe: no runtime check applies to it.
 
 ## 7. `schema` — compiled JSON
 
-A `schema` describes the shape of a JSON object. The compiler turns it
-into, in one go: a **record type** with the same name, `Name.clear`,
-`Name.parse`, `Name.write` and the constant `Name.jsonschema`. There is no
-DOM and no reflection; the parser reads straight from the input buffer.
+A `schema` describes the shape of a JSON object. The compiler turns it into, in one go: a
+**record type** with the same name, `Name.clear`, `Name.parse`, `Name.write` and the
+constant `Name.jsonschema`. No DOM, no reflection — the parser reads straight from the
+input buffer.
 
 ```pascal
 type Point = schema
@@ -434,7 +411,7 @@ n := Path.write(out, 0, p, buf);                // JSON back from out[0]; the po
 io.puts(STDOUT, Path.jsonschema);               // {"type":"object","properties":{...},"required":[...]}
 ```
 
-Per field `f` the record contains:
+Per field `f`, in the record:
 
 | field declaration | in the record |
 |---|---|
@@ -446,73 +423,163 @@ Per field `f` the record contains:
 | nested schema `S` | `f: S` |
 | always | `f_ok` (key present), `f_null` (value was `null`) |
 
-Rules: a missing required field (without `?`) makes `parse` return `-1`;
-an **unknown key is refused** — `parse` returns `-1` and
-`b[json.badkey0..json.badkey1)` is the key it rejected, because `parse` answers `-1` for
-every kind of failure and this is the one the caller can fix. A renamed or removed field
-used to be skipped in silence, so the call succeeded with the default in place of what
-the caller asked for. The consequence is that a schema **must declare everything it may
-receive**: for an open protocol envelope (MCP `initialize`, OAuth registration) that means
-declaring the members the protocol carries, as `json?` where the value is not read.
-`null` sets `f_null` and `f_ok`;
-a text that does not fit in `text[N]` or an array with more than `N`
-elements gives `-1`; an enum value outside the list gives `-1` in the
-field but no error. `write` always writes required fields and optional ones
-only if `f_ok` is true; `f_null` writes `null`. `write` returns `-1` when the object
-does not fit in `dst` (or when the starting position is negative or past the end) and
-writes nothing usable in that case: a short buffer is a **refusal**, not a truncation,
-because half a JSON object is not a shorter object but a syntax error. This differs
-deliberately from the appenders in `lib/` (`io.push`, `json.putraw`, `json.putstr`),
-which truncate at `len(dst)` and hand back a position that is still usable — a
-shortened message is still a message. **Test the result of `write`**; a generated
-`tool.run` does, and reports the failure to the peer instead of dying on it. A nested schema
-must have been declared earlier; a schema name is a type name (so no
-variable with the same name). A `json` field in an output record can also
-be filled by `Other.write` of another schema in the view buffer:
-`r.base_at := tool.vn; tool.vn := Other.write(tool.vbuf, tool.vn, o, tool.vbuf); r.base_end := tool.vn;`
-(this is how a tool nests another schema's output inside its own). Descriptions after the type (and after `?`)
-appear as `"description"` in the JSON Schema; `text[N]` gets
-`maxLength`, arrays `maxItems`.
+Rules:
+
+- A missing required field (without `?`) makes `parse` return `-1`.
+- An **unknown key is ignored but recorded** — `parse` steps over it and succeeds;
+  `json.ignoredn` counts skipped keys, `b[json.ignored0..json.ignored1)` is the first.
+  This lets a caller send a superset of a schema — what a client written against a
+  schema-validating server does — and refusing it would turn a harmless extra field into
+  a failed call. The recording matters because a renamed or misspelt **optional** field
+  would otherwise silently take its default with nothing saying so; a renamed
+  **required** field still fails, since the field it should fill is absent.
+- A key the schema *does* declare is strict: a value it cannot hold gives `-1`, and
+  `b[json.badkey0..json.badkey1)` names a key the parse rejected outright.
+- `null` sets `f_null` and `f_ok`. A text that does not fit `text[N]`, or an array with
+  more than `N` elements, gives `-1`. An enum value outside the list gives `-1` in the
+  field but no error.
+- `write` always writes required fields, optional ones only if `f_ok`; `f_null` writes
+  `null`. `write` returns `-1` when the object does not fit in `dst` (or the start
+  position is negative or past the end) and writes nothing usable — a short buffer is a
+  **refusal**, not a truncation, because half a JSON object is a syntax error, not a
+  shorter object. This differs deliberately from the appenders in `lib/` (`io.push`,
+  `json.putraw`, `json.putstr`), which truncate at `len(dst)` and hand back a still-usable
+  position — a shortened message is still a message. **Test the result of `write`**; a
+  generated `tool.run` does, and reports the failure to the peer instead of dying on it.
+- A nested schema must be declared earlier; a schema name is a type name (no variable
+  with the same name).
+- A `json` field in an output record can be filled by `Other.write` of another schema
+  into the same view buffer: `r.base_at := tool.vn; tool.vn := Other.write(tool.vbuf,
+  tool.vn, o, tool.vbuf); r.base_end := tool.vn;` (nesting one schema's output inside
+  another's).
+- Descriptions after the type (and after `?`) appear as `"description"` in the JSON
+  Schema; `text[N]` gets `maxLength`, arrays `maxItems`.
 
 ## 7b. `tools` — a tool table as a declaration
 
+A `tools ... end;` block declares an MCP tool table **once**. From each line the compiler
+generates the JSON Schemas, argument parsing, dispatch to your handler and result
+writing — the whole surface a hand-written MCP server otherwise builds one `mcp.add(...)`
+JSON fragment at a time. **This is the way to expose tools in Wantzel; do not build
+`tools/list` or a call reply by hand.** One declared line replaces tens of lines of
+hand-assembled JSON, and it stays correct as the schema changes, because the JSON comes
+from the same declaration the parser and dispatcher use.
+
+### The smallest complete program
+
 ```pascal
-tools
-  add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
-  greet(GreetArgs): GreetResult "Greet someone.";
+include "json.wz";
+
+type ConvertArgs = schema
+  celsius: real "the temperature to convert";
 end;
 
-include "lib/tools.wz";                      // MCP and REST transport for the table
+type ConvertResult = schema
+  fahrenheit: real;
+end;
 
-function tool.add(a: array of AddArgs; r: array of AddResult): int;
+tools
+  convert(ConvertArgs): ConvertResult "Convert Celsius to Fahrenheit." readonly idempotent;
+end;
+
+include "toolsmcp.wz";                      // AFTER the tools block: it reads it
+
+function tool.convert(a: array of ConvertArgs; r: array of ConvertResult): int;
 begin
-  r[0].sum := a[0].a + a[0].b;
+  r[0].fahrenheit := a[0].celsius * 9.0 / 5.0 + 32.0;
   return 0;                                  // 0 = success; otherwise: return tool.fail("message")
 end;
+
+begin
+  mcp.stdio;
+end.
 ```
 
-One `tools ... end;` block per program, after the schemas it uses.
-The compiler generates: the constant `tool.list` (the complete
-`tools/list` text with `inputSchema`, `outputSchema` and annotations),
-`tool.count` and `tool.id_<name>`, per tool the records `tool.in_<name>` and
-`tool.out_<name>`, `tool.fail(s)`, `tool.byname(b, at, upto)` and
-`tool.run(idx, b, at, upto, dst)` (parses the arguments, calls
-`tool.<name>` and writes the result JSON; `-1` on arguments that
-do not satisfy the schema, `-2` if the handler failed with `tool.err`,
-`-3` when the result JSON does not fit in `dst` — the writer refuses instead of
-truncating, and `-3` keeps that apart from `-1`, which would blame the caller's
-arguments for a limit on our side).
-For `text` and `json` fields (views) in the output schema the compiler
-generates the buffer `tool.vbuf` (1 MB) and the fill position `tool.vn`, which is
-0 at every call: the handler writes the text into `tool.vbuf` from
-`tool.vn` and points `f_at`/`f_end` at it; `tool.run` writes the result with
-`tool.vbuf` as the source of the views.
-The handlers are declared `forward`, so a missing handler is
-a compile error. Annotations: `readonly`, `idempotent`, `destructive`
-(all three false by default). `lib/tools.wz` turns that into `app.tools`,
-`app.call` (MCP: `content` + `structuredContent` + `isError`) and
-`tool.rest(prefix)` (REST: `POST <prefix><name>`, 200/400/405/422).
-`tools` is a keyword: do not use it as a namespace in your own code.
+That is a complete MCP server over stdio. `tools/list` from that program, generated, not
+written:
+
+```json
+{"name":"convert","description":"Convert Celsius to Fahrenheit.","inputSchema":{"type":"object","properties":{"celsius":{"type":"number","description":"the temperature to convert"}},"required":["celsius"]},"outputSchema":{"type":"object","properties":{"fahrenheit":{"type":"number"}},"required":["fahrenheit"]},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true}}
+```
+
+### Line anatomy
+
+```pascal
+convert(ConvertArgs): ConvertResult "Convert Celsius to Fahrenheit." readonly idempotent;
+// ^name  ^input schema ^output schema ^description (→ JSON Schema)  ^annotations
+```
+
+`name(ArgsSchema): ResultSchema "description" annotations;` — one line per tool, inside
+one `tools ... end;` block per program, placed after the schemas it uses. `ArgsSchema`
+and `ResultSchema` are ordinary `schema` types (§7); the same mechanism serves both
+directions.
+
+### What you write versus what the compiler generates
+
+| you write | the compiler generates |
+|---|---|
+| the `tools ... end;` block | `tool.list` — the complete `tools/list` text: `inputSchema`, `outputSchema`, `description`, `annotations` |
+| | `tool.count` and `tool.id_<name>` |
+| | per tool, the records `tool.in_<name>` and `tool.out_<name>` (from the schemas) |
+| | `tool.byname(b, at, upto)` — finds a tool by its `"name"` in a request buffer |
+| | `tool.run(idx, b, at, upto, dst)` — parses the arguments, calls `tool.<name>`, writes the result JSON |
+| | `tool.fail(s)` — call it from a handler to refuse with a message |
+| `function tool.<name>(a, r): int; ... end;` per tool (`forward`-checked: a missing handler is a compile error) | the dispatch that calls it from `tool.run` |
+| `include "lib/tools.wz";` or `include "lib/toolsmcp.wz";` | `app.tools`, `app.call` (MCP), and — `lib/tools.wz` only — `tool.rest(prefix)` (REST) |
+
+`lib/tools.wz` is two files: `lib/toolsmcp.wz` (`app.tools`, `app.call`, MCP only, no
+HTTP) and the REST half, which brings `lib/http.wz` and with it the forward
+`app.request` the program must define. A server that speaks MCP over stdio only needs
+`lib/toolsmcp.wz` and no `app.request`. `tools` is a keyword: do not use it as a
+namespace in your own code.
+
+**A tool name becomes a routine name in the `tool.` namespace**, so it cannot be one the
+compiler or `lib/tools.wz` already uses there. `count`, `list`, `run`, `byname`, `fail`,
+`err`, `rest`, `vbuf` and `vn` are taken, as are names starting with `id_`, `in_` or
+`out_`; the compiler reports it at the tool's own line, e.g. `tool name "count" is
+reserved: the tools block generates tool.count; choose another name`. Choose a more
+specific name (`wordcount`, not `count`).
+
+**Annotations**: `readonly`, `idempotent`, `destructive` — each `false` by default; write
+the ones that apply, in any order, after the description.
+
+**Errors and status codes.** A handler returns `0` for success or `tool.fail("message")`
+to refuse. `tool.run` reports three distinct failures, kept apart because they have
+different owners:
+
+| `tool.run` returns | meaning | REST (`tool.rest`) |
+|---|---|---|
+| `-1` | the arguments did not satisfy the input schema | 422 |
+| `-2` | the handler refused with `tool.fail("message")` | 400 |
+| `-3` | the result JSON does not fit in `dst` | 500 |
+
+**Only `-1` gives 422.** Every other handler-side rejection gives 400, the same as any
+other rejection — a 422 means specifically "this JSON does not match the schema", never
+"the handler looked at valid arguments and said no". A handler rejecting on the *content*
+of an otherwise valid argument (an out-of-range number, an unknown id) still gets 400.
+`-3` gives 500: the request was valid and the limit is ours, so it is kept apart from
+`-1`, which would otherwise blame the caller for a limit on our side.
+
+**View fields: buffer and escaping.** A `text`/`json` field (a view) in the INPUT schema
+cannot be read by the handler. `tool.run` parses the call into `tool.in_<name>` from the
+request buffer `b`, but the handler `tool.<name>(a, r)` only ever receives the parsed
+record, never `b` itself — a view field is a pair of offsets into a buffer the handler
+cannot reach. Declare every argument field `text[N]` (a copy) instead; `int`, `real`,
+`bool`, an enum, a nested schema or an array of those are unaffected, since those never
+point outside the record. Only the input side has this restriction, because only the
+input side is parsed into a record a *different* routine then uses without the source
+buffer.
+
+For `text`/`json` fields (views) in the output schema, the compiler generates the buffer
+`tool.vbuf` (1 MB) and fill position `tool.vn` (0 at every call): the handler writes text
+into `tool.vbuf` from `tool.vn` and points `f_at`/`f_end` at it; `tool.run` writes the
+result with `tool.vbuf` as the source of the views. **A view field is written LITERALLY**,
+byte for byte, with no escaping (`Result.write` uses `json.putraw`). A `text[N]` field is
+escaped automatically (`json.putslice`). So a handler building a `json`-view or
+`text`-view field's content from anything not already valid JSON / JSON-string-safe must
+escape it itself first, with `json.escslice(tool.vbuf, tool.vn, src, from, upto)` —
+skipping that produces invalid JSON, not merely wrong characters, because an unescaped
+quote or control character inside the slice ends the JSON string early.
 
 ## 8. Deliberate deviations from Pascal
 
@@ -536,52 +603,47 @@ a compile error. Annotations: `readonly`, `idempotent`, `destructive`
 ## 9. Planned (not yet valid)
 
 **Before 1.0, anything here can still change.** This is a young language: if a construct
-turns out to cost more than it gives, it goes, and code that used it will need editing. The
-`{ }` block comment was removed on 15 September 2026 for exactly that reason. Plan for it,
-and read this section on each release.
+costs more than it gives, it goes, and code using it needs editing. Plan for it, and
+re-read this section on each release.
 
 That is not licence to churn. **The bar is evidence, not taste** — a proposal resting on
-symmetry or familiarity does not clear it, one that can show what a construct costs in
+symmetry or familiarity does not clear it, one that shows what a construct costs in
 practice does. It is then weighed against the test in [`design.md`](design.md): a change
 should remove a *choice* between things that meant the same, never a *distinction*.
 
-After 1.0 this reverses: compatibility is the default and a break needs the stronger case.
-What an application still needs meanwhile is library (`lib/`), not language.
+After 1.0 this reverses: compatibility is the default, and a break needs the stronger
+case. What an application still needs meanwhile is library (`lib/`), not language.
 
-One thing has been **removed** since: the `{ }` block comment, on 15 September 2026. It
-ended at the first `}`, so a brace inside the comment text — a JSON example, the words
-"default {}" — closed it early and the rest of the sentence was compiled as code, with the
-error appearing far from its cause on a line that looked correct. Six of seven recorded
-syntax errors came from it, including several written after the pitfall was documented.
-`//` has no such failure mode. A source that still uses `{ }` is refused with a message
-naming the replacement.
+One thing was **removed**: the `{ }` block comment. It ended at the first `}`, so a brace
+inside the comment text (a JSON example, the words "default {}") closed it early and the
+rest of the sentence compiled as code, with the error appearing far from its cause. Most
+recorded syntax errors of that era came from it, including several written after the
+pitfall was documented. `//` has no such failure mode; a source that still uses `{ }` is
+refused with a message naming the replacement.
 
-What is **not** coming: heap/`new`/`dispose`, pointers, strings with content as a
-language type, sets, `with`, `goto`, variants, classes, generics, exceptions,
-threads, operator overloading, implicit conversions.
+**Not coming:** heap/`new`/`dispose`, pointers, strings with content as a language type,
+sets, `with`, `goto`, variants, classes, generics, exceptions, threads, operator
+overloading, implicit conversions.
 
-## 10. Runtime errors (always with file:line)
+## 10. Runtime errors
 
-array index out of bounds · division by zero · `chr()` outside 0..255 ·
-`schar()`/`scan()` out of range · function without `return` · (Windows and
-Linux identical).
+Always with file:line, identical on Windows and Linux: array index out of bounds ·
+division by zero · `chr()` outside 0..255 · `schar()`/`scan()` out of range · function
+without `return`.
 
 ## 10b. Memory
 
-There is no heap, no pointers and no garbage collector. The model, in three sentences:
+No heap, no pointers, no garbage collector. The model, in three sentences:
 
-1. **All memory is an array with an upper bound.** A global array
-   lives in bss and costs nothing until you touch it: declaring
-   `array[0..1073741823] of char` (1 GB) is free, every page you write to
-   costs 4 KB. Local arrays live on the stack and are zeroed.
-2. **An index is the pointer.** Where C would keep a pointer to an element,
-   Wantzel keeps the index number. An index cannot dangle, is checked
-   against the bounds at every use, and stays valid if you write the whole
-   array to disk and read it back.
-3. **Whatever is larger than the program wants to pin down comes from the
-   operating system through `mmap`, and becomes an ordinary array with
-   `view`.** You determine the size at startup or the file determines it;
-   the capacity is disk or virtual memory, not RAM.
+1. **All memory is an array with an upper bound.** A global array lives in bss and costs
+   nothing until touched: declaring `array[0..1073741823] of char` (1 GB) is free, every
+   page you write to costs 4 KB. Local arrays live on the stack and are zeroed.
+2. **An index is the pointer.** Where C would keep a pointer to an element, Wantzel keeps
+   the index number. An index cannot dangle, is checked against the bounds at every use,
+   and stays valid if you write the whole array to disk and read it back.
+3. **Whatever is larger than the program wants to pin down comes from the operating
+   system through `mmap`, and becomes an ordinary array with `view`.** The size is
+   decided at startup or by the file; capacity is disk or virtual memory, not RAM.
 
 Which form to use when:
 
@@ -592,66 +654,66 @@ Which form to use when:
 | size only known at startup | anonymous `mmap` of that size + `view` |
 | data that has to survive a restart | file + `mmap`, records as the format, indexes as references |
 | larger than RAM | file + `mmap`; the kernel pages |
-| temporary workspace per call | local array (stack, max 8 MB in total) or a slice of a global arena |
+| temporary workspace per call | local array (stack, max 8 MB total) or a slice of a global arena |
 | key → value | a hash table on two arrays |
 | references between objects | indexes in one table, with a free list for reuse |
 
-What you never need: an allocator per object. Every structure gets one
-reservation, at compile time or at startup, and inside it all references
-are indexes.
+No allocator per object: every structure gets one reservation, at compile time or at
+startup, and inside it every reference is an index.
 
 ## 11. Limits
 
-Every hard limit (arguments, identifier and literal length, include depth,
-numbers of globals/locals/routines/schemas/tools, source and code size,
-static memory, stack) is listed with a measured value in
-`tests/limits/README.md` and is guarded by `tests/limits/limits.sh`.
+Every hard limit (arguments, identifier and literal length, include depth, numbers of
+globals/locals/routines/schemas/tools, source and code size, static memory, stack) is
+listed with a measured value in `tests/limits/README.md`, guarded by
+`tests/limits/limits.sh`.
 
 ## 12. Targets
 
 Linux x86-64 ELF (raw syscalls) and Windows x86-64 PE32+: static binaries that talk to
-`kernel32.dll`, `ws2_32.dll` and `advapi32.dll` directly. On both targets there is no
-assembler, no linker, no C library and no external tool. `bootstrap/boot.c` and
-`src/wantzel.wz` produce byte-identical output, ELF and `.exe` alike; every language change
-lands in both and in `test.sh`.
+`kernel32.dll`, `ws2_32.dll` and `advapi32.dll` directly. No assembler, linker, C library
+or external tool on either target. `bootstrap/boot.c` and `src/wantzel.wz` produce
+byte-identical output, ELF and `.exe` alike; every language change lands in both and in
+`test.sh`.
 
 ### What is portable, and what is not
 
 Almost everything. The library (`io`, `fs`, `net`, `http`, `json`, ...) and `sys1`..`sys6`
-mean the same on both targets: on Linux a `sys*` call is the syscall instruction, on Windows
-the runtime translates it to the matching `kernel32`/`ws2_32` function. **A program written
-against those calls compiles and runs on both, unchanged** — `examples/winfacts.wz` does a
-file round trip, an existence check, a delete and a directory listing, and the ELF and the
-`.exe` print the same thing, which is what `tests/toolchain/win_same_output.sh` checks.
+mean the same on both targets: on Linux a `sys*` call is the syscall instruction, on
+Windows the runtime translates it to the matching `kernel32`/`ws2_32` function. **A
+program written against those calls compiles and runs on both, unchanged** —
+`examples/winfacts.wz` does a file round trip, an existence check, a delete and a
+directory listing, and the ELF and the `.exe` print the same thing
+(`tests/toolchain/win_same_output.sh`).
 
-The one exception is `winapi(slot, ...)`, which calls an imported DLL function directly.
-There is no Linux equivalent, so **it does not compile for a Linux target at all**:
+The one exception is `winapi(slot, ...)`, calling an imported DLL function directly. No
+Linux equivalent, so **it does not compile for a Linux target at all**:
 
 ```
 winfacts.wz:2: winapi() is only available in a Windows executable
 ```
 
-That is deliberate and it is the compile-time half of the rule: a program that reaches for
-a Windows-only facility cannot be built for Linux by accident and fail later. The other half
-is the slot itself — a literal outside the import table is refused the same way:
+That is the compile-time half of the rule: a program reaching for a Windows-only facility
+cannot be built for Linux by accident and fail later. The other half is the slot itself —
+a literal outside the import table is refused the same way:
 
 ```
 x.wz:3: winapi(): that import slot does not exist
 ```
 
-So if a program builds for both targets, it uses nothing Windows-specific; and if it uses
-`winapi`, the compiler says so at the point where you asked for the wrong target.
+So a program that builds for both targets uses nothing Windows-specific; a program using
+`winapi` gets told so at the point it names the wrong target.
 
-**`winapi` can also name the DLL and the function**, which is how a program reaches an API
-the compiler has never heard of:
+**`winapi` can also name the DLL and the function**, reaching an API the compiler has
+never heard of:
 
 ```pascal
 winapi("user32.dll", "MessageBoxA", 0, text, title, 0);
 ```
 
-The name is recorded while translating and written into the import table. That is the point
-— a new Windows API is data, not a change to this compiler — but it means the checking
-happens at **three different moments**, and it is worth knowing which is which:
+The name is recorded while translating and written into the import table — a new Windows
+API is data, not a compiler change — but checking then happens at three different
+moments:
 
 | what is wrong | when you find out | what you see |
 |---|---|---|
@@ -659,79 +721,59 @@ happens at **three different moments**, and it is worth knowing which is which:
 | the DLL does not exist | **load time**, before your program runs | the loader refuses to start the process |
 | the function does not exist in it | **run time**, at the call | the process starts, then aborts on that line |
 
-Measured, not assumed. The last row is the one to keep in mind: a missing DLL is fatal
-before `main`, but a *misspelled function* in a DLL that does exist gets filled in with a
-stub that only complains when something calls it. A typo in a rarely-taken path can
-therefore sit unnoticed. The compiler cannot help here — it has no way to know what a DLL on
-the target machine exports — so **exercise every `winapi` call at least once in a test**. Where a
-platform difference genuinely cannot be hidden it is named in this document, rather than
-left for a reader to discover.
+The last row matters most: a missing DLL is fatal before `main`, but a *misspelled
+function* in a DLL that does exist gets a stub that only complains when called — a typo
+on a rarely-taken path can sit unnoticed. The compiler cannot check this (it does not
+know what a DLL on the target machine exports), so **exercise every `winapi` call at
+least once in a test**.
 
-**Naming a function the compiler already imports costs nothing extra.** The compiler carries
-48 imports of its own — the ones the runtime needs before your first line runs, such as
-`GetStdHandle`, `WriteFile` and `ExitProcess`. Write `winapi("kernel32.dll", "WriteFile", ...)`
-and the call reuses that existing entry rather than adding a second one; the match ignores
-case, because a source writes `user32.dll` where the table holds `USER32.dll`.
-
-The reuse is per **function**, not per DLL — naming `user32.dll` does not hand you the whole
-built-in user32 block. Three cases, and they are all the compiler does:
+**Naming a function the compiler already imports costs nothing extra.** The compiler
+carries 48 imports of its own — what the runtime needs before your first line runs, such
+as `GetStdHandle`, `WriteFile`, `ExitProcess`. Writing `winapi("kernel32.dll",
+"WriteFile", ...)` reuses that entry rather than adding a second one (case-insensitive
+match). The reuse is per **function**, not per DLL:
 
 | what you name | what happens |
 |---|---|
-| a DLL it has, a function it has | the existing slot; nothing is added |
+| a DLL it has, a function it has | the existing slot; nothing added |
 | a DLL it has, a function it does not | a new entry, and a second directory entry for that DLL |
 | a DLL it does not have | a new directory entry and new slots |
 
-A function the compiler does *not* have gets an entry of its own, and that puts a **second
-directory entry for the same DLL** in the executable when you name a new `user32` function.
-That is legal and deliberate: the built-in names and the source-named ones are two separate
-runs in the name table, and interleaving them would put the address table out of step with
-the names. Two entries naming one library cost a few bytes; one ordering instead of two
-costs nothing at all.
+A function the compiler does not have gets its own entry, which can put a **second
+directory entry for the same DLL** in the executable — legal and deliberate: the built-in
+names and source-named ones are two separate runs in the name table, and interleaving
+them would put the address table out of step with the names.
 
-Why the 48 exist rather than being data like everything else: the loader fills the import
-table **before the first instruction runs**, so a program cannot look up the functions it
-needs in order to start. Those names have to be in the file the compiler wrote. The rest of
-what a program touches is data, which is the whole point of naming imports in the source.
-
-This works the same in both compilers, which matters more than it sounds: `lib/` is compiled
-**into** the compiler, so a library routine that names an import has to be understood by the
-C bootstrap as well — otherwise a fresh clone could not build. It is, and the two produce
-identical bytes. Nothing circular arises from that: the imports a library routine
-names land in **your** executable, not in the compiler's own table.
-
-The one place that boundary is real is the startup path. Code that runs *before* your
-program does cannot reach itself through an import table the loader has not filled yet — so
-the handful of names needed to start a process stay built in, and everything a program calls
-afterwards can be ordinary source.
+The 48 built-ins exist because the loader fills the import table **before the first
+instruction runs**, so a program cannot look itself up to start; the rest of what a
+program touches is data, which is the point of naming imports in source. `lib/` is
+compiled **into** the compiler, so a library routine that names an import is understood
+by the C bootstrap too — the two produce identical bytes, and nothing circular arises:
+the imports a library routine names land in **your** executable, not the compiler's own.
 
 ### `winproc(name)`: letting Windows call your routine
 
-On Windows the operating system calls *you*. A window procedure, a window enumerator, a
-hook, a timer: you hand the system an address and it jumps into your program. This language
-has no function pointers on purpose, so there is exactly one way to produce that address, and
-it is as narrow as the need:
+On Windows the operating system calls *you* — a window procedure, a window enumerator, a
+hook, a timer. This language has no function pointers on purpose, so there is exactly one
+way to produce that address:
 
 ```pascal
 poke64(wc, 8, winproc(wndproc));                  // WNDCLASSEXA.lpfnWndProc
 winapi("user32.dll", "EnumWindows", winproc(onwindow), 0);
 ```
 
-`winproc` takes the **name of a routine you declared** — not an expression, not a variable —
-and gives back an address to pass on. It is only valid when building for Windows; on Linux it
-does not compile, because a callback is a Windows notion and pretending otherwise would hide
-the difference rather than handle it.
+`winproc` takes the **name of a routine you declared** — not an expression, not a
+variable — and gives back an address. Valid only when building for Windows; on Linux it
+does not compile, since a callback is a Windows notion.
 
-**What it returns is not your routine's address.** Windows passes arguments in one set of
-registers and this language reads them from another, so the compiler writes a small adapter
-beside your routine and hands back the address of *that*. The adapter moves the arguments
-across, reserves the 32 bytes of shadow space the platform requires, and preserves the
-registers Windows expects to find untouched — `rdi`, `rsi` and `rbx`, which are yours to
-destroy on Linux and yours to preserve on Windows.
+**What it returns is not your routine's address.** Windows and this language read
+arguments from different registers, so the compiler writes a small adapter beside your
+routine and hands back that address instead. The adapter moves arguments across, reserves
+the 32-byte shadow space Windows requires, and preserves `rdi`, `rsi`, `rbx` — yours to
+destroy on Linux, Windows' to find untouched.
 
-The routine itself is ordinary: up to four `int` parameters, returning `int`. That is the
-shape of every callback in the Windows API, so one adapter carries all of them and a routine
-that takes fewer simply ignores the rest.
+The routine itself is ordinary: up to four `int` parameters, returning `int` — the shape
+of every Windows API callback, so one adapter carries all of them.
 
 ```pascal
 function wndproc(hw: int; m: int; wp: int; lp: int): int;
@@ -741,12 +783,14 @@ begin
 end;
 ```
 
-Why this exists at all: a button click is **sent** straight to a window procedure and never
-appears in the message queue a loop reads, so no message loop — however written — can see
-one. There is no way to write an interactive Windows program without a callback.
+Why this exists: a button click is **sent** straight to a window procedure and never
+appears in a message queue, so no message loop can see one — there is no way to write an
+interactive Windows program without a callback.
 
-**The target comes from `--target=` and from nowhere else.** The default is Linux; the
-output name decides nothing:
+### `--target`
+
+**The target comes from `--target=` and nowhere else.** Default is Linux; the output name
+decides nothing:
 
 ```bash
 ./bin/wantzel examples/hello.wz bin/hello                     # Linux ELF
@@ -756,35 +800,32 @@ output name decides nothing:
 ./bin/wantzel examples/hello.wz bin/hello.exe                 # refused: which target?
 ```
 
-A name ending in `.exe` used to select Windows on its own, which made the output name a
-second and invisible way to choose the target — `wantzel x.wz backup.exe` handed back a
-Windows binary nobody asked for. A `.exe` name with no `--target` is now **refused**
-rather than quietly built for Linux: the two contradict each other, and saying so costs
-nothing.
+A `.exe` name used to select Windows on its own — a second, invisible way to choose the
+target — so it is now refused rather than quietly built for Linux. `--target=linux` and
+`--target=windows` (short: `-tlinux`, `-twindows`) are the only values; the ELF output is
+unchanged.
 
-`--target=linux` and `--target=windows` (short: `-tlinux`, `-twindows`) are the only
-values. The ELF output is unchanged: the same source gives the same ELF as before.
+**The language is identical on both platforms.** Everything above holds for a `.exe`;
+what differs is underneath: Linux gets the `SYSCALL` instruction, Windows a runtime shim
+translating to the Win32 equivalent. Reads and writes, files, directory listing and
+`stat`, sockets, `epoll` (emulated over `WSAPoll`), time, `mmap`/`msync`, `fsync`,
+`rename`, `flock`, `getrandom` and the command line are all translated. The compiler
+compiles itself into a working `wantzel.exe`, which compiles Wantzel source and
+reproduces itself byte-identically: self-hosting on Windows.
 
-**The language is identical on both platforms.** Everything in this document holds for a
-`.exe`. What differs is underneath: where Linux gets the `SYSCALL` instruction, Windows
-gets a call into a runtime shim that translates to the Win32 equivalent. Reads and writes,
-files, directory listing and `stat`, sockets, `epoll` (emulated over `WSAPoll`), time,
-`mmap`/`msync`, `fsync`, `rename`, `flock`, `getrandom` and the command line are all
-translated. The compiler compiles itself into a working `wantzel.exe`, which in turn
-compiles Wantzel source and reproduces itself byte-identically: self-hosting on Windows.
+Three differences remain, all properties of the Windows runtime rather than of the language:
 
-Two things are not equivalent, and both are properties of Windows rather than of the
-language:
-
-- **No `fork`.** Windows does not have it, so `fork` returns `0` and the caller becomes
-  the only worker. A multi-worker HTTP server therefore runs single-process there: it
-  works, but it does not use every core the way it does on Linux.
-- **No PE checksum and no signature.** Not needed to run, but a fresh unsigned `.exe` is
-  blocked by SmartScreen and by some Defender ASR policies on managed machines. That is
-  not specific to Wantzel — an unsigned hello-world from any compiler is treated the same
-  — and the fix is an Authenticode signature the machine trusts, a folder exclusion from
-  your administrator, or testing in Windows Sandbox.
+- **No `fork`.** Windows lacks it, so `fork` returns `0` and the caller becomes the only
+  worker — a multi-worker HTTP server runs single-process there: it works, but does not
+  use every core the way it does on Linux.
+- **At most 16 `epoll` sets at once.** They behave as on Linux — independent, and one
+  can be watched inside another — but a seventeenth `epoll_create1` returns `EMFILE`,
+  where Linux is limited only by the number of open files.
+- **No PE checksum, no signature.** Not needed to run, but a fresh unsigned `.exe` is
+  blocked by SmartScreen and some Defender ASR policies on managed machines — not
+  specific to Wantzel, and fixed by an Authenticode signature the machine trusts, a
+  folder exclusion from an administrator, or testing in Windows Sandbox.
 
 `./wztest --toolchain` runs the Windows output under Wine (`run_win` in
-`tests/helpers.sh` sets the prefix and disables the crash dialog), so the two targets are
-tested together rather than one being assumed to still work.
+`tests/helpers.sh`), so both targets are tested together rather than one being assumed to
+still work.

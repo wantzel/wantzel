@@ -1,4 +1,8 @@
 // lib/kv.wz -- helpers for a small JSON object kept as compact text (the
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
 // `info` field of typical entities: at most a few KB, scalar or small nested
 // values).
 //
@@ -167,13 +171,19 @@ begin
 end;
 
 // are the raw bytes a[aat..aend) and b[bat..bend) identical?
+//
+// A NEGATIVE START OR AN END PAST THE ARRAY IS THE CALLER'S CONTRACT, NOT AN ANSWER. Both
+// are a range that does not exist, which is a different thing from two ranges that exist
+// and differ -- folding them into the same `false` used to hide a caller bug (an
+// off-by-one on a slice, an unguarded arithmetic result) behind an ordinary "they don't
+// match", indistinguishable from it at the call site. `io.fatal` says so instead.
 function kv.bytes(a: array of char; aat: int; aend: int; b: array of char; bat: int; bend: int): bool;
 var i, cnt: int;
 begin
-  if aat < 0 then return false;
-  if bat < 0 then return false;
-  if aend > len(a) then return false;
-  if bend > len(b) then return false;
+  if aat < 0 then io.fatal("kv.bytes: aat is negative");
+  if bat < 0 then io.fatal("kv.bytes: bat is negative");
+  if aend > len(a) then io.fatal("kv.bytes: aend is past the end of a");
+  if bend > len(b) then io.fatal("kv.bytes: bend is past the end of b");
   cnt := aend - aat;
   if bend - bat <> cnt then return false;
   i := 0;
@@ -223,12 +233,18 @@ end;
 // are two JSON values equal?  Strings byte-for-byte (escapes included),
 // numbers numerically (3 = 3.0 = 3e0), true/false/null by text; arrays and
 // objects byte-for-byte after trimming the surrounding whitespace.
+//
+// Same contract as kv.bytes above: a range that does not exist is the caller's bug, not
+// an answer of "not equal", so it stops the program instead of returning a plausible
+// false -- see kv.bytes for why folding the two together is the wrong kind of quiet.
 function kv.same(a: array of char; aat: int; aend: int; b: array of char; bat: int; bend: int): bool;
 var r, av: int;
     ar: real;
 begin
-  if (aat < 0) or (bat < 0) then return false;
-  if (aend > len(a)) or (bend > len(b)) then return false;
+  if aat < 0 then io.fatal("kv.same: aat is negative");
+  if bat < 0 then io.fatal("kv.same: bat is negative");
+  if aend > len(a) then io.fatal("kv.same: aend is past the end of a");
+  if bend > len(b) then io.fatal("kv.same: bend is past the end of b");
   aat := json.ws(a, aat, aend);
   aend := kv.rtrim(a, aat, aend);
   bat := json.ws(b, bat, bend);

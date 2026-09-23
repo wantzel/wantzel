@@ -1,0 +1,27 @@
+ok   the directory parses
+ok   newAccount comes out
+ok   newNonce comes out
+ok   newOrder comes out
+ok   a directory with a nested object parses
+ok   and a key nested inside another object is NOT picked up
+ok   a directory missing newOrder is refused
+ok   the Replay-Nonce header is found
+ok   and its value is exact
+ok   in any capitalisation
+ok   and still exact
+ok   a header whose name merely CONTAINS it is not matched
+ok   an order parses
+ok   finalize comes out
+ok   and the first authorization
+ok   a valid order parses
+ok   and yields the certificate URL
+ok   an authorization with three challenge types parses
+ok   and the http-01 challenge is chosen, not the first one
+ok   with its own token
+ok   an authorization without http-01 is refused
+ok   the account payload is exactly what the protocol expects
+ok   and without an address it still agrees to the terms
+ok   the order payload names the identifier as a dns type
+ok   the CSR payload is built
+ok   and carries no base64 padding
+ok   and is a plausible size for a real request

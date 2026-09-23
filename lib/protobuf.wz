@@ -1,5 +1,9 @@
 // lib/protobuf.wz -- reader for the protobuf wire format.
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 // The wire format is five things: a varint, a 64-bit fixed, a
 // length-delimited block, a 32-bit fixed, and a tag that says which of
 // those follows and for which field number.  Nothing else.  A reader that

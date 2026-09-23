@@ -1,5 +1,9 @@
 // lib/sha256.wz -- SHA-256 (FIPS 180-4).
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 // A streaming interface over one global state (sha256.init / update / final)
 // and a one-shot wrapper (sha256.hash).  All 32-bit arithmetic is done in
 // 64-bit ints and masked with band(.., 0xFFFFFFFF) after every add and shift;
@@ -111,6 +115,28 @@ begin
     end;
   end;
   sha256.total := sha256.total + len(b);
+end;
+
+// sha256.updateat -- hash b[at .. at+n-1] rather than the whole array.
+//
+// WHY THIS EXISTS BESIDE sha256.update. A certificate signature covers the tbsCertificate
+// exactly as it sits inside the larger buffer -- byte for byte, tag and length included --
+// and copying that slice out just to hash it would mean a second buffer big enough for any
+// certificate. This hashes it where it lies.
+procedure sha256.updateat(b: array of char; at: int; n: int);
+var i: int;
+begin
+  for i := at to at + n - 1 do
+  begin
+    sha256.buf[sha256.n] := b[i];
+    sha256.n := sha256.n + 1;
+    if sha256.n = 64 then
+    begin
+      sha256.block;
+      sha256.n := 0;
+    end;
+  end;
+  sha256.total := sha256.total + n;
 end;
 
 // pad, run the last block(s) and write the 32-byte digest into digest[0..31]

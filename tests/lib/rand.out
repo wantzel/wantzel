@@ -1,0 +1,10 @@
+ok   every byte of the buffer is written, including the last
+ok   a one-byte buffer is filled
+ok   a 256-byte buffer is filled, not just its first chunk
+ok   two draws are not the same bytes
+ok   every byte POSITION varies, not just the first few
+ok   all eight bit positions are used, none stuck
+ok   the output covers the whole byte range
+ok   rand.below(10) stays within 0..9
+ok   and reaches every value in its range
+ok   rand.below(1) is always 0

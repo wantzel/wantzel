@@ -1,0 +1,6 @@
+ok   the first 32 bytes of the RFC 2.3.2 keystream block
+ok   and the second 32
+ok   the RFC's plaintext is 114 bytes
+ok   the first 32 bytes of the RFC 2.4.2 ciphertext
+ok   and the last 18 bytes
+ok   decrypting with the same call returns the plaintext

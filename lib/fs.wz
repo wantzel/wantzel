@@ -1,5 +1,9 @@
 // lib/fs.wz -- directories, file metadata and reading, on raw syscalls.
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 // Read-only: nothing here creates, writes or deletes.
 
 include "io.wz";
@@ -15,21 +19,35 @@ const
 
   FS.DIRBUF = 32768;
 
+const
+  FS.ENOENT = 2;        // errno: no such file or directory
+
 var
   fs.st:   array[0..143] of char;      // struct stat
   fs.size, fs.mode, fs.mtime: int;
+  fs.err:  str;                        // the reason of the last fs.stat/fs.next failure, "" for the common case
+  fs.errno: int;                       // the raw -errno beside fs.err, 0 when there was none
 
   fs.dbuf: array[0..FS.DIRBUF - 1] of char;
   fs.dlen, fs.dpos: int;
   fs.name: array[0..255] of char;
   fs.namelen, fs.type: int;
 
-// fill fs.size/mode/mtime for the NUL-terminated path at address a
+// fill fs.size/mode/mtime for the NUL-terminated path at address a.  false either means the
+// path does not exist (fs.err stays "", the common case a caller checks for) or a different
+// failure (not a directory somewhere in the path, no permission, too many symlinks, ...):
+// fs.err then says so and fs.errno carries the raw -errno, since this file has no per-errno
+// name table and a wrong guess at the name would be worse than the number.
 function fs.stat(a: int): bool;
 var r: int;
 begin
+  fs.err := ""; fs.errno := 0;
   r := sys2(SYS.stat, a, addr(fs.st[0]));
-  if r < 0 then return false;
+  if r < 0 then
+  begin
+    if r <> 0 - FS.ENOENT then begin fs.err := "fs.stat failed"; fs.errno := 0 - r; end;
+    return false;
+  end;
   fs.mode  := io.get32(fs.st, 24);
   fs.size  := io.get64(fs.st, 48);
   fs.mtime := io.get64(fs.st, 88);
@@ -64,21 +82,63 @@ begin
   return sys3(SYS.open, a, 65536, 0);
 end;
 
-// Step to the next directory entry; fills fs.name/fs.namelen/fs.type.
+// fs.map(a) -- map the whole NUL-terminated file at address a into memory, read-only.
+//
+// Returns the base address, or -1. On success fs.size holds the length, so the caller has
+// both halves of what it needs from one call.
+//
+// WHY THIS IS A ROUTINE AND NOT FOUR LINES AT EACH CALLER. The four lines are a stat, an
+// open, an mmap and a close, and what they SAY is "syscall 4, syscall 2, syscall 9, syscall
+// 3". What they MEAN is "map this file". A reader has to recognise the sequence to know
+// which of the two they are looking at, and every caller that writes it out again is a
+// place the order can be wrong.
+//
+// THE CLOSE IS THE PART WORTH HAVING IN ONE PLACE. A mapping keeps its own reference to the
+// file, so the descriptor is finished the moment mmap returns -- but a caller that does not
+// know that leaks one per file, and that is invisible until a long-running program runs out.
+//
+// AN EMPTY FILE IS REFUSED rather than mapped: mmap with a length of zero fails anyway, and
+// -1 with fs.size = 0 lets the caller say "that file is empty" instead of "cannot map".
+function fs.map(a: int): int;
+var fd, base: int;
+begin
+  if not fs.stat(a) then return 0 - 1;
+  if fs.size <= 0 then return 0 - 1;
+  fd := fs.open(a);
+  if fd < 0 then return 0 - 1;
+  base := sys6(SYS.mmap, 0, fs.size, PROT_READ, MAP_SHARED, fd, 0);
+  fs.close(fd);
+  if base < 0 then return 0 - 1;
+  return base;
+end;
+
+// fs.unmap(base) -- give a mapping back. The length is the one fs.map reported.
+procedure fs.unmap(base: int; n: int);
+begin
+  if base > 0 then sys2(SYS.munmap, base, n);
+end;
+
+// Step to the next directory entry; fills fs.name/fs.namelen/fs.type.  false either means
+// the directory is exhausted (fs.err stays "", the common case) or a real failure -- getdents
+// returned a negative -errno, or the buffer it filled holds a record with no length, which
+// would otherwise loop forever: fs.err then says so and fs.errno carries the raw -errno (0
+// when there was none to report, as with a corrupt record).
 function fs.next(fd: int): bool;
 var reclen, nameat, i: int;
     c: char;
 begin
+  fs.err := ""; fs.errno := 0;
   while true do
   begin
     if fs.dpos >= fs.dlen then
     begin
       fs.dlen := sys3(SYS.getdents, fd, addr(fs.dbuf[0]), FS.DIRBUF);
       fs.dpos := 0;
-      if fs.dlen <= 0 then return false;
+      if fs.dlen < 0 then begin fs.err := "fs.next: getdents failed"; fs.errno := 0 - fs.dlen; return false; end;
+      if fs.dlen = 0 then return false;
     end;
     reclen := io.get16(fs.dbuf, fs.dpos + 16);
-    if reclen <= 0 then return false;
+    if reclen <= 0 then begin fs.err := "fs.next: corrupt directory record"; return false; end;
     fs.type := ord(fs.dbuf[fs.dpos + 18]);
     nameat := fs.dpos + 19;
     i := 0;

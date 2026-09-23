@@ -5,6 +5,11 @@
 # Temporary output of the toolchain tests.
 /tmp/
 
+# What a library test writes to have a real file to work on. A test RUNS in its own
+# temporary directory, but running one by hand from the repository root leaves this here --
+# twice now, and both times it reached a commit.
+/fs_map_proef.txt
+
 # Never a token in a repository. This is a safety net: nothing here reads a .env, but
 # if a copy ever drifts in, it must not be committed.
 .env

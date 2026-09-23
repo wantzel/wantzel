@@ -1,0 +1,2 @@
+calling proc.alive(0)
+proc.alive: pid must be positive

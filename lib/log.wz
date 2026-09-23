@@ -1,5 +1,9 @@
 // lib/log.wz -- one JSON line per event on stderr, for journald or a file.
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 //   log.info("started");                      {"t":...,"level":"info","msg":"started"}
 //   log.kv("port", 8080); log.info("listening");   extra fields go before the message
 //   log.error("cannot bind");

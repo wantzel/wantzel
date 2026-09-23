@@ -1,4 +1,8 @@
 // lib/math.wz -- real arithmetic beyond the operators: exp, log, pow, the
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
 // trigonometric functions, rounding, and fixed-decimal formatting.
 //
 // Everything is plain Wantzel on the `real` type: range reduction plus a short

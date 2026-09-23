@@ -1,5 +1,9 @@
 // lib/http.wz -- a non-blocking HTTP/1.1 server on epoll.
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 // One process, one event loop, no threads and no allocation: every
 // connection owns a fixed slice of two static buffers, indexed by its file
 // descriptor.  The application supplies app.request, which is called once
@@ -45,11 +49,80 @@ var
   http.hvat, http.hvend: int;                  // the value found by http.header
   http.pval: array[0..4095] of char;           // the decoded value found by http.param/http.form
   http.pvlen: int;
+  http.paramerr: bool;                         // true when http.param/http.form/http.lookup
+                                                // returned false because the key WAS found but
+                                                // its value had bad percent-encoding or did not
+                                                // fit http.pval -- as opposed to the key being
+                                                // absent.  Set at the start of every call to
+                                                // http.lookup, so a stale true from an earlier,
+                                                // unrelated key never leaks into this answer.
   http.started: int;                           // io.now at the start of the request
   http.logging: bool;                          // one JSON line per request on stderr
+  http.hdrseen: bool;                          // http.parse found the end of the headers
+  http.clen: int;                              // the Content-Length it read there, 0 if absent
+
+  // ------------------------------------------------------------ handing a connection off
+  //
+  // http.detach lets app.request give fd to another module (lib/websocket.wz, on a
+  // WebSocket upgrade) WITHOUT this file knowing that module exists. Set it to true
+  // and return from app.request without writing a reply; http.wz then removes fd
+  // from ITS OWN bookkeeping (out of http.open, out of http.ep) and closes nothing,
+  // so the fd is still a live, connected socket that the caller (app.request, or
+  // whatever it called before returning) now owns outright. See lib/websocket.wz's
+  // file header for why this is a plain variable and not a second forward hook: a
+  // program that never sets it sees no change at all in this file's behaviour.
+  http.detach: bool;
+
+  // ------------------------------------------------------------ the big-body path
+  //
+  // A request whose Content-Length is larger than fits in INBUF is not, by itself, a bad
+  // request -- a year of minute values is about 2.1 MB of JSON.  Before this the request
+  // was silently dropped once its bytes filled INBUF: no 413, no message, a bare
+  // 'connection reset' at the client.  http.maxbody(cap), called once before http.serve,
+  // reserves ONE extra region of `cap` bytes with mmap for the body of the ONE connection
+  // that is currently reading past INBUF -- not `cap * MAXCONN`.  A second connection that
+  // also overflows while the region is in use gets the 413 instead: there is one slot, not
+  // one per connection, which is the whole point of asking for it explicitly rather than
+  // raising INBUF itself.
+  http.bigbase: int;                           // address of the overflow region, -1 = none requested
+  http.bigcap:  int;                           // its size in bytes, 0 = the feature is off
+  http.bigowner: int;                          // fd currently using it, -1 = free
+  http.biglen:  int;                           // bytes of the body copied into it so far
+  http.bigtotal: int;                          // the Content-Length the owner is reading towards
+  http.bodyinbig: bool;                        // true while app.request runs: the body is in
+                                                // http.bigbase[0..http.bodylen), not http.inbuf
+  http.overflowed: bool;                       // the current reply did not fit in OUTBUF
 
 // the application must define this; it is called with a parsed request
 procedure app.request; forward;
+
+// Reserve a shared overflow region for request bodies larger than INBUF (256 kB).  Call
+// this once, before http.serve -- after fork, so each worker gets its own mapping rather
+// than one worker's writes racing another's through a shared page.  Only one connection at
+// a time can be reading into it; a second oversized request while it is in use is answered
+// with 413, the same as when this is never called at all.
+procedure http.maxbody(cap: int);
+begin
+  if cap <= 0 then io.fatal("http.maxbody needs a positive size");
+  http.bigbase := sys6(SYS.mmap, 0, cap, bor(PROT_READ, PROT_WRITE), bor(MAP_PRIVATE, MAP_ANONYMOUS), -1, 0);
+  if http.bigbase < 0 then io.fatal("http.maxbody: cannot map memory");
+  http.bigcap := cap;
+  http.bigowner := -1;
+end;
+
+// copy n bytes of the body read so far, out of this connection's ordinary slot in
+// http.inbuf, into the front of the shared overflow region -- so the bytes already read
+// before the switch are not re-requested from the client
+procedure http.copytobig(from: int; n: int; dst: array of char);
+var i: int;
+begin
+  i := 0;
+  while i < n do
+  begin
+    dst[i] := http.inbuf[from + i];
+    i := i + 1;
+  end;
+end;
 
 // ---------------------------------------------------------------- replies
 
@@ -57,6 +130,8 @@ procedure http.start;
 begin
   http.wpos := http.obase + HDRROOM;
   http.xlen := 0;
+  http.overflowed := false;
+  http.detach := false;
 end;
 
 // add a response header to the current reply: http.hdradd("Cache-Control: no-store")
@@ -118,18 +193,36 @@ begin
   io.out(STDERR, addr(http.logbuf[0]), n);
 end;
 
+// io.push and io.pushnum already stop at len(http.outbuf) rather than trap, but a reply
+// that stopped mid-write is wrong in a way nothing downstream can see -- so a short push
+// (the position did not advance by the full amount) is treated the same as the checked
+// writers below: http.overflowed, and http.finish turns that into a clean 500.
 procedure http.add(s: str);
+var want: int;
 begin
+  want := http.wpos + slen(s);
   http.wpos := io.push(http.outbuf, http.wpos, s);
+  if http.wpos < want then http.overflowed := true;
 end;
 
 procedure http.addn(v: int);
+var want: int;
 begin
+  want := http.wpos + io.digits(v);
   http.wpos := io.pushnum(http.outbuf, http.wpos, v);
+  if http.wpos < want then http.overflowed := true;
 end;
 
+// http.outbuf[http.wpos] := c without a check used to be a runtime array-bounds trap the
+// moment a reply ran past OUTBUF (512 kB) -- the whole worker process died on one large
+// reply, taking every OTHER connection it was serving down with it.  These two are the
+// only writers here that touch http.outbuf directly instead of going through io.push,
+// which already bounds-checks; http.finish turns http.overflowed into a clean 500 instead
+// of the truncated, wrong-Content-Length body that silently dropping the write would leave
+// behind.
 procedure http.addc(c: char);
 begin
+  if http.wpos >= http.obase + OUTBUF then begin http.overflowed := true; return; end;
   http.outbuf[http.wpos] := c;
   http.wpos := http.wpos + 1;
 end;
@@ -140,6 +233,7 @@ begin
   i := 0;
   while i < n do
   begin
+    if http.wpos >= http.obase + OUTBUF then begin http.overflowed := true; return; end;
     http.outbuf[http.wpos] := b[at + i];
     http.wpos := http.wpos + 1;
     i := i + 1;
@@ -151,6 +245,21 @@ end;
 procedure http.finish(status: int; ctype: str);
 var n, blen, i, start: int;
 begin
+  // A reply that ran past OUTBUF (512 kB) got here anyway before this: http.wpos still
+  // pointed past the true end of what was written, so Content-Length promised bytes that
+  // were never there and the client hung waiting for them.  Replace whatever partial body
+  // exists with a short, honest one instead of shipping a lie with the right status code
+  // on it.  This is deliberately not "raise OUTBUF": that buffer is declared per
+  // connection and multiplied by MAXCONN, so doubling it doubles that much static memory
+  // whether or not any connection ever needs it.
+  if http.overflowed then
+  begin
+    http.wpos := http.obase + HDRROOM;
+    http.wpos := io.push(http.outbuf, http.wpos, "the reply did not fit\n");
+    status := 500;
+    http.keep := false;
+    ctype := "text/plain";
+  end;
   blen := http.wpos - (http.obase + HDRROOM);
   n := 0;
   n := io.push(http.hdr, n, "HTTP/1.1 ");
@@ -232,6 +341,10 @@ end;
 
 // Returns the total length of the request once it is complete, 0 while more
 // data is needed, or -1 when the request is malformed.
+//
+// Even on a 0 (need more), http.hdrseen and http.clen are set as soon as the header block
+// itself is complete -- before this, that information only existed inside this function,
+// so a caller whose body will never fit in INBUF had nothing to decide with.
 function http.parse(base: int; n: int): int;
 var at, eoh, sp1, sp2, lineend, clen, v: int;
     c: char;
@@ -250,7 +363,11 @@ begin
     end;
     at := at + 1;
   end;
-  if eoh < 0 then return 0;
+  if eoh < 0 then
+  begin
+    http.hdrseen := false;
+    return 0;
+  end;
 
   sp1 := scan(http.inbuf, base, eoh, ' ');
   if sp1 >= eoh then return -1;
@@ -305,6 +422,8 @@ begin
   end;
 
   if clen < 0 then return -1;
+  http.hdrseen := true;
+  http.clen := clen;
   if eoh - base + clen > n then return 0;
   http.bodyat := eoh;
   http.bodylen := clen;
@@ -384,11 +503,15 @@ begin
   return n;
 end;
 
-// look up key in a urlencoded string b[from..upto); the decoded value lands in http.pval/http.pvlen
+// look up key in a urlencoded string b[from..upto); the decoded value lands in http.pval/http.pvlen.
+// http.paramerr distinguishes "key not found" (false, http.paramerr false) from "key found but its
+// value has bad percent-encoding or is too long for http.pval" (false, http.paramerr true) --
+// before this both cases returned a bare false and were indistinguishable to the caller.
 function http.lookup(b: array of char; from: int; upto: int; key: str): bool;
 var eq, amp, k: int;
     same: bool;
 begin
+  http.paramerr := false;
   while from < upto do
   begin
     amp := scan(b, from, upto, '&');
@@ -404,6 +527,7 @@ begin
     begin
       if eq < amp then http.pvlen := http.urldecode(b, eq + 1, amp, http.pval)
       else http.pvlen := 0;
+      if http.pvlen < 0 then http.paramerr := true;
       return http.pvlen >= 0;
     end;
     from := amp + 1;
@@ -458,6 +582,25 @@ begin
   http.ignored := net.watch(http.ep, EPOLL_DEL, fd, 0);
   net.close(fd);
   http.open[fd] := false;
+  // The event loop can drop a connection directly on EPOLLERR/EPOLLHUP without ever
+  // calling http.readbig again -- if that connection owned the overflow region, nothing
+  // else would ever free it, and the region would answer every later oversized request
+  // with 413 for the rest of the process's life.
+  if http.bigowner = fd then http.bigowner := -1;
+end;
+
+// http.dropdetach(fd) -- let go of fd after app.request set http.detach, WITHOUT
+// closing it: the opposite of http.drop, which always closes. fd comes out of
+// http.ep and http.open so this file's own loop never touches it again; the socket
+// itself, and everything still buffered in the kernel for it, is untouched.
+//
+// A failing DEL is ignored the same way http.drop ignores one (see there): it means
+// fd is already out of the set, which is the state this routine wants to reach.
+procedure http.dropdetach(fd: int);
+begin
+  http.ignored := net.watch(http.ep, EPOLL_DEL, fd, 0);
+  http.open[fd] := false;
+  if http.bigowner = fd then http.bigowner := -1;
 end;
 
 // push whatever is pending; ask for EPOLLOUT if the socket is full
@@ -493,16 +636,117 @@ begin
   if not http.keep then http.drop(fd);
 end;
 
+// Send a clean 413 and close: a request whose body will never fit is answered rather than
+// reset.  Called once headers are known complete (http.hdrseen), so http.method, the path
+// and the headers themselves are already valid -- only the body is the problem.
+procedure http.reply413(fd: int);
+begin
+  http.fd := fd;
+  http.obase := fd * OUTBUF;
+  http.requests := http.requests + 1;
+  http.started := io.now;
+  http.start;
+  http.keep := false;
+  http.add("request body too large\n");
+  http.finish(413, "text/plain");
+  http.inlen[fd] := 0;
+  http.flush(fd);
+end;
+
+// Continue a request whose body is being read into the shared overflow region rather than
+// http.inbuf: called instead of the normal read once http.bigowner = fd.  Everything about
+// the request except the body (method, path, headers) was already parsed into http.inbuf
+// while the region was still empty, and stays valid there -- only the body bytes move.
+//
+// http.bigbase is a raw address from mmap, not an index into any Wantzel array -- net.recv
+// takes a plain address (see net.wz), so it is used directly rather than through addr().
+// The body is NOT in http.inbuf, so http.bodyat/http.bodylen here are an offset and a
+// length into http.bigbase, not into http.inbuf: an application must check
+// http.bodyinbig and read view(http.bigbase, http.bodylen) instead of http.inbuf when it
+// is set. See docs/library.md.
+procedure http.readbig(fd: int);
+var r, room: int;
+begin
+  while true do
+  begin
+    room := http.bigtotal - http.biglen;
+    if room <= 0 then break;
+    r := net.recv(fd, http.bigbase + http.biglen, room);
+    if r > 0 then http.biglen := http.biglen + r
+    else if r = EAGAIN then return
+    else if r <> EINTR then
+    begin
+      http.bigowner := -1;
+      http.drop(fd);
+      return;
+    end;
+    // r = EINTR falls through to the top of the loop and retries the same recv, the same
+    // way http.readable and http.flush already do.
+  end;
+  // Reaching here (rather than one of the returns above) means the loop left through
+  // "room <= 0", i.e. http.biglen = http.bigtotal: the body is complete.
+  http.fd := fd;
+  http.obase := fd * OUTBUF;
+  http.requests := http.requests + 1;
+  http.started := io.now;
+  http.bodyinbig := true;
+  http.bodyat := 0;
+  http.bodylen := http.bigtotal;
+  http.start;
+  app.request;
+  http.bodyinbig := false;
+  // Same detach path as http.readable's ordinary case: see the comment there. A
+  // detach after a big-body request is not a real scenario (a WebSocket upgrade is
+  // a GET with no body) but is covered the same way rather than left unguarded.
+  if http.detach then begin http.dropdetach(fd); return; end;
+  http.bigowner := -1;
+  http.inlen[fd] := 0;
+  http.flush(fd);
+end;
+
 procedure http.readable(fd: int);
 var r, used, total, base: int;
 begin
+  if http.bigowner = fd then begin http.readbig(fd); return; end;
   base := fd * INBUF;
   while true do
   begin
     used := http.inlen[fd];
     if used >= INBUF then
     begin
-      http.drop(fd);
+      // The buffer is full and http.parse never returned a complete request (that path
+      // returns above, in the r > 0 branch).  Before this was always a bare http.drop --
+      // a reset with no status code, indistinguishable from a crash at the client.  What
+      // to do now depends on what http.parse already learned about the headers:
+      if not http.hdrseen then
+      begin
+        // The headers themselves do not fit in INBUF (256 kB).  That is not a legitimate
+        // large body, so treat it like any other malformed request.
+        http.drop(fd);
+        return;
+      end;
+      if (http.bigcap > 0) and (http.bigowner < 0) and (http.clen <= http.bigcap) then
+      begin
+        // Move the body bytes read so far into the shared region and keep reading there.
+        // The request line and headers stay put in http.inbuf -- http.pathat and friends
+        // still point at this connection's ordinary slot, which nothing here overwrites
+        // until http.inlen[fd] is reset for the NEXT request.
+        //
+        // used - (http.bodyat - base) <= http.clen always holds here: this branch is only
+        // reached with used = INBUF (the slot is completely full) while http.parse still
+        // called the request incomplete, which means the WHOLE request (headers + body)
+        // is already known to be bigger than INBUF -- so there is no room left in this
+        // buffer for bytes belonging to any request after this one.
+        http.biglen := used - (http.bodyat - base);
+        http.copytobig(http.bodyat, http.biglen, view(http.bigbase, http.bigcap));
+        http.bigowner := fd;
+        http.bigtotal := http.clen;
+        http.readbig(fd);
+        return;
+      end;
+      // No overflow region configured, too small for this body, or already busy with
+      // another connection's big body: answer honestly instead of resetting.
+      http.reply413(fd);
       return;
     end;
     r := net.recv(fd, addr(http.inbuf[base + used]), INBUF - used);
@@ -524,6 +768,12 @@ begin
         http.started := io.now;
         http.start;
         app.request;
+        // http.detach means app.request handed fd to another module (a WebSocket
+        // upgrade) instead of writing a reply through http.add/http.finish -- there
+        // is nothing here to flush, and calling http.flush would write whatever
+        // garbage happens to sit in this connection's http.outbuf onto a socket the
+        // new owner is about to start reading frames from. Just let go of it.
+        if http.detach then begin http.dropdetach(fd); return; end;
         http.inlen[fd] := 0;
         http.flush(fd);
         if not http.open[fd] then return;
@@ -567,6 +817,15 @@ end;
 procedure http.serve(port: int; workers: int);
 var n, i, fd, ev, pid: int;
 begin
+  // Global arrays and ints start zeroed, and fd 0 is a real descriptor -- so without this,
+  // http.bigowner would read 0 and every check against it would treat stdin as the owner
+  // of a region that was never even mapped.  Set unconditionally: a program that never
+  // calls http.maxbody still needs http.bigowner to read as "free" and http.bigcap as "off".
+  if http.bigcap = 0 then
+  begin
+    http.bigbase := -1;
+    http.bigowner := -1;
+  end;
   i := 1;
   while i < workers do
   begin

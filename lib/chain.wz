@@ -1,0 +1,754 @@
+// chain.wz -- does this certificate chain up to something we trust?
+//
+// WHAT WAS MISSING BEFORE THIS FILE, and it is the whole reason it exists. x509.wz could
+// READ a certificate -- issuer, subject, validity, public key, signature, and which
+// algorithm made it -- and p256.wz and rsa.wz could CHECK a signature. Nothing joined them
+// up. x509.sigalg was set in three places and read in none: the parser did its work and the
+// answer was thrown away.
+//
+// The visible consequence was in lib/tls.wz: tls.verified could only ever say "the server
+// proved it holds the key in this certificate", never "and that certificate was issued by
+// someone we trust". Necessary, and not sufficient.
+//
+// WHAT A CHAIN IS. The server sends its own certificate first, then the ones that vouch for
+// it, up to but usually NOT including the root. Each certificate is signed by the next; the
+// last one must be signed by a root we already hold. So verification walks the list, and at
+// every step asks the same question: does the NEXT certificate's public key verify THIS
+// certificate's signature over its tbsCertificate bytes?
+//
+// WHAT THIS FILE DOES NOT DO, listed because a half-checked chain is worse than an
+// unchecked one -- it looks like safety:
+//   - NO name constraints, no policy constraints, no path-length enforcement beyond basic
+//     constraints CA:TRUE
+//   - NO revocation: neither CRL nor OCSP. A revoked certificate still verifies here.
+//   - NO RSA-PSS (x509.sigalg = 3). Only PKCS#1 v1.5 and ECDSA P-256.
+//   - NO cross-signing search: the chain is checked in the order it was sent.
+// Each of these is a real gap and each is reported rather than silently tolerated: a
+// certificate this file cannot check is REFUSED, never waved through.
+
+include "io.wz";
+include "sha256.wz";
+include "x509.wz";
+include "p256.wz";
+include "p384.wz";
+include "sha384.wz";
+include "rsa.wz";
+include "der.wz";
+
+const
+  CH.MAXCERTS = 8;        // a chain longer than this is not a chain, it is a loop
+
+var
+  ch.err: str;
+  ch.bad: bool;
+  ch.digest: array[0..127] of char;  // 0..47 the digest (48 for SHA-384); 64..111 scratch for a DER INTEGER
+
+  // the certificates, as slices of one buffer
+  ch.at:  array[0..CH.MAXCERTS-1] of int;
+  ch.n:   array[0..CH.MAXCERTS-1] of int;
+  ch.cnt: int;
+
+  // the issuer's key, kept across the two parses of one step
+  ch.keyalg: int;
+  ch.keyat:  int;
+  ch.keyn:   int;
+  ch.keybuf: array[0..1023] of char;   // the issuer's key, copied out of whatever buffer it was in
+
+  // scratch for ECDSA
+  ch.qx, ch.qy, ch.e, ch.sr, ch.ss: array[0..P.N-1] of int;
+  // The same five, at P-384 width. Separate arrays rather than one wide pair, because
+  // p256.* and p384.* each expect their own limb count and mixing them silently reads
+  // garbage from beyond the end.
+  ch.qx4, ch.qy4, ch.e4, ch.sr4, ch.ss4: array[0..Q.N-1] of int;
+
+procedure ch.fail(m: str);
+begin
+  ch.err := m;
+  ch.bad := true;
+end;
+
+// ---- the trust store ---------------------------------------------------------------------
+//
+// ROOTS ARE HELD AS DER, one after another in a single buffer, because that is how they
+// arrive from disk and because parsing them at startup would mean keeping a parsed form of
+// every root in memory for the one that gets used.
+//
+// THE STORE IS DELIBERATELY SMALL AND EXPLICIT. A caller adds the roots it wants; there is
+// no system store to inherit, no directory scanned behind the caller's back, and therefore
+// no question about what is trusted -- which is exactly the property that makes a
+// zero-dependency binary worth having.
+// SIZED FOR A REAL SYSTEM BUNDLE. Debian's ca-certificates.crt holds 121 roots in 182 kB of
+// PEM, which is about 135 kB of DER. 65536 fitted 32 of them and silently stopped -- the
+// store said "full", the caller ignored it, and 89 roots were missing. A connection to a
+// site under one of those would have been refused with a message about an untrusted root,
+// which is the hardest kind of fault to trace: everything works except some of the time.
+const CH.ROOTBUF = 262144;
+var
+  ch.roots:   array[0..CH.ROOTBUF-1] of char;
+  // 256 slots: a system bundle has about 120 and a caller may add its own.
+  ch.rootat:  array[0..255] of int;
+  ch.rootn:   array[0..255] of int;
+  ch.rootcnt: int;
+  ch.rootlen: int;
+
+procedure ch.clearroots;
+begin
+  ch.rootcnt := 0;
+  ch.rootlen := 0;
+end;
+
+// Add one root, as DER. False when the store is full -- and it says so rather than
+// silently dropping it, because a root that is quietly missing turns into a rejected
+// connection somewhere far away.
+function ch.addroot(b: array of char; at: int; n: int): bool;
+var i: int;
+begin
+  if ch.rootcnt >= len(ch.rootat) then begin ch.fail("the trust store is full"); return false; end;
+  if ch.rootlen + n > CH.ROOTBUF then begin ch.fail("the trust store has no room for this root"); return false; end;
+  i := 0;
+  while i < n do begin ch.roots[ch.rootlen + i] := b[at + i]; i := i + 1; end;
+  ch.rootat[ch.rootcnt] := ch.rootlen;
+  ch.rootn[ch.rootcnt] := n;
+  ch.rootlen := ch.rootlen + n;
+  ch.rootcnt := ch.rootcnt + 1;
+  return true;
+end;
+
+// ---- one link: does `key` verify the signature on `cert`? --------------------------------
+//
+// THE SIGNATURE IS OVER THE tbsCertificate BYTES AS THEY LIE, tag and length included. That
+// is why x509.tbsat/tbsn point into the original buffer instead of a re-encoded copy: two
+// different byte sequences can decode to the same certificate, and only one of them is what
+// was signed.
+//
+// THE PARSE HAPPENS TWICE PER LINK and that is deliberate. x509.wz keeps ONE certificate's
+// fields in module variables, so checking "does cert B's key verify cert A's signature"
+// means parsing A (for its tbs and signature), remembering what is needed, then parsing B
+// (for its key). Keeping two parsed certificates would mean two of every field; copying the
+// three numbers that matter is cheaper and harder to get wrong.
+
+// Remember the public key of the certificate x509 has just parsed.
+//
+// THE BYTES ARE COPIED, not pointed at, and that is not caution but necessity: the issuer's
+// key often lives in a DIFFERENT BUFFER from the certificate being checked. A root comes
+// out of ch.roots while the chain sits in the caller's buffer, so an offset alone is
+// meaningless -- it would be read from the wrong array.
+//
+// That was a real bug here: ch.checksig took the key offset from the root and read it out of
+// the chain buffer, which is a stretch of some other certificate's bytes. It failed with "an
+// RSA key that does not parse", which is the good outcome; the bad one would have been
+// bytes that happened to parse.
+procedure ch.takekey;
+var i: int;
+begin
+  ch.keyalg := x509.keyalg;
+  ch.keyn   := x509.keyn;
+  ch.keyat  := 0;
+  if x509.keyn > len(ch.keybuf) then begin ch.fail("a public key larger than the buffer"); ch.keyn := 0; end;
+end;
+
+// The same, naming the buffer the key is to be copied out of.
+procedure ch.takekeyfrom(b: array of char);
+var i: int;
+begin
+  ch.takekey;
+  i := 0;
+  while i < ch.keyn do begin ch.keybuf[i] := b[x509.keyat + i]; i := i + 1; end;
+end;
+
+// An EC public key inside a certificate is the uncompressed point: 04 || X || Y.
+//
+// THE WIDTH FOLLOWS THE CURVE: 65 bytes for P-256 (1 + 32 + 32), 97 for P-384 (1 + 48 + 48).
+// Checking it is not pedantry -- a key of the wrong length under the right OID means the
+// certificate is malformed or lying, and reading it anyway would take bytes from beyond the
+// key.
+function ch.ecpoint(b: array of char; at: int; n: int): bool;
+begin
+  if n <> 65 then begin ch.fail("a P-256 key that is not 65 bytes"); return false; end;
+  if b[at] <> chr(4) then begin ch.fail("a compressed EC point, which this does not decode"); return false; end;
+  p256.frombytes(ch.qx, b, at + 1);
+  p256.frombytes(ch.qy, b, at + 33);
+  return true;
+end;
+
+function ch.ecpoint384(b: array of char; at: int; n: int): bool;
+begin
+  if n <> 97 then begin ch.fail("a P-384 key that is not 97 bytes"); return false; end;
+  if b[at] <> chr(4) then begin ch.fail("a compressed EC point, which this does not decode"); return false; end;
+  p384.frombytes(ch.qx4, b, at + 1);
+  p384.frombytes(ch.qy4, b, at + 49);
+  return true;
+end;
+
+// An RSA public key is SEQUENCE { INTEGER modulus, INTEGER exponent }.
+function ch.rsakey(b: array of char; at: int; n: int): bool;
+var inner, nat, nn, eat, en, upto: int;
+begin
+  if der.next(b, at, at + n) < 0 then begin ch.fail("an RSA key that does not parse"); return false; end;
+  if der.tag <> 0x30 then begin ch.fail("an RSA key that is not a SEQUENCE"); return false; end;
+  inner := der.vat;
+  upto := der.vend;
+  if der.next(b, inner, upto) < 0 then begin ch.fail("no modulus in the RSA key"); return false; end;
+  if der.tag <> 0x02 then begin ch.fail("the modulus is not an INTEGER"); return false; end;
+  nat := der.vat; nn := der.vend - der.vat;
+  if der.next(b, der.vend, upto) < 0 then begin ch.fail("no exponent in the RSA key"); return false; end;
+  if der.tag <> 0x02 then begin ch.fail("the exponent is not an INTEGER"); return false; end;
+  eat := der.vat; en := der.vend - der.vat;
+  if not rsa.setkey(b, nat, nn, b, eat, en) then begin ch.fail(rsa.err); return false; end;
+  return true;
+end;
+
+// A DER INTEGER into a 256-bit value: strip the leading zero DER adds for a positive number
+// whose top bit is set, then right-align the bytes.
+function ch.derint(r: array of int; b: array of char; at: int; n: int): bool;
+var i: int;
+begin
+  while (n > 0) and (b[at] = chr(0)) do begin at := at + 1; n := n - 1; end;
+  if (n = 0) or (n > 32) then return false;
+  i := 0;
+  // THE SCRATCH STARTS AT 64, not 32. A SHA-384 digest occupies 0..47, so the old offset
+  // overlapped it -- and the overlap only shows on a P-384 chain, where the digest is long
+  // enough to reach into the scratch.
+  while i < 32 do begin ch.digest[64 + i] := chr(0); i := i + 1; end;
+  i := 0;
+  while i < n do begin ch.digest[64 + 32 - n + i] := b[at + i]; i := i + 1; end;
+  p256.frombytes(r, ch.digest, 64);
+  return true;
+end;
+
+// The same, at P-384 width: 48 bytes instead of 32.
+function ch.derint384(r: array of int; b: array of char; at: int; n: int): bool;
+var i: int;
+begin
+  while (n > 0) and (b[at] = chr(0)) do begin at := at + 1; n := n - 1; end;
+  if (n = 0) or (n > 48) then return false;
+  i := 0;
+  while i < 48 do begin ch.digest[64 + i] := chr(0); i := i + 1; end;
+  i := 0;
+  while i < n do begin ch.digest[64 + 48 - n + i] := b[at + i]; i := i + 1; end;
+  p384.frombytes(r, ch.digest, 64);
+  return true;
+end;
+
+// ch.checksig -- verify the signature on the certificate at b[cat..cat+cn), using the key
+// remembered by ch.takekey.
+//
+// THE ALGORITHM COMES FROM THE CERTIFICATE AND THE KEY MUST AGREE WITH IT. An RSA signature
+// verified with an EC key, or the other way round, is not a mismatch to shrug at -- it is
+// the shape of an attack, so it is refused explicitly rather than falling through.
+function ch.checksig(b: array of char; cat: int; cn: int): bool;
+var sat, sn, rat, rn, sgat, sgn, inner2, end2: int;
+begin
+  if not x509.parse(b, cat, cat + cn) then begin ch.fail(x509.err); return false; end;
+
+  // HASH THE SIGNED REGION, with the hash the ALGORITHM names -- not a fixed one. Using
+  // SHA-256 for an ecdsa-with-SHA384 signature gives a digest of the right shape and the
+  // wrong value, so every such certificate would be refused with no hint why.
+  if x509.sigalg = 4 then
+  begin
+    sha384.init;
+    sha384.updateat(b, x509.tbsat, x509.tbsn);
+    sha384.final(ch.digest);
+  end
+  else
+  begin
+    sha256.init;
+    sha256.updateat(b, x509.tbsat, x509.tbsn);
+    sha256.final(ch.digest);
+  end;
+
+  sat := x509.sigat;
+  sn  := x509.sign;
+
+  if x509.sigalg = 1 then
+  begin
+    if ch.keyalg <> 1 then begin ch.fail("an RSA signature under a key that is not RSA"); return false; end;
+    if not ch.rsakey(ch.keybuf, 0, ch.keyn) then return false;
+    if not rsa.verify(b, sat, sn, ch.digest) then begin ch.fail(rsa.err); return false; end;
+    return true;
+  end;
+
+  if x509.sigalg = 2 then
+  begin
+    if ch.keyalg <> 2 then begin ch.fail("an ECDSA signature under a key that is not EC"); return false; end;
+    if not ch.ecpoint(ch.keybuf, 0, ch.keyn) then return false;
+    // the signature is SEQUENCE { INTEGER r, INTEGER s }
+    if der.next(b, sat, sat + sn) < 0 then begin ch.fail("the ECDSA signature does not parse"); return false; end;
+    if der.tag <> 0x30 then begin ch.fail("the ECDSA signature is not a SEQUENCE"); return false; end;
+    inner2 := der.vat; end2 := der.vend;
+    if der.next(b, inner2, end2) < 0 then begin ch.fail("no r in the ECDSA signature"); return false; end;
+    if der.tag <> 0x02 then begin ch.fail("r is not an INTEGER"); return false; end;
+    rat := der.vat; rn := der.vend - der.vat;
+    sgat := der.vend;
+    if der.next(b, sgat, end2) < 0 then begin ch.fail("no s in the ECDSA signature"); return false; end;
+    if der.tag <> 0x02 then begin ch.fail("s is not an INTEGER"); return false; end;
+    sgat := der.vat; sgn := der.vend - der.vat;
+    if not ch.derint(ch.sr, b, rat, rn) then begin ch.fail("r is out of range"); return false; end;
+    if not ch.derint(ch.ss, b, sgat, sgn) then begin ch.fail("s is out of range"); return false; end;
+    p256.frombytes(ch.e, ch.digest, 0);
+    if not p256.verify(ch.qx, ch.qy, ch.e, ch.sr, ch.ss) then begin ch.fail("the ECDSA signature does not verify"); return false; end;
+    return true;
+  end;
+
+  if x509.sigalg = 4 then
+  begin
+    if ch.keyalg <> 4 then begin ch.fail("an ECDSA P-384 signature under a key that is not P-384"); return false; end;
+    if not ch.ecpoint384(ch.keybuf, 0, ch.keyn) then return false;
+    if der.next(b, sat, sat + sn) < 0 then begin ch.fail("the ECDSA signature does not parse"); return false; end;
+    if der.tag <> 0x30 then begin ch.fail("the ECDSA signature is not a SEQUENCE"); return false; end;
+    inner2 := der.vat; end2 := der.vend;
+    if der.next(b, inner2, end2) < 0 then begin ch.fail("no r in the ECDSA signature"); return false; end;
+    if der.tag <> 0x02 then begin ch.fail("r is not an INTEGER"); return false; end;
+    rat := der.vat; rn := der.vend - der.vat;
+    sgat := der.vend;
+    if der.next(b, sgat, end2) < 0 then begin ch.fail("no s in the ECDSA signature"); return false; end;
+    if der.tag <> 0x02 then begin ch.fail("s is not an INTEGER"); return false; end;
+    sgat := der.vat; sgn := der.vend - der.vat;
+    if not ch.derint384(ch.sr4, b, rat, rn) then begin ch.fail("r is out of range"); return false; end;
+    if not ch.derint384(ch.ss4, b, sgat, sgn) then begin ch.fail("s is out of range"); return false; end;
+    p384.frombytes(ch.e4, ch.digest, 0);
+    if not p384.verify(ch.qx4, ch.qy4, ch.e4, ch.sr4, ch.ss4) then begin ch.fail("the ECDSA P-384 signature does not verify"); return false; end;
+    return true;
+  end;
+
+  if x509.sigalg = 3 then begin ch.fail("RSA-PSS signatures are not supported yet"); return false; end;
+  ch.fail("an unrecognised signature algorithm");
+  return false;
+end;
+
+// ---- the walk ----------------------------------------------------------------------------
+//
+// ch.verify -- is the chain in b[] trustworthy for `host` at time `now`?
+//
+// The caller has already split the chain into ch.cnt slices with ch.setcert; that split is
+// the caller's job because it differs per protocol (TLS frames them one way, a PEM file
+// another).
+//
+// WHAT IS CHECKED, in this order, and the order matters:
+//   1. every certificate parses
+//   2. the leaf's name matches the host
+//   3. every certificate is inside its validity window
+//   4. each certificate is signed by the next one's key
+//   5. the last one is signed by a ROOT we hold, and that root is a CA
+//
+// STEP 5 IS THE ONE THAT MAKES THE REST MEAN ANYTHING. Steps 1-4 are satisfied perfectly by
+// a chain an attacker made up from scratch: anyone can generate a key, sign a certificate
+// for any name with it, and sign that with another key they also made. Only the root check
+// distinguishes that from the real thing.
+function ch.setcert(i: int; at: int; n: int): bool;
+begin
+  if (i < 0) or (i >= CH.MAXCERTS) then begin ch.fail("too many certificates in the chain"); return false; end;
+  ch.at[i] := at;
+  ch.n[i] := n;
+  if i + 1 > ch.cnt then ch.cnt := i + 1;
+  return true;
+end;
+
+procedure ch.reset;
+begin
+  ch.cnt := 0;
+  ch.err := "";
+  ch.bad := false;
+end;
+
+// Is the certificate that x509 has just parsed a CA?
+function ch.isca: bool;
+begin
+  return x509.isca;
+end;
+
+// Is the certificate at b[bat..] byte for byte the root at ch.roots[rat..]?
+//
+// COMPARED AS BYTES, not by subject name. Two certificates with the same subject are not
+// the same certificate -- that is precisely the substitution a trust store exists to
+// prevent.
+function ch.samebytes(b: array of char; bat: int; bn: int; rat: int; rn: int): bool;
+var i: int;
+begin
+  if bn <> rn then return false;
+  i := 0;
+  while i < bn do
+  begin
+    if b[bat + i] <> ch.roots[rat + i] then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+function ch.verify(b: array of char; hostb: array of char; hostn: int; now: int): bool;
+var i, j, ok: int;
+begin
+  ch.err := ""; ch.bad := false;
+  if ch.cnt <= 0 then begin ch.fail("an empty chain"); return false; end;
+
+  // ---- 2 and 3: the leaf's name and everyone's validity
+  if not x509.parse(b, ch.at[0], ch.at[0] + ch.n[0]) then begin ch.fail(x509.err); return false; end;
+  if not x509.matchesb(b, hostb, hostn) then begin ch.fail("the certificate is not valid for this host"); return false; end;
+
+  i := 0;
+  while i < ch.cnt do
+  begin
+    if not x509.parse(b, ch.at[i], ch.at[i] + ch.n[i]) then begin ch.fail(x509.err); return false; end;
+    // THE CLOCK IS THE CALLER'S. Passing 0 means "do not check", which is for a test with a
+    // fixed certificate; anything else must be a real time or the window means nothing.
+    if now <> 0 then
+    begin
+      if now < x509.notbefore then begin ch.fail("a certificate in the chain is not valid yet"); return false; end;
+      if now > x509.notafter then begin ch.fail("a certificate in the chain has expired"); return false; end;
+    end;
+    i := i + 1;
+  end;
+
+  // ---- 4: each certificate is signed by the next
+  i := 0;
+  while i + 1 < ch.cnt do
+  begin
+    if not x509.parse(b, ch.at[i + 1], ch.at[i + 1] + ch.n[i + 1]) then begin ch.fail(x509.err); return false; end;
+    // THE ISSUER MUST BE A CA. Without this, a leaf certificate for any domain -- which
+    // anyone can buy -- could sign a certificate for any other domain.
+    if not x509.isca then begin ch.fail("a certificate in the chain signs but is not a CA"); return false; end;
+    ch.takekeyfrom(b);
+    if not ch.checksig(b, ch.at[i], ch.n[i]) then return false;
+    i := i + 1;
+  end;
+
+  // ---- 5: the top of the chain must be signed by a root we hold
+  //
+  // TRIED IN TURN, and a failure to verify against one root is not an error -- it just means
+  // this is not the right root. Only running out of roots is an error.
+  // TRY EVERY CERTIFICATE IN THE CHAIN AS THE LAST LINK, not only the final one.
+  //
+  // A server may send MORE than the path that matters. cloudflare.com sends four: leaf,
+  // intermediate, GTS Root R4, and a cross-signature saying who vouched for R4 in turn.
+  // Our store holds the SELF-SIGNED R4, which is a different certificate from the
+  // cross-signed one -- same key, different issuer, different bytes. So asking "does a root
+  // sign the LAST certificate" answers the wrong question, and comparing bytes does not
+  // find it either.
+  //
+  // WHAT DOES WORK is to try each certificate in turn: for certificate i, is there a root
+  // whose key verifies it? The first one that succeeds ends the walk, because everything
+  // below i was already verified by the loop above. That also handles the ordinary
+  // three-certificate case, where i is simply the last.
+  i := 0;
+  while (i < ch.cnt) and (ok = 0) do
+  begin
+    j := 0;
+    while (j < ch.rootcnt) and (ok = 0) do
+    begin
+      if x509.parse(ch.roots, ch.rootat[j], ch.rootat[j] + ch.rootn[j]) then
+      begin
+        if x509.isca then
+        begin
+          ch.takekeyfrom(ch.roots);
+          if ch.checksig(b, ch.at[i], ch.n[i]) then ok := 1;
+        end;
+      end;
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+  if ok <> 0 then return true;
+
+  // FIRST: IS ANY CERTIFICATE IN THE CHAIN ITSELF A ROOT WE HOLD?
+  //
+  // A server may send the cross-signed root along with the rest -- cloudflare.com does:
+  // four certificates, where the third IS a root in the store and the fourth only says who
+  // cross-signed it. Walking to the last one and demanding that a root signed IT asks the
+  // wrong question, and the answer was "no trusted root signs this chain" for a chain that
+  // ends at a trusted root.
+  //
+  // So a certificate that IS a root ends the walk. Everything below it has already been
+  // verified by the loop above; anything above it is decoration.
+  i := 0;
+  while (i < ch.cnt) and (ok = 0) do
+  begin
+    j := 0;
+    while (j < ch.rootcnt) and (ok = 0) do
+    begin
+      if ch.samebytes(b, ch.at[i], ch.n[i], ch.rootat[j], ch.rootn[j]) then ok := 1;
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+  if ok <> 0 then return true;
+
+  i := ch.cnt - 1;
+  j := 0;
+  ok := 0;
+  while (j < ch.rootcnt) and (ok = 0) do
+  begin
+    if x509.parse(ch.roots, ch.rootat[j], ch.rootat[j] + ch.rootn[j]) then
+    begin
+      if x509.isca then
+      begin
+        ch.takekeyfrom(ch.roots);
+        // checksig parses the chain certificate, which overwrites x509's fields -- that is
+        // why the key was copied out first.
+        if ch.checksig(b, ch.at[i], ch.n[i]) then ok := 1;
+      end;
+    end;
+    j := j + 1;
+  end;
+  if ok = 0 then begin ch.fail("no trusted root signs this chain"); return false; end;
+
+  return true;
+end;
+
+// ---- loading roots from a PEM bundle ------------------------------------------------------
+//
+// WHY PEM AND NOT DER HERE. Every system keeps its roots as one PEM file --
+// /etc/ssl/certs/ca-certificates.crt on Debian and its relatives -- and a tool that cannot
+// read it has to ship its own roots, which is worse: they go stale, and the user cannot see
+// what is trusted.
+//
+// THIS IS STILL NOT A SYSTEM STORE BY DEFAULT. The caller names the file. Nothing is
+// inherited behind its back; what is trusted is what was asked for.
+
+const
+  CH.B64BAD = 0 - 1;
+
+var
+  ch.pembuf: array[0..8191] of char;      // one decoded certificate
+
+function ch.b64val(c: char): int;
+begin
+  if (c >= 'A') and (c <= 'Z') then return ord(c) - ord('A');
+  if (c >= 'a') and (c <= 'z') then return ord(c) - ord('a') + 26;
+  if (c >= '0') and (c <= '9') then return ord(c) - ord('0') + 52;
+  if c = '+' then return 62;
+  if c = '/' then return 63;
+  if c = '=' then return 0 - 2;            // padding, not a value
+  return CH.B64BAD;                        // whitespace and everything else
+end;
+
+// Decode base64 from b[at..upto) into ch.pembuf. Returns the length, or -1.
+//
+// WHITESPACE IS SKIPPED RATHER THAN REFUSED, because PEM is line-wrapped by definition and
+// the wrapping is not part of the data.
+function ch.b64(b: array of char; at: int; upto: int): int;
+var acc, bits, n, v: int;
+begin
+  acc := 0; bits := 0; n := 0;
+  while at < upto do
+  begin
+    v := ch.b64val(b[at]);
+    at := at + 1;
+    if v = 0 - 2 then return n;            // '=' ends the data
+    if v <> CH.B64BAD then
+    begin
+      acc := band(acc * 64 + v, 0xFFFFFF);
+      bits := bits + 6;
+      if bits >= 8 then
+      begin
+        bits := bits - 8;
+        if n >= len(ch.pembuf) then return 0 - 1;
+        ch.pembuf[n] := chr(band(acc shr bits, 0xFF));
+        n := n + 1;
+      end;
+    end;
+  end;
+  return n;
+end;
+
+// Does b[at..] start with s?
+function ch.starts(b: array of char; at: int; upto: int; s: str): bool;
+var i, n: int;
+begin
+  n := slen(s);
+  if at + n > upto then return false;
+  i := 0;
+  while i < n do
+  begin
+    if b[at + i] <> schar(s, i) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// ch.addpem -- add every CERTIFICATE block in a PEM buffer to the trust store.
+//
+// Returns how many were added. A block that does not decode is SKIPPED rather than fatal:
+// a system bundle can contain comments, headers and the occasional oddity, and refusing the
+// whole file because of one entry would mean trusting nothing.
+function ch.addpem(b: array of char; at: int; upto: int): int;
+var added, bodyat, endat: int;
+begin
+  added := 0;
+  while at < upto do
+  begin
+    if ch.starts(b, at, upto, "-----BEGIN CERTIFICATE-----") then
+    begin
+      bodyat := at + 27;
+      // find the END line
+      endat := bodyat;
+      while (endat < upto) and (not ch.starts(b, endat, upto, "-----END CERTIFICATE-----")) do
+        endat := endat + 1;
+      if endat >= upto then return added;       // unterminated: stop, keep what we have
+      if ch.b64(b, bodyat, endat) > 0 then
+        if ch.addroot(ch.pembuf, 0, ch.b64(b, bodyat, endat)) then added := added + 1;
+      at := endat + 25;
+    end
+    else at := at + 1;
+  end;
+  return added;
+end;
+
+// ---- the roots that ship with the binary --------------------------------------------------
+//
+// WHY ANY ROOT IS BAKED IN AT ALL, when the whole point of this library is that nothing is
+// trusted unless the caller says so. Because a program that fetches its own certificate has
+// to trust Let's Encrypt BEFORE it has a certificate, and on a scratch container or a fresh
+// VPS there is no system bundle to read. Without these two, "just give it a domain name"
+// fails on exactly the machines it is meant for.
+//
+// SO THE ORDER IS: the system bundle if there is one, these if there is not. That way a
+// machine with its own trust decisions keeps them, and a machine with none still works.
+// ch.addsystem does that; these are its fallback, not its default.
+//
+// TWO ROOTS, because Let's Encrypt signs under either: X1 is RSA, X2 is ECDSA. Shipping
+// only X1 would work today and fail on a certificate chained to X2, which is the kind of
+// intermittent failure nobody traces.
+//
+// THEY EXPIRE, and that is a date in a ticket and not a surprise:
+//     ISRG Root X1  -- 4 June 2035
+//     ISRG Root X2  -- 17 September 2040
+//
+// THE BYTES CAME FROM THE SYSTEM BUNDLE of this machine, not from a download: the bundle is
+// what the rest of the operating system already trusts, so it is the one source that needs
+// no separate verification. Regenerate with the same route if they ever change.
+var
+  ch.baked:  array[0..2047] of char;
+  ch.bakedn: array[0..1] of int;
+  ch.bakedat: array[0..1] of int;
+  ch.bakedready: bool;
+
+procedure ch.setupbaked;
+var n: int;
+begin
+  if ch.bakedready then return;
+  n := 0;
+  ch.bakedat[0] := 0;
+  // ISRG Root X1 -- notAfter=Jun  4 11:04:38 2035 GMT, 1391 bytes DER
+  ch.bakedn[0] := 1391;
+  n := io.push(ch.baked, n, "\x30\x82\x05\x6b\x30\x82\x03\x53\xa0\x03\x02\x01\x02\x02\x11\x00\x82\x10\xcf\xb0\xd2\x40\xe3\x59\x44\x63\xe0\xbb\x63\x82\x8b\x00\x30\x0d\x06\x09\x2a\x86\x48\x86");
+  n := io.push(ch.baked, n, "\xf7\x0d\x01\x01\x0b\x05\x00\x30\x4f\x31\x0b\x30\x09\x06\x03\x55\x04\x06\x13\x02\x55\x53\x31\x29\x30\x27\x06\x03\x55\x04\x0a\x13\x20\x49\x6e\x74\x65\x72\x6e\x65");
+  n := io.push(ch.baked, n, "\x74\x20\x53\x65\x63\x75\x72\x69\x74\x79\x20\x52\x65\x73\x65\x61\x72\x63\x68\x20\x47\x72\x6f\x75\x70\x31\x15\x30\x13\x06\x03\x55\x04\x03\x13\x0c\x49\x53\x52\x47");
+  n := io.push(ch.baked, n, "\x20\x52\x6f\x6f\x74\x20\x58\x31\x30\x1e\x17\x0d\x31\x35\x30\x36\x30\x34\x31\x31\x30\x34\x33\x38\x5a\x17\x0d\x33\x35\x30\x36\x30\x34\x31\x31\x30\x34\x33\x38\x5a");
+  n := io.push(ch.baked, n, "\x30\x4f\x31\x0b\x30\x09\x06\x03\x55\x04\x06\x13\x02\x55\x53\x31\x29\x30\x27\x06\x03\x55\x04\x0a\x13\x20\x49\x6e\x74\x65\x72\x6e\x65\x74\x20\x53\x65\x63\x75\x72");
+  n := io.push(ch.baked, n, "\x69\x74\x79\x20\x52\x65\x73\x65\x61\x72\x63\x68\x20\x47\x72\x6f\x75\x70\x31\x15\x30\x13\x06\x03\x55\x04\x03\x13\x0c\x49\x53\x52\x47\x20\x52\x6f\x6f\x74\x20\x58");
+  n := io.push(ch.baked, n, "\x31\x30\x82\x02\x22\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01\x05\x00\x03\x82\x02\x0f\x00\x30\x82\x02\x0a\x02\x82\x02\x01\x00\xad\xe8\x24\x73\xf4\x14");
+  n := io.push(ch.baked, n, "\x37\xf3\x9b\x9e\x2b\x57\x28\x1c\x87\xbe\xdc\xb7\xdf\x38\x90\x8c\x6e\x3c\xe6\x57\xa0\x78\xf7\x75\xc2\xa2\xfe\xf5\x6a\x6e\xf6\x00\x4f\x28\xdb\xde\x68\x86\x6c\x44");
+  n := io.push(ch.baked, n, "\x93\xb6\xb1\x63\xfd\x14\x12\x6b\xbf\x1f\xd2\xea\x31\x9b\x21\x7e\xd1\x33\x3c\xba\x48\xf5\xdd\x79\xdf\xb3\xb8\xff\x12\xf1\x21\x9a\x4b\xc1\x8a\x86\x71\x69\x4a\x66");
+  n := io.push(ch.baked, n, "\x66\x6c\x8f\x7e\x3c\x70\xbf\xad\x29\x22\x06\xf3\xe4\xc0\xe6\x80\xae\xe2\x4b\x8f\xb7\x99\x7e\x94\x03\x9f\xd3\x47\x97\x7c\x99\x48\x23\x53\xe8\x38\xae\x4f\x0a\x6f");
+  n := io.push(ch.baked, n, "\x83\x2e\xd1\x49\x57\x8c\x80\x74\xb6\xda\x2f\xd0\x38\x8d\x7b\x03\x70\x21\x1b\x75\xf2\x30\x3c\xfa\x8f\xae\xdd\xda\x63\xab\xeb\x16\x4f\xc2\x8e\x11\x4b\x7e\xcf\x0b");
+  n := io.push(ch.baked, n, "\xe8\xff\xb5\x77\x2e\xf4\xb2\x7b\x4a\xe0\x4c\x12\x25\x0c\x70\x8d\x03\x29\xa0\xe1\x53\x24\xec\x13\xd9\xee\x19\xbf\x10\xb3\x4a\x8c\x3f\x89\xa3\x61\x51\xde\xac\x87");
+  n := io.push(ch.baked, n, "\x07\x94\xf4\x63\x71\xec\x2e\xe2\x6f\x5b\x98\x81\xe1\x89\x5c\x34\x79\x6c\x76\xef\x3b\x90\x62\x79\xe6\xdb\xa4\x9a\x2f\x26\xc5\xd0\x10\xe1\x0e\xde\xd9\x10\x8e\x16");
+  n := io.push(ch.baked, n, "\xfb\xb7\xf7\xa8\xf7\xc7\xe5\x02\x07\x98\x8f\x36\x08\x95\xe7\xe2\x37\x96\x0d\x36\x75\x9e\xfb\x0e\x72\xb1\x1d\x9b\xbc\x03\xf9\x49\x05\xd8\x81\xdd\x05\xb4\x2a\xd6");
+  n := io.push(ch.baked, n, "\x41\xe9\xac\x01\x76\x95\x0a\x0f\xd8\xdf\xd5\xbd\x12\x1f\x35\x2f\x28\x17\x6c\xd2\x98\xc1\xa8\x09\x64\x77\x6e\x47\x37\xba\xce\xac\x59\x5e\x68\x9d\x7f\x72\xd6\x89");
+  n := io.push(ch.baked, n, "\xc5\x06\x41\x29\x3e\x59\x3e\xdd\x26\xf5\x24\xc9\x11\xa7\x5a\xa3\x4c\x40\x1f\x46\xa1\x99\xb5\xa7\x3a\x51\x6e\x86\x3b\x9e\x7d\x72\xa7\x12\x05\x78\x59\xed\x3e\x51");
+  n := io.push(ch.baked, n, "\x78\x15\x0b\x03\x8f\x8d\xd0\x2f\x05\xb2\x3e\x7b\x4a\x1c\x4b\x73\x05\x12\xfc\xc6\xea\xe0\x50\x13\x7c\x43\x93\x74\xb3\xca\x74\xe7\x8e\x1f\x01\x08\xd0\x30\xd4\x5b");
+  n := io.push(ch.baked, n, "\x71\x36\xb4\x07\xba\xc1\x30\x30\x5c\x48\xb7\x82\x3b\x98\xa6\x7d\x60\x8a\xa2\xa3\x29\x82\xcc\xba\xbd\x83\x04\x1b\xa2\x83\x03\x41\xa1\xd6\x05\xf1\x1b\xc2\xb6\xf0");
+  n := io.push(ch.baked, n, "\xa8\x7c\x86\x3b\x46\xa8\x48\x2a\x88\xdc\x76\x9a\x76\xbf\x1f\x6a\xa5\x3d\x19\x8f\xeb\x38\xf3\x64\xde\xc8\x2b\x0d\x0a\x28\xff\xf7\xdb\xe2\x15\x42\xd4\x22\xd0\x27");
+  n := io.push(ch.baked, n, "\x5d\xe1\x79\xfe\x18\xe7\x70\x88\xad\x4e\xe6\xd9\x8b\x3a\xc6\xdd\x27\x51\x6e\xff\xbc\x64\xf5\x33\x43\x4f\x02\x03\x01\x00\x01\xa3\x42\x30\x40\x30\x0e\x06\x03\x55");
+  n := io.push(ch.baked, n, "\x1d\x0f\x01\x01\xff\x04\x04\x03\x02\x01\x06\x30\x0f\x06\x03\x55\x1d\x13\x01\x01\xff\x04\x05\x30\x03\x01\x01\xff\x30\x1d\x06\x03\x55\x1d\x0e\x04\x16\x04\x14\x79");
+  n := io.push(ch.baked, n, "\xb4\x59\xe6\x7b\xb6\xe5\xe4\x01\x73\x80\x08\x88\xc8\x1a\x58\xf6\xe9\x9b\x6e\x30\x0d\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b\x05\x00\x03\x82\x02\x01\x00\x55");
+  n := io.push(ch.baked, n, "\x1f\x58\xa9\xbc\xb2\xa8\x50\xd0\x0c\xb1\xd8\x1a\x69\x20\x27\x29\x08\xac\x61\x75\x5c\x8a\x6e\xf8\x82\xe5\x69\x2f\xd5\xf6\x56\x4b\xb9\xb8\x73\x10\x59\xd3\x21\x97");
+  n := io.push(ch.baked, n, "\x7e\xe7\x4c\x71\xfb\xb2\xd2\x60\xad\x39\xa8\x0b\xea\x17\x21\x56\x85\xf1\x50\x0e\x59\xeb\xce\xe0\x59\xe9\xba\xc9\x15\xef\x86\x9d\x8f\x84\x80\xf6\xe4\xe9\x91\x90");
+  n := io.push(ch.baked, n, "\xdc\x17\x9b\x62\x1b\x45\xf0\x66\x95\xd2\x7c\x6f\xc2\xea\x3b\xef\x1f\xcf\xcb\xd6\xae\x27\xf1\xa9\xb0\xc8\xae\xfd\x7d\x7e\x9a\xfa\x22\x04\xeb\xff\xd9\x7f\xea\x91");
+  n := io.push(ch.baked, n, "\x2b\x22\xb1\x17\x0e\x8f\xf2\x8a\x34\x5b\x58\xd8\xfc\x01\xc9\x54\xb9\xb8\x26\xcc\x8a\x88\x33\x89\x4c\x2d\x84\x3c\x82\xdf\xee\x96\x57\x05\xba\x2c\xbb\xf7\xc4\xb7");
+  n := io.push(ch.baked, n, "\xc7\x4e\x3b\x82\xbe\x31\xc8\x22\x73\x73\x92\xd1\xc2\x80\xa4\x39\x39\x10\x33\x23\x82\x4c\x3c\x9f\x86\xb2\x55\x98\x1d\xbe\x29\x86\x8c\x22\x9b\x9e\xe2\x6b\x3b\x57");
+  n := io.push(ch.baked, n, "\x3a\x82\x70\x4d\xdc\x09\xc7\x89\xcb\x0a\x07\x4d\x6c\xe8\x5d\x8e\xc9\xef\xce\xab\xc7\xbb\xb5\x2b\x4e\x45\xd6\x4a\xd0\x26\xcc\xe5\x72\xca\x08\x6a\xa5\x95\xe3\x15");
+  n := io.push(ch.baked, n, "\xa1\xf7\xa4\xed\xc9\x2c\x5f\xa5\xfb\xff\xac\x28\x02\x2e\xbe\xd7\x7b\xbb\xe3\x71\x7b\x90\x16\xd3\x07\x5e\x46\x53\x7c\x37\x07\x42\x8c\xd3\xc4\x96\x9c\xd5\x99\xb5");
+  n := io.push(ch.baked, n, "\x2a\xe0\x95\x1a\x80\x48\xae\x4c\x39\x07\xce\xcc\x47\xa4\x52\x95\x2b\xba\xb8\xfb\xad\xd2\x33\x53\x7d\xe5\x1d\x4d\x6d\xd5\xa1\xb1\xc7\x42\x6f\xe6\x40\x27\x35\x5c");
+  n := io.push(ch.baked, n, "\xa3\x28\xb7\x07\x8d\xe7\x8d\x33\x90\xe7\x23\x9f\xfb\x50\x9c\x79\x6c\x46\xd5\xb4\x15\xb3\x96\x6e\x7e\x9b\x0c\x96\x3a\xb8\x52\x2d\x3f\xd6\x5b\xe1\xfb\x08\xc2\x84");
+  n := io.push(ch.baked, n, "\xfe\x24\xa8\xa3\x89\xda\xac\x6a\xe1\x18\x2a\xb1\xa8\x43\x61\x5b\xd3\x1f\xdc\x3b\x8d\x76\xf2\x2d\xe8\x8d\x75\xdf\x17\x33\x6c\x3d\x53\xfb\x7b\xcb\x41\x5f\xff\xdc");
+  n := io.push(ch.baked, n, "\xa2\xd0\x61\x38\xe1\x96\xb8\xac\x5d\x8b\x37\xd7\x75\xd5\x33\xc0\x99\x11\xae\x9d\x41\xc1\x72\x75\x84\xbe\x02\x41\x42\x5f\x67\x24\x48\x94\xd1\x9b\x27\xbe\x07\x3f");
+  n := io.push(ch.baked, n, "\xb9\xb8\x4f\x81\x74\x51\xe1\x7a\xb7\xed\x9d\x23\xe2\xbe\xe0\xd5\x28\x04\x13\x3c\x31\x03\x9e\xdd\x7a\x6c\x8f\xc6\x07\x18\xc6\x7f\xde\x47\x8e\x3f\x28\x9e\x04\x06");
+  n := io.push(ch.baked, n, "\xcf\xa5\x54\x34\x77\xbd\xec\x89\x9b\xe9\x17\x43\xdf\x5b\xdb\x5f\xfe\x8e\x1e\x57\xa2\xcd\x40\x9d\x7e\x62\x22\xda\xde\x18\x27");
+  // ISRG Root X2 -- notAfter=Sep 17 16:00:00 2040 GMT, 543 bytes DER
+  ch.bakedn[1] := 543;
+  n := io.push(ch.baked, n, "\x30\x82\x02\x1b\x30\x82\x01\xa1\xa0\x03\x02\x01\x02\x02\x10\x41\xd2\x9d\xd1\x72\xea\xee\xa7\x80\xc1\x2c\x6c\xe9\x2f\x87\x52\x30\x0a\x06\x08\x2a\x86\x48\xce\x3d");
+  n := io.push(ch.baked, n, "\x04\x03\x03\x30\x4f\x31\x0b\x30\x09\x06\x03\x55\x04\x06\x13\x02\x55\x53\x31\x29\x30\x27\x06\x03\x55\x04\x0a\x13\x20\x49\x6e\x74\x65\x72\x6e\x65\x74\x20\x53\x65");
+  n := io.push(ch.baked, n, "\x63\x75\x72\x69\x74\x79\x20\x52\x65\x73\x65\x61\x72\x63\x68\x20\x47\x72\x6f\x75\x70\x31\x15\x30\x13\x06\x03\x55\x04\x03\x13\x0c\x49\x53\x52\x47\x20\x52\x6f\x6f");
+  n := io.push(ch.baked, n, "\x74\x20\x58\x32\x30\x1e\x17\x0d\x32\x30\x30\x39\x30\x34\x30\x30\x30\x30\x30\x30\x5a\x17\x0d\x34\x30\x30\x39\x31\x37\x31\x36\x30\x30\x30\x30\x5a\x30\x4f\x31\x0b");
+  n := io.push(ch.baked, n, "\x30\x09\x06\x03\x55\x04\x06\x13\x02\x55\x53\x31\x29\x30\x27\x06\x03\x55\x04\x0a\x13\x20\x49\x6e\x74\x65\x72\x6e\x65\x74\x20\x53\x65\x63\x75\x72\x69\x74\x79\x20");
+  n := io.push(ch.baked, n, "\x52\x65\x73\x65\x61\x72\x63\x68\x20\x47\x72\x6f\x75\x70\x31\x15\x30\x13\x06\x03\x55\x04\x03\x13\x0c\x49\x53\x52\x47\x20\x52\x6f\x6f\x74\x20\x58\x32\x30\x76\x30");
+  n := io.push(ch.baked, n, "\x10\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x05\x2b\x81\x04\x00\x22\x03\x62\x00\x04\xcd\x9b\xd5\x9f\x80\x83\x0a\xec\x09\x4a\xf3\x16\x4a\x3e\x5c\xcf\x77\xac\xde");
+  n := io.push(ch.baked, n, "\x67\x05\x0d\x1d\x07\xb6\xdc\x16\xfb\x5a\x8b\x14\xdb\xe2\x71\x60\xc4\xba\x45\x95\x11\x89\x8e\xea\x06\xdf\xf7\x2a\x16\x1c\xa4\xb9\xc5\xc5\x32\xe0\x03\xe0\x1e\x82");
+  n := io.push(ch.baked, n, "\x18\x38\x8b\xd7\x45\xd8\x0a\x6a\x6e\xe6\x00\x77\xfb\x02\x51\x7d\x22\xd8\x0a\x6e\x9a\x5b\x77\xdf\xf0\xfa\x41\xec\x39\xdc\x75\xca\x68\x07\x0c\x1f\xea\xa3\x42\x30");
+  n := io.push(ch.baked, n, "\x40\x30\x0e\x06\x03\x55\x1d\x0f\x01\x01\xff\x04\x04\x03\x02\x01\x06\x30\x0f\x06\x03\x55\x1d\x13\x01\x01\xff\x04\x05\x30\x03\x01\x01\xff\x30\x1d\x06\x03\x55\x1d");
+  n := io.push(ch.baked, n, "\x0e\x04\x16\x04\x14\x7c\x42\x96\xae\xde\x4b\x48\x3b\xfa\x92\xf8\x9e\x8c\xcf\x6d\x8b\xa9\x72\x37\x95\x30\x0a\x06\x08\x2a\x86\x48\xce\x3d\x04\x03\x03\x03\x68\x00");
+  n := io.push(ch.baked, n, "\x30\x65\x02\x30\x7b\x79\x4e\x46\x50\x84\xc2\x44\x87\x46\x1b\x45\x70\xff\x58\x99\xde\xf4\xfd\xa4\xd2\x55\xa6\x20\x2d\x74\xd6\x34\xbc\x41\xa3\x50\x5f\x01\x27\x56");
+  n := io.push(ch.baked, n, "\xb4\xbe\x27\x75\x06\xaf\x12\x2e\x75\x98\x8d\xfc\x02\x31\x00\x8b\xf5\x77\x6c\xd4\xc8\x65\xaa\xe0\x0b\x2c\xee\x14\x9d\x27\x37\xa4\xf9\x53\xa5\x51\xe4\x29\x83\xd7");
+  n := io.push(ch.baked, n, "\xf8\x90\x31\x5b\x42\x9f\x0a\xf5\xfe\xae\x00\x68\xe7\x8c\x49\x0f\xb6\x6f\x5b\x5b\x15\xf2\xe7");
+  ch.bakedat[1] := ch.bakedn[0];
+  ch.bakedready := true;
+end;
+
+// ch.addbaked -- put the built-in roots into the store. Returns how many went in.
+function ch.addbaked: int;
+var i, added: int;
+begin
+  ch.setupbaked;
+  added := 0;
+  i := 0;
+  while i < 2 do
+  begin
+    if ch.addroot(ch.baked, ch.bakedat[i], ch.bakedn[i]) then added := added + 1;
+    i := i + 1;
+  end;
+  return added;
+end;
+
+// ---- one call that does the right thing ---------------------------------------------------
+//
+// ch.addsystem -- fill the trust store the way a TOOL should: the machine's own bundle when
+// there is one, the built-in roots when there is not.
+//
+// THE ORDER IS THE POINT. A machine that has made its own trust decisions keeps them -- a
+// corporate CA, a removed root, a pinned set. A machine with nothing (a scratch container,
+// a fresh VPS, an initramfs) still works instead of failing with "no trusted root", which
+// is a message that sends the reader looking at the certificate rather than at the store.
+//
+// A LIBRARY DOES NOT CALL THIS BY ITSELF. It is here for programs; lib/tls.wz never calls
+// it, so including tls.wz does not quietly trust anything. That distinction is the whole
+// reason the store starts empty.
+//
+// Returns how many roots went in, or 0 -- which the caller should treat as fatal rather
+// than continue with an empty store.
+const CH.BUNDLE = "/etc/ssl/certs/ca-certificates.crt";
+
+var
+  ch.bundlebuf: array[0..262143] of char;
+  ch.bundlepath: array[0..127] of char;
+
+function ch.addfile(path: str): int;
+var fd, n, got: int;
+begin
+  n := io.push(ch.bundlepath, 0, path);
+  ch.bundlepath[n] := chr(0);
+  fd := sys3(SYS.open, addr(ch.bundlepath[0]), O_RDONLY, 0);
+  if fd < 0 then return 0;
+  n := 0;
+  while true do
+  begin
+    got := sys3(SYS.read, fd, addr(ch.bundlebuf[n]), len(ch.bundlebuf) - n);
+    if got <= 0 then break;
+    n := n + got;
+    if n >= len(ch.bundlebuf) then break;
+  end;
+  sys1(SYS.close, fd);
+  if n <= 0 then return 0;
+  return ch.addpem(ch.bundlebuf, 0, n);
+end;
+
+function ch.addsystem: int;
+var n: int;
+begin
+  n := ch.addfile(CH.BUNDLE);
+  // NOT "IF THE FILE IS MISSING" BUT "IF NOTHING CAME OUT OF IT". A bundle that exists and
+  // holds nothing we can parse is the same situation as no bundle at all, and it should
+  // have the same answer.
+  if n <= 0 then n := ch.addbaked;
+  return n;
+end;

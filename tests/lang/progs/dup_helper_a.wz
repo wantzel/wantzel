@@ -1,0 +1,2 @@
+// A library file with an ordinary (public) scratch variable.
+var scratch.i: int;

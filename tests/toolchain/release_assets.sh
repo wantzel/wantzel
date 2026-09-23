@@ -17,9 +17,22 @@ cd "$ROOT"
 
 # The version in the compiler is the one thing a human has to keep in step with the git
 # tag, so read it back from the built binary rather than from the source.
-version=$(./bin/wantzel --version | awk '{print $2}')
+# THE FIRST LINE ONLY: --version also reports where the library is, which is a second line.
+version=$(./bin/wantzel --version | head -1 | awk '{print $2}')
 [ -n "$version" ] || { echo "the compiler does not report a version"; exit 1; }
-assert_eq "the C bootstrap reports the same version" "$(./bin/wantzel0 --version)" "wantzel $version"
+# THE FIRST LINE ONLY. --version also prints where the library is and whether it is there,
+# which differs per machine -- what has to agree between the two compilers is the version.
+assert_eq "the C bootstrap reports the same version" \
+  "$(./bin/wantzel0 --version | head -1)" "wantzel $version"
+
+# AND BOTH SAY WHERE THE LIBRARY IS. Since the standard library moved to disk, a compiler
+# without lib/ beside it cannot resolve `include "io.wz"` -- so "where does it look?" became
+# a question an install can be wrong about, and the answer belongs in --version. The two
+# compilers are counterparts and must not drift on this either.
+assert_contains "the Wantzel compiler reports its library path" \
+  "$(./bin/wantzel --version)" "library "
+assert_contains "the C bootstrap reports its library path" \
+  "$(./bin/wantzel0 --version)" "library "
 
 # A tag, if we are on one, must agree with what the binary says. Off a tag this is
 # silent: most runs of the suite are not releases.

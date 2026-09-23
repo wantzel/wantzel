@@ -6,9 +6,7 @@
 # for a while after `program`, `repeat` and `case` were removed, next to a heading that
 # already said thirty-nine.
 #
-# grammar_matches_compiler.sh does not cover this. It compares the editor grammar with
-# the compiler and never reads the prose, because a number written out in a sentence is
-# not wired to anything. This is that wire.
+# A number written out in a sentence is not wired to anything. This is that wire.
 #
 # The list is checked against $WZSRC rather than against a number kept here, so
 # removing a keyword means editing the compiler and the page -- never this test.

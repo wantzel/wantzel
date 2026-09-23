@@ -1,0 +1,6 @@
+// Must not compile: a keyword cannot name a routine.
+procedure type;
+begin
+end;
+begin
+end.

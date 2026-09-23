@@ -29,9 +29,19 @@ assert_contains "the older version is echoed as well" "$got" '"protocolVersion":
 got=$(ask '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"readme.txt"},"_meta":{"progressToken":1}}}')
 assert_contains "a tools/call carrying _meta is answered" "$got" 'content'
 
-# and a genuinely unknown member in the params IS refused: strictness is the point, the
-# protocol fields are declared because the protocol carries them, not to open the door
+# A genuinely unknown member of params is IGNORED, like an unknown key anywhere else: a
+# peer that speaks a later revision of the protocol sends members this one has never
+# heard of, and refusing the call over one of them makes every extension a breaking
+# change.  The key is still recorded, so nothing is dropped in silence.
 got=$(ask '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"readme.txt"},"nosuchfield":1}}')
-assert_contains "an undeclared member of params is still refused" "$got" 'error'
+assert_contains "an undeclared member of params does not fail the call" "$got" 'content'
+case "$got" in
+  *'"error"'*) echo "an undeclared member of params must not produce an error"; echo "  $got"; exit 1 ;;
+esac
+
+# What params must STILL refuse is a member it DOES declare, given something it cannot
+# hold -- name is a text, and a number there is not a name.
+got=$(ask '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":5,"arguments":{"path":"readme.txt"}}}')
+assert_contains "a declared member with the wrong type is still refused" "$got" 'error'
 
 echo "initialize negotiates, tools/call takes _meta, an unknown member is refused"

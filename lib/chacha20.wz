@@ -1,0 +1,128 @@
+// lib/chacha20.wz -- the ChaCha20 stream cipher (RFC 8439).
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// WHAT IT IS FOR: the record layer of TLS 1.3, together with Poly1305. It is also a
+// perfectly good stream cipher on its own -- a key, a nonce and a counter produce a
+// keystream, and encryption is that keystream XORed with the data.
+//
+// EVERY OPERATION IS MASKED TO 32 BITS, and that is not decoration. ChaCha is defined on
+// 32-bit words; Wantzel ints are 64-bit, so a shift left carries bits into the high half
+// that must not be there. Measured: 0x80000001 shl 1 gives 4294967298, and the algorithm
+// wants 2. Every rotate and add below therefore ends in band(..., 0xFFFFFFFF), and dropping
+// one of them produces output that looks random and is wrong -- which no test but a KNOWN
+// ANSWER can catch.
+//
+// THE TEST VECTORS ARE RFC 8439's OWN, in tests/lib/chacha20.wz. Cryptography that is almost
+// right is worse than none: it encrypts, it decrypts, and it protects nothing.
+include "io.wz";
+
+const
+  CC_ROUNDS = 20;
+
+var
+  cc.st:  array[0..15] of int;          // the working state
+  cc.ks:  array[0..63] of char;         // one keystream block
+
+function cc.rotl(v: int; n: int): int;
+begin
+  v := band(v, 0xFFFFFFFF);
+  return band(bor(v shl n, v shr (32 - n)), 0xFFFFFFFF);
+end;
+
+// One quarter round, on four indices of the state.
+//
+// THE ORDER IS FIXED BY THE SPEC and the rotations are 16, 12, 8, 7. Swapping two of them
+// still produces a cipher -- just not this one, and not one the other side can read.
+procedure cc.qr(a: int; b: int; c: int; d: int);
+begin
+  cc.st[a] := band(cc.st[a] + cc.st[b], 0xFFFFFFFF);
+  cc.st[d] := cc.rotl(bxor(cc.st[d], cc.st[a]), 16);
+  cc.st[c] := band(cc.st[c] + cc.st[d], 0xFFFFFFFF);
+  cc.st[b] := cc.rotl(bxor(cc.st[b], cc.st[c]), 12);
+  cc.st[a] := band(cc.st[a] + cc.st[b], 0xFFFFFFFF);
+  cc.st[d] := cc.rotl(bxor(cc.st[d], cc.st[a]), 8);
+  cc.st[c] := band(cc.st[c] + cc.st[d], 0xFFFFFFFF);
+  cc.st[b] := cc.rotl(bxor(cc.st[b], cc.st[c]), 7);
+end;
+
+// cc.block(key, nonce, counter) -- one 64-byte keystream block into cc.ks.
+//
+// The key is 32 bytes and the nonce 12, both little-endian. The constant "expand 32-byte k"
+// is the first four words and is not a magic number to be changed: it is what makes this
+// ChaCha rather than a cipher of one's own.
+procedure cc.block(key: array of char; nonce: array of char; counter: int);
+var i, j: int;
+    w: array[0..15] of int;
+begin
+  cc.st[0] := 0x61707865;               // "expa"
+  cc.st[1] := 0x3320646E;               // "nd 3"
+  cc.st[2] := 0x79622D32;               // "2-by"
+  cc.st[3] := 0x6B206574;               // "te k"
+  i := 0;
+  while i < 8 do
+  begin
+    cc.st[4 + i] := io.get32(key, i * 4);
+    i := i + 1;
+  end;
+  cc.st[12] := band(counter, 0xFFFFFFFF);
+  cc.st[13] := io.get32(nonce, 0);
+  cc.st[14] := io.get32(nonce, 4);
+  cc.st[15] := io.get32(nonce, 8);
+
+  // KEEP THE INPUT, because the output is the mixed state PLUS the original. Without that
+  // addition the permutation is invertible and the cipher is not a cipher.
+  i := 0;
+  while i < 16 do begin w[i] := cc.st[i]; i := i + 1; end;
+
+  i := 0;
+  while i < CC_ROUNDS div 2 do
+  begin
+    // column rounds
+    cc.qr(0, 4,  8, 12);
+    cc.qr(1, 5,  9, 13);
+    cc.qr(2, 6, 10, 14);
+    cc.qr(3, 7, 11, 15);
+    // diagonal rounds
+    cc.qr(0, 5, 10, 15);
+    cc.qr(1, 6, 11, 12);
+    cc.qr(2, 7,  8, 13);
+    cc.qr(3, 4,  9, 14);
+    i := i + 1;
+  end;
+
+  i := 0;
+  while i < 16 do
+  begin
+    j := band(cc.st[i] + w[i], 0xFFFFFFFF);
+    cc.ks[i * 4]     := chr(band(j, 255));
+    cc.ks[i * 4 + 1] := chr(band(j shr 8, 255));
+    cc.ks[i * 4 + 2] := chr(band(j shr 16, 255));
+    cc.ks[i * 4 + 3] := chr(band(j shr 24, 255));
+    i := i + 1;
+  end;
+end;
+
+// cc.xor(key, nonce, counter, buf, from, n) -- encrypt or decrypt n bytes in place.
+//
+// THE SAME ROUTINE BOTH WAYS, because XOR is its own inverse. That is a property of the
+// construction and not a shortcut: there is no separate decrypt to get wrong.
+//
+// A COUNTER IS NEVER REUSED WITH ONE KEY AND NONCE. Doing so XORs two plaintexts together
+// and both are recoverable -- the one mistake that turns this cipher into no cipher at all.
+procedure cc.xor(key: array of char; nonce: array of char; counter: int;
+                 buf: array of char; from: int; n: int);
+var i, blk, off: int;
+begin
+  i := 0;
+  while i < n do
+  begin
+    blk := i div 64;
+    off := i mod 64;
+    if off = 0 then cc.block(key, nonce, counter + blk);
+    buf[from + i] := chr(bxor(ord(buf[from + i]), ord(cc.ks[off])));
+    i := i + 1;
+  end;
+end;

@@ -1,0 +1,754 @@
+// lib/jsonschema.wz -- validating JSON against a JSON Schema (2020-12), the useful subset.
+//
+// NAMED jsonschema.wz AND NOT schema.wz, and the reason is worth the line. An include is
+// resolved against lib/ as well as against the including file's directory, so a common name
+// here SHADOWS a file of the same name in an application. Measured 22-09-2026: adding
+// lib/schema.wz silently broke a program that had its own src/tasks/schema.wz -- it compiled
+// against this one and failed with `type expected` on a type that was defined in the file it
+// could no longer see.
+//
+// That is a trap for every application, not just that one, and it costs nothing to avoid:
+// a file in a shared library needs a name nobody else would pick.
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// WHAT IT CHECKS, and the list is deliberate rather than partial-for-now:
+//
+//     type  properties  required  additionalProperties
+//     items  minItems  maxItems
+//     enum  const
+//     minimum  maximum  minLength  maxLength
+//
+// WHAT IT DOES NOT, and why that is safe. Missing are $ref and $defs (references between
+// schemas, which need a resolution layer), allOf/anyOf/oneOf/not, if/then/else, and anything
+// needing regular expressions (pattern, format). An unknown keyword is IGNORED, which is what
+// the specification says to do -- so the failure mode is that a schema is stricter than what
+// is checked here, never looser. A document this accepts might still be rejected by a
+// complete validator; one this rejects would be rejected by any of them. That is the safe
+// direction, and a caller should know it: schema.partial says whether a keyword was skipped.
+//
+// THE ERROR CARRIES A PLACE. "invalid" without saying where is as useful as a compiler that
+// only says "error" -- and being specific about where is the thing this toolchain is for. The
+// path is built as it descends: /servers/0/command.
+//
+// NOTHING IS COPIED. Both the schema and the document are walked in place, the same shape as
+// lib/json.wz which does the parsing.
+
+include "io.wz";
+include "json.wz";
+
+const
+  SCH.MAXPATH  = 512;
+  SCH.MAXDEPTH = 32;
+
+var
+  sch.err:     str;                          // empty while valid
+  sch.path:    array[0..SCH.MAXPATH-1] of char;   // where the failure was
+  sch.pathn:   int;
+  sch.partial: bool;                         // a keyword was present that this cannot check
+  sch.skipped: str;                          // which one, for the message
+  sch.depth:   int;
+  sch.notjson: bool;     // the failure was the syntax, not the schema
+
+
+// ---- the path, built while descending -----------------------------------------------------
+
+procedure sch.pushname(b: array of char; from: int; upto: int);
+var i: int;
+begin
+  if sch.pathn < SCH.MAXPATH - 2 then
+  begin
+    sch.path[sch.pathn] := '/';
+    sch.pathn := sch.pathn + 1;
+  end;
+  i := from;
+  while (i < upto) and (sch.pathn < SCH.MAXPATH - 1) do
+  begin
+    sch.path[sch.pathn] := b[i];
+    sch.pathn := sch.pathn + 1;
+    i := i + 1;
+  end;
+end;
+
+procedure sch.pushindex(k: int);
+begin
+  if sch.pathn < SCH.MAXPATH - 12 then
+  begin
+    sch.path[sch.pathn] := '/';
+    sch.pathn := sch.pathn + 1;
+    sch.pathn := io.pushnum(sch.path, sch.pathn, k);
+  end;
+end;
+
+procedure sch.fail(m: str);
+begin
+  if slen(sch.err) = 0 then sch.err := m;
+end;
+
+// ---- walking a JSON value ------------------------------------------------------------------
+//
+// lib/json.wz gives json.skip, which returns the position after a whole value. Everything
+// here is built from that plus a look at the first character, which is what decides the type
+// in JSON -- there is no ambiguity to resolve.
+
+const
+  SCH.NONE = 0;
+  SCH.OBJ  = 1;
+  SCH.ARR  = 2;
+  SCH.STR  = 3;
+  SCH.NUM  = 4;
+  SCH.BOOL = 5;
+  SCH.NULL = 6;
+
+function sch.kind(b: array of char; at: int; last: int): int;
+var c: char;
+begin
+  at := json.ws(b, at, last);
+  if at >= last then return SCH.NONE;
+  c := b[at];
+  if c = '{' then return SCH.OBJ;
+  if c = '[' then return SCH.ARR;
+  if c = '"' then return SCH.STR;
+  if (c = 't') or (c = 'f') then return SCH.BOOL;
+  if c = 'n' then return SCH.NULL;
+  if ((c >= '0') and (c <= '9')) or (c = '-') then return SCH.NUM;
+  return SCH.NONE;
+end;
+
+// The value of member `key` in the object at `at`. Sets sch.vat/sch.vend and returns true.
+//
+// PRECONDITION: b[at..last) is a well-formed JSON object. This is a false either when the
+// key is genuinely absent from a well-formed object, or when b[at..last) is not a
+// well-formed object at all -- those two are NOT distinguished, so a caller outside this
+// file that has not first run json.wellformed cannot tell "no such key" from "not an
+// object". Inside this file the ambiguity is harmless: sch.valid checks json.wellformed on
+// the whole document and the whole schema before calling sch.check, and every value
+// sch.check hands down to sch.member afterwards is a slice sch.check itself walked out of
+// text that already passed that check -- so the "not an object" branch is unreachable from
+// here. A caller that invokes sch.member directly, without going through sch.valid, does
+// not have that guarantee and must run json.wellformed first.
+var
+  sch.vat:  int;
+  sch.vend: int;
+
+function sch.member(b: array of char; at: int; last: int; key: str): bool;
+var keyat, keyend, vat: int;
+begin
+  at := json.ws(b, at, last);
+  if (at >= last) or (b[at] <> '{') then return false;
+  at := at + 1;
+  while at < last do
+  begin
+    at := json.ws(b, at, last);
+    if (at >= last) or (b[at] = '}') then return false;
+    keyat := at;
+    at := json.string(b, at, last);
+    if at < 0 then return false;
+    keyend := at;
+    at := json.ws(b, at, last);
+    if (at >= last) or (b[at] <> ':') then return false;
+    at := json.ws(b, at + 1, last);
+    vat := at;
+    at := json.skip(b, at, last);
+    if at < 0 then return false;
+    // THE QUOTES ARE NOT PART OF THE NAME: json.eq compares the string body, and json.string
+    // returns the position after the closing quote.
+    if json.eq(b, keyat + 1, keyend - 1, key) then
+    begin
+      sch.vat := vat;
+      sch.vend := at;
+      return true;
+    end;
+    at := json.ws(b, at, last);
+    if (at < last) and (b[at] = ',') then at := at + 1;
+  end;
+  return false;
+end;
+
+// Compare two JSON values for equality, textually after skipping whitespace. Enough for enum
+// and const, where the values in a schema are written the same way as in a document.
+function sch.same(a: array of char; aat: int; aend: int;
+                  b: array of char; bat: int; bend: int): bool;
+var i, j: int;
+begin
+  aat := json.ws(a, aat, aend);
+  bat := json.ws(b, bat, bend);
+  while (aend > aat) and ((a[aend-1] = ' ') or (a[aend-1] = chr(10))
+        or (a[aend-1] = chr(13)) or (a[aend-1] = chr(9))) do aend := aend - 1;
+  while (bend > bat) and ((b[bend-1] = ' ') or (b[bend-1] = chr(10))
+        or (b[bend-1] = chr(13)) or (b[bend-1] = chr(9))) do bend := bend - 1;
+  if aend - aat <> bend - bat then return false;
+  i := aat;
+  j := bat;
+  while i < aend do
+  begin
+    if a[i] <> b[j] then return false;
+    i := i + 1;
+    j := j + 1;
+  end;
+  return true;
+end;
+
+// A number as an int, scaled by 1000 so a schema may say 1.5.
+//
+// NO FLOATING POINT IN THE COMPARISONS. minimum and maximum in real schemas are whole numbers
+// or one or two decimals; fixed point at three decimals covers that exactly and avoids the
+// question of whether 0.1 + 0.2 exceeds 0.3.
+function sch.milli(b: array of char; at: int; upto: int): int;
+var v, sign, frac, digits: int;
+begin
+  at := json.ws(b, at, upto);
+  sign := 1;
+  if (at < upto) and (b[at] = '-') then begin sign := 0 - 1; at := at + 1; end;
+  v := 0;
+  while (at < upto) and (b[at] >= '0') and (b[at] <= '9') do
+  begin
+    v := v * 10 + (ord(b[at]) - ord('0'));
+    at := at + 1;
+  end;
+  v := v * 1000;
+  if (at < upto) and (b[at] = '.') then
+  begin
+    at := at + 1;
+    frac := 0;
+    digits := 0;
+    while (at < upto) and (b[at] >= '0') and (b[at] <= '9') and (digits < 3) do
+    begin
+      frac := frac * 10 + (ord(b[at]) - ord('0'));
+      digits := digits + 1;
+      at := at + 1;
+    end;
+    while digits < 3 do begin frac := frac * 10; digits := digits + 1; end;
+    v := v + frac;
+  end;
+  return v * sign;
+end;
+
+// Is this number a whole one? `integer` accepts 1 and 1.0 but not 1.5.
+function sch.whole(b: array of char; at: int; upto: int): bool;
+begin
+  return sch.milli(b, at, upto) mod 1000 = 0;
+end;
+
+// The length of a string value in CHARACTERS, not bytes, excluding its quotes.
+//
+// TWO THINGS MAKE THIS MORE THAN A SUBTRACTION, and both would silently reject valid
+// documents if ignored:
+//
+//   - an escape is one character: "\n" is two bytes in the file and one character, and
+//     "\u00e9" is six bytes and one character.
+//   - a multi-byte UTF-8 sequence is one character: é is two bytes. Counting bytes makes a
+//     five-character name with one accent six long, and maxLength rejects it.
+//
+// A UTF-8 continuation byte has its top two bits 10, so counting only the bytes that are NOT
+// continuations counts characters.
+function sch.strlen(b: array of char; at: int; upto: int): int;
+var n: int;
+begin
+  at := json.ws(b, at, upto);
+  if (at >= upto) or (b[at] <> '"') then return 0 - 1;
+  at := at + 1;
+  n := 0;
+  while (at < upto) and (b[at] <> '"') do
+  begin
+    if b[at] = '\\' then
+    begin
+      // \uXXXX is six bytes and one character; every other escape is two and one.
+      if (at + 1 < upto) and (b[at + 1] = 'u') then at := at + 6
+      else at := at + 2;
+      n := n + 1;
+    end
+    else
+    begin
+      if band(ord(b[at]), 192) <> 128 then n := n + 1;
+      at := at + 1;
+    end;
+  end;
+  return n;
+end;
+
+// ---- the type keyword -------------------------------------------------------------------------
+//
+// `type` is either one name or an array of names, and a value matching ANY of them passes.
+// Both forms are common in real schemas, so handling only the string form fails on ordinary
+// input.
+//
+// number AND integer: every integer is a number, but not every number is an integer. Treating
+// them as the same keyword is how a validator quietly accepts 1.5 where a whole number was
+// required.
+function sch.typename(b: array of char; at: int; upto: int; kind: int): bool;
+begin
+  if json.eq(b, at, upto, "object")  then return kind = SCH.OBJ;
+  if json.eq(b, at, upto, "array")   then return kind = SCH.ARR;
+  if json.eq(b, at, upto, "string")  then return kind = SCH.STR;
+  if json.eq(b, at, upto, "boolean") then return kind = SCH.BOOL;
+  if json.eq(b, at, upto, "null")    then return kind = SCH.NULL;
+  if json.eq(b, at, upto, "number")  then return kind = SCH.NUM;
+  // `integer` is checked by the caller, which has the value; here it only has to match the
+  // kind so an unknown name can still be reported.
+  if json.eq(b, at, upto, "integer") then return kind = SCH.NUM;
+  return false;
+end;
+
+function sch.checktype(sc: array of char; scat: int; scend: int;
+                       d: array of char; dat: int; dend: int): bool;
+var kind, at, tat, tend, ok, isint: int;
+begin
+  if not sch.member(sc, scat, scend, "type") then return true;
+  tat := sch.vat;
+  tend := sch.vend;
+  kind := sch.kind(d, dat, dend);
+  ok := 0;
+  isint := 0;
+  if sch.kind(sc, tat, tend) = SCH.STR then
+  begin
+    if sch.typename(sc, tat + 1, tend - 1, kind) then ok := 1;
+    if json.eq(sc, tat + 1, tend - 1, "integer") then isint := 1;
+  end
+  else
+  begin
+    // the array form: any one of the names may match
+    at := json.ws(sc, tat, tend) + 1;
+    while at < tend do
+    begin
+      at := json.ws(sc, at, tend);
+      if (at >= tend) or (sc[at] = ']') then break;
+      tat := at;
+      at := json.skip(sc, at, tend);
+      if at < 0 then break;
+      if sch.kind(sc, tat, at) = SCH.STR then
+      begin
+        if sch.typename(sc, tat + 1, at - 1, kind) then ok := 1;
+        if json.eq(sc, tat + 1, at - 1, "integer") and (kind = SCH.NUM) then isint := 1;
+      end;
+      at := json.ws(sc, at, tend);
+      if (at < tend) and (sc[at] = ',') then at := at + 1;
+    end;
+  end;
+  if ok = 0 then
+  begin
+    sch.fail("the value is not of the required type");
+    return false;
+  end;
+  // AND IF integer WAS THE MATCHING NAME, the value must have no fractional part. A schema
+  // saying ["integer"] against 1.5 passes the kind check and must still fail.
+  if (isint = 1) and (kind = SCH.NUM) then
+  begin
+    if not sch.whole(d, dat, dend) then
+    begin
+      sch.fail("a whole number was required");
+      return false;
+    end;
+  end;
+  return true;
+end;
+
+// ---- enum and const ----------------------------------------------------------------------------
+
+function sch.checkenum(sc: array of char; scat: int; scend: int;
+                       d: array of char; dat: int; dend: int): bool;
+var at, eat, eend: int;
+begin
+  if sch.member(sc, scat, scend, "const") then
+  begin
+    if not sch.same(sc, sch.vat, sch.vend, d, dat, dend) then
+    begin
+      sch.fail("the value is not the required constant");
+      return false;
+    end;
+  end;
+  if not sch.member(sc, scat, scend, "enum") then return true;
+  eat := sch.vat;
+  eend := sch.vend;
+  at := json.ws(sc, eat, eend) + 1;
+  while at < eend do
+  begin
+    at := json.ws(sc, at, eend);
+    if (at >= eend) or (sc[at] = ']') then break;
+    eat := at;
+    at := json.skip(sc, at, eend);
+    if at < 0 then break;
+    if sch.same(sc, eat, at, d, dat, dend) then return true;
+    at := json.ws(sc, at, eend);
+    if (at < eend) and (sc[at] = ',') then at := at + 1;
+  end;
+  sch.fail("the value is not one of the allowed values");
+  return false;
+end;
+
+// ---- numbers and strings ------------------------------------------------------------------------
+
+function sch.checkrange(sc: array of char; scat: int; scend: int;
+                        d: array of char; dat: int; dend: int): bool;
+var v, n: int;
+begin
+  if sch.kind(d, dat, dend) = SCH.NUM then
+  begin
+    v := sch.milli(d, dat, dend);
+    if sch.member(sc, scat, scend, "minimum") then
+    begin
+      if v < sch.milli(sc, sch.vat, sch.vend) then
+      begin
+        sch.fail("the number is below the minimum");
+        return false;
+      end;
+    end;
+    if sch.member(sc, scat, scend, "maximum") then
+    begin
+      if v > sch.milli(sc, sch.vat, sch.vend) then
+      begin
+        sch.fail("the number is above the maximum");
+        return false;
+      end;
+    end;
+  end;
+  if sch.kind(d, dat, dend) = SCH.STR then
+  begin
+    n := sch.strlen(d, dat, dend);
+    if sch.member(sc, scat, scend, "minLength") then
+    begin
+      if n < sch.milli(sc, sch.vat, sch.vend) div 1000 then
+      begin
+        sch.fail("the string is too short");
+        return false;
+      end;
+    end;
+    if sch.member(sc, scat, scend, "maxLength") then
+    begin
+      if n > sch.milli(sc, sch.vat, sch.vend) div 1000 then
+      begin
+        sch.fail("the string is too long");
+        return false;
+      end;
+    end;
+  end;
+  return true;
+end;
+
+// Does the object have a member whose name is the text key[from..upto)?
+//
+// The name comes out of the SCHEMA here (a required list) rather than being a literal, so
+// json.eq's str form cannot be used -- Wantzel builds no str from characters.
+//
+// Same precondition as sch.member above: b[at..last) must be a well-formed JSON object, or
+// "absent" and "not an object" are the same false. sch.check only ever calls this on
+// b = d (the document), already passed through json.wellformed by sch.valid.
+function sch.memberb(b: array of char; at: int; last: int;
+                     key: array of char; from: int; upto: int): bool;
+var keyat, keyend, i, j: int;
+begin
+  at := json.ws(b, at, last);
+  if (at >= last) or (b[at] <> '{') then return false;
+  at := at + 1;
+  while at < last do
+  begin
+    at := json.ws(b, at, last);
+    if (at >= last) or (b[at] = '}') then return false;
+    keyat := at;
+    at := json.string(b, at, last);
+    if at < 0 then return false;
+    keyend := at;
+    // Compare the two string bodies, both without their quotes.
+    if keyend - keyat - 2 = upto - from then
+    begin
+      i := keyat + 1;
+      j := from;
+      while (j < upto) and (b[i] = key[j]) do begin i := i + 1; j := j + 1; end;
+      if j = upto then return true;
+    end;
+    at := json.ws(b, at, last);
+    if (at >= last) or (b[at] <> ':') then return false;
+    at := json.skip(b, json.ws(b, at + 1, last), last);
+    if at < 0 then return false;
+    at := json.ws(b, at, last);
+    if (at < last) and (b[at] = ',') then at := at + 1;
+  end;
+  return false;
+end;
+
+// The schema for one named property, out of the schema's "properties" object. Sets
+// sch.pat/sch.pend -- a SEPARATE pair from sch.vat, because the caller still needs the
+// member it found while this looks up another.
+//
+// Same precondition as sch.member above, twice over: sc must be well-formed JSON, and if
+// it declares "properties" that value must itself be a well-formed object -- otherwise
+// "no such property" and "the properties object is broken" are the same false. sch.check
+// only calls this with sc already passed through json.wellformed by sch.valid.
+var
+  sch.pat:  int;
+  sch.pend: int;
+
+function sch.propschema(sc: array of char; scat: int; scend: int;
+                        d: array of char; from: int; upto: int): bool;
+var pat, pend, at, keyat, keyend, vat, i, j: int;
+begin
+  if not sch.member(sc, scat, scend, "properties") then return false;
+  pat := sch.vat;
+  pend := sch.vend;
+  at := json.ws(sc, pat, pend);
+  if (at >= pend) or (sc[at] <> '{') then return false;
+  at := at + 1;
+  while at < pend do
+  begin
+    at := json.ws(sc, at, pend);
+    if (at >= pend) or (sc[at] = '}') then return false;
+    keyat := at;
+    at := json.string(sc, at, pend);
+    if at < 0 then return false;
+    keyend := at;
+    at := json.ws(sc, at, pend);
+    if (at >= pend) or (sc[at] <> ':') then return false;
+    at := json.ws(sc, at + 1, pend);
+    vat := at;
+    at := json.skip(sc, at, pend);
+    if at < 0 then return false;
+    if keyend - keyat - 2 = upto - from then
+    begin
+      i := keyat + 1;
+      j := from;
+      while (j < upto) and (sc[i] = d[j]) do begin i := i + 1; j := j + 1; end;
+      if j = upto then
+      begin
+        sch.pat := vat;
+        sch.pend := at;
+        return true;
+      end;
+    end;
+    at := json.ws(sc, at, pend);
+    if (at < pend) and (sc[at] = ',') then at := at + 1;
+  end;
+  return false;
+end;
+
+// Note which keywords a schema uses that this validator cannot check.
+//
+// WHY THIS IS REPORTED RATHER THAN IGNORED SILENTLY. The specification says an unknown
+// keyword must be ignored, so ignoring them is correct -- but it means a document can pass
+// here and be rejected by a complete validator. A caller that is deciding whether to trust
+// the answer needs to know that happened; "valid, but I skipped $ref" is a different
+// statement from "valid".
+procedure sch.notice(sc: array of char; scat: int; scend: int);
+begin
+  if sch.member(sc, scat, scend, "$ref") then begin sch.partial := true; sch.skipped := "$ref"; end;
+  if sch.member(sc, scat, scend, "allOf") then begin sch.partial := true; sch.skipped := "allOf"; end;
+  if sch.member(sc, scat, scend, "anyOf") then begin sch.partial := true; sch.skipped := "anyOf"; end;
+  if sch.member(sc, scat, scend, "oneOf") then begin sch.partial := true; sch.skipped := "oneOf"; end;
+  if sch.member(sc, scat, scend, "not") then begin sch.partial := true; sch.skipped := "not"; end;
+  if sch.member(sc, scat, scend, "if") then begin sch.partial := true; sch.skipped := "if"; end;
+  if sch.member(sc, scat, scend, "pattern") then begin sch.partial := true; sch.skipped := "pattern"; end;
+  if sch.member(sc, scat, scend, "patternProperties") then begin sch.partial := true; sch.skipped := "patternProperties"; end;
+end;
+
+// ---- the whole thing, recursively -----------------------------------------------------------
+//
+// One value against one schema. Returns false and leaves sch.err and sch.path set on the
+// FIRST failure -- reporting one clear place beats a list where the later entries are
+// consequences of the first.
+
+function sch.check(sc: array of char; scat: int; scend: int;
+                   d: array of char; dat: int; dend: int): bool;
+var at, dit, kend, vat, vend, n, k, mark: int;
+    kind, iat, iend: int;
+begin
+  // A SCHEMA MAY BE true OR false, not only an object. `true` accepts anything and `false`
+  // rejects everything -- used for additionalProperties and occasionally on its own.
+  kind := sch.kind(sc, scat, scend);
+  if kind = SCH.BOOL then
+  begin
+    at := json.ws(sc, scat, scend);
+    if sc[at] = 't' then return true;
+    sch.fail("this value is not allowed here");
+    return false;
+  end;
+  if kind <> SCH.OBJ then return true;      // not a schema we understand; nothing to check
+
+  sch.depth := sch.depth + 1;
+  if sch.depth > SCH.MAXDEPTH then
+  begin
+    // A GUARD, NOT A LIMIT ANYONE SHOULD MEET. Without it a schema that nests deeply enough
+    // exhausts the stack, and a crash is a much worse answer than a refusal.
+    sch.fail("the schema nests too deeply");
+    sch.depth := sch.depth - 1;
+    return false;
+  end;
+
+  if not sch.checktype(sc, scat, scend, d, dat, dend) then begin sch.depth := sch.depth - 1; return false; end;
+  if not sch.checkenum(sc, scat, scend, d, dat, dend) then begin sch.depth := sch.depth - 1; return false; end;
+  if not sch.checkrange(sc, scat, scend, d, dat, dend) then begin sch.depth := sch.depth - 1; return false; end;
+
+  kind := sch.kind(d, dat, dend);
+
+  // ---- objects ----
+  if kind = SCH.OBJ then
+  begin
+    // required: every named member must be present
+    if sch.member(sc, scat, scend, "required") then
+    begin
+      iat := sch.vat;
+      iend := sch.vend;
+      at := json.ws(sc, iat, iend) + 1;
+      while at < iend do
+      begin
+        at := json.ws(sc, at, iend);
+        if (at >= iend) or (sc[at] = ']') then break;
+        vat := at;
+        at := json.skip(sc, at, iend);
+        if at < 0 then break;
+        if not sch.memberb(d, dat, dend, sc, vat + 1, at - 1) then
+        begin
+          mark := sch.pathn;
+          sch.pushname(sc, vat + 1, at - 1);
+          sch.fail("a required member is missing");
+          sch.depth := sch.depth - 1;
+          return false;
+        end;
+        at := json.ws(sc, at, iend);
+        if (at < iend) and (sc[at] = ',') then at := at + 1;
+      end;
+    end;
+
+    // Walk the document's members: each one against its schema in properties, and anything
+    // left over against additionalProperties.
+    at := json.ws(d, dat, dend) + 1;
+    while at < dend do
+    begin
+      at := json.ws(d, at, dend);
+      if (at >= dend) or (d[at] = '}') then break;
+      dit := at;                                  // the member name, with quotes
+      at := json.string(d, at, dend);
+      if at < 0 then break;
+      kend := at;
+      at := json.ws(d, at, dend);
+      if (at >= dend) or (d[at] <> ':') then break;
+      at := json.ws(d, at + 1, dend);
+      vat := at;
+      at := json.skip(d, at, dend);
+      if at < 0 then break;
+      vend := at;
+
+      mark := sch.pathn;
+      if sch.propschema(sc, scat, scend, d, dit + 1, kend - 1) then
+      begin
+        sch.pushname(d, dit + 1, kend - 1);
+        if not sch.check(sc, sch.pat, sch.pend, d, vat, vend) then
+        begin
+          sch.depth := sch.depth - 1;
+          return false;
+        end;
+        sch.pathn := mark;
+      end
+      else if sch.member(sc, scat, scend, "additionalProperties") then
+      begin
+        sch.pushname(d, dit + 1, kend - 1);
+        if not sch.check(sc, sch.vat, sch.vend, d, vat, vend) then
+        begin
+          sch.fail("this member is not allowed here");
+          sch.depth := sch.depth - 1;
+          return false;
+        end;
+        sch.pathn := mark;
+      end;
+
+      at := json.ws(d, at, dend);
+      if (at < dend) and (d[at] = ',') then at := at + 1;
+    end;
+  end;
+
+  // ---- arrays ----
+  if kind = SCH.ARR then
+  begin
+    n := 0;
+    at := json.ws(d, dat, dend) + 1;
+    while at < dend do
+    begin
+      at := json.ws(d, at, dend);
+      if (at >= dend) or (d[at] = ']') then break;
+      vat := at;
+      at := json.skip(d, at, dend);
+      if at < 0 then break;
+      if sch.member(sc, scat, scend, "items") then
+      begin
+        mark := sch.pathn;
+        iat := sch.vat;
+        iend := sch.vend;
+        sch.pushindex(n);
+        if not sch.check(sc, iat, iend, d, vat, at) then
+        begin
+          sch.depth := sch.depth - 1;
+          return false;
+        end;
+        sch.pathn := mark;
+      end;
+      n := n + 1;
+      at := json.ws(d, at, dend);
+      if (at < dend) and (d[at] = ',') then at := at + 1;
+    end;
+    if sch.member(sc, scat, scend, "minItems") then
+    begin
+      if n < sch.milli(sc, sch.vat, sch.vend) div 1000 then
+      begin
+        sch.fail("the array has too few items");
+        sch.depth := sch.depth - 1;
+        return false;
+      end;
+    end;
+    if sch.member(sc, scat, scend, "maxItems") then
+    begin
+      if n > sch.milli(sc, sch.vat, sch.vend) div 1000 then
+      begin
+        sch.fail("the array has too many items");
+        sch.depth := sch.depth - 1;
+        return false;
+      end;
+    end;
+  end;
+
+  sch.depth := sch.depth - 1;
+  return true;
+end;
+
+// Validate a whole document against a whole schema. True when it is valid; otherwise sch.err
+// says what and sch.path/sch.pathn say where.
+// NAMED sch.valid AND NOT schema.valid: the file is schema.wz, and the compiler reads
+// `schema.valid` as a routine in a module called schema rather than as one name.
+function sch.valid(sc: array of char; scn: int; d: array of char; dn: int): bool;
+begin
+  sch.err := "";
+  sch.pathn := 0;
+  sch.depth := 0;
+  sch.partial := false;
+  sch.skipped := "";
+  sch.notjson := false;
+
+  // ---- IS IT JSON AT ALL? -------------------------------------------------------------
+  //
+  // THE FIRST QUESTION, AND IT USED TO GO UNASKED. Measured 22-09-2026: {"a":}, {"a" 1} and
+  // {"a":1,} were all reported VALID against {"type":"object"} -- the walk found an opening
+  // brace, agreed it was an object, and never noticed the rest was broken. For a validator
+  // that is the worst possible answer, because being asked whether it is correct is the
+  // whole reason anyone calls.
+  //
+  // AND IT IS A SEPARATE ANSWER from failing the schema. "this is not JSON" tells you to
+  // look at the syntax; "the value is not of the required type at /a" tells you to look at
+  // the schema. Collapsing them into one message sends people to the wrong place.
+  if not json.wellformed(d, 0, dn) then
+  begin
+    sch.notjson := true;
+    sch.fail("this is not valid JSON");
+    return false;
+  end;
+
+  // AND THE SCHEMA ITSELF MUST BE JSON, for the same reason. A broken schema that silently
+  // matches nothing would make every document look wrong.
+  if not json.wellformed(sc, 0, scn) then
+  begin
+    sch.notjson := true;
+    sch.fail("the schema is not valid JSON");
+    return false;
+  end;
+
+  sch.notice(sc, 0, scn);
+  return sch.check(sc, 0, scn, d, 0, dn);
+end;

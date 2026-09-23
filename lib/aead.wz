@@ -1,0 +1,145 @@
+// lib/aead.wz -- ChaCha20-Poly1305 as one operation (RFC 8439 section 2.8).
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// WHAT AEAD MEANS: encrypt the payload AND authenticate it together with data that travels
+// in the clear -- the record header in TLS. Both halves matter. Encryption without the tag
+// lets an attacker flip bits; a tag over the payload alone lets them rewrite the header.
+//
+// THE CONSTRUCTION IS NOT OURS TO IMPROVE. The Poly1305 key is the first 32 bytes of the
+// ChaCha20 keystream at counter ZERO, and the payload is encrypted from counter ONE. Using
+// counter 0 for both would authenticate with a key the attacker can derive.
+//
+// AND THE TAG COVERS THE LENGTHS. Without them, "AAD || ciphertext" is ambiguous: moving a
+// byte from one to the other gives the same input and therefore the same tag.
+include "io.wz";
+include "chacha20.wz";
+include "poly1305.wz";
+
+var
+  ae.pk:  array[0..63] of char;         // the derived one-time Poly1305 key
+  ae.len: array[0..15] of char;         // the two lengths, little-endian
+  ae.pad: array[0..15] of char;
+  // THE KEY AND NONCE ARE SET BEFORE A CALL, not passed to it.
+  //
+  // A routine here may take at most ten arguments and an array counts as two, which seal and
+  // open exceeded. That limit turns out to fit the use: a TLS record layer holds one key for
+  // many records and changes only the nonce per record, so passing the key every time would
+  // be repeating what the caller already knows.
+  ae.key:   array[0..31] of char;
+  ae.nonce: array[0..11] of char;
+
+// ae.tag(key, nonce, aad, aadn, ct, ctat, ctn, tag) -- the tag over aad and ciphertext.
+//
+// EACH PART IS PADDED TO A MULTIPLE OF 16 with zeros, then the two lengths follow as
+// 64-bit little-endian. That is the exact input Poly1305 sees, and every byte of it is part
+// of the specification.
+procedure ae.setkey(key: array of char);
+var i: int;
+begin
+  i := 0;
+  while i < 32 do begin ae.key[i] := key[i]; i := i + 1; end;
+end;
+
+procedure ae.setnonce(nonce: array of char);
+var i: int;
+begin
+  i := 0;
+  while i < 12 do begin ae.nonce[i] := nonce[i]; i := i + 1; end;
+end;
+
+procedure ae.tag(aad: array of char; aadn: int;
+                 ct: array of char; ctat: int; ctn: int;
+                 tag: array of char);
+var i, pad: int;
+begin
+  // The one-time key: counter 0 of the keystream. cc.block leaves it in cc.ks.
+  cc.block(ae.key, ae.nonce, 0);
+  i := 0;
+  while i < 32 do begin ae.pk[i] := cc.ks[i]; i := i + 1; end;
+
+  po.init(ae.pk);
+
+  if aadn > 0 then
+  begin
+    i := 0;
+    while i + 16 <= aadn do begin po.block(aad, i, 16, false); i := i + 16; end;
+    if i < aadn then
+    begin
+      // A SHORT LAST PIECE IS PADDED, NOT MARKED FINAL. po.block's `final` flag adds the
+      // 1 bit right after the data, which is right for the END of the message -- and this
+      // is the middle of it. The padding is zeros to a full block instead.
+      pad := 0;
+      while pad < 16 do begin ae.pad[pad] := chr(0); pad := pad + 1; end;
+      pad := 0;
+      while i + pad < aadn do begin ae.pad[pad] := aad[i + pad]; pad := pad + 1; end;
+      po.block(ae.pad, 0, 16, false);
+    end;
+  end;
+
+  if ctn > 0 then
+  begin
+    i := 0;
+    while i + 16 <= ctn do begin po.block(ct, ctat + i, 16, false); i := i + 16; end;
+    if i < ctn then
+    begin
+      pad := 0;
+      while pad < 16 do begin ae.pad[pad] := chr(0); pad := pad + 1; end;
+      pad := 0;
+      while i + pad < ctn do begin ae.pad[pad] := ct[ctat + i + pad]; pad := pad + 1; end;
+      po.block(ae.pad, 0, 16, false);
+    end;
+  end;
+
+  // The two lengths, 64-bit little-endian, as one final full block.
+  i := 0;
+  while i < 16 do begin ae.len[i] := chr(0); i := i + 1; end;
+  io.put32(ae.len, 0, band(aadn, 0xFFFFFFFF));
+  io.put32(ae.len, 4, band(aadn shr 32, 0xFFFFFFFF));
+  io.put32(ae.len, 8, band(ctn, 0xFFFFFFFF));
+  io.put32(ae.len, 12, band(ctn shr 32, 0xFFFFFFFF));
+  po.block(ae.len, 0, 16, false);
+
+  po.final(tag);
+end;
+
+// ae.seal(key, nonce, aad, aadn, buf, at, n, tag) -- encrypt in place and produce the tag.
+procedure ae.seal(aad: array of char; aadn: int;
+                  buf: array of char; at: int; n: int;
+                  tag: array of char);
+begin
+  // COUNTER ONE for the payload; counter zero made the Poly1305 key.
+  cc.xor(ae.key, ae.nonce, 1, buf, at, n);
+  ae.tag(aad, aadn, buf, at, n, tag);
+end;
+
+// ae.open(key, nonce, aad, aadn, buf, at, n, tag) -- verify and decrypt in place.
+//
+// FALSE MEANS DO NOT USE THE BUFFER. The tag is checked BEFORE anything is decrypted, which
+// is the only order that is safe: decrypting first and checking after means the caller has
+// plaintext from an unverified message in hand, and someone will use it.
+function ae.open(aad: array of char; aadn: int;
+                 buf: array of char; at: int; n: int;
+                 tag: array of char): bool;
+var want: array[0..15] of char;
+    i, diff: int;
+begin
+  ae.tag(aad, aadn, buf, at, n, want);
+
+  // CONSTANT TIME, and here it is not a nicety. Comparing byte by byte and returning early
+  // tells an attacker how many bytes of a guessed tag were right, and a tag can be forged
+  // one byte at a time from that. The whole difference is accumulated first.
+  diff := 0;
+  i := 0;
+  while i < 16 do
+  begin
+    diff := bor(diff, bxor(ord(want[i]), ord(tag[i])));
+    i := i + 1;
+  end;
+  if diff <> 0 then return false;
+
+  cc.xor(ae.key, ae.nonce, 1, buf, at, n);
+  return true;
+end;

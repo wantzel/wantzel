@@ -1,0 +1,5 @@
+not-object ok=0 err=[acme.find: the body is not a JSON object]
+key-absent ok=0 err=[]
+truncated ok=0 err=[acme.find: the object is truncated]
+missing-colon ok=0 err=[acme.find: a member is missing its ':']
+too-long ok=0 err=[acme.copy: the value is too long for the destination]

@@ -145,17 +145,37 @@ echo "$out" | grep -q 'readme.txt:1:' && ok "mcpfiles.exe searches the tree" || 
 
 echo "the HTTP server binds a socket and answers, as a .exe (socket, epoll over WSAPoll)"
 if command -v curl >/dev/null 2>&1; then
-    port=8099
+    # A FREE PORT, CHECKED, AND AN ANSWER WE CAN ATTRIBUTE. A fixed port once let a
+    # leftover httpd.exe from an earlier run answer this request, with the greeting of a
+    # binary that no longer existed -- and "request failed" said nothing about why.
+    # So: pick a port nobody listens on, give this build a greeting of its own, poll
+    # for the answer instead of sleeping, and check afterwards that the port is free.
+    port=""
+    for _c in $(seq $((20000 + $$ % 20000)) $((20000 + $$ % 20000 + 50))); do
+        ss -ltn 2>/dev/null | grep -q ":$_c " || { port=$_c; break; }
+    done
+    tag="probe-$$-$(date +%s)"
     # compile inside examples/ so the "../lib/http.wz" include resolves
-    sed "s/http.serve(8080, 8)/http.serve($port, 8)/" examples/httpd.wz > examples/_httpd_test.wz
+    sed -e "s/http.serve(8080, 8)/http.serve($port, 8)/" \
+        -e "s/hello from wantzel/hello from wantzel $tag/" examples/httpd.wz > examples/_httpd_test.wz
     ./bin/wantzel examples/_httpd_test.wz "$T/httpd.exe" --target=windows 2>/dev/null
     rm -f examples/_httpd_test.wz
     W "$T/httpd.exe" >/dev/null 2>&1 &
     hp=$!
-    sleep 6
-    body=$(curl -s --max-time 5 "http://127.0.0.1:$port/probe" 2>/dev/null)
-    kill "$hp" 2>/dev/null
-    echo "$body" | grep -q 'hello from wantzel' && ok "httpd.exe answers a request" || bad "httpd.exe request"
+    body=""; _n=0
+    while [ $_n -lt 60 ]; do
+        body=$(curl -s --max-time 2 "http://127.0.0.1:$port/probe" 2>/dev/null) && [ -n "$body" ] && break
+        _n=$((_n + 1)); sleep 0.25
+    done
+    # $! is the Wine loader, not necessarily the program: stop everything in OUR prefix
+    kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null || true
+    for _p in $(mine_win); do case "$(cat /proc/$_p/comm 2>/dev/null)" in httpd*) kill -9 "$_p" 2>/dev/null ;; esac; done
+    _n=0; while [ $_n -lt 40 ] && ss -ltn 2>/dev/null | grep -q ":$port "; do _n=$((_n + 1)); sleep 0.1; done
+    if [ -z "$port" ]; then bad "httpd.exe: no free port found"
+    elif echo "$body" | grep -q "hello from wantzel $tag"; then ok "httpd.exe answers a request"
+    elif [ -n "$body" ]; then bad "httpd.exe request: port $port answered, but not this build: $(echo "$body" | head -1)"
+    else bad "httpd.exe request: nothing answered on port $port"; fi
+    ss -ltn 2>/dev/null | grep -q ":$port " && bad "httpd.exe still listens on $port after the test" || ok "httpd.exe gone after the test"
 else
     echo "  skip  httpd.exe (curl not installed)"
 fi

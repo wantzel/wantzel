@@ -1,0 +1,69 @@
+// A schema field can carry the JSON key it corresponds to.
+//
+// TWO CASES, and neither can be expressed without it:
+//
+//   KEYS THAT DIFFER ONLY IN CASE. Identifiers are case-insensitive, so rdX and rdx are ONE
+//   name in Wantzel and TWO on the wire. A register dump, an API that uses camelCase beside
+//   lowercase -- the document is legal and the schema could not describe it.
+//
+//   KEYS THAT ARE NOT IDENTIFIERS AT ALL. "content-type", "$schema", "2". These are ordinary
+//   in real APIs and there is no spelling of them that the parser would accept.
+//
+// The key is a string literal before the colon, which needs no new keyword: a literal cannot
+// appear in that position otherwise, so it cannot collide with a name.
+include "io.wz";
+include "json.wz";
+
+type Reg = schema
+  rdx:          int;
+  rdxcap "rdX": int;                    // the same letters, a different key
+end;
+
+type Hdr = schema
+  ctype "content-type": text;           // not a name any language would accept
+  len   "Content-Length": int;
+end;
+
+var
+  r: Reg;
+  h: Hdr;
+  b: array[0..255] of char;
+  n: int;
+
+begin
+  // BOTH KEYS ARRIVE, and they must not overwrite each other.
+  n := io.push(b, 0, "{\"rdx\":1,\"rdX\":2}");
+  if Reg.parse(b, 0, n, r) < 0 then io.puts(STDOUT, "Reg: parse failed\n")
+  else
+  begin
+    io.puts(STDOUT, "rdx="); io.putn(STDOUT, r.rdx);
+    io.puts(STDOUT, " rdX="); io.putn(STDOUT, r.rdxcap);
+    io.puts(STDOUT, "\n");
+  end;
+
+  // AND THE ORDER IN THE DOCUMENT DOES NOT MATTER.
+  n := io.push(b, 0, "{\"rdX\":7,\"rdx\":8}");
+  if Reg.parse(b, 0, n, r) < 0 then io.puts(STDOUT, "Reg: parse failed\n")
+  else
+  begin
+    io.puts(STDOUT, "reversed: rdx="); io.putn(STDOUT, r.rdx);
+    io.puts(STDOUT, " rdX="); io.putn(STDOUT, r.rdxcap);
+    io.puts(STDOUT, "\n");
+  end;
+
+  n := io.push(b, 0, "{\"content-type\":\"application/json\",\"Content-Length\":42}");
+  if Hdr.parse(b, 0, n, h) < 0 then io.puts(STDOUT, "Hdr: parse failed\n")
+  else
+  begin
+    io.puts(STDOUT, "content-type=");
+    io.out(STDOUT, addr(b[h.ctype_at]), h.ctype_end - h.ctype_at);
+    io.puts(STDOUT, " length="); io.putn(STDOUT, h.len);
+    io.puts(STDOUT, "\n");
+  end;
+
+  // THE WANTZEL NAME IS NOT A KEY. Sending "ctype" rather than "content-type" must not
+  // parse -- otherwise the alias would be a second accepted spelling rather than a mapping.
+  n := io.push(b, 0, "{\"ctype\":\"x\",\"Content-Length\":1}");
+  if Hdr.parse(b, 0, n, h) < 0 then io.puts(STDOUT, "the Wantzel name is not accepted as a key\n")
+  else io.puts(STDOUT, "WRONG: the Wantzel name was accepted\n");
+end.

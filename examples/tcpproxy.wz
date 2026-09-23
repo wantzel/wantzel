@@ -1,0 +1,303 @@
+// tcpproxy.wz -- forward a port to somewhere else, in one static binary.
+//
+//   tcpproxy 8080 127 0 0 1 7777      listen on 8080, hand everything to 7777
+//
+// WHAT THIS IS FOR. A service that speaks plain TCP and needs to be reached from outside
+// wants something in front of it: one process that accepts connections and passes them on.
+// That shape is what a reverse proxy is, and the useful version of it terminates TLS -- the
+// outside speaks encrypted, the service behind it speaks plainly and knows nothing about
+// certificates.
+//
+// THIS IS THE PLUMBING WITHOUT THE ENCRYPTION, and it is worth having on its own: the
+// forwarding, the event loop and the bookkeeping are the same either way, and they are the
+// part that has to be right before any handshake is worth writing. What is missing to make
+// it a TLS terminator is a handshake and a record layer between recv and send.
+//
+// NO DEPENDENCIES AND ONE FILE. The binary is a few tens of kilobytes, starts in under a
+// millisecond and needs nothing installed -- which is the point of putting it in front of
+// something rather than adding a library to it.
+//
+// WHAT IT DOES NOT DO, deliberately: no hostname resolution (an address is four numbers, DNS
+// is its own protocol), no TLS yet, and no HTTP awareness at all -- it moves bytes, so it
+// works for anything, not only for HTTP.
+include "io.wz";
+include "net.wz";
+
+const
+  MAXPAIR = 64;                         // connections in flight
+  // 64 kB, AND THE NUMBER WAS MEASURED. Moving 8 MB through the proxy on loopback:
+  //
+  //   16 kB -> 46 ms     64 kB -> 19 ms     256 kB -> 23 ms     1 MB -> 24 ms
+  //
+  // So the gain is real up to 64 kB and gone after it -- past that the syscalls are no
+  // longer what costs. The binary is 22928 bytes at EVERY one of those sizes, because the
+  // buffer lives in .bss and not in the file, so "bigger is free on disk" is true and still
+  // not a reason to take more than the measurement supports.
+  //
+  // It also suits what comes next: a TLS record is at most 16 kB, so a 64 kB read hands the
+  // record layer several whole records at a time rather than fragments of one.
+  BUFSZ   = 65536;
+  // poll(2) is syscall 7 on x86-64. It is defined HERE rather than added to lib/io.wz:
+  // that file is the public standard library and a new constant in it is a change to the
+  // compiler repository, which deserves its own decision. A number an example needs once
+  // belongs in the example.
+  SYS_POLL = 7;
+  POLLOUT  = 4;
+  // ioctl(2) and the "how much is still queued to send?" request, for the same reason
+  // SYS_POLL is here: a number this example needs once does not belong in the library.
+  SYS_IOCTL = 16;
+  SIOCOUTQ  = 0x5411;
+
+var
+  // TWO FDS PER CONNECTION, and which is which matters: a and b are symmetric once the
+  // connection is up, so the loop does not care who called whom.
+  fa: array[0..MAXPAIR-1] of int;
+  fb: array[0..MAXPAIR-1] of int;
+  live: array[0..MAXPAIR-1] of bool;
+  npair: int;
+
+  buf: array[0..BUFSZ-1] of char;
+  evs: array[0..1023] of char;          // epoll_event is 12 bytes, packed
+  pfd: array[0..7] of char;             // one struct pollfd
+  qbuf: array[0..3] of char;            // the int SIOCOUTQ writes back
+
+  lfd, ep, i, n, fd, k, ev: int;
+  // A SEPARATE COUNTER FOR THE BYTES, and it is not tidiness. `n` holds how many events
+  // epoll returned and the loop below runs `while i < n`; reusing it for a recv length made
+  // that loop run to 16384 and read far past the event buffer. The symptom was an
+  // out-of-range at io.wz:194 -- in the library, on a line that is perfectly correct.
+  got, other, sent, tries, wrote: int;
+  dsta, dstb, dstc, dstd, dstport, lport: int;
+  served, moved: int;
+
+// slot(fd) -- which pair does this fd belong to, and is it side a?
+// Returns the pair index, or -1. Sets `sidea`.
+var sidea: bool;
+
+function slot(f: int): int;
+var j: int;
+begin
+  j := 0;
+  while j < npair do
+  begin
+    if live[j] then
+    begin
+      if fa[j] = f then begin sidea := true;  return j; end;
+      if fb[j] = f then begin sidea := false; return j; end;
+    end;
+    j := j + 1;
+  end;
+  return 0 - 1;
+end;
+
+// shut(j) -- close both ends of a pair.
+//
+// BOTH, ALWAYS. Half a connection is worse than none: the other side keeps waiting for
+// bytes that will never come, and the fd stays in the epoll set being reported ready
+// forever -- a loop that spins at 100% of a core while doing nothing.
+// Wait until everything written to `f` has actually left, then let the caller close it.
+//
+// SIOCOUTQ (0x5411) asks the kernel how many bytes are still queued on a socket. Polling it
+// is the only portable-enough way here: close() discards that queue, and there is no flag
+// that says "close when empty" without also blocking the whole event loop.
+//
+// The bound matters. A peer that never reads would otherwise hold this loop forever and
+// stall every other connection -- so it gives up after roughly two seconds and accepts that
+// those bytes are lost, which is the same outcome as before but bounded and deliberate.
+procedure linger(f: int);
+var waited, q: int;
+begin
+  if f < 0 then return;
+  waited := 0;
+  while waited < 2000 do
+  begin
+    io.put32(qbuf, 0, 0);
+    if sys3(SYS_IOCTL, f, SIOCOUTQ, addr(qbuf[0])) < 0 then return;
+    q := io.get32(qbuf, 0);
+    if q = 0 then return;
+    // pollfd with no events asked for is a plain timed wait on this one fd.
+    io.put32(pfd, 0, f);
+    io.put32(pfd, 4, 0);
+    if sys3(SYS_POLL, addr(pfd[0]), 1, 10) < 0 then return;
+    waited := waited + 10;
+  end;
+end;
+
+procedure shut(j: int);
+begin
+  if not live[j] then return;
+  k := 0;
+  if fa[j] >= 0 then
+  begin
+    if net.watch(ep, EPOLL_DEL, fa[j], 0) then k := k;
+    net.close(fa[j]);
+  end;
+  if fb[j] >= 0 then
+  begin
+    if net.watch(ep, EPOLL_DEL, fb[j], 0) then k := k;
+    net.close(fb[j]);
+  end;
+  live[j] := false;
+  fa[j] := 0 - 1;
+  fb[j] := 0 - 1;
+end;
+
+begin
+  if argc() < 7 then
+  begin
+    io.puts(STDERR, "usage: tcpproxy <listen-port> <a> <b> <c> <d> <port>\n");
+    io.puts(STDERR, "   eg: tcpproxy 8080 127 0 0 1 7777\n");
+    halt(1);
+  end;
+  lport   := io.argn(1);
+  dsta    := io.argn(2);
+  dstb    := io.argn(3);
+  dstc    := io.argn(4);
+  dstd    := io.argn(5);
+  dstport := io.argn(6);
+
+  lfd := net.listen(lport, 64, false);
+  if lfd < 0 then
+  begin
+    io.puts(STDERR, "cannot listen on that port: ");
+    io.putn(STDERR, lfd);
+    io.puts(STDERR, "\n");
+    halt(1);
+  end;
+
+  ep := net.epoll;
+  if ep < 0 then begin io.puts(STDERR, "no epoll\n"); halt(1); end;
+  if not net.watch(ep, EPOLL_ADD, lfd, EPOLLIN) then
+  begin io.puts(STDERR, "cannot watch the listening socket\n"); halt(1); end;
+
+  npair := 0;
+  served := 0;
+  moved := 0;
+  i := 0;
+  while i < MAXPAIR do begin live[i] := false; fa[i] := 0 - 1; fb[i] := 0 - 1; i := i + 1; end;
+
+  io.puts(STDOUT, "listening on ");
+  io.putn(STDOUT, lport);
+  io.puts(STDOUT, ", forwarding to ");
+  io.putn(STDOUT, dstport);
+  io.puts(STDOUT, "\n");
+
+  while true do
+  begin
+    n := net.wait(ep, addr(evs[0]), 64, 1000);
+    if n < 0 then break;
+    i := 0;
+    while i < n do
+    begin
+      ev := io.get32(evs, i * 12);
+      fd := io.get32(evs, i * 12 + 4);
+      i := i + 1;
+
+      if fd = lfd then
+      begin
+        // A NEW CONNECTION: accept it and open the one behind it before anything is read.
+        // Opening it lazily would mean holding bytes with nowhere to put them.
+        fd := net.accept(lfd);
+        if fd >= 0 then
+        begin
+          k := 0;
+          while (k < MAXPAIR) and live[k] do k := k + 1;
+          if k >= MAXPAIR then net.close(fd)      // full: refuse rather than queue
+          else
+          begin
+            fa[k] := fd;
+            fb[k] := net.connect(dsta, dstb, dstc, dstd, dstport);
+            if fb[k] < 0 then
+            begin
+              // THE SERVICE BEHIND IS DOWN. Close the caller straight away instead of
+              // holding a connection that can never be answered.
+              net.close(fd);
+              fa[k] := 0 - 1; fb[k] := 0 - 1;
+            end
+            else
+            begin
+              live[k] := true;
+              if k >= npair then npair := k + 1;
+              served := served + 1;
+              if net.watch(ep, EPOLL_ADD, fa[k], EPOLLIN) then k := k;
+              if net.watch(ep, EPOLL_ADD, fb[k], EPOLLIN) then k := k;
+            end;
+          end;
+        end;
+      end
+      else
+      begin
+        k := slot(fd);
+        if k >= 0 then
+        begin
+          got := net.recv(fd, addr(buf[0]), BUFSZ);
+          // A CLOSE ON ONE SIDE IS NOT PERMISSION TO DROP THE OTHER SIDE'S DATA.
+          //
+          // close() discards whatever is still queued on a socket, so closing the client
+          // the instant the backend reports EOF can throw away bytes that were accepted for
+          // sending but not yet delivered. linger() waits for that queue to empty first.
+          //
+          // HONEST ABOUT THE EVIDENCE: this is reasoning about close(), NOT a reproduced
+          // failure. One measurement on 22-09-2026 showed 7274920 bytes of 8000000 arriving
+          // through a slow reader, and this looked like the cause -- but it never came back.
+          // Removing linger() again and repeating with the identical binary gave 8000000 ten
+          // times out of ten, at 100k, 200k and 400k. So the single low reading is still
+          // unexplained, and this routine is a guard rather than a proven fix. Anyone who
+          // reproduces the truncation should come back here first.
+          if got <= 0 then
+          begin
+            if sidea then linger(fb[k]) else linger(fa[k]);
+            shut(k);
+          end
+          else
+          begin
+            // TO THE OTHER SIDE, AND ALL OF IT.
+            //
+            // A SHORT WRITE IS NORMAL, NOT AN ERROR, and treating it as one is how a proxy
+            // silently truncates. Measured before this loop existed: an 8000-byte reply
+            // arrived as 7000 -- a socket accepts what fits in its buffer and reports how
+            // much that was, which is a number smaller than asked for and not a failure.
+            //
+            // AND THE SOCKET IS NON-BLOCKING, which is why this waits instead of spinning.
+            // net.accept returns a socket with O_NONBLOCK, so send answers -EAGAIN the
+            // moment the kernel buffer is full rather than waiting for room. Measured with a
+            // plain retry loop: an 8000-byte reply arrived as 6000 or 7000, because the
+            // tries ran out while the receiver had simply not drained yet.
+            //
+            // poll() ON THE ONE FD is the smallest correct wait: it returns as soon as there
+            // is room, so the loop costs nothing while it waits and makes progress the
+            // instant it can. The bound stays as a guard against a peer that never reads.
+            if sidea then other := fb[k] else other := fa[k];
+            sent := 0;
+            tries := 0;
+            while (sent < got) and (tries < 1000) do
+            begin
+              wrote := net.send(other, addr(buf[sent]), got - sent);
+              if wrote > 0 then begin sent := sent + wrote; tries := 0; end
+              else
+              begin
+                tries := tries + 1;
+                // pollfd: the fd, then POLLOUT (4) as the events asked for.
+                io.put32(pfd, 0, other);
+                io.put32(pfd, 4, POLLOUT);
+                wrote := sys3(SYS_POLL, addr(pfd[0]), 1, 200);
+              end;
+            end;
+            if sent < got then
+            begin
+              k := slot(fd);
+              if k >= 0 then shut(k);
+            end
+            else moved := moved + sent;
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  io.puts(STDOUT, "stopped after ");
+  io.putn(STDOUT, served);
+  io.puts(STDOUT, " connections, ");
+  io.putn(STDOUT, moved);
+  io.puts(STDOUT, " bytes\n");
+end.

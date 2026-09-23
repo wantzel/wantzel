@@ -1,5 +1,9 @@
 // lib/proc.wz -- processes: forking, reaping, and knowing how it ended.
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 // Why this is a library and not a compiler feature: `sys1`..`sys6` are builtins that
 // emit the SYSCALL instruction literally, and the syscall number is an ordinary
 // constant.  The compiler knows no syscall by name.  Everything the operating system
@@ -15,6 +19,8 @@
 // from a signal has zero in those bits and the signal number in the lowest seven.  Read
 // only `shr 8` and a crashed child looks like "done, code 0" -- a silent error of
 // exactly the kind this project makes most often.
+
+include "io.wz";        // io.fatal, for proc.alive's pid <= 0 check
 
 const
   PROC.WNOHANG = 1;              // wait4: do not wait when nothing is ready
@@ -102,9 +108,15 @@ end;
 
 // Is this process still running?  Signal 0 sends nothing but does test whether the
 // process exists and whether we are allowed to send it anything.
+//
+// pid <= 0 is not a process to ask about -- 0 and negative pids address a process GROUP
+// to kill(2), not one process, so silently answering false would tell the caller "not
+// alive" for a question that was never asked. That is the caller's contract to keep
+// (like proc.arg's too-many-arguments check): every known caller already guards pid > 0
+// before this call, so the fix is to say so rather than to guess an answer.
 function proc.alive(pid: int): bool;
 begin
-  if pid <= 0 then return false;
+  if pid <= 0 then io.fatal("proc.alive: pid must be positive");
   return sys2(SYS.kill, pid, 0) = 0;
 end;
 

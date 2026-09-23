@@ -1,577 +1,256 @@
-# The design of Wantzel
+# Design
 
-Why this language exists, what it deliberately leaves out, and where the idea does not
-hold. What the language *is*, rather than why, is [language.md](language.md), which is
-binding.
+**Why the language is the way it is, and how the compiler works underneath it.**
 
-This document stays at the level of the argument. Where a claim rests on a measurement, it
-links to the document under [`internals/`](internals/) that carries the numbers, the method
-and the caveats — so the reasoning here stays readable and the evidence is one click away
-rather than paraphrased.
+[README](../README.md) · [Language](language.md) · [Syntax](syntax.md) · [Library](library.md) · [Writing Wantzel](writing-wantzel.md) · [How-to](howto.md) · [Design](design.md) · [Changelog](changelog.md)
 
 ---
 
-## The name is the idea
+What the language *is* belongs in [language.md](language.md), which is binding. This page
+argues why: the yardstick every change is weighed against, the choices that follow from it,
+and — in the second half — how the compiler itself is built.
 
-Pierre Wantzel proved in 1837 what **cannot** be done. Trisecting an angle with compass and
-straightedge, doubling a cube — people had tried for centuries, and he showed it is
-impossible. Not "not managed yet", but *impossible*.
+The case for the compiler, stated plainly by the maintainer: **it is strict, fast and
+verbose, has no dependencies, and gives errors an agent can act on.** Everything below
+explains that sentence. It does not argue it against other languages — no benchmarks, no
+essays — because the sentence is the argument.
 
-That is what a compiler should do: **say what cannot work, before you find out the hard
-way.** It sounds like a limitation and it is the opposite. A proof that something is
-impossible is liberating: you stop looking, and the time you would have spent on a dead end
-goes to the road that does exist.
-
-Everything below follows from that one idea.
-
----
-
-## Three problems this language is an answer to
-
-### 1. Dependencies
-
-A program that needs packages needs all of their versions to agree, today and on every
-machine it runs on, for as long as it runs. Each one is someone else's release schedule,
-someone else's breaking change, someone else's security advisory. The count grows on its
-own: you add one library, it brings thirty.
-
-The cost is not only maintenance. It is that you cannot answer a simple question — *will
-this still build in five years?* — without checking a tree you did not plant.
-
-**What Wantzel does.** Zero dependencies, as an invariant rather than a target. The
-standard library lives in this repository and changes in the same commit as the compiler.
-There is no package manager, so there is no mechanism by which a dependency could be added.
-Building needs a C compiler exactly once, for `bootstrap/boot.c`; after that the compiler
-builds itself.
-
-What you deploy is one static binary. No runtime to install on the target, no container to
-describe the runtime, no migration step, no connection string. Deploying is copying a file.
-
-### 2. Stacks that grew
-
-Look at a mature project in a dynamically typed language and you find an enormous amount of
-tooling that exists to compensate for the language: type checkers that add the types the
-language lacks, linters that find errors a compiler could have found, frameworks that
-impose the structure the language does not enforce, virtual environments to keep packages
-from destroying each other.
-
-Each of those is sensible on its own. Together they are a tower that has to stand upright
-before a single line of your code runs, and every combination of versions is slightly
-different from every other. When something breaks, the message can come from any layer.
-
-The same thing happened to build times. Computers got a thousand times faster, and builds
-got slower, because a build stopped being one compiler and became a compiler plus a bundler
-plus a transpiler plus a package manager plus a test runner plus a container layer — each
-with its own configuration and its own way of failing.
-
-**What Wantzel does.** One binary that does everything, in **one pass**. The compiler reads
-the source once and emits machine code as it goes: no AST, no intermediate representation,
-no optimiser pass, no separate assembler or linker. Forward jumps are backpatched where
-they stand.
-
-That design is why compiling stops being a step you wait for. Trying something is free,
-and the short loop between writing a line and knowing whether it holds is the most
-valuable thing a language can give you.
-
-It is measured rather than claimed: `./wztest --bench` reports lines per second and fails
-against a hard floor kept beside it, so a regression in the thing this language exists for
-shows up as a failing test rather than as a slow afternoon a year later.
-
-**Starting the result is as cheap as compiling it, which is the other half of that loop.**
-There is no dynamic linker, no libc and no runtime to initialise, so a Wantzel binary is
-running before a comparable program has finished loading. Measured 15-09-2026 on one
-machine, each program started 1,500–3,000 times through `fork` + `execve` + `wait` with no
-shell in the loop:
-
-| what starts | µs per start | starts/s |
-|---|---|---|
-| Wantzel, empty program (376 bytes) | 156 | 6,400 |
-| C, static, glibc (785 kB) | 275 | 3,600 |
-| C, dynamically linked (15 kB) | 398 | 2,500 |
-| `/bin/true` | 407 | 2,500 |
-| Go (1.4 MB) | 728 | 1,400 |
-| Python 3 | 7,841 | 128 |
-| Node 24 | 17,582 | 57 |
-
-Read the ratios, not the microseconds: the absolute figure depends on the machine and even
-on the *measuring* process, whose pages are the ones `fork` copies. Two independent
-harnesses of almost the same size, one written in Wantzel and one in C, disagreed by about
-50 µs on the absolute number and agreed to within 1.3 µs on the difference between two
-targets — so the difference is what carries meaning.
-
-The most useful number is the one against ourselves: `hello.wz`, which writes a line, costs
-within a few percent of a Wantzel program that does nothing at all. Almost the whole cost
-of starting is the kernel creating a process; the language adds close to none of it.
-`tests/bench/startup.sh` guards that ratio.
-
-The layers that a stack adds are either in the language or not needed. HTTP, JSON, MCP and
-OAuth are ordinary library code in `lib/`, not a framework you configure. There is nothing
-to keep in sync because there is nothing beside the compiler.
-
-### 3. Errors that surface too late
-
-An error that a compiler could have caught, but did not, becomes an error at run time —
-which means in front of a user, or in a log nobody reads, or on the one code path the tests
-do not cover. The worst case is code that exists, was reviewed, passes its tests, and could
-never have worked.
-
-This matters more now that an AI often writes the code. An AI that does not know something
-is impossible **keeps searching**: it writes something plausible, gets a vague error, tries
-a variation, builds a workaround, and sometimes produces something that runs — until one
-day it does not. What it needs instead is a fast, hard answer at compile time, with a line
-number. Then the loop is short: write, compile, error, fix, where each round takes seconds
-and each error points at its own cause.
-
-**What Wantzel does.** It moves as much as possible to compile time, and says exactly what
-is wrong and where. Declarations are mandatory, a `forward` must be fulfilled, signatures
-are compared, a function result may not be discarded, a procedure may not return a value,
-and there are no implicit conversions anywhere.
-
-What genuinely cannot be decided until the program runs is checked there, and reported with
-file and line: every array index against both bounds, division by zero, `chr()` out of
-range, a function that ends without a `return`. Locals are zeroed on every call, so there
-are no undefined initial values.
-
-Not checked, and stated plainly rather than implied: integer overflow, and anything reached
-through `addr`, `view` or `sysN`.
-
----
-
-## Why these three together
-
-Each answer above is useful on its own, and they reinforce each other when a lot of code
-is written quickly — by one person trying things, or by several at once.
-
-**Starting has to be cheap, not just running.** There is no daemon, no incremental build
-state, no lock file and no warm cache to share or corrupt: a process reads source and
-writes a binary. So you can run the compiler as often as you like, in as many copies as
-you like, and nothing coordinates them because there is nothing to coordinate.
-
-**The error has to be the whole answer.** A message that names the file, the line and the
-actual problem turns a failure into the next edit. A vague one, or a failure that only
-appears at run time on one path, turns it into guessing.
-
-**The pieces have to merge cleanly.** This is where zero dependencies stops being hygiene
-and becomes structural: there is no package to add, so no two branches can disagree about
-one, and no environment to reconcile. Every branch compiles against the same standard
-library, which lives in this repository and moves in the same commit.
-
-The same properties make the result reproducible. Any machine with a C compiler gets the
-same binary from `bootstrap/boot.c`, byte for byte, with no network access and nothing
-pinned — so a build can be rebuilt and checked rather than trusted.
-
-None of this was designed for agents; it fell out of wanting a program you can copy instead
-of install. But it is why the combination suits this way of working better than a faster
-compiler alone would.
-
----
-
-## A compiler for when you rarely write or read the code yourself
-
-There is a shift underneath all of this that is worth naming plainly, because it changes
-what a language is *for*.
-
-**And it is worth saying what this language is not.** The temptation with any new language
-is to widen the claim until it competes with Rust, Go and C at everything. The narrower
-statement is the stronger one, and it is the one to keep:
-
-> AI generates enormous quantities of code. Wantzel is designed around the fact that the
-> author can be a machine rather than a person.
-
-Every design decision below follows from that, which is what makes them decisions rather
-than arbitrary strictness: strict typing, no implicit ambiguity, few ways to say the same
-thing, a minimal dependency surface, deterministic compilation, refusing as early as
-possible, small binaries, extremely fast compiles, and generated APIs whose schemas are
-checked when the program is built. What a generator actually gets wrong — counted over a
-hundred real mistakes, and not mostly syntax — is in
-[`internals/why-strict.md`](internals/why-strict.md). A language that tried to be good at everything could not
-have made most of those choices.
-
-A growing number of programmers rarely type their own code any more, and read only some
-of it. The AI writes, they review and steer. That changes which properties of a language
-matter.
-
-When you wrote every line, you carried the program in your head: which function could be
-trusted, which corner was fragile, where the assumption lived that everything leaned on.
-That knowledge was the real safety net, not the compiler.
-
-**When you did not write it, that net is gone.** You are reviewing code you have never
-seen, and you cannot tell by eye whether a conversion is safe or whether an index can run
-past the end. The code looks fine — plausible code is exactly what a generator is good at
-producing.
-
-So the tool has to hold what you used to hold:
-
-- **What the compiler refuses, you do not have to check.** Every implicit conversion that
-  does not exist is a review question you never have to ask. Strictness is not there to
-  discipline the writer; it is there so the reader can stop looking.
-- **Small enough to read cold.** One way per concept means an unfamiliar file uses the
-  same constructions as a familiar one.
-- **Nothing hidden.** No allocation you cannot see, no destructor on the way out, no
-  dispatch you cannot follow. What the code says is what happens.
-- **The specification is short enough to check against.** [language.md](language.md) is
-  one document, and it binds.
-
-None of that removes the need to review. It changes what a review is: reading for whether
-the program does the right thing, rather than whether it is allowed to do what it says.
-
-### The standard every compiler decision is measured against
-
-Stated by the maintainer, 14 September 2026, as the sentence to weigh a proposal against:
+## The yardstick
 
 > **A compact, fast, strict language, fit to be used in iterations by AI when agents write
 > code.**
 
-Four words, and each of them decides something. Compact: the whole specification is
-readable in a sitting, so an agent that must consult it does not spend its attention
-there. Fast: a build is short enough that a loop can afford to compile on every change,
-which is what makes iteration possible at all. Strict: what the compiler refuses is what
-nobody has to review. And *in iterations* is the one that is easy to miss -- the unit of
-work is not a program a person writes once, but a cycle that runs many times, where every
-signal is read by a machine before a human sees it.
+| word | what it decides |
+|---|---|
+| compact | the whole specification is readable in one sitting; an agent does not spend its attention re-reading it |
+| fast | a build is short enough to run on every change, which is what makes iteration possible at all |
+| strict | what the compiler refuses is what nobody has to review by hand |
+| in iterations | the unit of work is a cycle that runs many times, and every signal is read by a machine before a person sees it |
 
-That last point turns several ordinary preferences into requirements. None of these was
-reasoned out in advance: each one is a bug that was fixed once the yardstick made the
-answer obvious, and they are listed with the case that produced them because the case is
-the argument.
+Weigh a proposal against those four. Where it does not decide, that is a ticket, not a
+guess — a yardstick used to justify a guess is worse than none, because the guess then
+arrives with a citation.
 
-- **An error must name the SOURCE, not the compiler.** A source that filled the data
-  segment used to fail with `array index out of range at src/wantzel.wz:495`. Every word
-  of that is true and all of it points the wrong way: the reader goes looking in the
-  compiler, or — worse, if the reader is a generator — in its own code, for a fault that
-  is not there. It now says `<file>:<line>: data segment overflow: the source is too
-  large`. Naming the input is not politeness; it is the difference between a loop that
-  converges and one that thrashes.
+## The main choices, and their one-line reason
 
-- **A limit must REFUSE — not truncate, not crash.** Three kinds of failure, and only one
-  of them is usable. A crash gives a caller nothing to act on. Silent truncation gives it
-  something worse: a result that looks complete. A clean refusal is a fact it can respond
-  to. The distinction is not academic — it decided the shape of two different repairs on
-  the same day. `io.push` may truncate, because its output is a *message* and a shortened
-  error string is still a readable error string. A generated `<Schema>.write` must refuse,
-  because its output is a *JSON object* that goes out as a protocol reply: truncating
-  hands the peer an unparseable envelope, which moves the failure from "this one call
-  failed cleanly" to "the session is broken and the reason is invisible". That is strictly
-  worse than the crash it replaced, because at least a crash is loud.
+| choice | reason |
+|---|---|
+| **No pointers, no heap, no garbage collector** | an index into an array cannot dangle, is bounds-checked at every use, and survives being written to disk — every linked structure normally built with pointers has been built this way instead |
+| **Strict typing, no implicit conversions** | what the compiler refuses is a review question nobody has to ask; a wrong call is a compile error, not a silent bug that ships |
+| **One way per concept** | a second way is a second thing to learn, review, and get wrong; `bool` and no `boolean`, `include` and no module system, errors and no warnings |
+| **No dependencies** | the standard library lives in this repository and moves in the same commit as the compiler; there is no package manager, so there is no mechanism by which a dependency could be added |
+| **No optimiser** | the generated code stays recognisable as the source you reviewed, and it is most of why compiling takes milliseconds |
+| **No warnings, only errors** | a grey zone between "wrong" and "fine, but" does not survive contact with time — it piles up and gets ignored; exit 0 has to mean correct |
+| **Schemas are compiled, not configured** | a `schema` or `tools` block *is* the parser, the writer and the JSON Schema — nothing to keep in sync, and a wrong field is a compile error instead of a run-time surprise |
 
-- **Both halves of an operation must fail the same way.** When `io.push` was given a
-  truncating contract, three neighbouring writers were left overrunning their buffers. The
-  result was not two bugs but one worse property: a caller could form no model at all of
-  what happens when output does not fit, because it depended on which half of the append
-  it reached. Consistency here is not tidiness; an inconsistent contract cannot be
-  remembered, and what cannot be remembered gets written wrong.
+**`tools` deserves a separate mention.** It is the language construct that turns a group of
+routines into an MCP tool table, argument parsing, dispatch, REST route and OpenAPI document
+— all from one declaration. See [language.md §7b](language.md#7b-tools--a-tool-table-as-a-declaration).
+It solves problem 3 below in its sharpest form: a contract that would otherwise be five
+things that can disagree becomes one thing that cannot.
 
-- **Silence must mean correct.** Exit 0 has to be trustworthy on its own, because
-  something machine-read acts on it without weighing tone or context. This is where the
-  no-warnings rule below comes from, and the yardstick is why it is not negotiable.
+### Why a generator makes this stricter, not more permissive
 
-- **A check must be able to judge without trusting what it is checking.** `slen(s)` on a
-  `str` that was never assigned killed the process with a segmentation fault and no
-  message — in a language where every array index is checked. The guard was not missing.
-  It was *unreachable*: the length of a string sits in the eight bytes before it, so
-  reading that length to compare against is itself a dereference, and on a null address
-  the comparison died before its own trap could fire. The same shape sat one function
-  away in `schar`, which looked correct for exactly as long as nobody passed it a zeroed
-  string. What makes this worth a rule rather than a fix is that reading the code does not
-  reveal it — the guard is present, it is correctly written, and it is circular. So the
-  question to ask of a check is not "is one here?" but "does this one need something that
-  is only valid once the check has already passed?"
+A hundred recorded mistakes in generated Wantzel put library misuse (wrong routine, wrong
+argument order) at 30 of 100 — bigger than syntax and namespace mistakes combined. A
+permissive language answers a wrong call by doing something; a strict one refuses. For a
+generator running in a loop, a refusal is a message the next iteration can act on; a silent
+wrong answer is a bug that ships unnoticed. That asymmetry is why the language stays narrow
+rather than growing convenience features.
 
-- **A routine's docstring is part of its contract, and a wrong one is a bug.**
-  `kv.match` promised "subset match as used by entity searches" and delivered something
-  narrower: a stored list could not contain anything, not even itself. The trap survived
-  as long as it did because the repository *argued with itself* — one document called the
-  behaviour a deliberate choice while the docstring implied the opposite, so a reader
-  could find support for either belief and neither was tested. Prose about behaviour is
-  either checked or it is a liability.
+### Three problems, answered once each
 
-- **One way per concept, even where two would be convenient.** A second way is a second
-  thing to learn, a second thing to review, and a second chance to pick the wrong one.
+| problem | what happens without an answer | what Wantzel does |
+|---|---|---|
+| **Dependencies** | a tree you did not plant, and "will this still build in five years" has no answer | zero dependencies as an invariant; one static binary, nothing to install on the target |
+| **Stacks that grew** | a build becomes compiler + bundler + transpiler + package manager + linter, each with its own way of failing | one binary, one pass, no AST, no intermediate representation; `hello.wz` compiles in ~3 ms |
+| **Errors that surface too late** | a mistake a compiler could catch instead ships to a user or a log nobody reads | declarations mandatory, signatures checked, every array index and division checked at run time with file and line |
 
-- **A behaviour change costs more here than elsewhere, and this is the rule most easily
-  underestimated.** Code a generator produced last week is not reread when the rules shift
-  underneath it; it simply starts being wrong, silently, in a place nobody is looking. So
-  a change that alters what existing working code does needs a stronger argument than one
-  that merely refuses something new — and when it is made anyway, both directions of the
-  change get written down, including the shape that used to work and now does not.
+### Where the idea does not hold
 
-- **Linux and Windows stay as identical as they can be made.** A
-  platform difference is one more thing the writer has to hold in their head, and that is
-  exactly what this language is trying to take off them. It weighs heavier here than in a
-  language people write by hand: a human learns "on Windows this one is different" once
-  and remembers it, while a generator has no such memory and will produce the Linux shape
-  every time. So the difference belongs in the runtime, not in the program -- one call,
-  one meaning, both targets. Where a platform genuinely cannot be hidden, it is named in
-  [language.md](language.md) rather than left for a reader to discover, because an
-  undocumented difference is the one that gets written wrong.
+No ecosystem — every library you need, you write. No debugger, no profiler, no IDE support
+beyond `printf` and tests. Almost nobody knows this language. No proven memory safety, only
+"no pointers" plus a test suite. Every compiler bug is your bug. A small language says no
+often, including to reasonable requests. That is a real price, and the honest answer for a
+lot of other work is to use something else.
 
-What those have in common is worth stating on its own: none of them makes the language
-more powerful. Every one of them makes a failure easier to read correctly by something that
-cannot ask a follow-up question. That is the whole of *fit to be used in iterations* -- the
-yardstick does not ask what the language can express, it asks what a machine can conclude
-from the answer.
+---
 
-Weigh a proposal against those, and a surprising number of questions answer themselves.
-Where it does not decide, say so in the ticket instead of guessing -- a yardstick used to
-justify a guess is worse than no yardstick, because the guess then arrives with a citation.
+## How the compiler works
 
-### So this compiler is built a little differently
+One pass, no AST, no intermediate representation: the compiler reads source once and emits
+machine code as it goes, backpatching forward jumps where they stand. It compiles itself
+(6,772 lines) in about 10 ms.
 
-- **No warnings — only errors.** A warning and an error are two ways of saying the same
-  thing with a grey zone between them, and the grey zone does not survive contact with
-  time: warnings pile up, get suppressed, and eventually nobody can tell whether a clean
-  run means clean code or silenced noise. Here either something is wrong and compilation
-  stops with one message, or there is silence. For anything reading that signal, exit 0
-  means correct as far as the compiler can tell — a loop can be built on that, and not on
-  "it worked, but there were nine remarks".
+### Two targets, one source
 
-- **No exceptions either.** An index out of range, a division by zero, a function that
-  ends without returning: each prints `runtime error:` with the file and line, and stops.
-  There is no handler to swallow it and no log level to lower.
+Library code names no platform. `lib/io.wz` writes a file with one line:
 
-- **Both failures leave the same kind of trace.** `wantzel: file.wz:12: type error in
-  assignment: expected int, found bool`, or `runtime error: array index out of range at
-  file.wz:42`. One line on stderr, always that shape, with the source location in it.
-  Anything reading the output — a test runner, a CI job, a person — can jump straight to
-  the line and try again, without reproducing the problem under a debugger first.
+```pascal
+return sys3(SYS.write, fd, a, n);
+```
 
-  One honest limit. This covers what the *language* guarantees. A system call that fails —
-  a file that is not there, a port already taken — is not a trap: it returns a negative
-  number (`fs.open` on a missing path gives `-2`, which is `-ENOENT`) and your code decides
-  what to do. That is deliberate, because a missing file is often an expected outcome
-  rather than a defect, but it does mean an unchecked return value is the one way a failure
-  can still pass by quietly. `lib/log.wz` exists for that side: one JSON line per event on
-  stderr, in a shape a machine can read, so a handled failure leaves a trace as legible as
-  an unhandled one.
-- **The error text is the interface, not a by-product.** Every message names the file, the
-  line and the actual problem in plain words — "a procedure has no value", "this parameter
-  needs an array" — because for an agent that message is the entire feedback channel, and
-  for a reviewer it is often the only explanation they will get. A message that does not
-  point at its own cause is treated here as a defect in the compiler and filed as such —
-  "forward declared routine is never defined" used to say only that, without naming the
-  routine or pointing at its declaration, and that was fixed as a bug rather than tolerated
-  as a quirk.
-- **No optimiser.** Not from laziness: an optimising pass is the one thing that makes the
-  generated code stop corresponding to the source you are reviewing. Straightforward code
-  generation keeps what runs recognisable as what you read, and it is a large part of why
-  compiling takes milliseconds.
+| target | what `sys3` emits |
+|---|---|
+| Linux | the `SYSCALL` instruction, literally — the kernel, nothing in between |
+| Windows | a call into `__wsys`, generated by the compiler **in Wantzel**, which dispatches the Linux call number onto the matching kernel32/ws2_32 call |
 
-  The obvious objection is that this must cost speed at run time, and for one class of
-  program it measurably does not. A log scanner written here — a tight loop over bytes —
-  was put next to the same program in Go on the same two gigabytes, both returning the
-  same answer: 0.72 s against 0.82 s, with the difference coming mostly from mapping the
-  file rather than reading it in blocks, not from the code generator. What differs is what
-  it took to get there. Go reached its number through SSA, register allocation and
-  inlining, and took 2.65 s to build cold (0.11 s with a warm cache); this compiler has no
-  optimisation pass at all and emitted its binary in 3 ms — the same compiler translates
-  its own 6,772 lines in about 10 ms.
+`__wsys` emulates a Linux syscall interface on top of the Windows API; it covers what the
+standard library needs, not all of Linux. Reaching a Windows API the compiler has never
+heard of is a line of source, not a compiler change:
 
-  The usual trade — fast builds or fast output, pick one — did not appear. That will not
-  hold everywhere: code leaning on deep abstraction or many small functions is exactly
-  where inlining earns its keep, and nothing here says otherwise. But for the kind of
-  straightforward, explicit code this language is meant to carry, the optimiser turns out
-  to be buying much less than its cost in build time, and build time is what an iterating
-  loop actually spends. The full comparison, with the caveats that belong with it, is in
-  [`internals/three-measures.md`](internals/three-measures.md).
-- **The language changes rarely, and only on evidence.** A moving target is one more thing you would have to keep
-  in your head, and one more way for code written last month to mean something else today.
+```pascal
+winapi("user32.dll", "MessageBoxA", 0, text, title, 0);
+```
 
-### And it makes writing it by hand pleasant again
+The name is written into the executable's import table at compile time. The compiler itself
+carries 48 built-in imports (27 kernel32, 11 ws2_32, 1 advapi32, 9 user32) — not for
+convenience, but because the loader fills the import table *before the first instruction
+runs*, so the startup path cannot look itself up. Anything needed only after the program has
+started can be named from source instead.
 
-This is not only tooling for machines, and it would be a poor outcome if it were. The same
-properties are what made programming feel light before the stacks grew: you press a key and
-it runs; the error tells you exactly what is wrong and where; there is one way to express
-the thing so you are not choosing between three; nothing is hidden, so you can follow what
-happens; and there is no environment to set up before you start.
+On Linux there is no such table at all: the ELF this compiler writes has no dynamic section,
+no `PT_INTERP`, nothing for `ld.so` to do. The kernel is reached directly through `sysN`, and
+a shared library that was not there at build time cannot be called — calling it as a
+**process** (`lib/proc.wz`, `fork`+`execve`, ~300 µs) is the answer that needs no compiler
+change.
 
-That combination is why Turbo Pascal was fun, and there is no reason it should have stopped
-being available. So this language is not an AI-only language with humans tolerated — it is
-a small, fast, strict language that happens to suit a generator for exactly the reasons it
-suits a person. If you want to write every line yourself, the loop is as short as it ever
-was, and the compiler is just as unwilling to let something wrong through.
+### Callbacks: letting Windows call you back
 
-This is the same idea as the name, arriving from the other side. A compiler that says
-quickly and firmly what cannot work is worth most precisely when you are not the one who
-wrote it — and it is still worth a great deal when you are.
+Linux events arrive on a socket and the program reads them in its own loop. Windows instead
+*calls into* the program — it needs the address of a function, which this language does not
+expose, on purpose: a function pointer is something nothing checks.
+
+The compiler adds exactly one builtin, `winproc(handler)`, which does not return the
+routine's address. It generates a small adapter beside the routine and returns the address
+of *that* — moving arguments between the register conventions the two platforms disagree
+about, and preserving the registers Windows expects untouched. Every Windows callback shape
+(window procedures, hooks, timers, comparators) fits the same four-argument, one-result
+adapter, so this is one mechanism, not a window-shaped special case. `winproc` compiles only
+for `--target=windows`.
+
+### Memory: an index is the pointer
+
+No heap, no pointers, no garbage collector. Instead:
+
+1. **All memory is an array with an upper bound.** A global array costs nothing until
+   touched: pages are 4 KB each. Local arrays live on the stack and are zeroed.
+2. **An index replaces a pointer.** It cannot dangle, is bounds-checked at every use, and
+   still means the same thing after being written to disk and read back.
+3. **Anything larger than the program wants to pin down comes through `mmap` and `view`**,
+   which turns an address and a length into an ordinary, bounds-checked array — the capacity
+   is disk or virtual memory, not RAM.
+
+| situation | pattern |
+|---|---|
+| a growable list | array + counter, `-1` past the bound |
+| text of unknown length | one arena array + `(offset, length)` slices |
+| linked structures (list, tree, graph) | index fields, `-1` for none, a free list for reuse |
+| key → value | open-addressed hash table on two parallel arrays |
+| bigger than RAM, or must survive a restart | `mmap` on a file; the array *is* the file format |
+
+The one thing an index cannot replace is the **address of a routine** — `addr(myroutine)` is
+rejected, because that is the same unsafe function pointer callbacks need. `winproc` (above)
+is the one deliberately narrow escape hatch for it.
+
+### Debug info: the `.wzdbg` sidecar
+
+`--debug` writes the executable byte-identical to a normal build, plus a text sidecar,
+`<output>.wzdbg`, that a debugger reads to map addresses to source and memory to variables.
+Own format, not DWARF: the only reader is a debugger for this compiler, and DWARF needs a
+library on both ends that this project does not carry.
+
+| record | fields | holds |
+|---|---|---|
+| `wzdbg` | version | format version (this page describes `1`) |
+| `target` / `base` / `text` / `data` / `bss` / `entry` | address(+length) | where each image section lives — addresses in the file are process addresses directly, no relocation |
+| `file` | id, path | source file table; a path starting `<` has no source (generated runtime code) |
+| `line` | address, file, line, kind | maps code to source; `kind` is `s` (statement start — the only safe breakpoint), `p` (prologue), or `e` (implicit return) |
+| `func` / `main` | name, start, end, file, line, framesize, result type | one routine's code range and frame size, followed by its `param`/`local` records |
+| `param` / `local` / `global` | name, location, type, array flag, bounds | where a variable lives and how to read it |
+| `record` / `field` | name, size, fields | a record type's layout, for typed variables of that type |
+
+Frames are found through the **rbp chain**: `[rbp]` is the caller's saved rbp, `[rbp+8]` the
+return address. At a statement-start (`s`) line, `rsp = rbp - framesize` and every variable
+is in memory — nothing is kept in a register across statements, so that is always a safe
+stopping point.
+
+### Calling convention
+
+| what | Linux | Windows |
+|---|---|---|
+| up to 10 parameters | `rdi, rsi, rdx, rcx, r8, r9, r12, r13, r14, r15` | same registers (Wantzel's own convention; Windows API calls go through `winapi`/callback adapters instead) |
+| array parameter | two registers: base pointer, then length | same |
+| result | `rax` (a `real` result is its IEEE-754 bit pattern in `rax`) | same |
+| frame set-up | `push rbp; mov rbp, rsp; sub rsp, framesize`, locals zeroed | same |
+
+### Types, in memory
+
+| type | size | layout |
+|---|---|---|
+| `int` | 8 | two's-complement, little-endian |
+| `char` | 1 | one byte |
+| `bool` | 1 | `0` or `1` |
+| `real` | 8 | IEEE-754 double |
+| `str` | 8 | address of the first character; length is the 8 bytes before it; NUL-terminated; `0` is the empty string |
+| `record` | sum of fields | declaration order; `char`/`bool` fields 1-aligned, everything else 8-aligned, size rounded up to a multiple of 8 |
+
+### What already works, beyond the standard library
+
+`sysN` emits the raw syscall instruction and the compiler knows no call by name, so anything
+the kernel offers is reachable without a compiler change — including things once assumed
+impossible:
+
+| capability | status |
+|---|---|
+| `fork`, copy-on-write, exit codes and signals, non-blocking reap | works, measured |
+| shared memory and locking between processes | works, measured |
+| several worker processes behind one listening socket | works (`http.serve`) |
+| durable storage with crash recovery | works (`lib/store.wz`: append-only log + snapshot) |
+| multiple writers to one store | not done — a deliberate choice, not a limit; the primitives (`MAP_SHARED`, `flock`) are already present |
+| TLS | no — handled by a process in front; the one honest exception to "no dependencies" |
+| threads | no, and stays no — separate processes do the same job without shared state |
+
+### Measurements the design rests on
+
+Same machine (Intel Core Ultra 7 258V, 6 cores, 16 GB), same job where stated: counting a
+pattern in a 2 GB file, every implementation giving the identical answer.
+
+| measure | value | what it means |
+|---|---|---|
+| compile speed | a 189-line program: 3 ms. The compiler itself, 6,772 lines: ~10 ms | one pass, no optimiser — compiling is not a step you wait for |
+| binary size | 22,786 bytes, static, vs. 2,040,611 for the same program in Go | a factor of 89.6 with no runtime hidden on either side |
+| run time | 0.72 s (`mmap` + scan) vs. 0.82 s for the same approach in Go | no optimiser does not cost speed for this class of program; the gap against Go's `read()`-based version (1.17 s) is larger but is an I/O-strategy difference, not code generation |
+| generated-code mistakes | 30 of 100 recorded errors are library misuse, more than syntax and namespace combined | the strictness and the whole-program examples in [writing-wantzel.md](writing-wantzel.md) answer this category specifically |
+
+These numbers are narrow by design: one machine, one class of program (a tight byte loop,
+exactly where an optimiser has least to find), and the run-time lead is mostly `mmap`, not
+code generation. They are not a claim against other languages in general — only evidence for
+the specific trade made above.
+
+### No pointers: what was tried before trusting it
+
+Nine linked structures were built without pointers — list, tree, graph with cycles, a
+heterogeneous AST, a free list, zero-copy views, arbitrary OS memory as an array — and all
+nine work, with two actively better off: a cyclic graph needs no ownership tracking (nothing
+to free), and an index-based structure written to disk and read back has every link still
+valid with no fix-up pass. The one place this does not extend is a **function** address,
+which callbacks (above) solve with a narrow, checked exception rather than general pointers.
 
 ---
 
 ## Influences
 
-Two languages shaped this one, in different ways.
-
-**Turbo Pascal**, for what a short loop feels like. I worked with it a great deal. It
-compiled in the blink of an eye — you pressed a key and your program ran — and that speed
-made something possible I have rarely experienced as well since: you *iterated in thought*,
-not in waiting time. You simply tried things, because trying was free. One environment, one
-step, strict enough to catch your mistakes, complete enough to build a whole project with.
-
-Later everything got slower, and it is worth asking why, because computers got a thousand
-times faster in the meantime. The gain went into layers: not one compiler but a compiler
-plus a bundler plus a transpiler plus a package manager plus a linter plus a test runner
-plus a container layer, each with its own configuration and its own way of breaking. The
-speed target here is not nostalgia; it is a claim that the old loop is still available if
-you decline the layers.
-
-The syntax comes from the same place, for a plainer reason: Pascal reads almost like
-pseudocode, with `begin`/`end` instead of braces, `:=` for assignment and `=` for
-comparison, and types after the name. Little syntactic noise, and nothing to learn before
-you can read the standard library.
-
-**Go**, for what a deployable artifact should be. A static binary with no runtime to
-install, fast builds, a standard library that can serve HTTP on its own rather than through
-a framework, and a deliberately small language that resists clever constructions — those
-are the right instincts, and this language shares all four. It pushes two of them further,
-at a cost Go had good reason not to pay: dependencies are not merely few but structurally
-impossible, and the contract for an API is a language construct rather than a code
-generator run as an extra build step. The price is an ecosystem of one.
-
-Neither is a model to copy. What is taken from Turbo Pascal is the loop, and what is taken
-from Go is the shape of the thing you ship.
-
----
-
-## One way per concept
-
-Many languages want to be object-oriented *and* functional *and* procedural. Constructions
-then appear that nobody fully oversees — three ways to do the same thing, each with its own
-edge cases. For a person that is hard to hold. For a generator it is an invitation to be
-inconsistent: one function in one style, the next in another, and nobody notices until it
-matters.
-
-Wantzel is procedural, strictly typed, and deliberately small: no heap, no pointers, no
-function pointers, no overloading, no generics, no exceptions, no threads, no implicit
-conversions. One type per concept.
-
-That is a choice, not poverty. Fewer ways to express a thing means fewer ways to get it
-wrong, and the expressiveness given up comes back as predictability — which is exactly what
-both a reader and a generator need.
-
-The rule is not only about types. Wherever two mechanisms would overlap, there is one:
-`bool` and no `boolean`, `include` and no module system, and — as the
-section above works out — errors and no warnings, because "valid" and "valid but I have
-remarks" are two answers to a question that should have one. The deviations from Pascal are
-the same rule applied case by case:
-
-| Pascal | Wantzel | why |
-|---|---|---|
-| `boolean`, `integer`, `real`, `single`, `double` | `bool`, `int`, `real` | one type per concept; no choice is no mistake |
-| pointers, `new`/`dispose` | absent | no heap means no memory leak and no use-after-free — see [`internals/no-pointers.md`](internals/no-pointers.md) for what that costs in practice |
-| `string`, `ansistring`, `pchar` | `str` (literal) + `array of char` | no hidden allocation |
-| units, `uses` | `include` | one mechanism |
-| `(* *)` and `{ }` | only `//` | `{ }` ended at the first `}`, so a brace in the comment text turned the rest of the sentence into code |
-
-### The test that decides a syntax question
-
-The rule above is easy to state and easy to misapply, because "one way per concept" sounds
-like an argument for removing anything that has a neighbour. Every row in that table has
-one thing in common, and it is the actual test:
-
-> **Each deviation removes a *choice* between alternatives that meant the same thing.
-> None of them removes a *distinction*.**
-
-Six integer types collapse to one because they were six spellings of the same idea. `units`
-and `include` were two mechanisms for one job. But `procedure` and `function` are not two
-ways to say one thing — one returns a value the caller must use, the other does not, and the
-rule that a result may not be discarded depends on telling them apart. Removing that would
-cost something; removing `longint` cost nothing.
-
-Two more things follow from it, and they settle most cases before an argument starts:
-
-- **A familiar spelling is kept where it costs nothing — and "nothing" is a measurement,
-  not an assumption.** The `{ }` comment looked free by this test: familiar to a Pascal
-  reader, one branch in the lexer, arguably a second concept rather than a second spelling.
-  The error log said otherwise — six of seven recorded syntax errors came from it, because
-  it ended at the first `}` and a brace in the comment text turned prose into code. It was
-  removed. Where a count exists, it outranks the argument.
-- **Compatibility is not a goal; familiarity is.** Wantzel is not an ISO-7185 dialect and
-  does not try to be. But "if you have written Pascal you will read Wantzel without
-  explanation" is a promise worth keeping, and a change that *creates* a deviation where
-  none existed — `end;` instead of `end.` — pays that price for nothing.
-
-Where the two genuinely pull against each other, the yardstick above decides: a familiar
-spelling that makes a *generator* likelier to be wrong loses, however comfortable it is for
-a person. Case-insensitive identifiers with a merely cosmetic dot are the live example —
-faithful to Pascal, and the largest single source of errors we have measured.
-
----
-
-## Why schemas are compiled
-
-This is problem 2 and problem 3 in their sharpest form, so it gets its own keyword.
-
-Exposing one function to the outside world normally takes a stack of layers: a schema file,
-a validation layer that reads it, a parser that turns JSON into objects, a serialisation
-layer that turns them back, a router that decides which function to call, and a generator
-that makes the documentation. Six pieces to describe one function, and the function itself
-is the smallest of them.
-
-Every one of those layers is *configured* rather than compiled. That has a direct
-consequence: almost nothing they can get wrong is caught before the program runs. A field
-arrives in a shape the parser did not expect, a route does not match what the schema
-promised, a validator is skipped on one path, a serialiser silently drops a value. Each of
-those is a runtime failure — in front of a caller — for a mistake that was fully knowable
-while compiling.
-
-**What Wantzel does.** The declaration *is* the implementation. A `schema` in your source
-is compiled into the parser, the writer and the JSON Schema; there is no DOM, no reflection
-and no allocation, and the parser reads straight out of the input buffer. A `tools` block
-compiles into the MCP tool table, the argument parsing, the dispatch, the REST route and
-the OpenAPI document.
-
-The point is not that those layers are easier to configure here. It is that they are gone:
-nothing is left to misconfigure, nothing has to be kept in sync, and the whole class of
-runtime failure above cannot happen. A field that is not in the schema is not a validation
-error at run time; it is a program that does not compile. Same idea as the name — make the
-impossible impossible rather than catch it afterwards.
-
-Two things follow from that, and both are the point rather than a bonus. The schema, the
-code and the documentation cannot drift apart, because they are one source rather than
-three that have to agree. And the generated parser is faster than a configured one, because
-it does no lookup, allocates nothing, and knows every field at compile time.
-
-The distinction that matters is what belongs *in the language* and what belongs in the
-library. The contract goes in the language, because that is what otherwise falls apart
-across six layers. The HTTP client does not: put that in the language and you can no longer
-replace it.
-
----
-
-## Where the idea does not hold
-
-The question is not whether this is right for everyone. It is whether it is the right tool
-for a given job, and what you give up is not little:
-
-- **No ecosystem.** Every library you need, you write.
-- **No debugger, no profiler, no IDE support.** Printf and tests.
-- **Almost nobody knows this language.** The bus factor is very small.
-- **No proven memory safety.** Only "no pointers" and a test suite — not years of work on a
-  type system that proves it. Nine structures were built to test whether the absence costs
-  anything ([`internals/no-pointers.md`](internals/no-pointers.md)); nine cases is evidence,
-  not a proof, and that document says so itself.
-- **Every bug in the compiler is your bug.** An example: an enum level starting with a digit
-  produces an invalid constant name. Elsewhere that is someone else's issue to fix; here it
-  is a ticket with your own name on it.
-- **A small language says no often.** Sometimes it says no to something reasonable, and the
-  answer is to write more code rather than reach for a feature.
-
-That list is the price, and it is a defensible price for a program that has to keep working
-for years on a machine nobody maintains, where the number of moving parts matters more than
-the speed of writing the first version. For a great deal of other work it is a bad price,
-and the honest answer is to use something else.
-
-An honest, measured comparison against other languages — one yardstick, and where each of
-them beats this one — is still outstanding. Until that exists, everything above is a
-reasoned position and not proof.
-
----
+Two languages shaped this one. **Turbo Pascal**, for what a short compile-run loop feels
+like, and for syntax that reads close to pseudocode. **Go**, for what a deployable artifact
+should be: a static binary, fast builds, a capable standard library, a deliberately small
+language. Wantzel pushes both further than either did: dependencies are not merely few but
+structurally impossible, and an API contract is a language construct rather than a generator
+run as a build step.
 
 ## What it comes down to
 
 One binary you can copy instead of a stack you have to install. A compiler that answers in
 milliseconds and says plainly what cannot work. One declaration where there were five
-descriptions that could disagree.
-
-The need was never "a new programming language". The need was a program you can copy rather
-than install, that still builds in five years. That the language had to be new for that is a
-consequence, not a goal.
+descriptions that could disagree. The language had to be new to get there; that was a
+consequence, not the goal.

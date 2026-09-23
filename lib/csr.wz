@@ -1,0 +1,472 @@
+// lib/csr.wz -- a certificate signing request, and a self-signed certificate (RFC 2986, 5280).
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// TWO THINGS THAT SHARE ALMOST EVERYTHING:
+//
+//   csr.make   a CSR, which is what ACME asks for: "here are the names I want, here is my
+//              public key, and here is proof I hold the matching private key"
+//   csr.selfsign  a certificate signed by its own key, for localhost -- where a certificate
+//              authority cannot help, because there is nothing about `localhost` to validate
+//
+// Both are: build the part that gets signed, hash it, sign it, and wrap the two together.
+//
+// P-256 ONLY. That is the key this library can generate and sign with; RSA would need the
+// bignum work that is still open.
+//
+// THE SIGNATURE COVERS THE BYTES AS ENCODED, which is why the signed region is remembered as
+// a slice rather than re-encoded. Re-encoding to sign is how two different requests end up
+// treated as the same one.
+
+include "io.wz";
+include "der.wz";
+include "sha256.wz";
+include "p256.wz";
+
+var
+  csr.buf:  array[0..4095] of char;
+  csr.n:    int;
+  csr.hash: array[0..31] of char;
+  csr.one:  array[0..0] of char;
+  csr.tmp:  array[0..255] of char;
+  csr.err:  str;
+  csr.tmp2: array[0..P.N-1] of int;   // the digest as a scalar, for signing
+
+// OID bytes, written out rather than parsed from dotted notation: there are four of them and
+// a parser would be more code than the constants.
+//   1.2.840.10045.2.1    id-ecPublicKey
+//   1.2.840.10045.3.1.7  prime256v1
+//   1.2.840.10045.4.3.2  ecdsa-with-SHA256
+//   2.5.4.3              commonName
+//   2.5.29.17            subjectAltName
+//   1.2.840.113549.1.9.14  extensionRequest (the CSR attribute that carries extensions)
+procedure csr.oid(which: int; out: array of char);
+var s: str;
+    i: int;
+begin
+  if which = 1 then s := "\x2a\x86\x48\xce\x3d\x02\x01"
+  else if which = 2 then s := "\x2a\x86\x48\xce\x3d\x03\x01\x07"
+  else if which = 3 then s := "\x2a\x86\x48\xce\x3d\x04\x03\x02"
+  else if which = 4 then s := "\x55\x04\x03"
+  else if which = 5 then s := "\x55\x1d\x11"
+  else if which = 6 then s := "\x2a\x86\x48\x86\xf7\x0d\x01\x09\x0e"
+  else if which = 7 then s := "\x55\x1d\x13"
+  else s := "";
+  i := 0;
+  while i < slen(s) do begin out[i] := schar(s, i); i := i + 1; end;
+  csr.n := slen(s);
+end;
+
+// An ECDSA signature as DER: SEQUENCE { INTEGER r, INTEGER s }.
+//
+// A DER INTEGER IS SIGNED, so a value with its top bit set needs a leading zero byte, and
+// leading zeros are otherwise forbidden so they must be stripped first. Both halves matter:
+// omit the zero and the peer reads a negative number; keep the extra zeros and the encoding
+// is not DER and some parsers refuse it.
+function csr.dersig(b: array of char; at: int; r: array of int; sg: array of int): int;
+var seqat, i, n: int;
+    tmp: array[0..31] of char;
+begin
+  b[at] := chr(DER.SEQ);
+  seqat := at + 1;
+  at := at + 2;
+  i := 0;
+  while i < 2 do
+  begin
+    if i = 0 then p256.tobytes(tmp, 0, r) else p256.tobytes(tmp, 0, sg);
+    n := 0;
+    while (n < 31) and (tmp[n] = chr(0)) do n := n + 1;
+    b[at] := chr(DER.INT);
+    if ord(tmp[n]) >= 128 then
+    begin
+      b[at + 1] := chr(32 - n + 1);
+      b[at + 2] := chr(0);
+      at := at + 3;
+    end
+    else
+    begin
+      b[at + 1] := chr(32 - n);
+      at := at + 2;
+    end;
+    while n < 32 do begin b[at] := tmp[n]; at := at + 1; n := n + 1; end;
+    i := i + 1;
+  end;
+  b[seqat] := chr(at - seqat - 1);
+  return at;
+end;
+
+// Hash b[from..from+n) into csr.hash.
+procedure csr.digest(b: array of char; from: int; n: int);
+var i: int;
+begin
+  sha256.init;
+  i := 0;
+  while i < n do
+  begin
+    csr.one[0] := b[from + i];
+    sha256.update(csr.one);
+    i := i + 1;
+  end;
+  sha256.final(csr.hash);
+end;
+
+// AlgorithmIdentifier for ecdsa-with-SHA256. NO PARAMETERS: RFC 5758 says the parameters
+// field must be ABSENT for ECDSA, not NULL. A NULL there is accepted by some parsers and
+// rejected by others, which makes it the kind of bug that works in testing and fails in the
+// field.
+function csr.algid(b: array of char; at: int): int;
+var mark: int;
+begin
+  at := der.open(b, at);
+  mark := der.mark;
+  csr.oid(3, csr.tmp);
+  at := der.putoid(b, at, csr.tmp, csr.n);
+  return der.close(b, mark, at);
+end;
+
+// SubjectPublicKeyInfo for a P-256 point: the two algorithm OIDs, then 04||X||Y in a BIT
+// STRING.
+function csr.spki(b: array of char; at: int; qx: array of int; qy: array of int): int;
+var outer, inner: int;
+    pt: array[0..64] of char;
+begin
+  at := der.open(b, at);
+  outer := der.mark;
+  at := der.open(b, at);
+  inner := der.mark;
+  csr.oid(1, csr.tmp);
+  at := der.putoid(b, at, csr.tmp, csr.n);
+  csr.oid(2, csr.tmp);
+  at := der.putoid(b, at, csr.tmp, csr.n);
+  at := der.close(b, inner, at);
+  pt[0] := chr(4);                       // uncompressed point
+  p256.tobytes(pt, 1, qx);
+  p256.tobytes(pt, 33, qy);
+  at := der.putbits(b, at, pt, 0, 65);
+  return der.close(b, outer, at);
+end;
+
+// A Name with one commonName. ACME ignores the subject entirely and looks only at the SANs,
+// but a CSR with an empty Name is refused by some tooling, so one CN goes in.
+function csr.name(b: array of char; at: int; cn: array of char; cnn: int): int;
+var seq, set1, rdn: int;
+begin
+  at := der.open(b, at);
+  seq := der.mark;
+  at := der.opentag(b, at, DER.SET);
+  set1 := der.mark;
+  at := der.open(b, at);
+  rdn := der.mark;
+  csr.oid(4, csr.tmp);
+  at := der.putoid(b, at, csr.tmp, csr.n);
+  at := der.putstrb(b, at, DER.UTF8STR, cn, cnn);
+  at := der.close(b, rdn, at);
+  at := der.close(b, set1, at);
+  return der.close(b, seq, at);
+end;
+
+// The subjectAltName extension holding one dNSName. Tag 0x82 is [2] IMPLICIT IA5String,
+// which is what a dNSName is inside a GeneralName.
+function csr.san(b: array of char; at: int; host: array of char; hn: int): int;
+var seq, i: int;
+begin
+  at := der.open(b, at);
+  seq := der.mark;
+  at := der.put(b, at, 0x82, host, 0, hn);
+  i := 0;
+  while i < 1 do i := i + 1;
+  return der.close(b, seq, at);
+end;
+
+// ---- the CSR ---------------------------------------------------------------------------
+//
+// CertificationRequest ::= SEQUENCE {
+//   certificationRequestInfo, signatureAlgorithm, signature BIT STRING }
+//
+// and the info is SEQUENCE { version, subject, spki, attributes [0] }.
+//
+// THE SANs GO IN AN ATTRIBUTE, not directly: a CSR has no extensions field of its own, so
+// requested extensions travel inside an extensionRequest attribute. ACME reads the names
+// from there.
+function csr.make(host: array of char; hn: int; d: array of int; qx: array of int; qy: array of int): bool;
+var at, outer, info, attrs, attr, attrset, exts, ext: int;
+    infoat, infon: int;
+begin
+  csr.err := "";
+  p256.setup;
+  at := 0;
+  at := der.open(csr.buf, at);
+  outer := der.mark;
+
+  infoat := at;
+  at := der.open(csr.buf, at);
+  info := der.mark;
+  at := der.putint(csr.buf, at, 0);                 // version v1
+  at := csr.name(csr.buf, at, host, hn);
+  at := csr.spki(csr.buf, at, qx, qy);
+
+  // attributes [0] IMPLICIT, holding one extensionRequest
+  at := der.opentag(csr.buf, at, 0xA0);
+  attrs := der.mark;
+  at := der.open(csr.buf, at);
+  attr := der.mark;
+  csr.oid(6, csr.tmp);
+  at := der.putoid(csr.buf, at, csr.tmp, csr.n);
+  at := der.opentag(csr.buf, at, DER.SET);
+  attrset := der.mark;
+  at := der.open(csr.buf, at);
+  exts := der.mark;
+  at := der.open(csr.buf, at);
+  ext := der.mark;
+  csr.oid(5, csr.tmp);
+  at := der.putoid(csr.buf, at, csr.tmp, csr.n);
+  // The extension's value is an OCTET STRING wrapping the encoded SAN sequence.
+  csr.n := csr.san(csr.tmp, 0, host, hn);
+  at := der.put(csr.buf, at, DER.OCTSTR, csr.tmp, 0, csr.n);
+  at := der.close(csr.buf, ext, at);
+  at := der.close(csr.buf, exts, at);
+  at := der.close(csr.buf, attrset, at);
+  at := der.close(csr.buf, attr, at);
+  at := der.close(csr.buf, attrs, at);
+  at := der.close(csr.buf, info, at);
+  infon := at - infoat;
+
+  // ---- sign the info, exactly as encoded ----
+  csr.digest(csr.buf, infoat, infon);
+  p256.frombytes(csr.tmp2, csr.hash, 0);
+  if not p256.sign(d, csr.tmp2) then
+  begin
+    csr.err := "could not sign the request";
+    return false;
+  end;
+  at := csr.algid(csr.buf, at);
+  csr.n := csr.dersig(csr.tmp, 0, p256.sigr, p256.sigs);
+  at := der.putbits(csr.buf, at, csr.tmp, 0, csr.n);
+  at := der.close(csr.buf, outer, at);
+  csr.n := at;
+  return true;
+end;
+
+// ---- a self-signed certificate ------------------------------------------------------------
+//
+// FOR LOCALHOST, AND NOT AS A POOR MAN'S CA. Let's Encrypt cannot issue for `localhost` or
+// `127.0.0.1` -- not out of strictness but because ACME proves control of a PUBLIC name, and
+// localhost belongs to everyone. There is no DNS record and no reachable address to
+// validate. The same holds for `.local`, `.internal` and every RFC1918 address.
+//
+// So a machine that wants TLS on loopback has to make its own, and this is that. It is also
+// what lets our own TLS server be tested without involving an authority.
+//
+// NOBODY WILL TRUST IT, and that is not a defect to work around. A self-signed certificate
+// gets a browser warning because the warning is correct: nothing vouches for it. The honest
+// uses are a developer who accepts the warning, and a client that was told this exact
+// certificate is the root -- which is what tests/lib/serve.sh does.
+//
+// TEN YEARS OF VALIDITY, because renewal here is work with no purpose: there is no authority
+// to re-check anything, and an expiry only creates an outage on a machine talking to itself.
+
+// THE CALENDAR, LOCALLY. x509.wz has the same two functions, but including it here would
+// pull the whole certificate PARSER into every program that only wants to WRITE one --
+// and csr.wz is the writing half. Two small functions duplicated is the cheaper mistake.
+function csr.leap(y: int): bool;
+begin
+  if band(y, 3) <> 0 then return false;
+  if y mod 100 <> 0 then return true;
+  return y mod 400 = 0;
+end;
+
+function csr.mdays(y: int; m: int): int;
+begin
+  if (m = 4) or (m = 6) or (m = 9) or (m = 11) then return 30;
+  if m = 2 then begin if csr.leap(y) then return 29; return 28; end;
+  return 31;
+end;
+
+procedure csr.two(b: array of char; at: int; v: int);
+begin
+  b[at] := chr(ord('0') + (v div 10) mod 10);
+  b[at + 1] := chr(ord('0') + v mod 10);
+end;
+
+// Encode a time as UTCTime, which is YYMMDDHHMMSSZ.
+//
+// UTCTime, NOT GeneralizedTime, for anything before 2050 -- RFC 5280 4.1.2.5 requires it,
+// and a certificate that uses the wrong one is refused by strict parsers while looking fine
+// to lenient ones. After 2050 the rule flips; this refuses rather than guessing, because a
+// certificate dated 2050 from a ten-year validity means the clock is wrong.
+function csr.puttime(b: array of char; at: int; t: int): int;
+var y, mo, d, h, mi, s, days, i, dim: int;
+begin
+  days := t div 86400;
+  s := t - days * 86400;
+  h := s div 3600; s := s - h * 3600;
+  mi := s div 60;  s := s - mi * 60;
+  y := 1970;
+  while true do
+  begin
+    i := 365;
+    if csr.leap(y) then i := 366;
+    if days < i then break;
+    days := days - i;
+    y := y + 1;
+  end;
+  if (y < 1950) or (y >= 2050) then begin csr.err := "a date UTCTime cannot express"; return 0 - 1; end;
+  mo := 1;
+  while true do
+  begin
+    dim := csr.mdays(y, mo);
+    if days < dim then break;
+    days := days - dim;
+    mo := mo + 1;
+  end;
+  d := days + 1;
+  b[at] := chr(DER.UTCTIME);
+  b[at + 1] := chr(13);
+  // THE YEAR IS y mod 100, NOT band(y, 100). That was a real bug: band is BITWISE, so 2026
+  // became 96 and the certificate claimed 1996 -- a date that parses, prints and is wrong.
+  csr.two(b, at + 2,  y mod 100);
+  csr.two(b, at + 4,  mo);
+  csr.two(b, at + 6,  d);
+  csr.two(b, at + 8,  h);
+  csr.two(b, at + 10, mi);
+  csr.two(b, at + 12, s);
+  b[at + 14] := 'Z';
+  return at + 15;
+end;
+
+
+
+// csr.selfsign -- a certificate for `host`, signed by its own key.
+//
+// The result is in csr.buf[0..csr.n), DER, ready for tls.setcert. `now` is seconds since
+// the epoch; `years` is how long it should last.
+//
+// WHAT GOES IN IT, and each line is required by RFC 5280 for a certificate anything will
+// parse:
+//   version v3          -- needed, because extensions only exist from v3
+//   serial              -- any positive integer; derived from the time here
+//   signature algid     -- twice, inside and outside, and they must agree
+//   issuer = subject    -- that is what "self-signed" means
+//   validity            -- notBefore a minute in the past, for clock skew between machines
+//   subjectPublicKeyInfo
+//   extensions          -- subjectAltName, and basicConstraints saying CA:FALSE
+//
+// notBefore IS BACKDATED ONE MINUTE on purpose. Two machines whose clocks differ by seconds
+// are ordinary, and a certificate that is not valid yet fails in a way that looks permanent.
+// THE CLOCK AND THE LIFETIME COME FROM MODULE STATE, not from arguments: four arrays plus
+// three integers is over the ten a routine may take (an array counts as two). Set them with
+// csr.setvalidity before calling.
+var
+  csr.now:   int;
+  csr.years: int;
+
+procedure csr.setvalidity(now: int; years: int);
+begin
+  csr.now := now;
+  csr.years := years;
+end;
+
+function csr.selfsign(host: array of char; hn: int; d: array of int;
+                      qx: array of int; qy: array of int): bool;
+var at, outer, tbs, exts, ext, bc, now, years: int;
+    tbsat, tbsn: int;
+begin
+  csr.err := "";
+  now := csr.now;
+  years := csr.years;
+  if years <= 0 then years := 10;
+  p256.setup;
+  at := 0;
+  at := der.open(csr.buf, at);
+  outer := der.mark;
+
+  tbsat := at;
+  at := der.open(csr.buf, at);
+  tbs := der.mark;
+
+  // version [0] EXPLICIT, holding INTEGER 2 -- that is v3.
+  csr.buf[at] := chr(0xA0);
+  csr.buf[at + 1] := chr(3);
+  csr.buf[at + 2] := chr(DER.INT);
+  csr.buf[at + 3] := chr(1);
+  csr.buf[at + 4] := chr(2);
+  at := at + 5;
+
+  // serialNumber. MUST BE POSITIVE (RFC 5280 4.1.2.2), so the top bit is cleared -- a
+  // negative serial is the kind of thing that works everywhere except in one parser.
+  at := der.putint(csr.buf, at, band(now, 0x7FFFFFFF));
+
+  at := csr.algid(csr.buf, at);
+  at := csr.name(csr.buf, at, host, hn);          // issuer
+
+  // validity
+  at := der.open(csr.buf, at);
+  ext := der.mark;
+  at := csr.puttime(csr.buf, at, now - 60);
+  if at < 0 then return false;
+  at := csr.puttime(csr.buf, at, now + years * 31536000);
+  if at < 0 then return false;
+  at := der.close(csr.buf, ext, at);
+
+  at := csr.name(csr.buf, at, host, hn);          // subject, the same
+  at := csr.spki(csr.buf, at, qx, qy);
+
+  // extensions [3] EXPLICIT
+  at := der.opentag(csr.buf, at, 0xA3);
+  exts := der.mark;
+  at := der.open(csr.buf, at);
+  ext := der.mark;
+
+  // basicConstraints, critical, CA:FALSE.
+  //
+  // CA:FALSE IS NOT DECORATION HERE. lib/chain.wz refuses a certificate that signs without
+  // it, and so does every other verifier -- leaving it out makes a certificate that could
+  // in principle issue others, which is not what a server certificate is for.
+  at := der.open(csr.buf, at);
+  bc := der.mark;
+  csr.oid(7, csr.tmp);
+  at := der.putoid(csr.buf, at, csr.tmp, csr.n);
+  csr.buf[at] := chr(DER.BOOL);
+  csr.buf[at + 1] := chr(1);
+  csr.buf[at + 2] := chr(0xFF);                   // critical
+  at := at + 3;
+  csr.tmp[0] := chr(DER.SEQ);
+  csr.tmp[1] := chr(0);
+  at := der.put(csr.buf, at, DER.OCTSTR, csr.tmp, 0, 2);
+  at := der.close(csr.buf, bc, at);
+
+  // subjectAltName
+  at := der.open(csr.buf, at);
+  bc := der.mark;
+  csr.oid(5, csr.tmp);
+  at := der.putoid(csr.buf, at, csr.tmp, csr.n);
+  csr.n := csr.san(csr.tmp, 0, host, hn);
+  at := der.put(csr.buf, at, DER.OCTSTR, csr.tmp, 0, csr.n);
+  at := der.close(csr.buf, bc, at);
+
+  at := der.close(csr.buf, ext, at);
+  at := der.close(csr.buf, exts, at);
+  at := der.close(csr.buf, tbs, at);
+  tbsn := at - tbsat;
+
+  // ---- sign the tbsCertificate, exactly as encoded ----
+  //
+  // EXACTLY AS ENCODED is the point: the signature covers those bytes, not a re-encoding of
+  // the same values. Two encodings of one certificate are two different certificates, and a
+  // verifier that re-encodes before hashing rejects its own output.
+  csr.digest(csr.buf, tbsat, tbsn);
+  p256.frombytes(csr.tmp2, csr.hash, 0);
+  if not p256.sign(d, csr.tmp2) then
+  begin
+    csr.err := "could not sign the certificate";
+    return false;
+  end;
+  at := csr.algid(csr.buf, at);
+  csr.n := csr.dersig(csr.tmp, 0, p256.sigr, p256.sigs);
+  at := der.putbits(csr.buf, at, csr.tmp, 0, csr.n);
+  at := der.close(csr.buf, outer, at);
+  csr.n := at;
+  return true;
+end;

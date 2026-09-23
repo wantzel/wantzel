@@ -1,5 +1,9 @@
 // lib/io.wz -- output, numbers and little-endian byte packing.
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 // Everything here talks to the kernel directly; there is no buffering
 // layer and no allocation.
 
@@ -158,12 +162,65 @@ begin
   return at;
 end;
 
+// A command-line argument, copied and read. Four examples wrote this pair out by hand
+// (serve.wz, getcert.wz, tcpproxy.wz, wget.wz) before it moved here --
+// the same loop over argch, stopping at chr(0) or the buffer's end, every time.
+//
+// io.argstr truncates rather than refusing, matching io.push above: a caller reading
+// its own argument list controls what it passes, and a truncated hostname is a worse
+// bug to chase than a short one that still runs.
+function io.argstr(k: int; dst: array of char): int;
+var j: int;
+    c: char;
+begin
+  j := 0;
+  c := argch(k, j);
+  while (c <> chr(0)) and (j < len(dst) - 1) do
+  begin
+    dst[j] := c;
+    j := j + 1;
+    c := argch(k, j);
+  end;
+  dst[j] := chr(0);
+  return j;
+end;
+
+// The k-th argument as a non-negative integer, stopping at the first non-digit. Reads
+// straight from argch rather than through io.argstr, so no buffer is needed for a port
+// number or a count.
+function io.argn(k: int): int;
+var j, v: int;
+    c: char;
+begin
+  v := 0; j := 0; c := argch(k, j);
+  while (c >= '0') and (c <= '9') do
+  begin v := v * 10 + (ord(c) - ord('0')); j := j + 1; c := argch(k, j); end;
+  return v;
+end;
+
 procedure io.put32(b: array of char; at: int; v: int);
 begin
   b[at]     := chr(band(v, 255));
   b[at + 1] := chr(band(v shr 8, 255));
   b[at + 2] := chr(band(v shr 16, 255));
   b[at + 3] := chr(band(v shr 24, 255));
+end;
+
+// Eight bytes, little-endian, the mirror of io.get64.
+//
+// THE SHIFT MUST BE MASKED AT EACH STEP and not only at the end: shr in Wantzel is
+// ARITHMETIC, so a negative value shifts ones in from the top. band(v, 255) on every byte
+// makes that harmless, which is why the loop looks more careful than it needs to.
+procedure io.put64(b: array of char; at: int; v: int);
+var i: int;
+begin
+  i := 0;
+  while i < 8 do
+  begin
+    b[at + i] := chr(band(v, 255));
+    v := v shr 8;
+    i := i + 1;
+  end;
 end;
 
 function io.get64(b: array of char; at: int): int;

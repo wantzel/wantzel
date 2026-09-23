@@ -1,0 +1,101 @@
+// winmessage.wz -- the smallest visible Windows call: a message box.
+//
+//   wantzel examples/winmessage.wz winmessage.exe --target=windows
+//
+// THE POINT IS THE SECOND LINE, not the box. `winapi("user32.dll", "MessageBoxA", ...)`
+// names a function the compiler has never heard of: there is no entry in an import table
+// and no recompilation of the compiler. The name is DATA, recorded from the source and
+// written into the PE like any other import.
+//
+// WHEN A NAME IS WRONG, YOU FIND OUT AT THREE DIFFERENT MOMENTS -- worth knowing before you
+// misspell one:
+//   the wrong --target      compile time   "winapi() is only available in a Windows executable"
+//   a DLL that is not there load time      the loader refuses; NOT ONE LINE runs
+//   a function that is not  RUN time       it starts, then aborts AT THAT CALL
+//
+// That third one is why every winapi call in this file is reached when it runs with no
+// arguments: a misspelled name sits quietly until something takes that path.
+//
+// The return value says which button was pressed: 1 = OK, 2 = Cancel, 6 = Yes, 7 = No.
+include "io.wz";
+
+const
+  MB_OK          = 0;
+  MB_OKCANCEL    = 1;
+  MB_YESNO       = 4;
+  MB_ICONINFO    = 64;
+  MB_ICONWARNING = 48;
+
+  IDOK     = 1;
+  IDCANCEL = 2;
+  IDYES    = 6;
+  IDNO     = 7;
+
+var
+  title: array[0..63] of char;
+  text:  array[0..255] of char;
+  answer: int;
+
+// zput(dst, s) -- a NUL-terminated copy, because every A-suffixed Win32 function wants one.
+//
+// THE NUL IS THE WHOLE REASON THIS EXISTS. MessageBoxA reads until it finds one; without it
+// the box shows whatever happened to follow in memory, and that is not a crash you get a
+// message about.
+// signed32(v) -- a Win32 return value as the 32-bit int it is.
+//
+// A Win32 function returns a 32-bit value and Wantzel ints are 64-bit, so a negative answer
+// arrives as a very large positive number. MEASURED: MessageBoxA with no display answers
+// 0xFFFFFFFF, which reads as 4294967295 until this is applied.
+function signed32(v: int): int;
+begin
+  v := band(v, 0xFFFFFFFF);
+  if v >= 0x80000000 then return v - 0x100000000;
+  return v;
+end;
+
+procedure zput(dst: array of char; s: str);
+var i: int;
+begin
+  i := 0;
+  while (i < slen(s)) and (i < len(dst) - 1) do
+  begin dst[i] := schar(s, i); i := i + 1; end;
+  dst[i] := chr(0);
+end;
+
+begin
+  zput(title, "Wantzel");
+  zput(text,  "This box came from a program with no runtime and no linker.");
+
+  // THE CALL ITSELF. Four arguments: owner window (0 = none), the text, the title, and the
+  // flags. addr(x[0]) is how an array becomes a pointer -- Win32 wants an address, and
+  // passing the array itself would pass a copy of nothing useful.
+  answer := signed32(winapi("user32.dll", "MessageBoxA",
+                            0, addr(text[0]), addr(title[0]), MB_OK + MB_ICONINFO));
+
+  io.puts(STDOUT, "MessageBox returned ");
+  io.putn(STDOUT, answer);
+  if answer = IDOK then io.puts(STDOUT, " (OK)");
+  io.puts(STDOUT, "\n");
+
+  // AND A SECOND ONE THAT ASKS SOMETHING, so the return value is worth reading. A box with
+  // one button always answers 1; this one can answer 6 or 7.
+  zput(text, "Was that the smallest Windows program you have seen?");
+  answer := signed32(winapi("user32.dll", "MessageBoxA",
+                            0, addr(text[0]), addr(title[0]), MB_YESNO + MB_ICONWARNING));
+
+  io.puts(STDOUT, "you answered ");
+  if answer = IDYES then io.puts(STDOUT, "yes\n")
+  else if answer = IDNO then io.puts(STDOUT, "no\n")
+  else
+  begin
+    // NOT AN else THAT ASSUMES. A box can be dismissed without pressing either button --
+    // Escape, or the close cross -- and then the answer is IDCANCEL (2). Zero means the box
+    // could not be created at all, and MEASURED under Wine with no display: it answers
+    // 0xFFFFFFFF. A Win32 function returns a 32-bit int, so read it as one before deciding
+    // it is a huge number.
+    if answer < 0 then io.puts(STDOUT, "no box at all -- is there a display? (")
+    else io.puts(STDOUT, "neither -- the box was dismissed (");
+    io.putn(STDOUT, answer);
+    io.puts(STDOUT, ")\n");
+  end;
+end.

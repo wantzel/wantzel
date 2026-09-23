@@ -1,0 +1,28 @@
+// The other of the two sibling library files, declaring the SAME two names.
+//
+// This is the case the writer of a library actually hits: two platform files, each wanting
+// its own scratch buffer and loop counter. They are different variables with the same
+// spelling, and each file sees only its own.
+local var i: int;
+local var buf: array[0..15] of char;
+
+function b.sum(n: int): int;
+var t: int;
+begin
+  t := 0;
+  i := 0;
+  while i < n do
+  begin
+    t := t + 1;
+    i := i + 1;
+  end;
+  // The buffer is touched so the declaration is not optimised into nothing.
+  buf[0] := chr(66);
+  return t;
+end;
+
+// What this file's own `i` holds afterwards -- the other file must not have changed it.
+function b.lasti: int;
+begin
+  return i;
+end;

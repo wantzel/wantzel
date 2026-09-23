@@ -1,0 +1,317 @@
+// lib/jws.wz -- JSON Web Signature with ES256, and the JWK thumbprint (RFC 7515, 7638).
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// THIS EXISTS FOR ACME. Every request to a certificate authority is a JWS: a header, a
+// payload and a signature over both, each base64url-encoded and joined with dots. The
+// authority replies with a fresh nonce for the next request, which is what stops a captured
+// request from being replayed.
+//
+// THE FLATTENED JSON SERIALISATION, not the compact one. ACME (RFC 8555 §6.2) requires
+//     {"protected":"...","payload":"...","signature":"..."}
+// rather than the three fields joined by dots -- the same bytes, a different envelope.
+//
+// BASE64URL WITHOUT PADDING, everywhere. The '=' of ordinary base64 is not merely optional
+// here: a padded value is a DIFFERENT string, so it changes the signed bytes and the
+// thumbprint. lib/base64.wz's urlencode already does this.
+//
+// THE SIGNATURE IS R||S, NOT DER. This is the one place where ECDSA is not encoded as a DER
+// SEQUENCE: JWS ES256 (RFC 7518 §3.4) wants the two 32-byte values concatenated, 64 bytes
+// flat. Handing it DER produces a signature every verifier rejects, and the error message
+// says nothing useful.
+
+include "io.wz";
+include "base64.wz";
+include "sha256.wz";
+include "p256.wz";
+
+var
+  jws.buf:   array[0..8191] of char;   // the assembled JWS
+  jws.n:     int;
+  jws.tmp:   array[0..2047] of char;   // scratch for one field being encoded
+  jws.tmpn:  int;
+  jws.sig:   array[0..63] of char;     // r || s
+  jws.hash:  array[0..31] of char;
+  jws.thumb: array[0..43] of char;     // the base64url thumbprint, 43 characters
+  jws.thumbn: int;
+  jws.one:   array[0..0] of char;
+  jws.xb:    array[0..31] of char;
+  jws.yb:    array[0..31] of char;
+  jws.err:   str;
+  jws.d:     array[0..P.N-1] of int;
+  jws.qx:    array[0..P.N-1] of int;
+  jws.qy:    array[0..P.N-1] of int;
+  jws.nonceb: array[0..127] of char;
+  jws.noncen: int;
+  jws.kidb:   array[0..255] of char;
+  jws.kidn:   int;
+
+// ---- small helpers -------------------------------------------------------------------------
+
+// base64url of the first n bytes of src, written at `at`. Returns the new position.
+//
+// lib/base64.wz sizes its input with len(), so a prefix cannot be expressed -- the bytes are
+// copied into a view of exactly the right length first.
+function jws.b64(dst: array of char; at: int; src: array of char; n: int): int;
+begin
+  return base64.enc(dst, at, view(addr(src[0]), n), true, false);
+end;
+
+procedure jws.feed(b: array of char; n: int);
+var i: int;
+begin
+  i := 0;
+  while i < n do
+  begin
+    jws.one[0] := b[i];
+    sha256.update(jws.one);
+    i := i + 1;
+  end;
+end;
+
+function jws.push(dst: array of char; at: int; s: str): int;
+begin
+  return io.push(dst, at, s);
+end;
+
+// ---- the JWK, and its thumbprint -----------------------------------------------------------
+//
+// A P-256 public key as a JWK is {"crv":"P-256","kty":"EC","x":"...","y":"..."}.
+//
+// THE FIELD ORDER IS PART OF THE SPECIFICATION, which is unusual for JSON and is the thing
+// that trips people up. RFC 7638 §3.3 says the thumbprint is the SHA-256 of the JSON with
+// no whitespace and the members in LEXICOGRAPHIC order: crv, kty, x, y. Any other order is
+// valid JSON, hashes to something else, and produces an ACME challenge that never validates
+// -- with no error that points here.
+function jws.jwk(dst: array of char; at: int; qx: array of int; qy: array of int): int;
+begin
+  p256.tobytes(jws.xb, 0, qx);
+  p256.tobytes(jws.yb, 0, qy);
+  at := jws.push(dst, at, "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"");
+  at := jws.b64(dst, at, jws.xb, 32);
+  at := jws.push(dst, at, "\",\"y\":\"");
+  at := jws.b64(dst, at, jws.yb, 32);
+  at := jws.push(dst, at, "\"}");
+  return at;
+end;
+
+// The thumbprint of a public key, base64url, into jws.thumb. 43 characters, no padding.
+procedure jws.thumbprint(qx: array of int; qy: array of int);
+begin
+  jws.tmpn := jws.jwk(jws.tmp, 0, qx, qy);
+  sha256.init;
+  jws.feed(jws.tmp, jws.tmpn);
+  sha256.final(jws.hash);
+  jws.thumbn := jws.b64(jws.thumb, 0, jws.hash, 32);
+end;
+
+// The key authorization for an HTTP-01 challenge: "<token>.<thumbprint>" (RFC 8555 §8.1).
+// This is the exact text that must be served at
+//     /.well-known/acme-challenge/<token>
+function jws.keyauth(dst: array of char; at: int; token: str; qx: array of int; qy: array of int): int;
+var i: int;
+begin
+  jws.thumbprint(qx, qy);
+  i := 0;
+  while i < slen(token) do begin dst[at] := schar(token, i); at := at + 1; i := i + 1; end;
+  dst[at] := '.'; at := at + 1;
+  i := 0;
+  while i < jws.thumbn do begin dst[at] := jws.thumb[i]; at := at + 1; i := i + 1; end;
+  return at;
+end;
+
+// ---- signing ---------------------------------------------------------------------------------
+//
+// The signed bytes are  base64url(protected) || "." || base64url(payload)  -- the ENCODED
+// forms joined by a dot, not the raw JSON. Signing the raw JSON instead is a mistake that
+// produces a well-formed JWS which every verifier rejects.
+//
+// Two shapes of header, and ACME needs both (RFC 8555 §6.2):
+//   - with "jwk", the full public key: used for the very first request, which creates the
+//     account, because the server does not know the key yet
+//   - with "kid", the account URL: every request after that. Sending "jwk" once the account
+//     exists is an error the server reports as malformed.
+//
+// jws.sign builds the whole flattened JSON into jws.buf and leaves its length in jws.n.
+// THE KEY LIVES IN MODULE STATE, set with jws.setkey, because a routine takes at most ten
+// arguments and an array counts as two -- d, qx, qy plus a payload is already eight before
+// the three strings. The same reason lib/aead.wz keeps its key aside.
+procedure jws.setkey(d: array of int; qx: array of int; qy: array of int);
+begin
+  p256.copy(jws.d, d);
+  p256.copy(jws.qx, qx);
+  p256.copy(jws.qy, qy);
+end;
+
+// THE SAME SIGNING WITH EVERYTHING AS BYTES, for a caller whose nonce, URL and account
+// identifier arrived over the wire -- Wantzel cannot build a str from characters, so none of
+// those can ever reach the str form above.
+//
+// usekid selects the header shape: false is the jwk form (only the first request, which
+// creates the account), true is the kid form (every request after it). Sending jwk once the
+// account exists is an error the authority reports as malformed.
+// THE NONCE AND THE ACCOUNT ID GO IN MODULE STATE, set with jws.setnonce and jws.setkid,
+// because a routine takes at most ten arguments and an array counts as two -- nonce, url,
+// payload and kid is already eight before the lengths. The same reason lib/aead.wz keeps
+// its key aside.
+procedure jws.setnonce(b: array of char; n: int);
+var i: int;
+begin
+  jws.noncen := 0;
+  while (jws.noncen < n) and (jws.noncen < 127) do
+  begin
+    jws.nonceb[jws.noncen] := b[jws.noncen];
+    jws.noncen := jws.noncen + 1;
+  end;
+  i := 0;
+  while i < 1 do i := i + 1;
+end;
+
+procedure jws.setkid(b: array of char; n: int);
+begin
+  jws.kidn := 0;
+  while (jws.kidn < n) and (jws.kidn < 255) do
+  begin
+    jws.kidb[jws.kidn] := b[jws.kidn];
+    jws.kidn := jws.kidn + 1;
+  end;
+end;
+
+function jws.signb(url: array of char; urln: int;
+                   payload: array of char; paylen: int; usekid: bool): bool;
+var hdr, hdrn, at, protat, protn, payat, payn, i: int;
+    e: array[0..P.N-1] of int;
+begin
+  jws.err := "";
+  hdr := jws.push(jws.tmp, 0, "{\"alg\":\"ES256\",");
+  if usekid then
+  begin
+    hdr := jws.push(jws.tmp, hdr, "\"kid\":\"");
+    i := 0;
+    while i < jws.kidn do begin jws.tmp[hdr] := jws.kidb[i]; hdr := hdr + 1; i := i + 1; end;
+    hdr := jws.push(jws.tmp, hdr, "\",");
+  end
+  else
+  begin
+    hdr := jws.push(jws.tmp, hdr, "\"jwk\":");
+    hdr := jws.jwk(jws.tmp, hdr, jws.qx, jws.qy);
+    hdr := jws.push(jws.tmp, hdr, ",");
+  end;
+  hdr := jws.push(jws.tmp, hdr, "\"nonce\":\"");
+  i := 0;
+  while i < jws.noncen do begin jws.tmp[hdr] := jws.nonceb[i]; hdr := hdr + 1; i := i + 1; end;
+  hdr := jws.push(jws.tmp, hdr, "\",\"url\":\"");
+  i := 0;
+  while i < urln do begin jws.tmp[hdr] := url[i]; hdr := hdr + 1; i := i + 1; end;
+  hdr := jws.push(jws.tmp, hdr, "\"}");
+  hdrn := hdr;
+
+  at := jws.push(jws.buf, 0, "{\"protected\":\"");
+  protat := at;
+  at := jws.b64(jws.buf, at, jws.tmp, hdrn);
+  protn := at - protat;
+  at := jws.push(jws.buf, at, "\",\"payload\":\"");
+  payat := at;
+  at := jws.b64(jws.buf, at, payload, paylen);
+  payn := at - payat;
+  at := jws.push(jws.buf, at, "\",\"signature\":\"");
+
+  sha256.init;
+  jws.feed(view(addr(jws.buf[protat]), protn), protn);
+  jws.one[0] := '.';
+  sha256.update(jws.one);
+  jws.feed(view(addr(jws.buf[payat]), payn), payn);
+  sha256.final(jws.hash);
+  p256.frombytes(e, jws.hash, 0);
+  if not p256.sign(jws.d, e) then
+  begin
+    jws.err := "could not sign";
+    return false;
+  end;
+  p256.tobytes(jws.sig, 0, p256.sigr);
+  p256.tobytes(jws.sig, 32, p256.sigs);
+  at := jws.b64(jws.buf, at, jws.sig, 64);
+  at := jws.push(jws.buf, at, "\"}");
+  jws.n := at;
+  return true;
+end;
+
+// The key authorization with the token as bytes.
+function jws.keyauthb(dst: array of char; at: int; tok: array of char; tokn: int;
+                      qx: array of int; qy: array of int): int;
+var i: int;
+begin
+  jws.thumbprint(qx, qy);
+  i := 0;
+  while i < tokn do begin dst[at] := tok[i]; at := at + 1; i := i + 1; end;
+  dst[at] := '.'; at := at + 1;
+  i := 0;
+  while i < jws.thumbn do begin dst[at] := jws.thumb[i]; at := at + 1; i := i + 1; end;
+  return at;
+end;
+
+function jws.sign(nonce: str; url: str; payload: array of char; paylen: int; kid: str): bool;
+var hdr: int;
+    hdrn: int;
+    e: array[0..P.N-1] of int;
+    at, protat, protn, payat, payn, i: int;
+begin
+  jws.err := "";
+  // ---- the protected header, as JSON, then encoded ----
+  hdr := 0;
+  hdr := jws.push(jws.tmp, hdr, "{\"alg\":\"ES256\",");
+  if slen(kid) > 0 then
+  begin
+    hdr := jws.push(jws.tmp, hdr, "\"kid\":\"");
+    hdr := jws.push(jws.tmp, hdr, kid);
+    hdr := jws.push(jws.tmp, hdr, "\",");
+  end
+  else
+  begin
+    hdr := jws.push(jws.tmp, hdr, "\"jwk\":");
+    hdr := jws.jwk(jws.tmp, hdr, jws.qx, jws.qy);
+    hdr := jws.push(jws.tmp, hdr, ",");
+  end;
+  hdr := jws.push(jws.tmp, hdr, "\"nonce\":\"");
+  hdr := jws.push(jws.tmp, hdr, nonce);
+  hdr := jws.push(jws.tmp, hdr, "\",\"url\":\"");
+  hdr := jws.push(jws.tmp, hdr, url);
+  hdr := jws.push(jws.tmp, hdr, "\"}");
+  hdrn := hdr;
+
+  at := 0;
+  at := jws.push(jws.buf, at, "{\"protected\":\"");
+  protat := at;
+  at := jws.b64(jws.buf, at, jws.tmp, hdrn);
+  protn := at - protat;
+  at := jws.push(jws.buf, at, "\",\"payload\":\"");
+  payat := at;
+  at := jws.b64(jws.buf, at, payload, paylen);
+  payn := at - payat;
+  at := jws.push(jws.buf, at, "\",\"signature\":\"");
+
+  // ---- the signature, over "<protected>.<payload>" ----
+  sha256.init;
+  jws.feed(view(addr(jws.buf[protat]), protn), protn);
+  jws.one[0] := '.';
+  sha256.update(jws.one);
+  jws.feed(view(addr(jws.buf[payat]), payn), payn);
+  sha256.final(jws.hash);
+  p256.frombytes(e, jws.hash, 0);
+  if not p256.sign(jws.d, e) then
+  begin
+    jws.err := "could not sign";
+    return false;
+  end;
+  // R || S, 32 bytes each, big-endian and zero-padded -- NOT DER.
+  p256.tobytes(jws.sig, 0, p256.sigr);
+  p256.tobytes(jws.sig, 32, p256.sigs);
+  at := jws.b64(jws.buf, at, jws.sig, 64);
+  at := jws.push(jws.buf, at, "\"}");
+  jws.n := at;
+  i := 0;
+  while i < 1 do i := i + 1;
+  return true;
+end;

@@ -1,0 +1,20 @@
+// lib/proc.wz: proc.alive(pid) used to answer false, silently, for pid <= 0 -- a "not
+// alive" that looks like a real answer but was never an answer to a real question. 0 and
+// a negative pid address a process GROUP to kill(2), not a single process, so treating
+// that as "checked, and it is not running" can hide a caller bug (an uninitialised or
+// unset pid field) behind what looks like ordinary control flow.
+//
+// Every known caller (lib/proc.wz's own test, and the applications built on it)
+// already guards pid > 0 itself before calling proc.alive, so this must be the caller's
+// contract to keep -- the same shape as proc.arg's "too many arguments" check -- and the
+// fix is io.fatal, not a quieter false.
+//
+// Must stop at run time with exit status 1 and the message below; take the
+// `if pid <= 0 then io.fatal(...)` line out of proc.alive and this prints nothing and
+// exits 0 instead.
+include "io.wz";
+include "proc.wz";
+begin
+  io.puts(STDOUT, "calling proc.alive(0)\n");
+  if proc.alive(0) then io.puts(STDOUT, "alive\n") else io.puts(STDOUT, "not alive\n");
+end.

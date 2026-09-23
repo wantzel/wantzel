@@ -1,0 +1,21 @@
+// kv.bytes and kv.same used to answer "false" for a range that does not exist at all --
+// a negative start, or an end past the array -- exactly the same false they give for two
+// ranges that exist and simply differ. A caller reading only the bool could not tell "these
+// do not match" from "you called me with a broken slice", and the second one is a bug in
+// the caller that a passing test would otherwise hide behind a green "not equal".
+//
+// This pins the fix: such a call now stops the program with io.fatal instead of returning
+// a plausible false. Only one violation can be shown per run (the process halts on the
+// first), so this exercises kv.same's "aend past the end of a" branch; the others in
+// kv.bytes and kv.same follow the same guard, one line for each of the four parameters.
+include "kv.wz";
+var
+  a: array[0..3] of char;
+  b: array[0..3] of char;
+begin
+  io.puts(STDOUT, "before the call\n");
+  // a holds 4 bytes; asking for a[0..5) reaches past the end.
+  io.puts(STDOUT, "kv.same out of range -> ");
+  if kv.same(a, 0, 5, b, 0, 2) then io.puts(STDOUT, "1\n") else io.puts(STDOUT, "0\n");
+  io.puts(STDOUT, "unreachable\n");
+end.

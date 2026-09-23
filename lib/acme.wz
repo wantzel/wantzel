@@ -1,0 +1,421 @@
+// lib/acme.wz -- getting a certificate from a certificate authority (RFC 8555).
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// THE WHOLE PROTOCOL IS SIX REQUESTS, and each is a JWS signed with the account key:
+//
+//   GET  /directory          where everything else lives
+//   HEAD /new-nonce          a nonce; every reply also carries the next one
+//   POST /new-account        create or find the account
+//   POST /new-order          "I want a certificate for these names"
+//   POST /challenge/...      "the token is in place, go and look"
+//   POST /finalize           here is the CSR
+//   POST /cert               fetch the certificate
+//
+// EVERY REPLY CARRIES THE NEXT NONCE in a Replay-Nonce header, and a request that reuses one
+// is refused as badNonce. That is the replay protection, and it means the client is a state
+// machine rather than a set of independent calls.
+//
+// WHAT IS NOT HERE. This module builds and reads the messages; it does not open sockets. The
+// caller does the HTTPS with lib/tls.wz and hands the bodies over, because that keeps the
+// protocol testable without a network and lets the same code run inside an existing event
+// loop rather than blocking one.
+//
+// HTTP-01 ONLY. The challenge is answered by serving one file at
+//     /.well-known/acme-challenge/<token>
+// containing "<token>.<thumbprint>" (lib/jws.wz builds it). DNS-01 is the only way to a
+// wildcard and needs the operator's DNS provider, which is a dependency this stack avoids;
+// it can be added as an explicit choice later.
+
+include "io.wz";
+include "json.wz";
+include "base64.wz";
+include "jws.wz";
+include "csr.wz";
+
+const
+  ACME.MAXURL = 255;
+
+var
+  // The URLs out of the directory.
+  acme.newnonce:  array[0..ACME.MAXURL] of char;
+  acme.newnoncen: int;
+  acme.newacct:   array[0..ACME.MAXURL] of char;
+  acme.newacctn:  int;
+  acme.neworder:  array[0..ACME.MAXURL] of char;
+  acme.newordern: int;
+
+  // State that moves between the steps.
+  acme.nonce:   array[0..127] of char;
+  acme.noncen:  int;
+  acme.kid:     array[0..ACME.MAXURL] of char;   // the account URL
+  acme.kidn:    int;
+  acme.order:   array[0..ACME.MAXURL] of char;
+  acme.ordern:  int;
+  acme.authz:   array[0..ACME.MAXURL] of char;
+  acme.authzn:  int;
+  acme.chal:    array[0..ACME.MAXURL] of char;
+  acme.chaln:   int;
+  acme.finalize: array[0..ACME.MAXURL] of char;
+  acme.finalizen: int;
+  acme.certurl: array[0..ACME.MAXURL] of char;
+  acme.certurln: int;
+  acme.token:   array[0..127] of char;
+  acme.tokenn:  int;
+
+  acme.body:  array[0..2047] of char;   // a payload being built
+  acme.bodyn: int;
+  acme.err:   str;
+
+procedure acme.fail(m: str);
+begin
+  if slen(acme.err) = 0 then acme.err := m;
+end;
+
+// ---- reading JSON ---------------------------------------------------------------------------
+//
+// ONE HELPER DOES ALMOST EVERYTHING: find a member of the top-level object and report where
+// its value sits. lib/json.wz has a full parser but no "give me this field", which is the
+// only shape ACME needs.
+//
+// Sets acme.vat and acme.vend to the value's bounds and returns true. For a string those
+// bounds EXCLUDE the quotes, so the caller gets the text.
+
+var
+  acme.vat:  int;
+  acme.vend: int;
+
+// Both "the key is not there" and "the JSON could not be parsed at all" used to come back
+// as a bare false, so a caller reading acme.err after a failed lookup found it empty even
+// when the body was truncated or malformed -- indistinguishable from a normal absent field.
+// Every branch below that means the input is NOT WELL-FORMED JSON (as opposed to a
+// well-formed object that simply lacks this key, which is the ordinary end of the loop and
+// stays silent) now records why through acme.fail.
+function acme.find(b: array of char; n: int; key: str): bool;
+var at, keyat, keyend, vat: int;
+begin
+  at := json.ws(b, 0, n);
+  if (at >= n) or (b[at] <> '{') then begin acme.fail("acme.find: the body is not a JSON object"); return false; end;
+  at := at + 1;
+  while at < n do
+  begin
+    at := json.ws(b, at, n);
+    if at >= n then begin acme.fail("acme.find: the object never closes"); return false; end;
+    if b[at] = '}' then return false;                    // the ordinary "key not present" exit
+    keyat := at;
+    at := json.string(b, at, n);
+    if at < 0 then begin acme.fail("acme.find: a member name is not a valid JSON string"); return false; end;
+    keyend := at;
+    at := json.ws(b, at, n);
+    if (at >= n) or (b[at] <> ':') then begin acme.fail("acme.find: a member is missing its ':'"); return false; end;
+    at := json.ws(b, at + 1, n);
+    vat := at;
+    at := json.skip(b, at, n);
+    if at < 0 then begin acme.fail("acme.find: a member's value is not valid JSON"); return false; end;
+    // THE QUOTES ARE NOT PART OF THE NAME. json.eq compares the string BODY, so the bounds
+    // have to exclude the quotes json.string included -- measured: passing them whole made
+    // every lookup fail, because "newOrder" (10 characters) is never equal to newOrder (8).
+    if json.eq(b, keyat + 1, keyend - 1, key) then
+    begin
+      // Strings come back without their quotes; everything else as it stands.
+      if b[vat] = '"' then
+      begin
+        acme.vat := vat + 1;
+        acme.vend := at - 1;
+      end
+      else
+      begin
+        acme.vat := vat;
+        acme.vend := at;
+      end;
+      return true;
+    end;
+    at := json.ws(b, at, n);
+    if (at < n) and (b[at] = ',') then at := at + 1;
+  end;
+  // The loop only exits here by running past n without ever seeing '}' -- a truncated
+  // object, not a well-formed one that lacks the key.
+  acme.fail("acme.find: the object is truncated");
+  return false;
+end;
+
+// Copy the value found by acme.find into dst, returning its length, or -1 when it does not
+// fit. A value that does not fit is refused rather than truncated: a truncated URL is a
+// request to somewhere else.
+function acme.copy(b: array of char; dst: array of char; max: int): int;
+var i, n: int;
+begin
+  n := acme.vend - acme.vat;
+  if n < 0 then begin acme.fail("acme.copy: the value has negative length"); return 0 - 1; end;
+  if n > max then begin acme.fail("acme.copy: the value is too long for the destination"); return 0 - 1; end;
+  i := 0;
+  while i < n do begin dst[i] := b[acme.vat + i]; i := i + 1; end;
+  return n;
+end;
+
+// Find a field and copy it in one step.
+function acme.get(b: array of char; n: int; key: str; dst: array of char; max: int): int;
+begin
+  if not acme.find(b, n, key) then return 0 - 1;
+  return acme.copy(b, dst, max);
+end;
+
+// ---- the directory ----------------------------------------------------------------------------
+
+function acme.readdir(b: array of char; n: int): bool;
+begin
+  acme.newnoncen := acme.get(b, n, "newNonce", acme.newnonce, ACME.MAXURL);
+  acme.newacctn  := acme.get(b, n, "newAccount", acme.newacct, ACME.MAXURL);
+  acme.newordern := acme.get(b, n, "newOrder", acme.neworder, ACME.MAXURL);
+  if (acme.newnoncen < 0) or (acme.newacctn < 0) or (acme.newordern < 0) then
+  begin
+    acme.fail("the directory is missing newNonce, newAccount or newOrder");
+    return false;
+  end;
+  return true;
+end;
+
+// Lowercase one character. Local rather than borrowed from lib/x509.wz: a case fold is not
+// certificate work and a module should not depend on another for three lines.
+function acme.lower(c: char): int;
+var v: int;
+begin
+  v := ord(c);
+  if (v >= 65) and (v <= 90) then return v + 32;
+  return v;
+end;
+
+// The Replay-Nonce header out of a raw HTTP response. Case-insensitive, because header names
+// are, and a client that only matches one spelling works against one server.
+function acme.readnonce(b: array of char; n: int): bool;
+var i, j, k: int;
+    name: str;
+begin
+  name := "replay-nonce:";
+  i := 0;
+  while i + 13 < n do
+  begin
+    // Only at the start of a line.
+    if (i = 0) or (b[i - 1] = chr(10)) then
+    begin
+      j := 0;
+      while (j < 13) and (acme.lower(b[i + j]) = ord(schar(name, j))) do j := j + 1;
+      if j = 13 then
+      begin
+        k := i + 13;
+        while (k < n) and ((b[k] = ' ') or (b[k] = chr(9))) do k := k + 1;
+        acme.noncen := 0;
+        while (k < n) and (b[k] <> chr(13)) and (b[k] <> chr(10))
+              and (acme.noncen < len(acme.nonce)) do
+        begin
+          acme.nonce[acme.noncen] := b[k];
+          acme.noncen := acme.noncen + 1;
+          k := k + 1;
+        end;
+        return acme.noncen > 0;
+      end;
+    end;
+    i := i + 1;
+  end;
+  return false;
+end;
+
+// The "status" of whatever came back: true only when it says "valid".
+//
+// "pending" AND "processing" ARE NOT FAILURES, they mean ask again -- but this client does
+// not poll, because the test fixture validates synchronously and a real authority usually
+// does too for http-01. A caller that needs polling gets the status text and decides.
+function acme.readstatus(b: array of char; n: int): bool;
+var m: int;
+    st: array[0..31] of char;
+begin
+  m := acme.get(b, n, "status", st, 31);
+  if m < 0 then
+  begin
+    acme.fail("the reply carries no status");
+    return false;
+  end;
+  if (m = 5) and (st[0] = 'v') and (st[1] = 'a') and (st[2] = 'l')
+     and (st[3] = 'i') and (st[4] = 'd') then return true;
+  // An invalid challenge usually carries a detail worth showing.
+  m := acme.get(b, n, "detail", st, 31);
+  acme.fail("the authority did not accept it");
+  return false;
+end;
+
+// ---- the payloads -----------------------------------------------------------------------------
+//
+// Each of these fills acme.body/acme.bodyn with the JSON that goes inside the JWS.
+
+// {"termsOfServiceAgreed":true,"contact":["mailto:<email>"]}
+//
+// THE TERMS MUST BE AGREED EXPLICITLY or the account is refused. There is no way around it
+// and no reason to want one: it is the authority's condition for issuing certificates.
+procedure acme.acctbody(email: array of char; emailn: int);
+var i: int;
+begin
+  acme.bodyn := io.push(acme.body, 0, "{\"termsOfServiceAgreed\":true");
+  if emailn > 0 then
+  begin
+    acme.bodyn := io.push(acme.body, acme.bodyn, ",\"contact\":[\"mailto:");
+    i := 0;
+    while i < emailn do
+    begin
+      acme.body[acme.bodyn] := email[i];
+      acme.bodyn := acme.bodyn + 1;
+      i := i + 1;
+    end;
+    acme.bodyn := io.push(acme.body, acme.bodyn, "\"]");
+  end;
+  acme.bodyn := io.push(acme.body, acme.bodyn, "}");
+end;
+
+// {"identifiers":[{"type":"dns","value":"<host>"}]}
+procedure acme.orderbody(host: array of char; hn: int);
+var i: int;
+begin
+  acme.bodyn := io.push(acme.body, 0, "{\"identifiers\":[{\"type\":\"dns\",\"value\":\"");
+  i := 0;
+  while i < hn do
+  begin
+    acme.body[acme.bodyn] := host[i];
+    acme.bodyn := acme.bodyn + 1;
+    i := i + 1;
+  end;
+  acme.bodyn := io.push(acme.body, acme.bodyn, "\"}]}");
+end;
+
+// {"csr":"<base64url of the DER>"}
+//
+// BASE64URL WITHOUT PADDING, like everything else in ACME. A padded value is a different
+// string and the server rejects it as malformed.
+function acme.csrbody(d: array of int; qx: array of int; qy: array of int;
+                      host: array of char; hn: int): bool;
+begin
+  if not csr.make(host, hn, d, qx, qy) then
+  begin
+    acme.fail("could not build the certificate request");
+    return false;
+  end;
+  acme.bodyn := io.push(acme.body, 0, "{\"csr\":\"");
+  acme.bodyn := base64.enc(acme.body, acme.bodyn,
+                           view(addr(csr.buf[0]), csr.n), true, false);
+  acme.bodyn := io.push(acme.body, acme.bodyn, "\"}");
+  return true;
+end;
+
+// ---- reading the answers ------------------------------------------------------------------------
+
+// An order: keep its authorization and finalize URLs.
+// AN ORDER IS READ TWICE AND LOOKS DIFFERENT EACH TIME. When it is created it carries
+// authorizations and a finalize URL; once finalized it carries a certificate URL and need
+// not repeat either. So finalize and authorizations are optional here and the caller checks
+// what it actually needs -- requiring them always made the finalized order fail to parse
+// with "the order has no finalize URL", which points at the wrong thing entirely.
+function acme.readorder(b: array of char; n: int): bool;
+var at, i: int;
+begin
+  acme.finalizen := acme.get(b, n, "finalize", acme.finalize, ACME.MAXURL);
+  // "authorizations" is an ARRAY; we take the first, because one identifier was asked for.
+  // Absent on a finalized order, which is not an error.
+  acme.authzn := 0;
+  if not acme.find(b, n, "authorizations") then
+  begin
+    acme.certurln := acme.get(b, n, "certificate", acme.certurl, ACME.MAXURL);
+    return true;
+  end;
+  at := acme.vat;
+  while (at < acme.vend) and (b[at] <> '"') do at := at + 1;
+  if at >= acme.vend then
+  begin
+    acme.certurln := acme.get(b, n, "certificate", acme.certurl, ACME.MAXURL);
+    return true;
+  end;
+  at := at + 1;
+  acme.authzn := 0;
+  while (at < acme.vend) and (b[at] <> '"') and (acme.authzn < ACME.MAXURL) do
+  begin
+    acme.authz[acme.authzn] := b[at];
+    acme.authzn := acme.authzn + 1;
+    at := at + 1;
+  end;
+  // The certificate URL only appears once the order is valid; absent is not an error here.
+  acme.certurln := acme.get(b, n, "certificate", acme.certurl, ACME.MAXURL);
+  return true;
+end;
+
+// ---- finding a field inside a SUB-RANGE ---------------------------------------------------
+//
+// acme.find walks the whole buffer as one object. A challenge lives inside an array of
+// objects, so the same walk is needed over a slice -- expressed by passing a view rather
+// than by duplicating the parser.
+function acme.getin(b: array of char; from: int; upto: int; key: str;
+                    dst: array of char; max: int): int;
+begin
+  return acme.get(view(addr(b[from]), upto - from), upto - from, key, dst, max);
+end;
+
+// Is the object in b[from..upto) the http-01 challenge?
+function acme.ishttp01(b: array of char; from: int; upto: int): bool;
+var n: int;
+    t: array[0..31] of char;
+begin
+  n := acme.getin(b, from, upto, "type", t, 31);
+  if n <> 7 then return false;
+  return (t[0] = 'h') and (t[1] = 't') and (t[2] = 't') and (t[3] = 'p')
+     and (t[4] = '-') and (t[5] = '0') and (t[6] = '1');
+end;
+
+// An authorization: find the http-01 challenge and take its URL and token.
+//
+// THE CHALLENGE TYPE MUST BE CHECKED. A server offers several, and taking the first one
+// means answering a dns-01 challenge with an HTTP file -- which never validates, and fails
+// as a timeout rather than as an error that says why.
+function acme.readauthz(b: array of char; n: int): bool;
+var at, depth, objat, listat, listend: int;
+begin
+  if not acme.find(b, n, "challenges") then
+  begin
+    acme.fail("the authorization has no challenges");
+    return false;
+  end;
+  // THE BOUNDS ARE SAVED FIRST. acme.vat and acme.vend are module state, and every nested
+  // lookup below (acme.getin -> acme.get -> acme.find) overwrites them. Reading them inside
+  // the loop means the loop's own limit changes underneath it -- measured: the walk examined
+  // exactly one challenge and then stopped, so a list with http-01 second was reported as
+  // having no http-01 at all.
+  listat := acme.vat;
+  listend := acme.vend;
+  at := listat;
+  while at < listend do
+  begin
+    if b[at] <> '{' then at := at + 1
+    else
+    begin
+      // Walk to the matching brace. The nesting is shallow here, and counting braces is
+      // enough because a challenge object contains no strings with braces in them -- a URL
+      // and a token are both plain.
+      objat := at;
+      depth := 0;
+      while at < listend do
+      begin
+        if b[at] = '{' then depth := depth + 1
+        else if b[at] = '}' then depth := depth - 1;
+        at := at + 1;
+        if depth = 0 then break;
+      end;
+      if acme.ishttp01(b, objat, at) then
+      begin
+        acme.chaln  := acme.getin(b, objat, at, "url", acme.chal, ACME.MAXURL);
+        acme.tokenn := acme.getin(b, objat, at, "token", acme.token, 127);
+        if (acme.chaln > 0) and (acme.tokenn > 0) then return true;
+        acme.fail("the http-01 challenge has no url or token");
+        return false;
+      end;
+    end;
+  end;
+  acme.fail("no http-01 challenge was offered");
+  return false;
+end;

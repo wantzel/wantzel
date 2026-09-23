@@ -1,0 +1,7 @@
+take-fits ok=1 err=[]
+take-toolong ok=0 err=[oauth.take: the value is too long for the destination]
+cookie-header-absent ok=0 err=[]
+cookie-no-session ok=0 err=[]
+cookie-oversize ok=0 err=[oauth.readcookie: the session cookie is too long]
+newsession-ok ok=1 err=[]
+newsession-full ok=0 err=[oauth.newsession: no room for more sessions]

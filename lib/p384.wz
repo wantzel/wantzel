@@ -1,0 +1,870 @@
+// lib/p384.wz -- ECDSA over NIST P-384 (secp384r1), verification only.
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// WHY THIS EXISTS. Measured 22-09-2026: the intermediates and roots of github.com,
+// cloudflare.com and letsencrypt.org all sign with ecdsa-with-SHA384 over P-384. Only
+// google.com's chain is pure RSA. So three of four real chains cannot be closed without
+// this file -- letsencrypt.org included, which is the one an ACME client must verify.
+//
+// THE SAME SHAPE AS lib/p256.wz, DELIBERATELY. The generic arithmetic -- add, subtract,
+// schoolbook multiply, the slow bit-by-bit reduction, the point operations -- is the same
+// code with 12 limbs instead of 8. Keeping the two files parallel means a reader who knows
+// one knows the other, and it means a bug found in one is worth looking for in the other.
+//
+// WHAT IS GENUINELY DIFFERENT is the fast reduction, because the prime is different:
+//     P-256:  p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+//     P-384:  p = 2^384 - 2^128 - 2^96 + 2^32 - 1
+// P-384 has SIX S-terms against four, THREE D-terms against four, and only ONE doubling
+// instead of two. Those differences are exactly the kind that produce a plausible wrong
+// answer rather than an obvious one, so the terms are transcribed from the standard and
+// checked against the slow reduction on random input -- see p384.redfast.
+//
+// NO CONSTANT-TIME REQUIREMENT, and that is deliberate rather than an omission: everything
+// here operates on PUBLIC values -- a signature, a public key, a message hash. There is no
+// secret to leak. Timing only matters where a private scalar is involved, which is signing,
+// and this file does not sign.
+
+include "io.wz";
+include "rand.wz";
+
+const
+  Q.N = 12;                 // 12 limbs of 32 bits = 384 bits
+
+var
+  // The curve parameters, filled by p384.setup.
+  p384.p:  array[0..Q.N-1] of int;   // the field prime
+  p384.n:  array[0..Q.N-1] of int;   // the order of the base point
+  p384.b:  array[0..Q.N-1] of int;   // the curve's b coefficient
+  p384.gx: array[0..Q.N-1] of int;
+  p384.gy: array[0..Q.N-1] of int;
+  p384.ready: bool;
+
+  // scratch
+  p384.t0: array[0..Q.N-1] of int;
+  p384.t1: array[0..Q.N-1] of int;
+  p384.t2: array[0..Q.N-1] of int;
+  p384.t3: array[0..Q.N-1] of int;
+  p384.t4: array[0..Q.N-1] of int;
+  p384.pr: array[0..23] of int;      // a 768-bit product
+
+// ---- limb arithmetic --------------------------------------------------------------------
+//
+// Every limb is kept in 0..2^32-1. Wantzel's int is 64 bits and signed, so a product of two
+// limbs (up to 2^64) would overflow -- but a product of two 32-bit values is at most
+// (2^32-1)^2 which is just under 2^64, and that DOES NOT FIT in a signed 64-bit int.
+//
+// So multiplication is done in HALVES: each 32-bit limb is split into two 16-bit pieces and
+// the products are at most 2^32, with room to accumulate. Slower, and it cannot overflow.
+
+procedure p384.zero(r: array of int);
+var i: int;
+begin
+  i := 0;
+  while i < Q.N do begin r[i] := 0; i := i + 1; end;
+end;
+
+procedure p384.copy(dst: array of int; src: array of int);
+var i: int;
+begin
+  i := 0;
+  while i < Q.N do begin dst[i] := src[i]; i := i + 1; end;
+end;
+
+function p384.iszero(a: array of int): bool;
+var i: int;
+begin
+  i := 0;
+  while i < Q.N do
+  begin
+    if a[i] <> 0 then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// -1, 0 or 1 as a < b, a = b or a > b.
+function p384.cmp(a: array of int; b: array of int): int;
+var i: int;
+begin
+  i := Q.N - 1;
+  while i >= 0 do
+  begin
+    if a[i] < b[i] then return 0 - 1;
+    if a[i] > b[i] then return 1;
+    i := i - 1;
+  end;
+  return 0;
+end;
+
+// r := a + b, returning the carry out of the top.
+function p384.addc(r: array of int; a: array of int; b: array of int): int;
+var i, c, v: int;
+begin
+  c := 0;
+  i := 0;
+  while i < Q.N do
+  begin
+    v := a[i] + b[i] + c;
+    r[i] := band(v, 0xFFFFFFFF);
+    c := v shr 32;
+    i := i + 1;
+  end;
+  return c;
+end;
+
+// r := a - b, returning the borrow.
+function p384.subb(r: array of int; a: array of int; b: array of int): int;
+var i, c, v: int;
+begin
+  c := 0;
+  i := 0;
+  while i < Q.N do
+  begin
+    v := a[i] - b[i] - c;
+    if v < 0 then begin v := v + 0x100000000; c := 1; end else c := 0;
+    r[i] := v;
+    i := i + 1;
+  end;
+  return c;
+end;
+
+// r := (a + b) mod m
+procedure p384.addm(r: array of int; a: array of int; b: array of int; m: array of int);
+var c: int;
+begin
+  c := p384.addc(r, a, b);
+  // A carry out means the value is at least 2^384, so it is certainly >= m.
+  if (c <> 0) or (p384.cmp(r, m) >= 0) then
+  begin
+    if p384.subb(r, r, m) = 0 then c := c;
+  end;
+end;
+
+// r := (a - b) mod m
+procedure p384.subm(r: array of int; a: array of int; b: array of int; m: array of int);
+begin
+  if p384.subb(r, a, b) <> 0 then
+  begin
+    // Borrowed, so the true result is negative: add m back.
+    if p384.addc(r, r, m) = 0 then r[0] := r[0];
+  end;
+end;
+
+// ---- multiplication --------------------------------------------------------------------
+//
+// Schoolbook into 24 limbs, in 16-bit halves so nothing overflows a signed 64-bit int.
+procedure p384.mul512(a: array of int; b: array of int);
+var i, j, carry, cur: int;
+    al, ah, bl, bh, lo, mid, hi: int;
+begin
+  i := 0;
+  while i < 24 do begin p384.pr[i] := 0; i := i + 1; end;
+  i := 0;
+  while i < Q.N do
+  begin
+    al := band(a[i], 0xFFFF);
+    ah := a[i] shr 16;
+    carry := 0;
+    j := 0;
+    while j < Q.N do
+    begin
+      bl := band(b[j], 0xFFFF);
+      bh := b[j] shr 16;
+      // (al + ah*2^16)(bl + bh*2^16) = al*bl + (al*bh + ah*bl)*2^16 + ah*bh*2^32
+      lo  := al * bl;
+      mid := al * bh + ah * bl;
+      hi  := ah * bh;
+      // Fold the middle term in, carrying its top half into hi.
+      lo := lo + band(mid, 0xFFFF) * 0x10000;
+      hi := hi + (mid shr 16);
+      hi := hi + (lo shr 32);
+      lo := band(lo, 0xFFFFFFFF);
+
+      cur := p384.pr[i + j] + lo + carry;
+      p384.pr[i + j] := band(cur, 0xFFFFFFFF);
+      carry := hi + (cur shr 32);
+      j := j + 1;
+    end;
+    // Push the last carry up through the remaining limbs.
+    j := i + Q.N;
+    while (carry <> 0) and (j < 24) do
+    begin
+      cur := p384.pr[j] + carry;
+      p384.pr[j] := band(cur, 0xFFFFFFFF);
+      carry := cur shr 32;
+      j := j + 1;
+    end;
+    i := i + 1;
+  end;
+end;
+
+// Reduce the 768-bit product in p384.pr modulo m, by long division one bit at a time.
+//
+// SLOW AND OBVIOUSLY CORRECT, and the cost is larger than it first looks.
+//
+// MEASURED 22-09-2026: 97 ms per ECDSA verification, against OpenSSL's 47 microseconds on
+// the same machine -- so roughly 2000x slower. (For comparison our X25519, which has a
+// friendly prime and folds with a single small constant, is only 70x slower than OpenSSL's.
+// Essentially all of this gap is here.)
+//
+// IT IS STILL THE RIGHT TRADE FOR NOW. A TLS handshake verifies a chain of two or three
+// certificates, so ~0.3 s of the connection setup -- noticeable but not broken, and paid
+// once per connection rather than per request. The fast way is the Solinas reduction, nine
+// additions and subtractions of shifted words, and it is famously easy to get wrong by one
+// term in a way that yields a valid-LOOKING field element. Getting that wrong in a verifier
+// means accepting signatures that should be refused.
+//
+// So: correct first, behind test vectors, and the Solinas version goes in later behind those
+// same vectors if the measurements show it matters. That ordering is the whole point.
+procedure p384.redc(r: array of int; m: array of int);
+var i, bit, c, v, top: int;
+begin
+  p384.zero(r);
+  i := 767;
+  while i >= 0 do
+  begin
+    // r := r * 2, remembering the bit that falls off the top
+    top := r[Q.N - 1] shr 31;
+    v := Q.N - 1;
+    while v > 0 do
+    begin
+      r[v] := bor(band(r[v] shl 1, 0xFFFFFFFF), r[v - 1] shr 31);
+      v := v - 1;
+    end;
+    r[0] := band(r[0] shl 1, 0xFFFFFFFF);
+    // bring down bit i of the product
+    bit := band(p384.pr[i shr 5] shr band(i, 31), 1);
+    r[0] := bor(r[0], bit);
+    // if r >= m (or it overflowed past 2^384), subtract m
+    if (top <> 0) or (p384.cmp(r, m) >= 0) then
+    begin
+      c := p384.subb(r, r, m);
+      if c <> 0 then c := 0;
+    end;
+    i := i - 1;
+  end;
+end;
+
+
+// ---- the fast reduction for P-384, FIPS 186-4 D.2.4 --------------------------------------
+//
+// WHY A FAST REDUCTION AT ALL. Measured in lib/p256.wz: the schoolbook multiply costs
+// 0.33 us and the bit-by-bit reduction 10.4 us -- 31 times as much, and 88% of every
+// modular multiplication. A verification does hundreds of them. At 384 bits the slow
+// reduction loops over 768 bits instead of 512, so the ratio is worse, not better.
+//
+// THE TERMS ARE TRANSCRIBED FROM THE STANDARD, not derived. The source is kept verbatim in
+// localfiles/research/sources/fips-186-4-p384-reductie.md, because paraphrasing a
+// specification is how you implement it wrongly.
+//
+//     B = T + 2*S1 + S2 + S3 + S4 + S5 + S6 - D1 - D2 - D3   mod p
+//
+// THREE THINGS THAT ARE EASY TO GET WRONG, and each gives a plausible field element rather
+// than an obvious failure:
+//   - only S1 is DOUBLED; in P-256 both S1 and S2 are
+//   - D3 names A23 TWICE, in words 5 and 4. That is what the standard says.
+//   - S4 has zeroes in words 2 and 0, with A20 at word 3 and A23 at word 1 -- not a
+//     straight run like S2
+//
+// SO IT IS KEPT BESIDE THE SLOW VERSION rather than replacing it, exactly as p256.wz does,
+// and the test compares the two on random products. The slow one is correct by
+// construction; the fast one is correct because it agrees with it everywhere.
+
+var
+  p384.sv:  array[0..Q.N-1] of int;    // one term being assembled
+  p384.wi:  array[0..Q.N-1] of int;    // the word indices of that term
+
+// Word k of the product, or 0 when the index is -1 (the zeroes in the table above).
+function p384.pw(k: int): int;
+begin
+  if k < 0 then return 0;
+  return p384.pr[k];
+end;
+
+// Assemble the term whose word indices are in p384.wi, highest word first.
+//
+// THE INDICES COME IN AN ARRAY rather than as twelve arguments, because a routine takes at
+// most ten and an array counts as two. Writing them as a list at the call site also keeps
+// each term on one line, which is what makes it checkable against the standard.
+procedure p384.term;
+var i: int;
+begin
+  i := 0;
+  while i < Q.N do
+  begin
+    p384.sv[i] := p384.pw(p384.wi[i]);
+    i := i + 1;
+  end;
+end;
+
+// wi := the twelve indices. SPLIT IN TWO because a routine takes at most ten arguments;
+// the high six and the low six, each written in the order the standard prints them.
+procedure p384.wihi(a: int; b: int; c: int; d: int; e: int; f: int);
+begin
+  p384.wi[11] := a; p384.wi[10] := b; p384.wi[9] := c;
+  p384.wi[8]  := d; p384.wi[7]  := e; p384.wi[6] := f;
+end;
+
+procedure p384.wilo(g: int; h: int; i: int; j: int; k: int; l: int);
+begin
+  p384.wi[5] := g; p384.wi[4] := h; p384.wi[3] := i;
+  p384.wi[2] := j; p384.wi[1] := k; p384.wi[0] := l;
+end;
+
+procedure p384.accadd(r: array of int);
+begin
+  p384.addm(r, r, p384.sv, p384.p);
+end;
+
+procedure p384.accsub(r: array of int);
+begin
+  p384.subm(r, r, p384.sv, p384.p);
+end;
+
+procedure p384.redfast(r: array of int);
+var bw: int;
+begin
+  // T = (A11 .. A0)
+  p384.wihi(11, 10, 9, 8, 7, 6);
+  p384.wilo(5, 4, 3, 2, 1, 0);
+  p384.term;
+  p384.copy(r, p384.sv);
+  // r may be >= p after a plain copy of the low words, so bring it in range first. The
+  // borrow is discarded on purpose: the comparison above has already established r >= p,
+  // so there cannot be one.
+  if p384.cmp(r, p384.p) >= 0 then bw := p384.subb(r, r, p384.p);
+
+  // S1 = (0 0 0 0 0 A23 A22 A21 0 0 0 0), counted TWICE
+  p384.wihi(0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 23);
+  p384.wilo(22, 21, 0 - 1, 0 - 1, 0 - 1, 0 - 1);
+  p384.term;
+  p384.accadd(r);
+  p384.accadd(r);
+
+  // S2 = (A23 A22 A21 A20 A19 A18 A17 A16 A15 A14 A13 A12)
+  p384.wihi(23, 22, 21, 20, 19, 18);
+  p384.wilo(17, 16, 15, 14, 13, 12);
+  p384.term;
+  p384.accadd(r);
+
+  // S3 = (A20 A19 A18 A17 A16 A15 A14 A13 A12 A23 A22 A21)
+  p384.wihi(20, 19, 18, 17, 16, 15);
+  p384.wilo(14, 13, 12, 23, 22, 21);
+  p384.term;
+  p384.accadd(r);
+
+  // S4 = (A19 A18 A17 A16 A15 A14 A13 A12 A20 0 A23 0)
+  p384.wihi(19, 18, 17, 16, 15, 14);
+  p384.wilo(13, 12, 20, 0 - 1, 23, 0 - 1);
+  p384.term;
+  p384.accadd(r);
+
+  // S5 = (0 0 0 0 A23 A22 A21 A20 0 0 0 0)
+  p384.wihi(0 - 1, 0 - 1, 0 - 1, 0 - 1, 23, 22);
+  p384.wilo(21, 20, 0 - 1, 0 - 1, 0 - 1, 0 - 1);
+  p384.term;
+  p384.accadd(r);
+
+  // S6 = (0 0 0 0 0 0 A23 A22 A21 0 0 A20)
+  p384.wihi(0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1);
+  p384.wilo(23, 22, 21, 0 - 1, 0 - 1, 20);
+  p384.term;
+  p384.accadd(r);
+
+  // D1 = (A22 A21 A20 A19 A18 A17 A16 A15 A14 A13 A12 A23)
+  p384.wihi(22, 21, 20, 19, 18, 17);
+  p384.wilo(16, 15, 14, 13, 12, 23);
+  p384.term;
+  p384.accsub(r);
+
+  // D2 = (0 0 0 0 0 0 0 A23 A22 A21 A20 0)
+  p384.wihi(0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1);
+  p384.wilo(0 - 1, 23, 22, 21, 20, 0 - 1);
+  p384.term;
+  p384.accsub(r);
+
+  // D3 = (0 0 0 0 0 0 0 A23 A23 0 0 0)   -- A23 appears TWICE, as the standard has it
+  p384.wihi(0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1);
+  p384.wilo(0 - 1, 23, 23, 0 - 1, 0 - 1, 0 - 1);
+  p384.term;
+  p384.accsub(r);
+end;
+
+procedure p384.mulm(r: array of int; a: array of int; b: array of int; m: array of int);
+begin
+  p384.mul512(a, b);
+  // THE FAST PATH IS ONLY FOR p. The order n is not a Solinas prime and has no such
+  // shortcut, so work modulo n -- which is only the two scalar multiplications in verify --
+  // still goes through the slow reduction. That is a handful of operations against the
+  // hundreds done modulo p.
+  if p384.cmp(m, p384.p) = 0 then p384.redfast(r)
+  else p384.redc(r, m);
+end;
+
+// r := a^e mod m, for a fixed public exponent. Square-and-multiply, MSB first.
+//
+// The exponent here is always public (p-2 or n-2, for an inverse), so there is nothing to
+// hide and a plain conditional is fine.
+procedure p384.powm(r: array of int; a: array of int; e: array of int; m: array of int);
+var i, bit: int;
+begin
+  p384.zero(r);
+  r[0] := 1;
+  i := 383;
+  while i >= 0 do
+  begin
+    p384.mulm(p384.t4, r, r, m);
+    p384.copy(r, p384.t4);
+    bit := band(e[i shr 5] shr band(i, 31), 1);
+    if bit <> 0 then
+    begin
+      p384.mulm(p384.t4, r, a, m);
+      p384.copy(r, p384.t4);
+    end;
+    i := i - 1;
+  end;
+end;
+
+// r := 1/a mod m, by Fermat: a^(m-2). m must be prime, which both p and n are.
+procedure p384.invm(r: array of int; a: array of int; m: array of int);
+var e: array[0..Q.N-1] of int;
+    two: array[0..Q.N-1] of int;
+begin
+  p384.zero(two);
+  two[0] := 2;
+  if p384.subb(e, m, two) = 0 then p384.powm(r, a, e, m);
+end;
+
+// ---- setup ------------------------------------------------------------------------------
+
+procedure p384.hexto(r: array of int; s: str);
+var i, k, c, v, limb: int;
+begin
+  p384.zero(r);
+  // The string is big-endian hex; limb 0 is the LOW 32 bits.
+  k := slen(s);
+  i := 0;
+  while i < k do
+  begin
+    c := ord(schar(s, k - 1 - i));
+    if c >= ord('a') then v := c - ord('a') + 10
+    else if c >= ord('A') then v := c - ord('A') + 10
+    else v := c - ord('0');
+    limb := i shr 3;
+    if limb < Q.N then r[limb] := bor(r[limb], v shl (band(i, 7) * 4));
+    i := i + 1;
+  end;
+end;
+
+
+
+// ---- the curve ----------------------------------------------------------------------------
+//
+// FIPS 186-4 D.1.2.4, the curve P-384 / secp384r1. The prime was checked against its own
+// Solinas form -- p = 2^384 - 2^128 - 2^96 + 2^32 - 1 -- rather than trusted as a string of
+// hex, because a single wrong digit there makes every operation below quietly wrong.
+procedure p384.setup;
+begin
+  if p384.ready then return;
+  p384.hexto(p384.p,  "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff");
+  p384.hexto(p384.n,  "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973");
+  p384.hexto(p384.b,  "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef");
+  p384.hexto(p384.gx, "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7");
+  p384.hexto(p384.gy, "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f");
+  p384.ready := true;
+end;
+
+// ---- points, in Jacobian coordinates -----------------------------------------------------
+//
+// An affine point (x, y) is (X, Y, Z) with x = X/Z^2 and y = Y/Z^3. The point at infinity is
+// Z = 0. Jacobian form is used because it avoids a modular inverse on every addition -- one
+// inverse at the very end instead of one per step, and an inverse is by far the most
+// expensive operation here.
+
+var
+  p384.ax: array[0..Q.N-1] of int;   // accumulator point
+  p384.ay: array[0..Q.N-1] of int;
+  p384.az: array[0..Q.N-1] of int;
+  p384.bx: array[0..Q.N-1] of int;   // the point being added
+  p384.by: array[0..Q.N-1] of int;
+  p384.bz: array[0..Q.N-1] of int;
+  p384.s0: array[0..Q.N-1] of int;
+  p384.s1: array[0..Q.N-1] of int;
+  p384.s2: array[0..Q.N-1] of int;
+  p384.s3: array[0..Q.N-1] of int;
+  p384.s4: array[0..Q.N-1] of int;
+  p384.s5: array[0..Q.N-1] of int;
+
+// Double the accumulator, in place. The a = -3 shortcut of the standard formulas.
+procedure p384.dbl;
+begin
+  if p384.iszero(p384.az) then return;
+  p384.mulm(p384.s0, p384.az, p384.az, p384.p);          // Z^2
+  p384.subm(p384.s1, p384.ax, p384.s0, p384.p);          // X - Z^2
+  p384.addm(p384.s2, p384.ax, p384.s0, p384.p);          // X + Z^2
+  p384.mulm(p384.s3, p384.s1, p384.s2, p384.p);          // X^2 - Z^4
+  p384.addm(p384.s1, p384.s3, p384.s3, p384.p);
+  p384.addm(p384.s3, p384.s1, p384.s3, p384.p);          // M = 3(X^2 - Z^4)
+
+  p384.mulm(p384.s0, p384.ay, p384.ay, p384.p);          // Y^2
+  p384.mulm(p384.s1, p384.ax, p384.s0, p384.p);
+  p384.addm(p384.s1, p384.s1, p384.s1, p384.p);
+  p384.addm(p384.s1, p384.s1, p384.s1, p384.p);          // S = 4XY^2
+
+  p384.mulm(p384.s2, p384.ay, p384.az, p384.p);
+  p384.addm(p384.az, p384.s2, p384.s2, p384.p);          // Z' = 2YZ
+
+  p384.mulm(p384.s4, p384.s3, p384.s3, p384.p);          // M^2
+  p384.subm(p384.s4, p384.s4, p384.s1, p384.p);
+  p384.subm(p384.s4, p384.s4, p384.s1, p384.p);          // X' = M^2 - 2S
+
+  p384.subm(p384.s5, p384.s1, p384.s4, p384.p);          // S - X'
+  p384.mulm(p384.s5, p384.s3, p384.s5, p384.p);          // M(S - X')
+  p384.mulm(p384.s2, p384.s0, p384.s0, p384.p);          // Y^4
+  p384.addm(p384.s2, p384.s2, p384.s2, p384.p);
+  p384.addm(p384.s2, p384.s2, p384.s2, p384.p);
+  p384.addm(p384.s2, p384.s2, p384.s2, p384.p);          // 8Y^4
+  p384.subm(p384.ay, p384.s5, p384.s2, p384.p);          // Y' = M(S-X') - 8Y^4
+  p384.copy(p384.ax, p384.s4);
+end;
+
+// Add point b (Jacobian) into the accumulator.
+procedure p384.add;
+var u1: array[0..Q.N-1] of int;
+    u2: array[0..Q.N-1] of int;
+    h:  array[0..Q.N-1] of int;
+    r:  array[0..Q.N-1] of int;
+begin
+  if p384.iszero(p384.bz) then return;
+  if p384.iszero(p384.az) then
+  begin
+    p384.copy(p384.ax, p384.bx);
+    p384.copy(p384.ay, p384.by);
+    p384.copy(p384.az, p384.bz);
+    return;
+  end;
+  p384.mulm(p384.s0, p384.bz, p384.bz, p384.p);       // Z2^2
+  p384.mulm(u1, p384.ax, p384.s0, p384.p);            // U1 = X1 Z2^2
+  p384.mulm(p384.s1, p384.s0, p384.bz, p384.p);       // Z2^3
+  p384.mulm(p384.s2, p384.ay, p384.s1, p384.p);       // S1 = Y1 Z2^3
+
+  p384.mulm(p384.s0, p384.az, p384.az, p384.p);       // Z1^2
+  p384.mulm(u2, p384.bx, p384.s0, p384.p);            // U2 = X2 Z1^2
+  p384.mulm(p384.s1, p384.s0, p384.az, p384.p);       // Z1^3
+  p384.mulm(p384.s3, p384.by, p384.s1, p384.p);       // S2 = Y2 Z1^3
+
+  p384.subm(h, u2, u1, p384.p);                       // H = U2 - U1
+  p384.subm(r, p384.s3, p384.s2, p384.p);             // R = S2 - S1
+  if p384.iszero(h) then
+  begin
+    // Same x. Either the same point -- then double -- or opposite points, giving infinity.
+    if p384.iszero(r) then p384.dbl else p384.zero(p384.az);
+    return;
+  end;
+
+  p384.mulm(p384.s0, h, h, p384.p);                   // H^2
+  p384.mulm(p384.s1, p384.s0, h, p384.p);             // H^3
+  p384.mulm(p384.s4, u1, p384.s0, p384.p);            // U1 H^2
+
+  p384.mulm(p384.s5, r, r, p384.p);                   // R^2
+  p384.subm(p384.s5, p384.s5, p384.s1, p384.p);
+  p384.subm(p384.s5, p384.s5, p384.s4, p384.p);
+  p384.subm(p384.s5, p384.s5, p384.s4, p384.p);       // X3 = R^2 - H^3 - 2 U1 H^2
+
+  p384.subm(p384.s0, p384.s4, p384.s5, p384.p);
+  p384.mulm(p384.s0, r, p384.s0, p384.p);
+  p384.mulm(p384.s3, p384.s2, p384.s1, p384.p);
+  p384.subm(p384.ay, p384.s0, p384.s3, p384.p);       // Y3 = R(U1H^2 - X3) - S1 H^3
+  p384.copy(p384.ax, p384.s5);
+
+  p384.mulm(p384.s0, p384.az, p384.bz, p384.p);
+  p384.mulm(p384.az, p384.s0, h, p384.p);             // Z3 = Z1 Z2 H
+end;
+
+// The accumulator, brought back to affine coordinates in p384.t0 (x) and p384.t1 (y).
+procedure p384.affine;
+var zi: array[0..Q.N-1] of int;
+    z2: array[0..Q.N-1] of int;
+begin
+  if p384.iszero(p384.az) then
+  begin
+    p384.zero(p384.t0);
+    p384.zero(p384.t1);
+    return;
+  end;
+  p384.invm(zi, p384.az, p384.p);
+  p384.mulm(z2, zi, zi, p384.p);
+  p384.mulm(p384.t0, p384.ax, z2, p384.p);
+  p384.mulm(z2, z2, zi, p384.p);
+  p384.mulm(p384.t1, p384.ay, z2, p384.p);
+end;
+
+// ---- ECDSA verification ------------------------------------------------------------------
+//
+// FIPS 186-4 §6.4.2. Given a public key Q, a hash e and a signature (r, s):
+//
+//   w  = 1/s mod n
+//   u1 = e*w mod n,  u2 = r*w mod n
+//   R  = u1*G + u2*Q
+//   the signature is valid when R.x mod n = r
+//
+// THE RANGE CHECKS ON r AND s ARE NOT OPTIONAL. Both must lie in 1..n-1. A verifier that
+// accepts s = 0 divides by zero; one that accepts values above n lets the same signature be
+// presented in several forms, which breaks anything that deduplicates by signature. They are
+// cheap and they are the first thing here.
+
+var
+  p384.u1: array[0..Q.N-1] of int;
+  p384.u2: array[0..Q.N-1] of int;
+  p384.qx: array[0..Q.N-1] of int;
+  p384.qy: array[0..Q.N-1] of int;
+  p384.rx: array[0..Q.N-1] of int;
+  p384.ry: array[0..Q.N-1] of int;
+  p384.w:  array[0..Q.N-1] of int;
+
+// Is 1 <= v < n?
+function p384.inrange(v: array of int): bool;
+begin
+  if p384.iszero(v) then return false;
+  return p384.cmp(v, p384.n) < 0;
+end;
+
+// Is the point (x, y) actually on the curve? y^2 = x^3 - 3x + b (mod p).
+//
+// A KEY OFF THE CURVE IS AN ATTACK, not a typo: invalid-curve attacks feed a point from a
+// different, weaker curve and read information out of the result. The check costs two
+// multiplications and is done before the key is used for anything.
+function p384.oncurve(x: array of int; y: array of int): bool;
+var l: array[0..Q.N-1] of int;
+    r: array[0..Q.N-1] of int;
+    t: array[0..Q.N-1] of int;
+begin
+  if (p384.cmp(x, p384.p) >= 0) or (p384.cmp(y, p384.p) >= 0) then return false;
+  p384.mulm(l, y, y, p384.p);                   // y^2
+  p384.mulm(t, x, x, p384.p);
+  p384.mulm(r, t, x, p384.p);                   // x^3
+  p384.addm(t, x, x, p384.p);
+  p384.addm(t, t, x, p384.p);                   // 3x
+  p384.subm(r, r, t, p384.p);                   // x^3 - 3x
+  p384.addm(r, r, p384.b, p384.p);              // + b
+  return p384.cmp(l, r) = 0;
+end;
+
+// Multiply the point (px, py) by the scalar k, leaving the result in the accumulator.
+// Double-and-add, MSB first. The scalar is public here (it is derived from the signature and
+// the message), so a plain branch is fine.
+procedure p384.mulpoint(px: array of int; py: array of int; k: array of int);
+var i, bit: int;
+begin
+  p384.zero(p384.ax);
+  p384.zero(p384.ay);
+  p384.zero(p384.az);                            // start at infinity
+  i := 383;
+  while i >= 0 do
+  begin
+    p384.dbl;
+    bit := band(k[i shr 5] shr band(i, 31), 1);
+    if bit <> 0 then
+    begin
+      p384.copy(p384.bx, px);
+      p384.copy(p384.by, py);
+      p384.zero(p384.bz);
+      p384.bz[0] := 1;
+      p384.add;
+    end;
+    i := i - 1;
+  end;
+end;
+
+// Add k*(px,py) into the accumulator, leaving the sum there.
+procedure p384.mulacc(px: array of int; py: array of int; k: array of int);
+var i, bit: int;
+    sx: array[0..Q.N-1] of int;
+    sy: array[0..Q.N-1] of int;
+    sz: array[0..Q.N-1] of int;
+begin
+  // Keep the running sum aside while mulpoint uses the accumulator.
+  p384.copy(sx, p384.ax);
+  p384.copy(sy, p384.ay);
+  p384.copy(sz, p384.az);
+  p384.mulpoint(px, py, k);
+  // Now add the saved sum back in.
+  p384.copy(p384.bx, p384.ax);
+  p384.copy(p384.by, p384.ay);
+  p384.copy(p384.bz, p384.az);
+  p384.copy(p384.ax, sx);
+  p384.copy(p384.ay, sy);
+  p384.copy(p384.az, sz);
+  p384.add;
+end;
+
+// Verify an ECDSA-SHA256 signature. All five inputs are 32-byte big-endian values except the
+// key, which is (qx, qy).
+function p384.verify(qx: array of int; qy: array of int; e: array of int; r: array of int; s: array of int): bool;
+begin
+  p384.setup;
+  if not p384.inrange(r) then return false;
+  if not p384.inrange(s) then return false;
+  if not p384.oncurve(qx, qy) then return false;
+
+  p384.invm(p384.w, s, p384.n);                  // w = 1/s mod n
+  p384.mulm(p384.u1, e, p384.w, p384.n);
+  p384.mulm(p384.u2, r, p384.w, p384.n);
+
+  p384.mulpoint(p384.gx, p384.gy, p384.u1);      // u1*G
+  p384.mulacc(qx, qy, p384.u2);                  // + u2*Q
+  if p384.iszero(p384.az) then return false;     // R is the point at infinity: invalid
+  p384.affine;
+
+  // R.x is a field element; compare it modulo n.
+  p384.copy(p384.rx, p384.t0);
+  if p384.cmp(p384.rx, p384.n) >= 0 then
+  begin
+    if p384.subb(p384.rx, p384.rx, p384.n) = 0 then p384.rx[0] := p384.rx[0];
+  end;
+  return p384.cmp(p384.rx, r) = 0;
+end;
+
+// 48 big-endian bytes -> twelve limbs.
+procedure p384.frombytes(r: array of int; b: array of char; at: int);
+var i, limb: int;
+begin
+  p384.zero(r);
+  i := 0;
+  while i < 48 do
+  begin
+    limb := (47 - i) shr 2;
+    r[limb] := bor(r[limb], ord(b[at + i]) shl (band(47 - i, 3) * 8));
+    i := i + 1;
+  end;
+end;
+
+// ---- signing ------------------------------------------------------------------------------
+//
+// THE DANGEROUS HALF OF THIS FILE, and it is here only because ACME needs it: every ACME
+// request is a JWS, signed with the account key. Nothing in the TLS client signs anything.
+//
+// THE NONCE IS THE WHOLE PROBLEM. ECDSA needs a random k per signature, and:
+//   - the same k used twice, with two different messages, reveals the private key outright
+//     by simple algebra. This is how a games console and a cryptocurrency wallet were both
+//     broken in public.
+//   - a k that is even slightly biased leaks the key over a few hundred signatures.
+//
+// So k comes straight from getrandom(2) via rand.wz -- the kernel's CSPRNG, the same source
+// used for TLS keys -- and a k that lands outside 1..n-1 is REDRAWN rather than reduced.
+// Reducing it (k mod n) is the obvious shortcut and it introduces exactly the bias above.
+//
+// AND THIS ROUTINE IS NOT CONSTANT-TIME, which matters here in a way it did not for
+// verification. The scalar multiplication walks the bits of k with a branch. A local
+// attacker who can time it could recover k and therefore the key. For signing ACME requests
+// on a machine the operator controls that is an acceptable risk and a deliberate one; it
+// would NOT be acceptable for signing on behalf of others, and this comment is the record
+// that the question was asked rather than missed.
+
+var
+  p384.k:    array[0..Q.N-1] of int;
+  p384.kinv: array[0..Q.N-1] of int;
+  p384.dr:   array[0..Q.N-1] of int;
+  p384.sigr: array[0..Q.N-1] of int;
+  p384.sigs: array[0..Q.N-1] of int;
+  p384.kb:   array[0..47] of char;   // 48 bytes: p384.frombytes reads a full P-384 scalar
+  p384.err:  str;    // the reason p384.sign or p384.genkey last returned false
+
+// Sign the hash e with the private key d. The signature lands in p384.sigr and p384.sigs.
+// False when no valid signature could be made; p384.err says why. A fresh k landing on
+// r = 0 or s = 0 is retried (that is what "100 tries" is for) and never reaches p384.err --
+// running out of tries there would mean the RNG is broken, which is exactly what p384.err
+// reports.
+function p384.sign(d: array of int; e: array of int): bool;
+var tries: int;
+begin
+  p384.setup;
+  p384.err := "";
+  if not p384.inrange(d) then begin p384.err := "the private key is out of range"; return false; end;
+  tries := 0;
+  while tries < 100 do
+  begin
+    tries := tries + 1;
+    rand.bytes(p384.kb);
+    p384.frombytes(p384.k, p384.kb, 0);
+    // REDRAWN, NOT REDUCED. k mod n would bias the low values, and a biased k leaks the
+    // private key over a few hundred signatures.
+    if p384.inrange(p384.k) then
+    begin
+      // r = (k*G).x mod n
+      p384.mulpoint(p384.gx, p384.gy, p384.k);
+      // k IS IN RANGE (1..n-1) AND G HAS ORDER n, so k*G = infinity is not a retry case --
+      // it is the multiplication getting a mathematically impossible answer. Retrying would
+      // hide a broken scalar multiplication behind "no valid signature could be made".
+      if p384.iszero(p384.az) then
+        io.fatal("p384.sign: k*G is the point at infinity for an in-range k; the curve arithmetic is broken");
+      p384.affine;
+      p384.copy(p384.sigr, p384.t0);
+      if p384.cmp(p384.sigr, p384.n) >= 0 then
+        p384.subm(p384.sigr, p384.sigr, p384.n, p384.n);
+      if not p384.iszero(p384.sigr) then
+      begin
+        // s = (e + r*d) / k mod n
+        p384.mulm(p384.dr, p384.sigr, d, p384.n);
+        p384.addm(p384.dr, p384.dr, e, p384.n);
+        p384.invm(p384.kinv, p384.k, p384.n);
+        p384.mulm(p384.sigs, p384.dr, p384.kinv, p384.n);
+        if not p384.iszero(p384.sigs) then
+        begin
+          // THE KEY MATERIAL DOES NOT STAY IN A GLOBAL. k is as secret as d itself.
+          p384.zero(p384.k);
+          p384.zero(p384.kinv);
+          return true;
+        end;
+      end;
+    end;
+  end;
+  p384.err := "the RNG produced 100 unusable nonces in a row";
+  return false;
+end;
+
+// A fresh private key and its public point. The key lands in d, the point in qx and qy.
+// False when no valid key could be made; p384.err says why.
+function p384.genkey(d: array of int; qx: array of int; qy: array of int): bool;
+var tries: int;
+begin
+  p384.setup;
+  p384.err := "";
+  tries := 0;
+  while tries < 100 do
+  begin
+    tries := tries + 1;
+    rand.bytes(p384.kb);
+    p384.frombytes(d, p384.kb, 0);
+    if p384.inrange(d) then
+    begin
+      p384.mulpoint(p384.gx, p384.gy, d);
+      // Same invariant as in p384.sign: d is in range, so d*G = infinity can only mean the
+      // arithmetic itself is wrong, not that this draw of d was unlucky.
+      if p384.iszero(p384.az) then
+        io.fatal("p384.genkey: d*G is the point at infinity for an in-range d; the curve arithmetic is broken");
+      p384.affine;
+      p384.copy(qx, p384.t0);
+      p384.copy(qy, p384.t1);
+      return true;
+    end;
+  end;
+  p384.err := "the RNG produced 100 out-of-range keys in a row";
+  return false;
+end;
+
+// Twelve limbs -> 48 big-endian bytes, the inverse of p384.frombytes.
+procedure p384.tobytes(b: array of char; at: int; a: array of int);
+var i, limb: int;
+begin
+  i := 0;
+  while i < 48 do
+  begin
+    limb := (47 - i) shr 2;
+    b[at + i] := chr(band(a[limb] shr (band(47 - i, 3) * 8), 255));
+    i := i + 1;
+  end;
+end;

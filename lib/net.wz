@@ -1,4 +1,8 @@
 // lib/net.wz -- sockets and epoll, straight on top of the system calls.
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
 
 include "io.wz";
 
@@ -94,6 +98,46 @@ begin
   begin
     net.close(fd);
     return -9;                           // EBADF: the fd did not take O_NONBLOCK
+  end;
+  return fd;
+end;
+
+// net.connect(ip, port) -- an outgoing connection to a numeric IPv4 address.
+//
+// THE ADDRESS IS FOUR BYTES, NOT A NAME. Resolving a hostname means DNS, which is a protocol
+// of its own over UDP -- a separate job, and one that does not belong inside a connect. Pass
+// 127, 0, 0, 1 for localhost.
+//
+// BLOCKING, unlike net.listen. A listening socket is polled in a loop and must not make
+// accept() wait; a client that has just opened a connection has nothing else to do until it
+// is up. A caller that wants otherwise can set O_NONBLOCK afterwards and handle EINPROGRESS,
+// which is a different contract and deserves to be asked for.
+//
+// Returns the fd, or a negative errno -- and the fd is closed on failure, so a caller that
+// only tests the sign cannot leak one.
+function net.connect(a: int; b: int; c: int; d: int; port: int): int;
+var fd, r, i: int;
+begin
+  fd := net.socket;
+  if fd < 0 then return fd;
+  i := 0;
+  while i < 16 do
+  begin
+    net.sa[i] := chr(0);
+    i := i + 1;
+  end;
+  net.sa[0] := chr(AF_INET);
+  net.sa[2] := chr(port shr 8);          // network byte order, as in net.listen
+  net.sa[3] := chr(band(port, 255));
+  net.sa[4] := chr(band(a, 255));
+  net.sa[5] := chr(band(b, 255));
+  net.sa[6] := chr(band(c, 255));
+  net.sa[7] := chr(band(d, 255));
+  r := sys3(SYS.connect, fd, addr(net.sa[0]), 16);
+  if r < 0 then
+  begin
+    net.close(fd);
+    return r;
   end;
   return fd;
 end;

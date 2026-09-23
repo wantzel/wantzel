@@ -1,0 +1,9 @@
+ok   RFC 7748 5.2 first scalarmult vector
+ok   RFC 7748 5.2 second scalarmult vector
+ok   RFC 7748 6.1 Alice's public key
+ok   RFC 7748 6.1 Bob's public key
+ok   RFC 7748 6.1 the shared secret
+ok   and both sides derive the same secret
+ok   clamping normalises a scalar that differs only in clamped bits
+ok   a different private key gives a different secret
+ok   p itself encodes as zero, not as 19

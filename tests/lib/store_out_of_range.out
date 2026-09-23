@@ -1,0 +1,3 @@
+table out of range: store.write: table out of range: table 99
+row out of range: store.write: row out of range: table readings row 10
+rmdir = 0

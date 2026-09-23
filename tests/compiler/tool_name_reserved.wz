@@ -1,0 +1,25 @@
+// Must not compile: "tool_name_reserved.wz:16: tool name "count" is reserved: the tools
+// block generates tool.count; choose another name" -- the tools block itself generates
+// the constant tool.count, so a tool named count collides with it.
+//
+// This used to be reported as "<tools>:19: name already used by a variable or constant",
+// a line of the GENERATED <tools> text: a file nobody can open, at a line that has
+// nothing to do with the entry below. The message must name this file and this line.
+include "json.wz";
+type A = schema
+  x: int;
+end;
+type R = schema
+  y: int;
+end;
+tools
+  count(A): R "Count something.";
+end;
+include "lib/toolsmcp.wz";
+function tool.count(a: array of A; r: array of R): int;
+begin
+  r[0].y := a[0].x;
+  return 0;
+end;
+begin
+end.

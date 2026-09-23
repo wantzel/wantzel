@@ -1,4 +1,8 @@
 // lib/uuid.wz -- UUID version 4 (RFC 9562): 16 random bytes with a version
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
 // and variant stamp, and the canonical 8-4-4-4-12 text form.
 //
 // A UUID is an array of 16 char; the text form is 36 lowercase characters.

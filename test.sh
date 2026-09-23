@@ -53,7 +53,7 @@ same "mcp initialize" \
   '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"wantzel-mcp","version":"1.0"}}}'
 same "mcp tools/call add" \
   "$(mcpsend '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add","arguments":{"a":19,"b":23}}}')" \
-  '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"42"}]}}'
+  '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"sum\":42}"}],"structuredContent":{"sum":42},"isError":false}}'
 same "mcp string id is echoed" \
   "$(mcpsend '{"jsonrpc":"2.0","id":"x-1","method":"ping"}')" \
   '{"jsonrpc":"2.0","id":"x-1","result":{}}'
@@ -68,26 +68,40 @@ same "mcp echoes the protocol version" \
   '{"jsonrpc":"2.0","id":10,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"wantzel-mcp","version":"1.0"}}}'
 same "mcp escapes survive a round trip" \
   "$(mcpsend '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{"text":"a\"b\nc"}}}')" \
-  '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"a\"b\nc"}]}}'
+  '{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"{\"text\":\"a\\\"b\\nc\"}"}],"structuredContent":{"text":"a\"b\nc"},"isError":false}}'
 same "mcp notification is silent" \
   "$(printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}' | "$T/mcp" | wc -c)" "0"
 same "mcp missing tool argument" \
   "$(mcpsend '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"add","arguments":{"a":1}}}')" \
-  '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"add needs two integers a and b"}],"isError":true}}'
+  '{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":"the arguments do not match the tool'"'"'s input schema"}],"isError":true}}'
 
 ./bin/wantzel examples/mcpfiles.wz "$T/files" 2>/dev/null
 mkdir -p "$T/root/sub"
 printf 'alpha beta\ngamma delta\n' > "$T/root/one.txt"
 printf 'beta again\n' > "$T/root/sub/two.txt"
 filesend() { printf '%s\n' "$1" | "$T/files" "$T/root" | head -1; }
-# The text out of {"result":{"content":[{"type":"text","text":"..."}]}}, with the JSON
-# escapes the server actually emits turned back into characters.  sed rather than a JSON
-# parser because this repository depends on nothing: the shape is fixed, it is our own
-# server answering, and a test that needed another language to read one field would
-# contradict the thing being tested.
+# The free-text result, with the JSON escapes the server actually emits turned back into
+# characters.  sed rather than a JSON parser because this repository depends on nothing:
+# the shape is fixed, it is our own server answering, and a test that needed another
+# language to read one field would contradict the thing being tested.
+#
+# A `tools` block wraps free text as an output schema field ("text"), so a successful
+# call carries it TWICE: once JSON-encoded inside content[0].text (for a client that only
+# reads content), and once plain inside structuredContent (for one that reads that
+# instead).  structuredContent is the simpler extraction and is tried first.  A refused
+# call (tool.fail, still "no `tools` block" shaped) has no structuredContent at all, so
+# that falls through to the plain content[0].text extraction, same as before the tools
+# block existed.
 jtext() {
-  sed -e 's/.*"text":"//' -e 's/"}\].*//' \
-      -e 's/\\"/"/g' -e 's/\\\\/\\/g' | sed -e 's/\\n/\n/g'
+  line=$(cat)
+  case "$line" in
+    *'"structuredContent":{"text":"'*)
+      printf '%s' "$line" | sed -e 's/.*"structuredContent":{"text":"//' -e 's/"},"isError".*//' \
+          -e 's/\\"/"/g' -e 's/\\\\/\\/g' | sed -e 's/\\n/\n/g' ;;
+    *)
+      printf '%s' "$line" | sed -e 's/.*"text":"//' -e 's/"}\].*//' \
+          -e 's/\\"/"/g' -e 's/\\\\/\\/g' | sed -e 's/\\n/\n/g' ;;
+  esac
 }
 same "files list_dir" \
   "$(filesend '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_dir","arguments":{}}}' | jtext | sort | tr '\n' '|')" \

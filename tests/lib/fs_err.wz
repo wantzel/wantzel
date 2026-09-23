@@ -1,0 +1,75 @@
+// lib/fs.wz: fs.stat and fs.next used to conflate every reason for `false` into one
+// bit, so a caller could not tell "this path does not exist" (the common, expected case)
+// from a real failure (a component of the path is not a directory) or "the directory is
+// exhausted" from a getdents error. fs.err/fs.errno now carry that difference: empty for
+// the common case, filled for a real failure.
+include "io.wz";
+include "fs.wz";
+
+var
+  pad: array[0..511] of char;
+  failures: int;
+
+procedure setpath(s: str);
+var k: int;
+begin
+  k := 0;
+  while (k < slen(s)) and (k < len(pad) - 1) do begin pad[k] := schar(s, k); k := k + 1; end;
+  pad[k] := chr(0);
+end;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ") else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+var fd, d: int;
+
+begin
+  failures := 0;
+
+  // ---- fs.stat: the common case, a missing path, leaves fs.err empty ------------------
+  setpath("fs_err_does_not_exist.wz");
+  expect(not fs.stat(addr(pad[0])), "a missing path is refused");
+  expect(slen(fs.err) = 0, "and fs.err stays empty for the common case");
+
+  // ---- fs.stat: a real failure names the reason ----------------------------------------
+  //
+  // A component of the path that is not a directory (ENOTDIR) is a different failure from
+  // "does not exist": create a plain file, then stat a path that walks THROUGH it.
+  setpath("fs_err_plain_file.wz");
+  fd := sys3(SYS.open, addr(pad[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
+  if fd < 0 then begin io.puts(STDOUT, "FAIL cannot create the sample file\n"); halt(1); end;
+  sys1(SYS.close, fd);
+  setpath("fs_err_plain_file.wz/nested");
+  expect(not fs.stat(addr(pad[0])), "a path through a plain file is refused");
+  expect(slen(fs.err) > 0, "and fs.err names the reason this time");
+  expect(fs.errno > 0, "with the raw errno beside it");
+
+  // ---- fs.next: the common case, an exhausted directory, leaves fs.err empty -----------
+  setpath(".");
+  d := fs.opendir(addr(pad[0]));
+  if d < 0 then begin io.puts(STDOUT, "FAIL cannot open .\n"); halt(1); end;
+  while fs.next(d) do ;    // drain it
+  expect(slen(fs.err) = 0, "an exhausted directory leaves fs.err empty");
+  fs.close(d);
+
+  // ---- fs.next: a real failure names the reason -----------------------------------------
+  //
+  // getdents on a descriptor that is not a directory (the plain file above, reopened) fails
+  // with ENOTDIR rather than reporting zero entries -- that must not read as "exhausted".
+  setpath("fs_err_plain_file.wz");
+  fd := fs.open(addr(pad[0]));
+  if fd < 0 then begin io.puts(STDOUT, "FAIL cannot reopen the sample file\n"); halt(1); end;
+  fs.dlen := 0; fs.dpos := 0;
+  expect(not fs.next(fd), "getdents on a plain file is refused");
+  expect(slen(fs.err) > 0, "and fs.err names the reason, not silent exhaustion");
+  fs.close(fd);
+
+  setpath("fs_err_plain_file.wz");
+  sys1(SYS.unlink, addr(pad[0]));
+
+  if failures > 0 then halt(1);
+end.

@@ -1,0 +1,9 @@
+ok   the bytes come out little-endian, in that exact order
+ok   zero round-trips
+ok   one round-trips
+ok   minus one round-trips
+ok   and minus one is eight 0xFF bytes, not a sign-extended mess
+ok   a small negative round-trips
+ok   the largest positive value round-trips
+ok   and it writes at the offset it is given
+ok   starting exactly there

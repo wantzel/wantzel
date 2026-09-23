@@ -1,0 +1,65 @@
+// lib/io.wz: io.put64, the mirror of io.get64.
+//
+// WHY IT NEEDED WRITING AT ALL. io.wz had get64, get32, get16 and put32 -- but no put64, so
+// anyone writing a 64-bit field did it by hand, a byte at a time. That loop is where the
+// byte order goes quietly wrong: reversing it produces no error, just a different number.
+//
+// WHAT IS CHECKED, and the edges are the point: a round trip is not enough on its own,
+// because two mirrored bugs cancel out. So the exact bytes are checked as well.
+include "io.wz";
+
+var
+  b: array[0..15] of char;
+  i, failures: int;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ")
+  else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+begin
+  failures := 0;
+
+  // ---- THE EXACT BYTES, not just a round trip -------------------------------------------
+  //
+  // 0x0807060504030201 little-endian is 01 02 03 04 05 06 07 08. A put64 that wrote the
+  // bytes in the other order would still round-trip perfectly through a matching get64 --
+  // the two bugs cancel -- and would be wrong against every other reader of the format.
+  io.put64(b, 0, 0x0807060504030201);
+  i := 0;
+  while (i < 8) and (ord(b[i]) = i + 1) do i := i + 1;
+  expect(i = 8, "the bytes come out little-endian, in that exact order");
+
+  // ---- the round trip, over the values that break a careless implementation ----------------
+  io.put64(b, 0, 0);
+  expect(io.get64(b, 0) = 0, "zero round-trips");
+
+  io.put64(b, 0, 1);
+  expect(io.get64(b, 0) = 1, "one round-trips");
+
+  // A NEGATIVE VALUE, which is where an arithmetic shift shows itself: shr propagates the
+  // sign bit, so without masking each byte the top bytes fill with ones.
+  io.put64(b, 0, 0 - 1);
+  expect(io.get64(b, 0) = 0 - 1, "minus one round-trips");
+  i := 0;
+  while (i < 8) and (ord(b[i]) = 255) do i := i + 1;
+  expect(i = 8, "and minus one is eight 0xFF bytes, not a sign-extended mess");
+
+  io.put64(b, 0, 0 - 2);
+  expect(io.get64(b, 0) = 0 - 2, "a small negative round-trips");
+
+  // THE LARGEST POSITIVE VALUE. One bit below the sign bit, so any accidental sign handling
+  // shows up here.
+  io.put64(b, 0, 0x7FFFFFFFFFFFFFFF);
+  expect(io.get64(b, 0) = 0x7FFFFFFFFFFFFFFF, "the largest positive value round-trips");
+
+  // AT AN OFFSET, because a routine that ignores `at` passes every check above.
+  io.put64(b, 4, 0x1122334455667788);
+  expect(io.get64(b, 4) = 0x1122334455667788, "and it writes at the offset it is given");
+  expect(ord(b[4]) = 0x88, "starting exactly there");
+
+  if failures > 0 then halt(1);
+end.

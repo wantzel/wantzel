@@ -1,0 +1,81 @@
+// lib/log.wz: one JSON line per event, on stderr.
+//
+// WHY THIS TEST EXISTS. 69 lines of public standard library with no test at all: a change to
+// the compiler could break it and nothing in this repository would notice, because nothing
+// here includes it.
+//
+// WHAT IS AWKWARD, and it shapes the whole test: log.emit writes to STDERR and every line
+// starts with a timestamp that differs per run. A .out file cannot contain that. So the test
+// checks the BUFFER before it is emitted -- log.n and log.buf are ordinary variables -- and
+// prints only what is stable.
+//
+// THE FIELD ORDER IS PART OF THE FORMAT, not an accident: t, then any extra fields, then
+// level and msg last. A reader scanning a log file finds the message where it always is.
+include "io.wz";
+include "json.wz";
+include "log.wz";
+
+var failures: int;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ") else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+// contains(s) -- does s appear literally in the part of log.buf built so far?
+function contains(s: str): bool;
+var i, k: int;
+begin
+  i := 0;
+  while i + slen(s) <= log.n do
+  begin
+    k := 0;
+    while (k < slen(s)) and (log.buf[i + k] = schar(s, k)) do k := k + 1;
+    if k = slen(s) then return true;
+    i := i + 1;
+  end;
+  return false;
+end;
+
+begin
+  failures := 0;
+
+  // ---- 1. A LINE OPENS WITH A TIMESTAMP -------------------------------------------------
+  log.n := 0;
+  log.begin;
+  expect(contains("{\"t\":"), "a line opens with a timestamp");
+  expect(log.n > 5, "and a number follows it");
+
+  // ---- 2. EXTRA FIELDS COME BEFORE THE MESSAGE ------------------------------------------
+  log.n := 0;
+  log.kv("port", 8080);
+  expect(contains("\"port\":8080"), "an int field goes in as a number");
+  log.kvs("host", "localhost");
+  expect(contains("\"host\":\"localhost\""), "and a str field between quotes");
+
+  // ---- 3. AND LEVEL AND MESSAGE CLOSE IT OFF --------------------------------------------
+  //
+  // log.emit writes to STDERR and empties the buffer, so what was IN it cannot be read
+  // afterwards. The building is therefore followed here up to just before the write -- that
+  // is the only part a test without a pipe can see.
+  expect(log.fields, "log.kv records that fields are present");
+
+  // ---- 4. A QUOTE IN A VALUE DOES NOT BREAK THE JSON ------------------------------------
+  //
+  // THIS IS THE CHECK THAT MATTERS. A log line carries text from outside -- a filename, an
+  // error message -- and a bare " in it makes the line invalid JSON. Then the whole line is
+  // dropped by whoever reads it, exactly when something went wrong.
+  log.n := 0;
+  log.kvs("file", "a\"b");
+  expect(contains("a\\\"b"), "a quote in a value is escaped");
+  expect(not contains("\"a\"b\""), "and so does NOT appear bare");
+
+  // ---- 5. A KEY IS TREATED THE SAME WAY -------------------------------------------------
+  log.n := 0;
+  log.kvs("a\"b", "x");
+  expect(contains("a\\\"b"), "and a quote in a KEY too");
+
+  if failures > 0 then halt(1);
+end.

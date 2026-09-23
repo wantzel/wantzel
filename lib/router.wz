@@ -1,4 +1,8 @@
 // lib/router.wz -- a few helpers on top of lib/http.wz for routing by path
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
 // and method, and the standard JSON error replies.
 //
 //   if router.get("/status") then ... else

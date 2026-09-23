@@ -1,0 +1,141 @@
+// lib/toolsmcp.wz -- the MCP half of the glue for a declared `tools` block.
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// Include this after the tools block.  It defines the two hooks lib/mcp.wz leaves
+// open, so a program with a tools block needs no app.tools/app.call of its own:
+//
+//   schema ...;  tools ... end;
+//   include "lib/toolsmcp.wz";
+//   <the handlers tool.<name>(a, r)>
+//   begin mcp.stdio; end.
+//
+// It does NOT bring lib/http.wz, so a server that only speaks MCP over standard input
+// and output needs no app.request.  lib/tools.wz is this file plus the REST half
+// (tool.rest) and lib/http.wz; include that one when the table is also served over HTTP.
+//
+// The generated tool.run writes the result JSON; this file wraps it as an MCP tool
+// result (content + structuredContent + isError).
+
+include "mcp.wz";
+
+const
+  TOOLBUF = 1048576;
+
+var
+  tool.out: array[0..TOOLBUF - 1] of char;   // the result JSON of one call
+  tool.empty: array[0..1] of char;           // "{}" for calls without arguments
+  // The undeclared keys of the call being answered, copied out of the request buffer
+  // because the reply is written while that buffer is still the request's.
+  tool.ign: array[0..95] of char;            // the first one, truncated to fit
+  tool.ignn: int;                            // its length, 0 when there was none
+  tool.ignc: int;                            // how many there were in total
+
+procedure app.tools;
+begin
+  mcp.add(tool.list);
+end;
+
+// Take the undeclared keys the parse recorded, before anything else can overwrite them.
+//
+// WHY THE CALL IS ANSWERED AT ALL. A key the schema does not declare is skipped rather
+// than refused, because a caller may legitimately send a superset -- that is what a
+// schema-validating server does by default, and refusing it turns a harmless extra field
+// into a failed call.
+//
+// WHY IT IS STILL SAID OUT LOUD. Skipping in silence is the older failure: a caller that
+// misspells or renames an OPTIONAL field then gets a perfectly normal answer computed
+// with the default in its place, and nothing anywhere says so. A required field still
+// fails the presence check, so the report is what closes the remaining hole. Naming the
+// key is the whole value of it -- "something was ignored" sends the caller hunting.
+//
+// Only the FIRST key is kept. It names the mistake, and a list would need a buffer
+// sized for input we do not control; the count says whether there were more.
+// Everything outside printable ASCII becomes '?'.  The key is the CALLER'S text and it
+// goes out in a response header, where a CR or an LF would end the header and let the
+// caller write the ones after it.  A name mangled to '?' is still a usable hint; a
+// header the caller controls the shape of is not acceptable at any price.  Note this
+// takes the key as it stands in the document, escapes and all -- no unescaping happens
+// here, so a "\u000d" in the source arrives as those six harmless characters.
+procedure tool.takeignored(b: array of char);
+var i: int;
+    c: char;
+begin
+  tool.ignn := 0;
+  tool.ignc := json.ignoredn;
+  if json.ignoredn = 0 then return;
+  i := json.ignored0;
+  while (i < json.ignored1) and (tool.ignn < len(tool.ign)) do
+  begin
+    c := b[i];
+    if (c < ' ') or (c > chr(126)) then c := '?';
+    tool.ign[tool.ignn] := c;
+    tool.ignn := tool.ignn + 1;
+    i := i + 1;
+  end;
+end;
+
+// the MCP tools/call: name and arguments are in mcp.callp
+procedure app.call(b: array of char; last: int);
+var idx, n: int;
+begin
+  idx := tool.byname(b, mcp.callp.name_at, mcp.callp.name_end);
+  if idx < 0 then
+  begin
+    mcp.failed := true;
+    mcp.text("no such tool");
+    return;
+  end;
+  if mcp.callp.arguments_ok then
+  begin
+    n := tool.run(idx, b, mcp.callp.arguments_at, mcp.callp.arguments_end, tool.out);
+    tool.takeignored(b);
+  end
+  else
+  begin
+    tool.empty[0] := '{'; tool.empty[1] := '}';
+    n := tool.run(idx, tool.empty, 0, 2, tool.out);
+    tool.takeignored(tool.empty);
+  end;
+  if n = -1 then
+  begin
+    mcp.failed := true;
+    mcp.text("the arguments do not match the tool's input schema");
+    return;
+  end;
+  // -3: the generated writer refused because the result does not fit in tool.out.  It
+  // refuses rather than truncating, since half an object would leave the peer with an
+  // unparseable envelope instead of one failed call.  Reported separately because -1
+  // would blame the caller's arguments for a limit on our side.
+  if n = -3 then
+  begin
+    mcp.failed := true;
+    mcp.text("the result does not fit in the tool output buffer");
+    return;
+  end;
+  if n < 0 then
+  begin
+    mcp.failed := true;
+    mcp.textbytes(tool.err, 0, tool.errn);
+    return;
+  end;
+  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":");
+  mcp.addqslice(tool.out, 0, n);
+  mcp.add("}],\"structuredContent\":");
+  mcp.addslice(tool.out, 0, n);
+  // The report rides in _meta and NOT in structuredContent, which has to keep the shape
+  // the tool's output schema declares -- a field the schema does not name would make a
+  // validating client reject an answer that is otherwise correct.  _meta is the place
+  // the protocol leaves open for exactly this.
+  if tool.ignc > 0 then
+  begin
+    mcp.add(",\"_meta\":{\"ignoredFields\":{\"first\":");
+    mcp.addqslice(tool.ign, 0, tool.ignn);
+    mcp.add(",\"count\":");
+    mcp.addn(tool.ignc);
+    mcp.add("}}");
+  end;
+  mcp.add(",\"isError\":false}");
+end;

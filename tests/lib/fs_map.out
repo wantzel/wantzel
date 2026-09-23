@@ -1,0 +1,5 @@
+ok   a file that exists maps
+ok   and fs.size carries its length
+ok   and the first byte is the file's
+ok   a file that does not exist is refused
+ok   fifty maps leak no descriptor

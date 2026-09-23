@@ -1,0 +1,27 @@
+// Must not compile: "tool_name_reserved_lib.wz:15: tool name "rest" is reserved:
+// lib/tools.wz or lib/toolsmcp.wz declares tool.rest; choose another name" -- lib/tools.wz
+// is included AFTER the tools block (see docs/language.md 7b), so at the point the block
+// is read the library has not been parsed yet and an ordinary name lookup cannot see the
+// clash. Before this fix the error surfaced deep inside lib/tools.wz itself, naming
+// neither the tool nor this file.
+include "json.wz";
+type A = schema
+  x: int;
+end;
+type R = schema
+  y: int;
+end;
+tools
+  rest(A): R "Clashes with tool.rest from lib/tools.wz.";
+end;
+include "lib/tools.wz";
+function tool.rest(a: array of A; r: array of R): int;
+begin
+  r[0].y := a[0].x;
+  return 0;
+end;
+procedure app.request;
+begin
+end;
+begin
+end.

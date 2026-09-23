@@ -1,0 +1,4 @@
+a -> found [hello]
+b -> malformed
+c -> absent
+d -> malformed

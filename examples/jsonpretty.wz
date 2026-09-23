@@ -23,7 +23,7 @@ var
   path: array[0..1023] of char;
   n, e, fd, got, i: int;
 
-procedure fout(m: str);
+procedure fail(m: str);
 begin
   io.puts(STDERR, m);
   io.puts(STDERR, "\n");
@@ -40,7 +40,7 @@ begin
     begin path[i] := argch(1, i); i := i + 1; end;
     path[i] := chr(0);
     fd := fs.open(addr(path[0]));
-    if fd < 0 then fout("cannot open that file");
+    if fd < 0 then fail("cannot open that file");
   end;
 
   n := 0;
@@ -51,14 +51,14 @@ begin
     n := n + got;
     // THE LIMIT IS SAID OUT LOUD.  Silently formatting the first 256 kB of a
     // larger file would produce valid-looking output that is missing its tail.
-    if n >= MAXIN then fout("that document is larger than 256 kB");
+    if n >= MAXIN then fail("that document is larger than 256 kB");
   end;
   if fd <> STDIN then fs.close(fd);
-  if n = 0 then fout("nothing to read");
+  if n = 0 then fail("nothing to read");
 
   // ---- one call ------------------------------------------------------------
   e := json.pretty(src, 0, n, dst, 0, 0);
-  if e < 0 then fout("that is not valid JSON");
+  if e < 0 then fail("that is not valid JSON");
 
   io.out(STDOUT, addr(dst[0]), e);
   io.puts(STDOUT, "\n");

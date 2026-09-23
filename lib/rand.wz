@@ -1,5 +1,9 @@
 // lib/rand.wz -- random bytes and numbers from the kernel.
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 // Everything comes from getrandom(2), so the bytes are suitable for keys,
 // tokens and identifiers.  There is no seed and no user-space generator.
 

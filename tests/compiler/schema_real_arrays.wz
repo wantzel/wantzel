@@ -60,12 +60,38 @@ begin
   show("name too long = ", Sample.parse(doc, 0, n, s));
   load("{\"name\":\"x\",\"value\":\"1.0\",\"points\":[],\"keys\":[]}");
   show("string for real = ", Sample.parse(doc, 0, n, s));
-  // An undeclared key is refused rather than skipped, whatever it holds --
-  // this one carries a nested object, which the old skipper walked over in silence
+  // An undeclared key is SKIPPED and RECORDED, whatever it holds -- this one carries a
+  // nested object, so the skipper has to walk it rather than stop at the first '}'.
+  // The parse succeeds (a caller may send a superset) and the key is still nameable.
   load("{\"name\":\"x\",\"value\":1.0,\"points\":[],\"keys\":[],\"extra\":{\"x\":[1,2]}}");
   show("undeclared key = ", Sample.parse(doc, 0, n, s));
-  io.puts(STDOUT, "  refused key = ");
-  io.out(STDOUT, addr(doc[json.badkey0]), json.badkey1 - json.badkey0);
+  io.puts(STDOUT, "  ignored key = ");
+  io.out(STDOUT, addr(doc[json.ignored0]), json.ignored1 - json.ignored0);
+  io.puts(STDOUT, " count = ");
+  io.putn(STDOUT, json.ignoredn);
+  io.puts(STDOUT, "\n");
+  // The value really was stepped over and not partly read: the declared fields still
+  // carry what the document said, and name survives the nested object that followed it.
+  io.puts(STDOUT, "  name after skip = ");
+  io.out(STDOUT, addr(s.name), s.name_n);
+  io.puts(STDOUT, "\n");
+  // Two undeclared keys: the FIRST is the one that is named, and both are counted.
+  load("{\"name\":\"x\",\"value\":1.0,\"points\":[],\"keys\":[],\"aaa\":1,\"bbb\":2}");
+  show("two undeclared = ", Sample.parse(doc, 0, n, s));
+  io.puts(STDOUT, "  ignored key = ");
+  io.out(STDOUT, addr(doc[json.ignored0]), json.ignored1 - json.ignored0);
+  io.puts(STDOUT, " count = ");
+  io.putn(STDOUT, json.ignoredn);
+  io.puts(STDOUT, "\n");
+  // A DECLARED key with the wrong type is still refused -- tolerance is for keys the
+  // schema does not know, never for a value it cannot hold.
+  load("{\"name\":\"x\",\"value\":\"nope\",\"points\":[],\"keys\":[],\"extra\":1}");
+  show("undeclared plus bad type = ", Sample.parse(doc, 0, n, s));
+  // A clean document leaves no ignored key behind from the parse before it.
+  load("{\"name\":\"x\",\"value\":1.0,\"points\":[],\"keys\":[]}");
+  show("clean again = ", Sample.parse(doc, 0, n, s));
+  io.puts(STDOUT, "  count = ");
+  io.putn(STDOUT, json.ignoredn);
   io.puts(STDOUT, "\n");
   io.puts(STDOUT, Sample.jsonschema); io.puts(STDOUT, "\n");
 end.

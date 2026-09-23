@@ -1,0 +1,154 @@
+// lib/x25519.wz: key agreement on Curve25519, against RFC 7748's own vectors.
+//
+// WHY THE VECTORS ARE THE WHOLE TEST. Every intermediate value here is a 255-bit number
+// with no meaning a human can check by eye, so there is nothing to inspect: either the
+// final 32 bytes match the RFC or the implementation is wrong. The vectors are §5.2 (two
+// scalar/u-coordinate pairs) and §6.1 (the full Diffie-Hellman between Alice and Bob).
+//
+// AND THE CHECKS THE VECTORS CANNOT GIVE, which is the part that catches the mistakes the
+// RFC does not anticipate:
+//   - clamping actually happens: two scalars differing only in the bits clamping clears
+//     must produce the SAME public key
+//   - the shared secret agrees in both directions, which no single vector proves
+//   - a different private key gives a different secret (a routine returning a constant
+//     would pass every symmetry check above)
+include "io.wz";
+include "x25519.wz";
+
+var
+  sc, pt, got, want: array[0..31] of char;
+  a_priv, a_pub, b_priv, b_pub, s1, s2: array[0..31] of char;
+  i: int;
+  failures: int;
+
+// Fill 32 bytes from a 64-character hex string.
+procedure sethex(b: array of char; s: str);
+var i, hi, lo, c: int;
+begin
+  i := 0;
+  while i < 32 do
+  begin
+    c := ord(schar(s, i * 2));
+    if c >= ord('a') then hi := c - ord('a') + 10 else hi := c - ord('0');
+    c := ord(schar(s, i * 2 + 1));
+    if c >= ord('a') then lo := c - ord('a') + 10 else lo := c - ord('0');
+    b[i] := chr(hi * 16 + lo);
+    i := i + 1;
+  end;
+end;
+
+procedure puthex(b: array of char);
+var i, v: int;
+begin
+  i := 0;
+  while i < 32 do
+  begin
+    v := ord(b[i]) shr 4;
+    if v < 10 then io.puts(STDOUT, "0") else io.puts(STDOUT, "a");
+    // printed as two nibbles via putn on the offset is awkward; do it by hand
+    i := i + 1;
+  end;
+end;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ")
+  else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+function same(a: array of char; b: array of char): bool;
+var i: int;
+begin
+  i := 0;
+  while i < 32 do
+  begin
+    if a[i] <> b[i] then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+begin
+  failures := 0;
+
+  // ---- RFC 7748 §5.2, first vector -------------------------------------------------------
+  sethex(sc,   "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+  sethex(pt,   "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
+  sethex(want, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
+  x.scalarmult(got, sc, pt);
+  expect(same(got, want), "RFC 7748 5.2 first scalarmult vector");
+
+  // ---- RFC 7748 §5.2, second vector ------------------------------------------------------
+  sethex(sc,   "4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d");
+  sethex(pt,   "e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493");
+  sethex(want, "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957");
+  x.scalarmult(got, sc, pt);
+  expect(same(got, want), "RFC 7748 5.2 second scalarmult vector");
+
+  // ---- RFC 7748 §6.1, the Diffie-Hellman -------------------------------------------------
+  //
+  // THE PUBLIC KEYS FIRST, because if these are wrong the shared secret below is wrong for
+  // a reason that has nothing to do with the agreement itself.
+  sethex(a_priv, "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+  sethex(want,   "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+  x.base(a_pub, a_priv);
+  expect(same(a_pub, want), "RFC 7748 6.1 Alice's public key");
+
+  sethex(b_priv, "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+  sethex(want,   "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+  x.base(b_pub, b_priv);
+  expect(same(b_pub, want), "RFC 7748 6.1 Bob's public key");
+
+  sethex(want, "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+  x.scalarmult(s1, a_priv, b_pub);
+  expect(same(s1, want), "RFC 7748 6.1 the shared secret");
+
+  // ---- WHAT NO VECTOR GIVES --------------------------------------------------------------
+  //
+  // BOTH DIRECTIONS AGREE. Every vector above fixes one direction; this is the property the
+  // protocol actually depends on, and an implementation can match a vector while getting
+  // the other side wrong.
+  x.scalarmult(s2, b_priv, a_pub);
+  expect(same(s1, s2), "and both sides derive the same secret");
+
+  // CLAMPING HAPPENS. The scalar's low three bits and top bit are cleared and bit 254 set
+  // before use, so a scalar differing ONLY in those bits must give the same public key.
+  // Without clamping these two differ -- which is how an unclamped implementation passes
+  // the vectors above (they are already clamped) and still fails in the field.
+  sethex(sc, "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+  sc[0]  := chr(bor(ord(sc[0]), 7));      // set the three bits clamping must clear
+  sc[31] := chr(bor(ord(sc[31]), 128));   // set bit 255, which clamping must clear
+  sc[31] := chr(band(ord(sc[31]), 191));  // clear bit 254, which clamping must set
+  x.base(got, sc);
+  expect(same(got, a_pub), "clamping normalises a scalar that differs only in clamped bits");
+
+  // A DIFFERENT KEY GIVES A DIFFERENT SECRET. Without this, a scalarmult that ignored its
+  // arguments and returned a fixed 32 bytes would satisfy every symmetry check above.
+  x.scalarmult(s2, b_priv, b_pub);
+  expect(not same(s1, s2), "a different private key gives a different secret");
+
+  // THE ENCODING IS CANONICAL, and nothing above checks it.
+  //
+  // A field element has many limb representations of the same number -- p + 3 and 3 are
+  // equal mod p -- and they MUST encode to the same 32 bytes, or two peers whose maths
+  // agrees still derive different byte strings and the handshake fails with no visible
+  // arithmetic error.
+  //
+  // MEASURED 22-09-2026: an earlier x.pack compared top limbs after adding 19, and feeding
+  // it exactly p produced the encoding of 19 instead of 0. Every check above stayed GREEN
+  // through that bug -- sabotaging the reduction again afterwards changed nothing -- so it
+  // is checked here directly: p must encode as zero, and so must 2p.
+  i := 0;
+  while i < 32 do begin sc[i] := chr(255); i := i + 1; end;
+  sc[0]  := chr(237);            // p = 2^255 - 19, little-endian
+  sc[31] := chr(127);
+  x.unpack(x.a, sc);
+  x.pack(got, x.a);
+  i := 0;
+  while i < 32 do begin want[i] := chr(0); i := i + 1; end;
+  expect(same(got, want), "p itself encodes as zero, not as 19");
+
+  if failures > 0 then halt(1);
+end.

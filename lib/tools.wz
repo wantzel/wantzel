@@ -1,80 +1,26 @@
 // lib/tools.wz -- MCP and REST glue for a declared `tools` block.
 //
-// Include this after the tools block (and after lib/mcp.wz and, for REST,
-// lib/http.wz).  It defines the two hooks lib/mcp.wz leaves open, so a
-// program with a tools block needs no app.tools/app.call of its own:
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
 //
-//   include "lib/mcp.wz";  include "lib/http.wz";
+// Include this after the tools block.  It is lib/toolsmcp.wz (app.tools and app.call,
+// the two hooks lib/mcp.wz leaves open) plus tool.rest, which answers the same table
+// over REST -- and therefore it brings lib/http.wz, whose app.request the program must
+// define.  A server that only speaks MCP over stdio includes lib/toolsmcp.wz instead
+// and needs no app.request.
+//
 //   schema ...;  tools ... end;
 //   include "lib/tools.wz";
 //   <the handlers tool.<name>(a, r)>
+//   procedure app.request; ... tool.rest("/tools/") ...
 //
-// The generated tool.run writes the result JSON; this file wraps it as an
-// MCP tool result (content + structuredContent) or a REST body.  For the
-// MCP endpoint itself over HTTP, include lib/mcphttp.wz and call mcp.http
-// from app.request.
+// The generated tool.run writes the result JSON; toolsmcp.wz wraps it as an MCP tool
+// result and this file as a REST body.  For the MCP endpoint itself over HTTP, include
+// lib/mcphttp.wz and call mcp.http from app.request.
 
-include "mcp.wz";
+include "toolsmcp.wz";
 include "http.wz";
-
-const
-  TOOLBUF = 1048576;
-
-var
-  tool.out: array[0..TOOLBUF - 1] of char;   // the result JSON of one call
-  tool.empty: array[0..1] of char;           // "{}" for calls without arguments
-
-procedure app.tools;
-begin
-  mcp.add(tool.list);
-end;
-
-// the MCP tools/call: name and arguments are in mcp.callp
-procedure app.call(b: array of char; last: int);
-var idx, n: int;
-begin
-  idx := tool.byname(b, mcp.callp.name_at, mcp.callp.name_end);
-  if idx < 0 then
-  begin
-    mcp.failed := true;
-    mcp.text("no such tool");
-    return;
-  end;
-  if mcp.callp.arguments_ok then
-    n := tool.run(idx, b, mcp.callp.arguments_at, mcp.callp.arguments_end, tool.out)
-  else
-  begin
-    tool.empty[0] := '{'; tool.empty[1] := '}';
-    n := tool.run(idx, tool.empty, 0, 2, tool.out);
-  end;
-  if n = -1 then
-  begin
-    mcp.failed := true;
-    mcp.text("the arguments do not match the tool's input schema");
-    return;
-  end;
-  // -3: the generated writer refused because the result does not fit in tool.out.  It
-  // refuses rather than truncating, since half an object would leave the peer with an
-  // unparseable envelope instead of one failed call.  Reported separately because -1
-  // would blame the caller's arguments for a limit on our side.
-  if n = -3 then
-  begin
-    mcp.failed := true;
-    mcp.text("the result does not fit in the tool output buffer");
-    return;
-  end;
-  if n < 0 then
-  begin
-    mcp.failed := true;
-    mcp.textbytes(tool.err, 0, tool.errn);
-    return;
-  end;
-  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":");
-  mcp.addqslice(tool.out, 0, n);
-  mcp.add("}],\"structuredContent\":");
-  mcp.addslice(tool.out, 0, n);
-  mcp.add(",\"isError\":false}");
-end;
 
 // Where the value of the leading "result" key starts, or -1 when the object does not
 // begin with one.  tool.listend is set to just past that value.
@@ -239,8 +185,13 @@ begin
   begin
     tool.empty[0] := '{'; tool.empty[1] := '}';
     n := tool.run(idx, tool.empty, 0, 2, tool.out);
+    tool.takeignored(tool.empty);
   end
-  else n := tool.run(idx, http.inbuf, http.bodyat, http.bodyat + http.bodylen, tool.out);
+  else
+  begin
+    n := tool.run(idx, http.inbuf, http.bodyat, http.bodyat + http.bodylen, tool.out);
+    tool.takeignored(http.inbuf);
+  end;
   if n = -1 then
   begin
     http.add("{\"detail\":\"the body does not match the tool's input schema\"}");
@@ -267,6 +218,16 @@ begin
     return true;
   end;
   tool.restbody(n);
+  // The report goes out as headers and NOT in the body, for the same reason the
+  // truncation fields do: a list tool's body is a bare array here, and there is nowhere
+  // in it to put a note without putting the wrapper back and changing the shape every
+  // consumer reads.  A header reaches the caller either way and costs the body nothing.
+  if tool.ignc > 0 then
+  begin
+    http.hdraddslice("X-Ignored-Field", tool.ign, 0, tool.ignn);
+    tool.numn := io.pushnum(tool.numbuf, 0, tool.ignc);
+    http.hdraddslice("X-Ignored-Count", tool.numbuf, 0, tool.numn);
+  end;
   http.finish(200, "application/json");
   return true;
 end;

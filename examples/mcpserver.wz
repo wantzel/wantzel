@@ -3,96 +3,107 @@
 //   mcpserver              speak MCP over stdin/stdout (how editors run it)
 //   mcpserver --http 8080  serve MCP over HTTP on that port
 //
-// Every request shape is declared as a schema, so the parsers are generated
-// at compile time.  Nothing is allocated while serving.
+// The tools are declared in one `tools` block (see examples/mcptools.wz for the
+// pattern in full); this example adds `wordcount`, which decodes its text once
+// and scans it itself instead of only echoing or summing what it is given.
+// (Named `wordcount` and not `count`: a `tools` block turns the tool name
+// directly into its handler `tool.<name>`, and `tool.count` is already the
+// compiler-generated number of tools, so a tool literally named `count`
+// cannot be declared.)
 
 
 include "mcphttp.wz";
 
-// ---- tool argument shapes ------------------------------------------
+// ---- tool argument and result shapes --------------------------------
 
 type AddArgs = schema
-  a: int;
-  b: int;
+  a: int "the left operand";
+  b: int "the right operand";
+end;
+
+type AddResult = schema
+  sum: int;
 end;
 
 type EchoArgs = schema
+  text: text[65536] "the text to return";
+end;
+
+type EchoResult = schema
   text: text;
 end;
 
 type CountArgs = schema
+  text: text[65536] "the text to count";
+  word: text[255]? "a word to count occurrences of";
+end;
+
+type CountResult = schema
   text: text;
-  word: text?;
 end;
 
-// ---- the tools -----------------------------------------------------
+// ---- the tools -------------------------------------------------------
 
-procedure app.tools;
+tools
+  add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
+  echo(EchoArgs): EchoResult "Return the text it is given." readonly idempotent;
+  wordcount(CountArgs): CountResult "Count characters, words, and optionally how often a word occurs." readonly idempotent;
+end;
+
+include "tools.wz";
+
+function tool.add(a: array of AddArgs; r: array of AddResult): int;
 begin
-  mcp.add("{\"name\":\"add\",\"description\":\"Add two whole numbers.\",");
-  mcp.add("\"inputSchema\":{\"type\":\"object\",\"properties\":{");
-  mcp.add("\"a\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"}},");
-  mcp.add("\"required\":[\"a\",\"b\"]}},");
-
-  mcp.add("{\"name\":\"echo\",\"description\":\"Return the text it is given.\",");
-  mcp.add("\"inputSchema\":{\"type\":\"object\",\"properties\":{");
-  mcp.add("\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}},");
-
-  mcp.add("{\"name\":\"count\",\"description\":\"Count characters, words, and optionally how often a word occurs.\",");
-  mcp.add("\"inputSchema\":{\"type\":\"object\",\"properties\":{");
-  mcp.add("\"text\":{\"type\":\"string\"},\"word\":{\"type\":\"string\"}},");
-  mcp.add("\"required\":[\"text\"]}}");
+  r[0].sum := a[0].a + a[0].b;
+  return 0;
 end;
 
-procedure app.fail(msg: str);
+function tool.echo(a: array of EchoArgs; r: array of EchoResult): int;
+var at: int;
 begin
-  mcp.failed := true;
-  mcp.text(msg);
+  at := tool.vn;
+  at := json.escslice(tool.vbuf, at, a[0].text, 0, a[0].text_n);
+  r[0].text_at := tool.vn; r[0].text_end := at; tool.vn := at;
+  return 0;
 end;
 
-var
-  app.add: AddArgs;
-  app.echo: EchoArgs;
-  app.cnt: CountArgs;
-  app.text: array[0..65535] of char;
-  app.word: array[0..255] of char;
-  app.textlen, app.wordlen: int;
-
-function app.same(from: int; upto: int; wlen: int): bool;
+// text[wstart..wend) equals word[0..wlen), byte for byte
+function app.same(text: array of char; wstart: int; wend: int; word: array of char; wlen: int): bool;
 var i: int;
 begin
-  if upto - from <> wlen then return false;
+  if wend - wstart <> wlen then return false;
   i := 0;
   while i < wlen do
   begin
-    if app.text[from + i] <> app.word[i] then return false;
+    if text[wstart + i] <> word[i] then return false;
     i := i + 1;
   end;
   return true;
 end;
 
-// Count characters and words in the decoded text, and how often the needle
+// Count characters and words in the given text, and how often the needle
 // occurs if one was given.
-procedure app.count;
-var i, n, wlen, words, hits, wstart: int;
+function tool.wordcount(a: array of CountArgs; r: array of CountResult): int;
+var i, n, wlen, words, hits, wstart, at: int;
     inword: bool;
 begin
   words := 0;
   hits := 0;
   inword := false;
   wstart := 0;
-  n := app.textlen;
-  wlen := app.wordlen;
+  n := a[0].text_n;
+  wlen := 0;
+  if a[0].word_ok then wlen := a[0].word_n;
   i := 0;
   while i <= n do
   begin
-    if (i = n) or (app.text[i] = ' ') or (app.text[i] = chr(10))
-       or (app.text[i] = chr(9)) or (app.text[i] = chr(13)) then
+    if (i = n) or (a[0].text[i] = ' ') or (a[0].text[i] = chr(10))
+       or (a[0].text[i] = chr(9)) or (a[0].text[i] = chr(13)) then
     begin
       if inword then
       begin
         words := words + 1;
-        if (wlen > 0) and app.same(wstart, i, wlen) then hits := hits + 1;
+        if (wlen > 0) and app.same(a[0].text, wstart, i, a[0].word, wlen) then hits := hits + 1;
       end;
       inword := false;
     end
@@ -103,95 +114,31 @@ begin
     end;
     i := i + 1;
   end;
-  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":\"");
-  mcp.addn(n);
-  mcp.add(" characters, ");
-  mcp.addn(words);
-  mcp.add(" words");
+  at := tool.vn;
+  at := io.pushnum(tool.vbuf, at, n);
+  at := io.push(tool.vbuf, at, " characters, ");
+  at := io.pushnum(tool.vbuf, at, words);
+  at := io.push(tool.vbuf, at, " words");
   if wlen > 0 then
   begin
-    mcp.add(", ");
-    mcp.addn(hits);
-    mcp.add(" of them ");
-    mcp.addslice(app.word, 0, wlen);
+    at := io.push(tool.vbuf, at, ", ");
+    at := io.pushnum(tool.vbuf, at, hits);
+    at := io.push(tool.vbuf, at, " of them ");
+    at := json.escslice(tool.vbuf, at, a[0].word, 0, wlen);
   end;
-  mcp.add("\"}]}");
+  r[0].text_at := tool.vn; r[0].text_end := at; tool.vn := at;
+  return 0;
 end;
 
-procedure app.call(b: array of char; last: int);
-begin
-  if json.eq(b, mcp.callp.name_at, mcp.callp.name_end, "add") then
-  begin
-    if not mcp.callp.arguments_ok then
-    begin
-      app.fail("add needs arguments a and b");
-      return;
-    end;
-    if AddArgs.parse(b, mcp.callp.arguments_at, mcp.callp.arguments_end, app.add) < 0 then
-    begin
-      app.fail("add needs two integers a and b");
-      return;
-    end;
-    mcp.textnum(app.add.a + app.add.b);
-    return;
-  end;
+// ---- HTTP transport ---------------------------------------------------
 
-  if json.eq(b, mcp.callp.name_at, mcp.callp.name_end, "echo") then
-  begin
-    if not mcp.callp.arguments_ok then
-    begin
-      app.fail("echo needs a text argument");
-      return;
-    end;
-    if EchoArgs.parse(b, mcp.callp.arguments_at, mcp.callp.arguments_end, app.echo) < 0 then
-    begin
-      app.fail("echo needs a text argument");
-      return;
-    end;
-    mcp.textslice(b, app.echo.text_at, app.echo.text_end);
-    return;
-  end;
-
-  if json.eq(b, mcp.callp.name_at, mcp.callp.name_end, "count") then
-  begin
-    if not mcp.callp.arguments_ok then
-    begin
-      app.fail("count needs a text argument");
-      return;
-    end;
-    if CountArgs.parse(b, mcp.callp.arguments_at, mcp.callp.arguments_end, app.cnt) < 0 then
-    begin
-      app.fail("count needs a text argument");
-      return;
-    end;
-    app.textlen := json.unescape(b, app.cnt.text_at, app.cnt.text_end, app.text, 0);
-    if app.textlen < 0 then
-    begin
-      app.fail("the text contains malformed escapes");
-      return;
-    end;
-    app.wordlen := 0;
-    if app.cnt.word_ok then
-    begin
-      app.wordlen := json.unescape(b, app.cnt.word_at, app.cnt.word_end, app.word, 0);
-      if app.wordlen < 0 then app.wordlen := 0;
-    end;
-    app.count;
-    return;
-  end;
-
-  app.fail("no such tool");
-end;
-
-// ---- HTTP transport -------------------------------------------------
-
-// MCP on every path: the whole server is the endpoint
 procedure app.request;
 begin
+  if tool.rest("/tools/") then return;
   mcp.http;
 end;
 
-// ---- start ----------------------------------------------------------
+// ---- start -------------------------------------------------------------
 
 var
   port, i: int;

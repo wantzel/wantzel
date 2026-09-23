@@ -1,0 +1,16 @@
+{"a":1} -> well-formed, toolarge=0
+[1,2,3] -> well-formed, toolarge=0
+"x" -> well-formed, toolarge=0
+42 -> well-formed, toolarge=0
+true -> well-formed, toolarge=0
+null -> well-formed, toolarge=0
+  {"a":1}   -> well-formed, toolarge=0
+ -> not, toolarge=0
+{"a":} -> not, toolarge=0
+{"a" 1} -> not, toolarge=0
+[,] -> not, toolarge=0
+tru -> not, toolarge=0
+{} {} -> not, toolarge=0
+1 2 -> not, toolarge=0
+8192-digit number -> not, toolarge=1
+{"a":} -> not, toolarge=0

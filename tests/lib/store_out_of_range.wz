@@ -1,0 +1,65 @@
+// lib/store.wz: store.apply and store.write used to return false for an out-of-range
+// table or row WITHOUT saying why, unlike their sibling branches in the same functions
+// (a bad log record, a bad snapshot, ...) which already fill store.err. A caller reading
+// store.err after any failed call would find the reason of a PREVIOUS failure, or "",
+// which reads as "no error" -- exactly the silent false this test guards against.
+include "store.wz";
+var
+  tab, row, n: int;
+  dir: array[0..31] of char;
+  dirn: int;
+  path: array[0..63] of char;
+  rec: array[0..15] of char;
+procedure reason;
+begin
+  io.puts(STDOUT, store.err);
+  if store.detn > 0 then
+  begin
+    io.puts(STDOUT, ": ");
+    io.out(STDOUT, addr(store.det[0]), store.detn);
+  end;
+  io.puts(STDOUT, "\n");
+end;
+function inwork(suffix: str): int;
+var n: int;
+begin
+  for n := 0 to dirn - 1 do path[n] := dir[n];
+  n := io.push(path, dirn, "/");
+  n := io.push(path, n, suffix);
+  path[n] := chr(0);
+  return n;
+end;
+begin
+  dirn := io.push(dir, 0, "st_oor_");
+  dirn := io.pushnum(dir, dirn, sys1(SYS.getpid, 0));
+  dirn := io.push(dir, dirn, ".d");
+  n := inwork("store.log"); sys1(SYS.unlink, addr(path[0]));
+  n := inwork("store.snap"); sys1(SYS.unlink, addr(path[0]));
+
+  tab := store.table("readings", 16, 10);
+  if not store.opendir(dir[0..dirn - 1]) then begin reason; halt(1); end;
+
+  // store.write with a table index that was never declared
+  if store.write(99, STORE.OPSET, 0, rec[0..15]) then
+  begin
+    io.puts(STDOUT, "FAIL: wrote with an undeclared table\n");
+    halt(1);
+  end;
+  io.puts(STDOUT, "table out of range: "); reason;
+
+  // store.write with a row outside the table's capacity
+  row := store.cap[tab];    // one past the last valid row
+  if store.write(tab, STORE.OPSET, row, rec[0..15]) then
+  begin
+    io.puts(STDOUT, "FAIL: wrote to a row out of range\n");
+    halt(1);
+  end;
+  io.puts(STDOUT, "row out of range: "); reason;
+
+  store.close;
+  n := inwork("store.log"); sys1(SYS.unlink, addr(path[0]));
+  n := inwork("store.snap"); sys1(SYS.unlink, addr(path[0]));
+  for n := 0 to dirn - 1 do path[n] := dir[n];
+  path[dirn] := chr(0);
+  io.puts(STDOUT, "rmdir = "); io.putn(STDOUT, sys1(SYS.rmdir, addr(path[0]))); io.puts(STDOUT, "\n");
+end.

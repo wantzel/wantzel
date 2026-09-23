@@ -9,9 +9,31 @@
 # testing the network rather than the language. Behaviour is covered by tests/lib.
 . "$ROOT/tests/helpers.sh"
 
+# WINDOWS-ONLY EXAMPLES. A program whose subject IS the Win32 API cannot build for Linux --
+# winapi() refuses at compile time, which is correct and is itself demonstrated in
+# tests/toolchain/win_examples_build.sh. They are named here rather than detected, so adding
+# one is a decision someone takes on purpose: an example that only builds for Windows is a
+# narrower promise than the rest of examples/ makes, and it should not happen by accident.
+windows_only="winmessage.wz"
+
 fails=0
 for f in "$ROOT"/examples/*.wz; do
   name=$(basename "$f")
+  skip_linux=0
+  for w in $windows_only; do
+    [ "$name" = "$w" ] && skip_linux=1
+  done
+  if [ $skip_linux -eq 1 ]; then
+    # IT MUST STILL BUILD FOR WINDOWS, and it must REFUSE for Linux -- a Windows-only example
+    # that silently compiled for Linux would be a program that cannot run and says nothing.
+    if ! "$WANTZEL" "$f" "$T/prog.exe" --target=windows >"$T/err" 2>&1; then
+      printf '  %s does not compile for Windows:\n' "$name"; sed 's/^/    /' <"$T/err"; fails=$((fails+1))
+    fi
+    if "$WANTZEL" "$f" "$T/prog" >"$T/err" 2>&1; then
+      printf '  %s is listed as Windows-only but compiled for Linux\n' "$name"; fails=$((fails+1))
+    fi
+    continue
+  fi
   if ! "$WANTZEL" "$f" "$T/prog" >"$T/err" 2>&1; then
     printf '  %s does not compile:\n' "$name"; sed 's/^/    /' <"$T/err"; fails=$((fails+1)); continue
   fi
@@ -23,4 +45,4 @@ for f in "$ROOT"/examples/*.wz; do
 done
 
 [ $fails -eq 0 ] || { echo "$fails example(s) failed"; exit 1; }
-echo "all examples compile, for Linux and for Windows"
+echo "all examples compile for Linux and Windows, except $windows_only (Windows only)"

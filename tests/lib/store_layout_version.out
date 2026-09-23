@@ -1,0 +1,38 @@
+phs1 written = 123
+layout 0 reads the old snapshot:
+  rows = 3
+  upgraded = -1
+  row 4: 65 80 65 80
+layout 1 without an upgrade:
+  layout version differs and no conversion is registered: table readings is version 1, the snapshot holds version 0; no store.upgrade from version 0
+layout 1 with store.upgrade(t, 0, 16):
+  rows = 5
+  upgraded = 0
+  row 0: 1 16 0 0
+  row 4: 65 80 0 0
+again, a log of layout 0 and layout 1 records, then a snapshot:
+  rows = 6
+  upgraded = 0
+  row 5: 200 200 119 119
+  snapshot magic = PHS2
+  snapshot layout = 1
+layout 1, no upgrade needed any more:
+  rows = 6
+  upgraded = -1
+layout 0 on a layout-1 store:
+  the store was written with a newer layout version: table readings is version 0, the snapshot holds version 1
+layout 2 with a carry, from the layout-1 snapshot:
+  rows = 6
+  upgraded = 1
+  row 0: 9 0 0 1 8
+  row 5: 200 119 0 200 200
+layout 2 without the step from 0:
+  layout version differs and no conversion is registered: table readings is version 2, a log record holds version 0; no store.upgrade from version 0
+layout 2 with both steps, from layout-0 log records:
+  rows = 2
+  upgraded = 0
+  row 1: 25 0 0 17 24
+layout 1 on a log that holds a layout-2 record:
+  the store was written with a newer layout version: table readings is version 1, a log record holds version 2
+rmdir = 0
+rmdir b = 0

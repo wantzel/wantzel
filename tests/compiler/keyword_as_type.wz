@@ -1,0 +1,7 @@
+// Must not compile: a keyword in the place of a later type name ended the declaration
+// loop and was then read as the start of a new block ("variable name expected").
+type
+  A = record x: int; end;
+  var = record y: int; end;
+begin
+end.

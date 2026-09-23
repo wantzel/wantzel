@@ -1,0 +1,3 @@
+// A second library file wanting the SAME name, without `local`. This is the collision the
+// flat namespace produces, and it is why `local` exists.
+var scratch.i: int;

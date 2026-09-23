@@ -1,0 +1,59 @@
+// lib/json.wz: json.wellformed -- is this exactly one valid JSON value and nothing else?
+//
+// json.toolarge distinguishes "too large to answer" from "not valid JSON": both used to
+// come back as the same plain false, and a caller reporting "malformed" for a document
+// that was simply bigger than the scratch buffer was reporting the wrong reason. The
+// flag must be reset on every call, so a true from an earlier oversized document does not
+// survive into a later, ordinary failure.
+include "json.wz";
+var
+  buf: array[0..8191] of char;
+  n: int;
+procedure zet(s: str);
+var i: int;
+begin
+  i := 0;
+  while i < slen(s) do begin buf[i] := schar(s, i); i := i + 1; end;
+  n := i;
+end;
+procedure toon(s: str);
+begin
+  zet(s);
+  io.puts(STDOUT, s);
+  io.puts(STDOUT, " -> ");
+  if json.wellformed(buf, 0, n) then io.puts(STDOUT, "well-formed") else io.puts(STDOUT, "not");
+  io.puts(STDOUT, ", toolarge=");
+  if json.toolarge then io.puts(STDOUT, "1\n") else io.puts(STDOUT, "0\n");
+end;
+begin
+  // ordinary well-formed values
+  toon("{\"a\":1}");
+  toon("[1,2,3]");
+  toon("\"x\"");
+  toon("42");
+  toon("true");
+  toon("null");
+  toon("  {\"a\":1}  ");            // surrounding whitespace is fine
+
+  // ordinary malformed input: not too large, just broken -- toolarge must stay 0
+  toon("");
+  toon("{\"a\":}");
+  toon("{\"a\" 1}");
+  toon("[,]");
+  toon("tru");
+  toon("{} {}");                    // trailing content: two values is not one
+  toon("1 2");
+
+  // too large to answer: bigger than json.wfbuf / 3, so the routine refuses to guess.
+  // This must come back false WITH toolarge=1, not indistinguishable from "not JSON".
+  n := 0;
+  while n < len(buf) do begin buf[n] := '1'; n := n + 1; end;   // 8192 digits, one giant number
+  io.puts(STDOUT, "8192-digit number -> ");
+  if json.wellformed(buf, 0, n) then io.puts(STDOUT, "well-formed") else io.puts(STDOUT, "not");
+  io.puts(STDOUT, ", toolarge=");
+  if json.toolarge then io.puts(STDOUT, "1\n") else io.puts(STDOUT, "0\n");
+
+  // and immediately afterward, an ordinary small failure must show toolarge=0 again --
+  // the flag from the oversized call above must not leak into this one.
+  toon("{\"a\":}");
+end.

@@ -6,10 +6,13 @@
 // Read-only and sandboxed: every path is resolved inside the given root, and
 // anything that starts with "/" or contains ".." is refused.  Searching uses
 // the SIMD scan, so it walks a tree at roughly memchr speed.
+//
+// The four tools are declared in one `tools` block; the compiler generates the
+// tools/list text, the argument parsers, the dispatch and the result writers,
+// and this program only writes the handlers (tool.<name>).
 
 
-include "mcp.wz";
-include "http.wz";
+include "mcphttp.wz";
 include "fs.wz";
 
 const
@@ -19,26 +22,52 @@ const
   MAXQUEUE = 8192;
   MAXLINE  = 300;
 
-type PathArgs = schema
-  path: text?;
+type ListDirArgs = schema
+  path: text[MAXPATH]? "path relative to the root";
 end;
 
-type ReadArgs = schema
-  path:   text;
-  offset: int?;
-  limit:  int?;
+type ListDirResult = schema
+  text: text "the directory listing, one entry per line";
+end;
+
+type ReadFileArgs = schema
+  path:   text[MAXPATH] "path relative to the root";
+  offset: int? "byte offset to start at";
+  limit:  int? "how many bytes to return, at most 262144";
+end;
+
+type ReadFileResult = schema
+  text: text "the file contents";
+end;
+
+type FileInfoArgs = schema
+  path: text[MAXPATH] "path relative to the root";
+end;
+
+type FileInfoResult = schema
+  text: text "size, kind and modification time";
 end;
 
 type SearchArgs = schema
-  query: text;
-  path:  text?;
-  max:   int?;
+  query: text[255] "the literal text to look for";
+  path:  text[MAXPATH]? "directory to search, relative to the root; defaults to the root";
+  max:   int? "maximum number of matches, default 100";
 end;
 
+type SearchResult = schema
+  text: text "matching lines with their file and line number";
+end;
+
+tools
+  list_dir(ListDirArgs): ListDirResult "List the entries of a directory inside the served root. Give path as a relative path, or omit it for the root itself." readonly;
+  read_file(ReadFileArgs): ReadFileResult "Read a text file inside the served root." readonly;
+  file_info(FileInfoArgs): FileInfoResult "Size, kind and modification time of a path inside the served root." readonly;
+  search(SearchArgs): SearchResult "Search every text file under a directory for a literal string, and return matching lines with their file and line number." readonly;
+end;
+
+include "tools.wz";
+
 var
-  app.pa: PathArgs;
-  app.ra: ReadArgs;
-  app.sa: SearchArgs;
   app.root:    array[0..MAXPATH - 1] of char;
   app.rootlen: int;
   app.path:    array[0..MAXPATH - 1] of char;    // absolute, NUL terminated
@@ -54,7 +83,6 @@ var
   app.qhead, app.qtail, app.qfill: int;
 
   app.hits, app.scanned, app.bytes, app.limit: int;
-  app.requests: int;
 
 // ---- paths ----------------------------------------------------------
 
@@ -160,17 +188,18 @@ end;
 
 // ---- tool: list_dir --------------------------------------------------
 
-procedure app.listdir;
-var fd, n, files, dirs: int;
+function tool.list_dir(a: array of ListDirArgs; r: array of ListDirResult): int;
+var fd, n, files, dirs, at: int;
 begin
-  fd := fs.opendir(addr(app.path[0]));
-  if fd < 0 then
+  app.rellen := 0;
+  app.build;
+  if a[0].path_ok then
   begin
-    mcp.failed := true;
-    mcp.text("cannot open that directory");
-    return;
+    if not app.setrel(a[0].path, 0, a[0].path_n) then return tool.fail("that path is outside the served directory");
   end;
-  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":\"");
+  fd := fs.opendir(addr(app.path[0]));
+  if fd < 0 then return tool.fail("cannot open that directory");
+  at := tool.vn;
   n := 0;
   files := 0;
   dirs := 0;
@@ -179,94 +208,88 @@ begin
     if n >= 1000 then break;
     if fs.type = DT_DIR then
     begin
-      mcp.add("dir    ");
+      at := io.push(tool.vbuf, at, "dir    ");
       dirs := dirs + 1;
     end
-    else if fs.type = DT_LNK then mcp.add("link   ")
+    else if fs.type = DT_LNK then at := io.push(tool.vbuf, at, "link   ")
     else
     begin
-      mcp.add("file   ");
+      at := io.push(tool.vbuf, at, "file   ");
       files := files + 1;
     end;
-    mcp.addesc(fs.name, 0, fs.namelen);
-    mcp.add("\\n");
+    at := json.escslice(tool.vbuf, at, fs.name, 0, fs.namelen);
+    at := io.push(tool.vbuf, at, "\\n");
     n := n + 1;
   end;
   fs.close(fd);
-  if n = 0 then mcp.add("(empty directory)\\n");
-  mcp.add("\\n");
-  mcp.addn(dirs);
-  mcp.add(" directories, ");
-  mcp.addn(files);
-  mcp.add(" files");
-  mcp.add("\"}]}");
+  if n = 0 then at := io.push(tool.vbuf, at, "(empty directory)\\n");
+  at := io.push(tool.vbuf, at, "\\n");
+  at := io.pushnum(tool.vbuf, at, dirs);
+  at := io.push(tool.vbuf, at, " directories, ");
+  at := io.pushnum(tool.vbuf, at, files);
+  at := io.push(tool.vbuf, at, " files");
+  r[0].text_at := tool.vn; r[0].text_end := at; tool.vn := at;
+  return 0;
 end;
 
 // ---- tool: file_info -------------------------------------------------
 
-procedure app.fileinfo;
+function tool.file_info(a: array of FileInfoArgs; r: array of FileInfoResult): int;
+var at: int;
 begin
-  if not fs.stat(addr(app.path[0])) then
-  begin
-    mcp.failed := true;
-    mcp.text("no such path");
-    return;
-  end;
-  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":\"");
-  mcp.addesc(app.rel, 0, app.rellen);
-  if app.rellen = 0 then mcp.add(".");
-  mcp.add("\\n");
-  if fs.isdir then mcp.add("kind: directory\\n")
-  else if fs.isfile then mcp.add("kind: file\\n")
-  else mcp.add("kind: other\\n");
-  mcp.add("size: ");
-  mcp.addn(fs.size);
-  mcp.add(" bytes\\nmodified: ");
-  mcp.addn(fs.mtime);
-  mcp.add(" (unix seconds)\\nmode: ");
-  mcp.addn(band(fs.mode, 511));
-  mcp.add(" (octal-ish, decimal here)");
-  mcp.add("\"}]}");
+  app.rellen := 0;
+  app.build;
+  if not app.setrel(a[0].path, 0, a[0].path_n) then return tool.fail("that path is outside the served directory");
+  if not fs.stat(addr(app.path[0])) then return tool.fail("no such path");
+  at := tool.vn;
+  at := json.escslice(tool.vbuf, at, app.rel, 0, app.rellen);
+  if app.rellen = 0 then at := io.push(tool.vbuf, at, ".");
+  at := io.push(tool.vbuf, at, "\\n");
+  if fs.isdir then at := io.push(tool.vbuf, at, "kind: directory\\n")
+  else if fs.isfile then at := io.push(tool.vbuf, at, "kind: file\\n")
+  else at := io.push(tool.vbuf, at, "kind: other\\n");
+  at := io.push(tool.vbuf, at, "size: ");
+  at := io.pushnum(tool.vbuf, at, fs.size);
+  at := io.push(tool.vbuf, at, " bytes\\nmodified: ");
+  at := io.pushnum(tool.vbuf, at, fs.mtime);
+  at := io.push(tool.vbuf, at, " (unix seconds)\\nmode: ");
+  at := io.pushnum(tool.vbuf, at, band(fs.mode, 511));
+  at := io.push(tool.vbuf, at, " (octal-ish, decimal here)");
+  r[0].text_at := tool.vn; r[0].text_end := at; tool.vn := at;
+  return 0;
 end;
 
 // ---- tool: read_file -------------------------------------------------
 
-procedure app.readfile(offset: int; limit: int);
-var fd, r, got: int;
+function tool.read_file(a: array of ReadFileArgs; r: array of ReadFileResult): int;
+var fd, rd, got, offset, limit, at: int;
 begin
-  if not fs.stat(addr(app.path[0])) then
-  begin
-    mcp.failed := true;
-    mcp.text("no such file");
-    return;
-  end;
-  if fs.isdir then
-  begin
-    mcp.failed := true;
-    mcp.text("that is a directory; use list_dir");
-    return;
-  end;
+  app.rellen := 0;
+  app.build;
+  if not app.setrel(a[0].path, 0, a[0].path_n) then return tool.fail("that path is outside the served directory");
+  if not fs.stat(addr(app.path[0])) then return tool.fail("no such file");
+  if fs.isdir then return tool.fail("that is a directory; use list_dir");
   fd := fs.open(addr(app.path[0]));
-  if fd < 0 then
-  begin
-    mcp.failed := true;
-    mcp.text("cannot open that file");
-    return;
-  end;
+  if fd < 0 then return tool.fail("cannot open that file");
+  offset := 0;
+  if a[0].offset_ok then offset := a[0].offset;
+  limit := 0;
+  if a[0].limit_ok then limit := a[0].limit;
   if offset > 0 then sys3(8, fd, offset, 0);
   if limit <= 0 then limit := 65536;
   if limit > 262144 then limit := 262144;
   got := 0;
   while got < limit do
   begin
-    r := io.read(fd, addr(app.file[got]), limit - got);
-    if r <= 0 then break;
-    got := got + r;
+    rd := io.read(fd, addr(app.file[got]), limit - got);
+    if rd <= 0 then break;
+    got := got + rd;
   end;
   fs.close(fd);
-  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":");
-  mcp.addqslice(app.file, 0, got);
-  mcp.add("}]}");
+  at := tool.vn;
+  at := json.escslice(tool.vbuf, at, app.file, 0, got);
+  r[0].text_at := tool.vn; r[0].text_end := at; tool.vn := at;
+  return 0;
 end;
 
 // ---- tool: search ----------------------------------------------------
@@ -294,7 +317,7 @@ begin
   return fs.name[0] = '.';
 end;
 
-// search the file at app.path, appending "rel:line: text" per match
+// search the file at app.path, appending "rel:line: text" per match to tool.vbuf
 procedure app.grep;
 var fd, r, got, at, hit, ls, le, i, line, probe: int;
 begin
@@ -335,12 +358,12 @@ begin
     end;
     le := scan(app.file, hit, got, chr(10));
     if le - ls > MAXLINE then le := ls + MAXLINE;
-    if app.hits > 0 then mcp.add("\\n");
-    mcp.addesc(app.rel, 0, app.rellen);
-    mcp.add(":");
-    mcp.addn(line);
-    mcp.add(": ");
-    mcp.addesc(app.file, ls, le);
+    if app.hits > 0 then tool.vn := io.push(tool.vbuf, tool.vn, "\\n");
+    tool.vn := json.escslice(tool.vbuf, tool.vn, app.rel, 0, app.rellen);
+    tool.vn := io.push(tool.vbuf, tool.vn, ":");
+    tool.vn := io.pushnum(tool.vbuf, tool.vn, line);
+    tool.vn := io.push(tool.vbuf, tool.vn, ": ");
+    tool.vn := json.escslice(tool.vbuf, tool.vn, app.file, ls, le);
     app.hits := app.hits + 1;
     if app.hits >= app.limit then return;
     at := hit + app.ndlen;
@@ -348,9 +371,31 @@ begin
   end;
 end;
 
-procedure app.search;
-var fd, qi, t0, ms, startlen: int;
+function tool.search(a: array of SearchArgs; r: array of SearchResult): int;
+var fd, qi, t0, ms, startlen, textat, at, i: int;
 begin
+  textat := tool.vn;
+  app.ndlen := a[0].query_n;
+  if app.ndlen <= 0 then return tool.fail("the query is empty");
+  if app.ndlen > 255 then return tool.fail("the query is too long");
+  i := 0;
+  while i < app.ndlen do
+  begin
+    app.needle[i] := a[0].query[i];
+    i := i + 1;
+  end;
+  app.rellen := 0;
+  if a[0].path_ok then
+  begin
+    if not app.setrel(a[0].path, 0, a[0].path_n) then return tool.fail("that path is outside the served directory");
+  end;
+  app.limit := 100;
+  if a[0].max_ok then
+  begin
+    app.limit := a[0].max;
+    if app.limit <= 0 then app.limit := 1;
+    if app.limit > 1000 then app.limit := 1000;
+  end;
   t0 := io.now;
   app.qhead := 0;
   app.qtail := 0;
@@ -360,7 +405,6 @@ begin
   app.bytes := 0;
   app.enqueue;                       // app.rel already holds the start point
   startlen := app.rellen;
-  mcp.add("{\"content\":[{\"type\":\"text\",\"text\":\"");
   while app.qhead < app.qtail do
   begin
     if app.hits >= app.limit then break;
@@ -384,194 +428,33 @@ begin
     end;
   end;
   ms := (io.now - t0) div 1000000;
-  if app.hits = 0 then mcp.add("no matches");
-  mcp.add("\\n\\n");
-  mcp.addn(app.hits);
-  mcp.add(" matches, ");
-  mcp.addn(app.scanned);
-  mcp.add(" files searched, ");
-  mcp.addn(app.bytes div 1024);
-  mcp.add(" kB in ");
-  mcp.addn(ms);
-  mcp.add(" ms");
-  mcp.add("\"}]}");
-end;
-
-// ---- the tool table --------------------------------------------------
-
-procedure app.tools;
-begin
-  mcp.add("{\"name\":\"list_dir\",\"description\":\"List the entries of a directory inside the served root. Give path as a relative path, or omit it for the root itself.\",");
-  mcp.add("\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"path relative to the root\"}}}},");
-
-  mcp.add("{\"name\":\"read_file\",\"description\":\"Read a text file inside the served root.\",");
-  mcp.add("\"inputSchema\":{\"type\":\"object\",\"properties\":{");
-  mcp.add("\"path\":{\"type\":\"string\",\"description\":\"path relative to the root\"},");
-  mcp.add("\"offset\":{\"type\":\"integer\",\"description\":\"byte offset to start at\"},");
-  mcp.add("\"limit\":{\"type\":\"integer\",\"description\":\"how many bytes to return, at most 262144\"}},");
-  mcp.add("\"required\":[\"path\"]}},");
-
-  mcp.add("{\"name\":\"file_info\",\"description\":\"Size, kind and modification time of a path inside the served root.\",");
-  mcp.add("\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}},");
-
-  mcp.add("{\"name\":\"search\",\"description\":\"Search every text file under a directory for a literal string, and return matching lines with their file and line number.\",");
-  mcp.add("\"inputSchema\":{\"type\":\"object\",\"properties\":{");
-  mcp.add("\"query\":{\"type\":\"string\",\"description\":\"the literal text to look for\"},");
-  mcp.add("\"path\":{\"type\":\"string\",\"description\":\"directory to search, relative to the root; defaults to the root\"},");
-  mcp.add("\"max\":{\"type\":\"integer\",\"description\":\"maximum number of matches, default 100\"}},");
-  mcp.add("\"required\":[\"query\"]}}");
-end;
-
-procedure app.fail(msg: str);
-begin
-  mcp.failed := true;
-  mcp.text(msg);
-end;
-
-procedure app.call(b: array of char; last: int);
-var n: int;
-begin
-  app.requests := app.requests + 1;
-
-  if json.eq(b, mcp.callp.name_at, mcp.callp.name_end, "list_dir") then
-  begin
-    app.rellen := 0;
-    app.build;
-    if mcp.callp.arguments_ok then
-    begin
-      if PathArgs.parse(b, mcp.callp.arguments_at, mcp.callp.arguments_end, app.pa) < 0 then
-      begin
-        app.fail("bad arguments");
-        return;
-      end;
-      if app.pa.path_ok then
-      begin
-        if not app.setrel(b, app.pa.path_at, app.pa.path_end) then
-        begin
-          app.fail("that path is outside the served directory");
-          return;
-        end;
-      end;
-    end;
-    app.listdir;
-    return;
-  end;
-
-  if json.eq(b, mcp.callp.name_at, mcp.callp.name_end, "file_info") then
-  begin
-    if not mcp.callp.arguments_ok then
-    begin
-      app.fail("file_info needs a path");
-      return;
-    end;
-    if PathArgs.parse(b, mcp.callp.arguments_at, mcp.callp.arguments_end, app.pa) < 0 then
-    begin
-      app.fail("file_info needs a path");
-      return;
-    end;
-    app.rellen := 0;
-    app.build;
-    if app.pa.path_ok then
-    begin
-      if not app.setrel(b, app.pa.path_at, app.pa.path_end) then
-      begin
-        app.fail("that path is outside the served directory");
-        return;
-      end;
-    end;
-    app.fileinfo;
-    return;
-  end;
-
-  if json.eq(b, mcp.callp.name_at, mcp.callp.name_end, "read_file") then
-  begin
-    if not mcp.callp.arguments_ok then
-    begin
-      app.fail("read_file needs a path");
-      return;
-    end;
-    if ReadArgs.parse(b, mcp.callp.arguments_at, mcp.callp.arguments_end, app.ra) < 0 then
-    begin
-      app.fail("read_file needs a path");
-      return;
-    end;
-    if not app.setrel(b, app.ra.path_at, app.ra.path_end) then
-    begin
-      app.fail("that path is outside the served directory");
-      return;
-    end;
-    n := 0;
-    if app.ra.limit_ok then n := app.ra.limit;
-    if app.ra.offset_ok then app.readfile(app.ra.offset, n)
-    else app.readfile(0, n);
-    return;
-  end;
-
-  if json.eq(b, mcp.callp.name_at, mcp.callp.name_end, "search") then
-  begin
-    if not mcp.callp.arguments_ok then
-    begin
-      app.fail("search needs a query");
-      return;
-    end;
-    if SearchArgs.parse(b, mcp.callp.arguments_at, mcp.callp.arguments_end, app.sa) < 0 then
-    begin
-      app.fail("search needs a query");
-      return;
-    end;
-    app.ndlen := json.unescape(b, app.sa.query_at, app.sa.query_end, app.needle, 0);
-    if app.ndlen <= 0 then
-    begin
-      app.fail("the query is empty");
-      return;
-    end;
-    if app.ndlen > 255 then
-    begin
-      app.fail("the query is too long");
-      return;
-    end;
-    app.rellen := 0;
-    if app.sa.path_ok then
-    begin
-      if not app.setrel(b, app.sa.path_at, app.sa.path_end) then
-      begin
-        app.fail("that path is outside the served directory");
-        return;
-      end;
-    end;
-    app.limit := 100;
-    if app.sa.max_ok then
-    begin
-      app.limit := app.sa.max;
-      if app.limit <= 0 then app.limit := 1;
-      if app.limit > 1000 then app.limit := 1000;
-    end;
-    app.search;
-    return;
-  end;
-
-  app.fail("no such tool");
+  at := tool.vn;
+  if app.hits = 0 then at := io.push(tool.vbuf, at, "no matches");
+  at := io.push(tool.vbuf, at, "\\n\\n");
+  at := io.pushnum(tool.vbuf, at, app.hits);
+  at := io.push(tool.vbuf, at, " matches, ");
+  at := io.pushnum(tool.vbuf, at, app.scanned);
+  at := io.push(tool.vbuf, at, " files searched, ");
+  at := io.pushnum(tool.vbuf, at, app.bytes div 1024);
+  at := io.push(tool.vbuf, at, " kB in ");
+  at := io.pushnum(tool.vbuf, at, ms);
+  at := io.push(tool.vbuf, at, " ms");
+  r[0].text_at := textat; r[0].text_end := at; tool.vn := at;
+  return 0;
 end;
 
 // ---- HTTP transport ---------------------------------------------------
 
 procedure app.request;
-var n: int;
 begin
-  if http.method <> 2 then
+  if tool.rest("/tools/") then return;
+  if http.pathis("/mcp") then
   begin
-    http.add("this endpoint speaks MCP over POST\n");
-    http.finish(405, "text/plain");
+    mcp.http;
     return;
   end;
-  n := mcp.handle(http.inbuf, http.bodyat, http.bodyat + http.bodylen);
-  if n = 0 then
-  begin
-    http.finish(202, "application/json");
-    return;
-  end;
-  http.addb(mcp.buf, 0, n);
-  http.finish(200, "application/json");
+  http.add("{\"detail\":\"not found: MCP is at POST /mcp, REST at POST /tools/<tool>\"}");
+  http.finish(404, "application/json");
 end;
 
 // ---- start -------------------------------------------------------------

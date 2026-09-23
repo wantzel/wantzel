@@ -1,0 +1,114 @@
+// Two epoll sets must be two sets, on Windows as on Linux: a fixture for
+// tests/toolchain/win_syscalls.sh, which runs it as an ELF and as an .exe and wants the
+// same lines from both. Arguments: port A, port B, and x to also count how many sets fit.
+//
+// It listens on A and B and never accepts, so once the client (epollcli.wz) has connected
+// to both, both listening sockets stay readable for the rest of the run. Each wait below
+// is a zero-timeout poll that names what it got back.
+include "net.wz";
+var
+  evs: array[0..191] of char;
+  la, lb, e1, e2, e3, i, r: int;
+function arg(k: int): int;
+var i, v: int;
+begin
+  v := 0;
+  i := 0;
+  while argch(k, i) <> chr(0) do
+  begin
+    v := v * 10 + (ord(argch(k, i)) - 48);
+    i := i + 1;
+  end;
+  return v;
+end;
+// epoll_ctl with the errno, which net.watch folds into a bool
+function ctl(ep: int; op: int; fd: int): int;
+begin
+  io.put32(net.ev, 0, EPOLLIN);
+  io.put32(net.ev, 4, fd);
+  io.put32(net.ev, 8, 0);
+  return sys4(SYS.epctl, ep, op, fd, addr(net.ev[0]));
+end;
+procedure line(what: str; v: int);
+begin
+  io.puts(STDOUT, what); io.puts(STDOUT, ": "); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+// what one wait on ep reports, by name: A, B, e2, or ? for anything else
+procedure show(what: str; ep: int);
+var n, i, fd: int;
+begin
+  n := net.wait(ep, addr(evs[0]), 16, 0);
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, ":");
+  if n < 0 then
+  begin
+    io.puts(STDOUT, " error ");
+    io.putn(STDOUT, n);
+  end;
+  if n = 0 then io.puts(STDOUT, " nothing");
+  i := 0;
+  while i < n do
+  begin
+    fd := io.get32(evs, i * 12 + 4);
+    if fd = la then io.puts(STDOUT, " A")
+    else if fd = lb then io.puts(STDOUT, " B")
+    else if fd = e2 then io.puts(STDOUT, " e2")
+    else io.puts(STDOUT, " ?");
+    i := i + 1;
+  end;
+  io.puts(STDOUT, "\n");
+end;
+// wait in 100 ms steps, up to 30 s, until ep has something ready
+procedure await(ep: int);
+var t: int;
+begin
+  t := 0;
+  while (t < 300) and (net.wait(ep, addr(evs[0]), 16, 100) = 0) do t := t + 1;
+end;
+begin
+  lb := net.listen(arg(2), 16, false);
+  la := net.listen(arg(1), 16, false);
+  if (la < 0) or (lb < 0) then io.fatal("cannot listen");
+  e1 := net.epoll;
+  e2 := net.epoll;
+  if (e1 < 0) or (e2 < 0) then io.fatal("cannot create an epoll set");
+  if e1 = e2 then io.puts(STDOUT, "one set for both\n") else io.puts(STDOUT, "two sets\n");
+  line("A into e1", ctl(e1, EPOLL_ADD, la));
+  line("B into e2", ctl(e2, EPOLL_ADD, lb));
+  // the client connects to A, then to B; neither is ever accepted, so both stay ready
+  await(e1);
+  await(e2);
+  show("e1", e1);
+  show("e2", e2);
+  line("A out of e1", ctl(e1, EPOLL_DEL, la));
+  show("e1", e1);
+  show("e2", e2);
+  line("A into e1 again", ctl(e1, EPOLL_ADD, la));
+  show("e1", e1);
+  // an epoll set watched as an fd inside another set
+  e3 := net.epoll;
+  line("e2 into e3", ctl(e3, EPOLL_ADD, e2));
+  show("e3", e3);
+  line("e3 into e2, a loop", ctl(e2, EPOLL_ADD, e3));
+  line("e2 into itself", ctl(e2, EPOLL_ADD, e2));
+  line("B out of e2", ctl(e2, EPOLL_DEL, lb));
+  show("e3", e3);
+  line("B into e2 again", ctl(e2, EPOLL_ADD, lb));
+  show("e3", e3);
+  net.close(e2);
+  show("e3 after closing e2", e3);
+  show("e1", e1);
+  // how many sets there can be: on Windows a fixed number, and then EMFILE
+  if argch(3, 0) = 'x' then
+  begin
+    i := 0;
+    r := 0;
+    while (i < 64) and (r >= 0) do
+    begin
+      r := net.epoll;
+      i := i + 1;
+    end;
+    if r < 0 then line("the set that did not fit", r)
+    else io.puts(STDOUT, "no limit within 64 sets\n");
+  end;
+end.

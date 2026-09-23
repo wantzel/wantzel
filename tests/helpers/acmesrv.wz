@@ -1,0 +1,684 @@
+// acmesrv.wz -- a certificate authority, small enough to be a test fixture.
+//
+// WHY THIS IS WRITTEN HERE RATHER THAN BORROWED. Let's Encrypt publishes Pebble for exactly
+// this job, and it would work -- but it is a Go binary fetched through Docker or `go
+// install`, and that is the kind of dependency this whole stack exists to avoid. openssl
+// earns its place in these tests because it gives an INDEPENDENT JUDGEMENT on what we
+// produce; a test double gives no judgement at all, it just has to speak the protocol. That
+// is something we can write.
+//
+// And it pays for itself twice: it proves the language can hold both ends of a real
+// protocol, and it is the starting point for an internal certificate authority later.
+//
+// WHAT IT IS NOT. Not a real authority. No chain, no revocation, no rate limits, no accounts
+// that survive a restart, and the certificates it issues are trusted by nobody. What is
+// being tested is whether OUR CLIENT walks the protocol correctly and ends up with a usable
+// certificate -- not whether the certificate would be accepted by a browser.
+//
+// THE ONE THING IT DOES FOR REAL is the challenge: when the client says the token is in
+// place, this server actually fetches
+//     http://127.0.0.1:<port>/.well-known/acme-challenge/<token>
+// and compares what comes back. A fixture that just said "yes, validated" would let a client
+// that never serves the token pass, which is the single most important thing to get right.
+
+include "http.wz";
+include "json.wz";
+include "net.wz";
+include "csr.wz";
+include "x509.wz";
+include "base64.wz";
+
+const
+  ACMESRV.MAXTOK = 64;
+
+var
+  // The CA's own key, made fresh at startup.
+  ca.d, ca.qx, ca.qy: array[0..P.N-1] of int;
+
+  // One order at a time, which is all a test needs.
+  srv.token:   array[0..ACMESRV.MAXTOK-1] of char;
+  srv.tokenn:  int;
+  srv.host:    array[0..255] of char;
+  srv.hostn:   int;
+  srv.validated: bool;
+  srv.finalized: bool;
+  srv.cert:    array[0..4095] of char;
+  srv.certn:   int;
+  srv.nonce:   int;
+  srv.chalport: int;      // where to look for the challenge file
+  srv.port:     int;
+
+  srv.tmp:  array[0..1023] of char;
+  srv.tmpn: int;
+  srv.thumb:  array[0..63] of char;   // the client's JWK thumbprint, taken from its JWS
+  srv.thumbn: int;
+
+// ---- helpers ---------------------------------------------------------------------------
+
+function argnum(k: int): int;
+var j, v: int;
+    c: char;
+begin
+  v := 0;
+  j := 0;
+  c := argch(k, j);
+  while (c >= '0') and (c <= '9') do
+  begin
+    v := v * 10 + (ord(c) - ord('0'));
+    j := j + 1;
+    c := argch(k, j);
+  end;
+  return v;
+end;
+
+// ---- reading the JWS the client sent ------------------------------------------------------
+//
+// The body is {"protected":"...","payload":"...","signature":"..."}. Only the payload is
+// needed here, base64url-decoded.
+//
+// THE SIGNATURE IS NOT CHECKED, and that is deliberate. A fixture that verified signatures
+// would be a second implementation of the thing under test, so a bug shared by both would
+// cancel out and look like success. The client's signing is judged by openssl in
+// tests/lib/jws.sh, where a genuinely independent verifier does it.
+
+var
+  srv.pay:  array[0..2047] of char;
+  srv.payn: int;
+
+function acmesrv.payload(out1: int; out2: int): bool;
+var at, i, n, enc: int;
+begin
+  n := http.bodylen;
+  if n <= 0 then return false;
+  at := 0;
+  // Find "payload":" and take what follows up to the closing quote.
+  while at + 11 < n do
+  begin
+    if (http.inbuf[http.bodyat + at] = '"')
+       and (http.inbuf[http.bodyat + at + 1] = 'p')
+       and (http.inbuf[http.bodyat + at + 2] = 'a')
+       and (http.inbuf[http.bodyat + at + 3] = 'y')
+       and (http.inbuf[http.bodyat + at + 4] = 'l')
+       and (http.inbuf[http.bodyat + at + 5] = 'o')
+       and (http.inbuf[http.bodyat + at + 6] = 'a')
+       and (http.inbuf[http.bodyat + at + 7] = 'd')
+       and (http.inbuf[http.bodyat + at + 8] = '"') then
+    begin
+      // ONE QUOTE HERE, TWO IN acmesrv.thumbprint, and the difference is only how much of
+      // the name each match consumed: "payload" is nine characters and at+9 is already past
+      // its closing quote, sitting on the colon; "prot is five and leaves the cursor inside
+      // the name. Applying the same skip to both is wrong, which is a mistake worth the
+      // extra sentence to prevent.
+      at := at + 9;
+      while (at < n) and (http.inbuf[http.bodyat + at] <> '"') do at := at + 1;
+      at := at + 1;
+      enc := at;
+      while (at < n) and (http.inbuf[http.bodyat + at] <> '"') do at := at + 1;
+      i := at - enc;
+      if i = 0 then return false;
+      srv.payn := base64.decode(view(addr(http.inbuf[http.bodyat + enc]), i), srv.pay);
+      return srv.payn > 0;
+    end;
+    at := at + 1;
+  end;
+  return false;
+end;
+
+// The thumbprint of the key in the JWS "protected" header.
+//
+// RFC 7638: sha256 of the JWK with no whitespace and its members in LEXICOGRAPHIC order,
+// base64url without padding. The header the client sent already contains the JWK in that
+// form, so the bytes between "jwk": and the matching brace can be hashed directly -- which
+// also means a client whose JWK is ordered differently gets a different thumbprint here and
+// fails its own challenge, exactly as a real authority would have it fail.
+function acmesrv.thumbprint: bool;
+var n, at, from, depth, i: int;
+    hdr: array[0..2047] of char;
+    hn: int;
+    h: array[0..31] of char;
+    one: array[0..0] of char;
+begin
+  srv.thumbn := 0;
+  n := http.bodylen;
+  if n <= 0 then return false;
+  at := 0;
+  while at + 12 < n do
+  begin
+    if (http.inbuf[http.bodyat + at] = '"')
+       and (http.inbuf[http.bodyat + at + 1] = 'p')
+       and (http.inbuf[http.bodyat + at + 2] = 'r')
+       and (http.inbuf[http.bodyat + at + 3] = 'o')
+       and (http.inbuf[http.bodyat + at + 4] = 't') then
+    begin
+      // TWO QUOTES TO SKIP, NOT ONE. After "prot the next quote CLOSES the member name
+      // ("protected"), and the one after that OPENS the value -- the colon sits between
+      // them. Skipping a single quote leaves the cursor on the colon, so the slice handed
+      // to the decoder starts with :" and decodes to nothing. Measured: every account
+      // request was refused with no jwk found, while the body was plainly correct.
+      at := at + 5;
+      while (at < n) and (http.inbuf[http.bodyat + at] <> '"') do at := at + 1;
+      at := at + 1;                                     // past the name's closing quote
+      while (at < n) and (http.inbuf[http.bodyat + at] <> '"') do at := at + 1;
+      at := at + 1;                                     // past the value's opening quote
+      from := at;
+      while (at < n) and (http.inbuf[http.bodyat + at] <> '"') do at := at + 1;
+      hn := base64.decode(view(addr(http.inbuf[http.bodyat + from]), at - from), hdr);
+      if hn <= 0 then return false;
+      // find "jwk": and the object that follows
+      i := 0;
+      while i + 6 < hn do
+      begin
+        if (hdr[i] = '"') and (hdr[i+1] = 'j') and (hdr[i+2] = 'w')
+           and (hdr[i+3] = 'k') and (hdr[i+4] = '"') then
+        begin
+          i := i + 5;
+          while (i < hn) and (hdr[i] <> '{') do i := i + 1;
+          from := i;
+          depth := 0;
+          while i < hn do
+          begin
+            if hdr[i] = '{' then depth := depth + 1
+            else if hdr[i] = '}' then depth := depth - 1;
+            i := i + 1;
+            if depth = 0 then break;
+          end;
+          sha256.init;
+          depth := from;
+          while depth < i do
+          begin
+            one[0] := hdr[depth];
+            sha256.update(one);
+            depth := depth + 1;
+          end;
+          sha256.final(h);
+          srv.thumbn := base64.enc(srv.thumb, 0, view(addr(h[0]), 32), true, false);
+          return srv.thumbn > 0;
+        end;
+        i := i + 1;
+      end;
+      return false;
+    end;
+    at := at + 1;
+  end;
+  return false;
+end;
+
+// The dns identifier out of a new-order payload.
+function acmesrv.identifier(a: int; b2: int; dst: array of char; max: int): int;
+var at, from, n: int;
+begin
+  n := srv.payn;
+  at := 0;
+  // ... "value":"<host>" ...
+  while at + 8 < n do
+  begin
+    if (srv.pay[at] = '"') and (srv.pay[at+1] = 'v') and (srv.pay[at+2] = 'a')
+       and (srv.pay[at+3] = 'l') and (srv.pay[at+4] = 'u') and (srv.pay[at+5] = 'e')
+       and (srv.pay[at+6] = '"') then
+    begin
+      at := at + 7;
+      while (at < n) and (srv.pay[at] <> '"') do at := at + 1;
+      at := at + 1;
+      from := at;
+      while (at < n) and (srv.pay[at] <> '"') do at := at + 1;
+      if at - from > max then return 0 - 1;
+      n := 0;
+      while from + n < at do begin dst[n] := srv.pay[from + n]; n := n + 1; end;
+      return n;
+    end;
+    at := at + 1;
+  end;
+  return 0 - 1;
+end;
+
+// The key authorization this order expects: "<token>.<thumbprint of the client's key>".
+//
+// THE THUMBPRINT COMES OUT OF THE JWS HEADER the client just sent, so the fixture does not
+// need to be told the key in advance -- and a client whose jwk and signing key disagree
+// would produce a thumbprint that does not match what it served.
+function acmesrv.keyauth(dst: array of char; max: int): int;
+var i, n: int;
+begin
+  n := 0;
+  while (n < srv.tokenn) and (n < max) do begin dst[n] := srv.token[n]; n := n + 1; end;
+  if n >= max then return 0 - 1;
+  dst[n] := '.';
+  n := n + 1;
+  i := 0;
+  while (i < srv.thumbn) and (n < max) do
+  begin
+    dst[n] := srv.thumb[i];
+    n := n + 1;
+    i := i + 1;
+  end;
+  if srv.thumbn = 0 then return 0 - 1;
+  return n;
+end;
+
+// The public key out of the CSR the client sent to finalize, so the issued certificate
+// carries the key the client actually holds.
+function acmesrv.csrkey(qx: array of int; qy: array of int): bool;
+var at, n, i, from: int;
+    der1: array[0..2047] of char;
+    dn: int;
+begin
+  if not acmesrv.payload(0, 0) then return false;
+  n := srv.payn;
+  at := 0;
+  while at + 6 < n do
+  begin
+    if (srv.pay[at] = '"') and (srv.pay[at+1] = 'c') and (srv.pay[at+2] = 's')
+       and (srv.pay[at+3] = 'r') and (srv.pay[at+4] = '"') then
+    begin
+      at := at + 5;
+      while (at < n) and (srv.pay[at] <> '"') do at := at + 1;
+      at := at + 1;
+      from := at;
+      while (at < n) and (srv.pay[at] <> '"') do at := at + 1;
+      dn := base64.decode(view(addr(srv.pay[from]), at - from), der1);
+      if dn <= 0 then return false;
+      // Walk to the SubjectPublicKeyInfo: it is the BIT STRING inside the info's third
+      // element. The parser in lib/x509.wz is for certificates, so this finds it directly.
+      i := der.find(der1, 0, dn, DER.SEQ);
+      if i < 0 then return false;
+      i := der.find(der1, der.vat, der.vend, DER.SEQ);
+      if i < 0 then return false;
+      // inside the CertificationRequestInfo: version, subject, spki
+      i := der.skip(der1, der.vat, der.vend, 2);
+      if i < 0 then return false;
+      i := der.enter(der1, i, dn);
+      if i < 0 then return false;
+      i := der.find(der1, i, der.vend, DER.BITSTR);
+      if i < 0 then return false;
+      if der.vend - der.vat <> 66 then return false;     // 1 unused-bits byte + 04 || X || Y
+      p256.frombytes(qx, der1, der.vat + 2);
+      p256.frombytes(qy, der1, der.vat + 34);
+      return p256.oncurve(qx, qy);
+    end;
+    at := at + 1;
+  end;
+  return false;
+end;
+
+// Is the request path exactly this?
+function pathis(s: str): bool;
+var i: int;
+begin
+  if http.pathlen <> slen(s) then return false;
+  i := 0;
+  while i < http.pathlen do
+  begin
+    if http.inbuf[http.pathat + i] <> schar(s, i) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// EVERY REPLY CARRIES A NONCE, which is what makes a captured request unusable a second
+// time. A fixture that skipped this would let a client that never reads the header pass, and
+// that client would then fail against a real authority with "badNonce".
+procedure addnonce;
+begin
+  // http.hdraddslice ADDS THE NAME AND ": " ITSELF, so only the value goes in the slice.
+  // Passing the whole line with an empty name produced ": Replay-Nonce: nonce-1", which is
+  // not at a line start -- and a client that (correctly) only matches a header name at the
+  // beginning of a line found nothing.
+  srv.nonce := srv.nonce + 1;
+  srv.tmpn := io.push(srv.tmp, 0, "nonce-");
+  srv.tmpn := io.pushnum(srv.tmp, srv.tmpn, srv.nonce);
+  http.hdraddslice("Replay-Nonce", srv.tmp, 0, srv.tmpn);
+end;
+
+procedure addlocation(s: str);
+begin
+  srv.tmpn := io.push(srv.tmp, 0, s);
+  http.hdraddslice("Location", srv.tmp, 0, srv.tmpn);
+end;
+
+// The base URL of this server, so the directory can point at itself.
+procedure addbase(dst: array of char; at: int);
+begin
+  srv.tmpn := at;
+end;
+
+// ---- fetching the challenge file ---------------------------------------------------------
+//
+// THIS IS THE PART THAT MUST BE REAL. The client claims it has published
+// "<token>.<thumbprint>"; this goes and looks. A plain HTTP GET on loopback, no TLS -- which
+// is what a real authority does too, because the challenge exists precisely to establish the
+// trust that TLS would otherwise need.
+function fetchchallenge(expect: array of char; expectn: int): bool;
+var fd, n, i, got, tries: int;
+    req: array[0..511] of char;
+    rep: array[0..2047] of char;
+    bodyat: int;
+begin
+  fd := net.connect(127, 0, 0, 1, srv.chalport);
+  if fd < 0 then return false;
+  n := io.push(req, 0, "GET /.well-known/acme-challenge/");
+  i := 0;
+  while i < srv.tokenn do begin req[n] := srv.token[i]; n := n + 1; i := i + 1; end;
+  n := io.push(req, n, " HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+  i := 0;
+  tries := 0;
+  while (i < n) and (tries < 100000) do
+  begin
+    got := net.send(fd, addr(req[i]), n - i);
+    if got > 0 then begin i := i + got; tries := 0; end
+    else if got = EAGAIN then tries := tries + 1
+    else begin net.close(fd); return false; end;
+  end;
+
+  got := 0;
+  tries := 0;
+  while (got < 2040) and (tries < 200000) do
+  begin
+    n := net.recv(fd, addr(rep[got]), 2040 - got);
+    if n > 0 then begin got := got + n; tries := 0; end
+    else if n = EAGAIN then tries := tries + 1
+    else break;
+  end;
+  net.close(fd);
+  if got = 0 then return false;
+
+  // The body starts after the blank line.
+  bodyat := 0;
+  i := 0;
+  while i + 3 < got do
+  begin
+    if (rep[i] = chr(13)) and (rep[i+1] = chr(10))
+       and (rep[i+2] = chr(13)) and (rep[i+3] = chr(10)) then
+    begin
+      bodyat := i + 4;
+      i := got;
+    end
+    else i := i + 1;
+  end;
+  if bodyat = 0 then return false;
+
+  // COMPARED EXACTLY, trailing whitespace aside. A client serving the token without the
+  // thumbprint, or with the wrong one, must fail here -- that is the whole point of the
+  // challenge.
+  n := got;
+  while (n > bodyat) and ((rep[n-1] = chr(10)) or (rep[n-1] = chr(13))
+        or (rep[n-1] = ' ')) do n := n - 1;
+  if n - bodyat <> expectn then return false;
+  i := 0;
+  while i < expectn do
+  begin
+    if rep[bodyat + i] <> expect[i] then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// ---- issuing a certificate ------------------------------------------------------------------
+//
+// A v3 certificate with the requested name in its subjectAltName, signed by the CA key.
+// Built with the same lib/der.wz that reads them, which is the point of having writing as
+// well as reading.
+function issue(qx: array of int; qy: array of int): bool;
+var at, outer, tbs, mark, extblk, extseq, ext, m2: int;
+    tbsat, tbsn: int;
+begin
+  at := 0;
+  at := der.open(srv.cert, at);
+  outer := der.mark;
+
+  tbsat := at;
+  at := der.open(srv.cert, at);
+  tbs := der.mark;
+  // version [0] EXPLICIT 2 (v3), which is what carries extensions
+  srv.cert[at] := chr(0xA0);
+  srv.cert[at + 1] := chr(3);
+  at := at + 2;
+  at := der.putint(srv.cert, at, 2);
+  at := der.putint(srv.cert, at, 1);              // serial
+  at := csr.algid(srv.cert, at);                  // signature algorithm
+  at := csr.name(srv.cert, at, srv.host, srv.hostn);   // issuer (self)
+  // validity
+  at := der.open(srv.cert, at);
+  mark := der.mark;
+  at := der.putstr(srv.cert, at, DER.UTCTIME, "250101000000Z");
+  at := der.putstr(srv.cert, at, DER.UTCTIME, "350101000000Z");
+  at := der.close(srv.cert, mark, at);
+  at := csr.name(srv.cert, at, srv.host, srv.hostn);   // subject
+  at := csr.spki(srv.cert, at, qx, qy);
+
+  // extensions [3] EXPLICIT SEQUENCE OF Extension
+  at := der.opentag(srv.cert, at, 0xA3);
+  extblk := der.mark;
+  at := der.open(srv.cert, at);
+  extseq := der.mark;
+  at := der.open(srv.cert, at);
+  ext := der.mark;
+  csr.oid(5, srv.tmp);                            // 2.5.29.17 subjectAltName
+  at := der.putoid(srv.cert, at, srv.tmp, csr.n);
+  m2 := csr.san(srv.tmp, 0, srv.host, srv.hostn);
+  at := der.put(srv.cert, at, DER.OCTSTR, srv.tmp, 0, m2);
+  at := der.close(srv.cert, ext, at);
+  at := der.close(srv.cert, extseq, at);
+  at := der.close(srv.cert, extblk, at);
+  at := der.close(srv.cert, tbs, at);
+  tbsn := at - tbsat;
+
+  // sign the tbsCertificate exactly as encoded
+  csr.digest(srv.cert, tbsat, tbsn);
+  p256.frombytes(csr.tmp2, csr.hash, 0);
+  if not p256.sign(ca.d, csr.tmp2) then return false;
+  at := csr.algid(srv.cert, at);
+  m2 := csr.dersig(srv.tmp, 0, p256.sigr, p256.sigs);
+  at := der.putbits(srv.cert, at, srv.tmp, 0, m2);
+  at := der.close(srv.cert, outer, at);
+  srv.certn := at;
+  return true;
+end;
+
+// ---- the endpoints ----------------------------------------------------------------------------
+
+procedure app.request;
+var i, n, at, keyat: int;
+    payat, payn: int;
+    qx, qy: array[0..P.N-1] of int;
+    pt: array[0..127] of char;
+    ptn: int;
+begin
+  addnonce;
+
+  // ---- GET /directory ----
+  if pathis("/directory") then
+  begin
+    http.add("{\"newNonce\":\"http://127.0.0.1:");
+    http.addn(srv.port);
+    http.add("/new-nonce\",\"newAccount\":\"http://127.0.0.1:");
+    http.addn(srv.port);
+    http.add("/new-acct\",\"newOrder\":\"http://127.0.0.1:");
+    http.addn(srv.port);
+    http.add("/new-order\"}");
+    http.finish(200, "application/json");
+    return;
+  end;
+
+  // ---- HEAD /new-nonce: the nonce is already in the header ----
+  if pathis("/new-nonce") then
+  begin
+    http.finish(200, "application/json");
+    return;
+  end;
+
+  // ---- POST /new-acct ----
+  //
+  // The JWS is NOT verified here. A fixture that checked signatures would be a second
+  // implementation of the thing under test, and a bug shared between them would cancel out.
+  // The client's signing is judged by openssl in tests/lib/jws.sh, where an independent
+  // verifier does it.
+  if pathis("/new-acct") then
+  begin
+    // THE THUMBPRINT IS TAKEN HERE AND NOWHERE ELSE, because this is the only request that
+    // carries a jwk. RFC 8555 6.2: new-account uses the "jwk" form because the server does
+    // not know the key yet; every request after it uses "kid", the account URL. A fixture
+    // that tried to read the jwk from the challenge request would find none -- and that is
+    // exactly what the first version of this file did.
+    if not acmesrv.thumbprint then
+    begin
+      io.puts(STDERR, "DIAG bodylen=");
+      io.putn(STDERR, http.bodylen);
+      io.puts(STDERR, " body=");
+      if http.bodylen > 0 then io.out(STDERR, addr(http.inbuf[http.bodyat]), 60);
+      io.puts(STDERR, "\n");
+      http.add("{\"type\":\"urn:ietf:params:acme:error:malformed\",\"detail\":\"no jwk in the new-account request\"}");
+      http.finish(400, "application/json");
+      return;
+    end;
+    addlocation("http://127.0.0.1:0/acct/1");
+    http.add("{\"status\":\"valid\"}");
+    http.finish(201, "application/json");
+    return;
+  end;
+
+  // ---- POST /new-order ----
+  if pathis("/new-order") then
+  begin
+    // The identifier comes out of the JWS payload, which is base64url in the "payload"
+    // member. Decoded here so the issued certificate really carries the requested name --
+    // a fixture returning a fixed name would hide a client that sends the wrong one.
+    srv.hostn := 0;
+    if acmesrv.payload(payat, payn) then
+      srv.hostn := acmesrv.identifier(payat, payn, srv.host, 255);
+    if srv.hostn <= 0 then
+    begin
+      http.add("{\"type\":\"urn:ietf:params:acme:error:malformed\"}");
+      http.finish(400, "application/json");
+      return;
+    end;
+    // A fresh token per order.
+    srv.tokenn := 0;
+    while srv.tokenn < 22 do
+    begin
+      srv.token[srv.tokenn] := chr(ord('a') + rand.below(26));
+      srv.tokenn := srv.tokenn + 1;
+    end;
+    srv.validated := false;
+    srv.finalized := false;
+    addlocation("http://127.0.0.1:0/order/1");
+    http.add("{\"status\":\"pending\",\"identifiers\":[{\"type\":\"dns\",\"value\":\"");
+    http.addb(srv.host, 0, srv.hostn);
+    http.add("\"}],\"authorizations\":[\"http://127.0.0.1:");
+    http.addn(srv.port);
+    http.add("/authz/1\"],\"finalize\":\"http://127.0.0.1:");
+    http.addn(srv.port);
+    http.add("/finalize/1\"}");
+    http.finish(201, "application/json");
+    return;
+  end;
+
+  // ---- POST /authz/1 ----
+  //
+  // THREE CHALLENGE TYPES, with http-01 NOT first. A client that takes the first one would
+  // answer a dns-01 challenge by serving a file, which never validates -- and against a real
+  // authority that failure is a timeout with nothing saying why.
+  if pathis("/authz/1") then
+  begin
+    http.add("{\"status\":\"pending\",\"identifier\":{\"type\":\"dns\",\"value\":\"");
+    http.addb(srv.host, 0, srv.hostn);
+    http.add("\"},\"challenges\":[{\"type\":\"dns-01\",\"url\":\"http://127.0.0.1:");
+    http.addn(srv.port);
+    http.add("/chal/dns\",\"token\":\"unused\"},{\"type\":\"http-01\",\"url\":\"http://127.0.0.1:");
+    http.addn(srv.port);
+    http.add("/chal/http\",\"token\":\"");
+    http.addb(srv.token, 0, srv.tokenn);
+    http.add("\"}]}");
+    http.finish(200, "application/json");
+    return;
+  end;
+
+  // ---- POST /chal/http: GO AND LOOK ----
+  if pathis("/chal/http") then
+  begin
+    ptn := acmesrv.keyauth(pt, 127);
+    if (ptn > 0) and fetchchallenge(pt, ptn) then
+    begin
+      srv.validated := true;
+      http.add("{\"status\":\"valid\"}");
+      http.finish(200, "application/json");
+    end
+    else
+    begin
+      http.add("{\"status\":\"invalid\",\"error\":{\"detail\":\"the token was not served correctly\"}}");
+      http.finish(200, "application/json");
+    end;
+    return;
+  end;
+
+  // ---- POST /finalize/1 ----
+  if pathis("/finalize/1") then
+  begin
+    // NOT VALIDATED MEANS NO CERTIFICATE. Without this the whole challenge could be skipped
+    // and the test would still pass, which would make the fixture worse than useless.
+    if not srv.validated then
+    begin
+      http.add("{\"type\":\"urn:ietf:params:acme:error:orderNotReady\"}");
+      http.finish(403, "application/json");
+      return;
+    end;
+    if not acmesrv.csrkey(qx, qy) then
+    begin
+      http.add("{\"type\":\"urn:ietf:params:acme:error:badCSR\"}");
+      http.finish(400, "application/json");
+      return;
+    end;
+    if not issue(qx, qy) then
+    begin
+      http.add("{\"type\":\"urn:ietf:params:acme:error:serverInternal\"}");
+      http.finish(500, "application/json");
+      return;
+    end;
+    srv.finalized := true;
+    http.add("{\"status\":\"valid\",\"certificate\":\"http://127.0.0.1:");
+    http.addn(srv.port);
+    http.add("/cert/1\"}");
+    http.finish(200, "application/json");
+    return;
+  end;
+
+  // ---- POST /cert/1 ----
+  if pathis("/cert/1") then
+  begin
+    if not srv.finalized then
+    begin
+      http.finish(404, "application/json");
+      return;
+    end;
+    http.addb(srv.cert, 0, srv.certn);
+    http.finish(200, "application/pkix-cert");
+    return;
+  end;
+
+  http.add("{\"type\":\"urn:ietf:params:acme:error:malformed\"}");
+  http.finish(404, "application/json");
+end;
+
+begin
+  p256.setup;
+  if not p256.genkey(ca.d, ca.qx, ca.qy) then
+  begin
+    io.puts(STDERR, "cannot make a CA key\n");
+    halt(1);
+  end;
+  srv.port := argnum(1);
+  srv.chalport := argnum(2);
+  if (srv.port = 0) or (srv.chalport = 0) then
+  begin
+    io.puts(STDERR, "usage: acmesrv <port> <challenge-port>\n");
+    halt(1);
+  end;
+  io.puts(STDOUT, "LISTENING\n");
+  // ONE WORKER, AND THAT IS NOT A PERFORMANCE CHOICE. http.serve forks a process per worker
+  // above one, and each gets its own copy of the module state -- so the order would be
+  // remembered in one process and the authorization served from another, which is exactly
+  // what happened: the token came back empty and the challenge could never be answered.
+  //
+  // A real authority keeps that state in a database shared between its workers. A fixture
+  // handles one order at a time, so a single process is both correct and simpler.
+  http.serve(srv.port, 1);
+end.

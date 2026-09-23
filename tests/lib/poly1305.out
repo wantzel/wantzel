@@ -1,0 +1,5 @@
+ok   the RFC's message is 34 bytes
+ok   the tag is the RFC's
+ok   one changed byte changes the tag
+ok   and so does one changed key byte
+ok   an empty message authenticates to s alone

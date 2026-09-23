@@ -1,0 +1,67 @@
+// lib/acme.wz: acme.find and acme.copy must tell "the key is simply not in a well-formed
+// object" apart from "the input could not be parsed at all" or "the value does not fit".
+//
+// Before this, every one of those cases answered with a bare false/-1 and acme.err stayed
+// empty, so a caller had no way to show why a directory, order or authorization was
+// refused -- a malformed reply from the certificate authority looked exactly like one that
+// simply omitted an optional field.
+include "io.wz";
+include "acme.wz";
+
+var
+  buf: array[0..255] of char;
+  out: array[0..255] of char;
+  n, k: int;
+  ok: bool;
+
+function load(s: str): int;
+var i: int;
+begin
+  i := 0;
+  while i < slen(s) do begin buf[i] := schar(s, i); i := i + 1; end;
+  return i;
+end;
+
+procedure show(label: str; ok: bool);
+begin
+  io.puts(STDOUT, label);
+  io.puts(STDOUT, " ok=");
+  if ok then io.puts(STDOUT, "1") else io.puts(STDOUT, "0");
+  io.puts(STDOUT, " err=[");
+  io.puts(STDOUT, acme.err);
+  io.puts(STDOUT, "]\n");
+end;
+
+begin
+  // Not an object at all: a real parse failure.
+  acme.err := "";
+  n := load("not json at all");
+  show("not-object", acme.find(buf, n, "x"));
+
+  // A well-formed object that simply lacks the key: the ordinary case, no error text.
+  acme.err := "";
+  n := load("{\"a\":1}");
+  show("key-absent", acme.find(buf, n, "missing"));
+
+  // The object never closes: truncated, not merely missing the key.
+  acme.err := "";
+  n := load("{\"a\":1");
+  show("truncated", acme.find(buf, n, "z"));
+
+  // A member missing its ':': malformed syntax, not a missing key.
+  acme.err := "";
+  n := load("{\"a\" 1}");
+  show("missing-colon", acme.find(buf, n, "a"));
+
+  // The key IS there, but the destination is too small: acme.copy's own failure, distinct
+  // from acme.find's.
+  acme.err := "";
+  n := load("{\"a\":\"toolongvalueforthedestination\"}");
+  ok := acme.find(buf, n, "a");
+  k := acme.copy(buf, out, 4);
+  io.puts(STDOUT, "too-long ok=");
+  if k >= 0 then io.puts(STDOUT, "1") else io.puts(STDOUT, "0");
+  io.puts(STDOUT, " err=[");
+  io.puts(STDOUT, acme.err);
+  io.puts(STDOUT, "]\n");
+end.

@@ -1,0 +1,561 @@
+// lib/x509.wz -- reading an X.509 certificate (RFC 5280), on top of lib/der.wz.
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// WHAT A TLS CLIENT ACTUALLY NEEDS from a certificate, and it is far less than a
+// certificate contains: the public key (to check the signature on the handshake), the
+// names it is valid for, the dates it is valid between, the issuer (to find the next
+// certificate up the chain), and the signature itself plus the exact bytes it covers.
+//
+// THE SIGNED BYTES ARE A SLICE, NOT A RECONSTRUCTION. A certificate is
+// SEQUENCE { tbsCertificate, signatureAlgorithm, signature }, and the signature is over the
+// tbsCertificate as it appears ON THE WIRE -- byte for byte, including its own tag and
+// length. Re-encoding it to check a signature is how implementations end up accepting two
+// different certificates as the same one; x509.tbsat/tbsn point at the original bytes.
+//
+// PARSING HAPPENS BEFORE ANY TRUST EXISTS. These bytes come from whoever answered the
+// socket. Every length is checked in lib/der.wz and every routine here reports failure
+// rather than returning a half-filled structure.
+
+include "io.wz";
+include "der.wz";
+
+const
+  // 128, NOT 16. Measured 22-09-2026: google.com's certificate carries about seventy
+  // dNSName entries and "google.com" sits past the sixteenth, so the name check failed on a
+  // certificate that was perfectly valid for the host asked for. A silent truncation that
+  // REFUSES is the better direction than one that accepts, but it is still wrong.
+  //
+  // The names are slices of the original DER, so this costs two ints each and nothing is
+  // copied. A certificate with more than 128 is refused rather than half-read -- see the
+  // note at x509.altnames.
+  X509.MAXNAMES = 128;
+
+var
+  // the whole certificate
+  x509.at:   int;
+  x509.end:  int;
+
+  // tbsCertificate, as the bytes the signature covers
+  x509.tbsat: int;
+  x509.tbsn:  int;
+
+  // subjectPublicKeyInfo
+  x509.keyalg:  int;      // 0 unknown, 1 RSA, 2 ECDSA P-256
+  x509.keyat:   int;      // the key bits themselves
+  x509.keyn:    int;
+
+  // the signature on this certificate, and which algorithm made it
+  x509.sigalg:  int;      // 0 unknown, 1 RSA PKCS1 SHA-256, 2 ECDSA SHA-256, 3 RSA-PSS
+  x509.sigat:   int;
+  x509.sign:    int;
+
+  // validity, as seconds since the epoch
+  x509.notbefore: int;
+  x509.notafter:  int;
+
+  // issuer and subject, as slices of the original DER, for chain building
+  x509.issat:  int;
+  x509.issn:   int;
+  x509.subat:  int;
+  x509.subn:   int;
+
+  // dNSName entries from subjectAltName
+  x509.nameat: array[0..X509.MAXNAMES-1] of int;
+  x509.namen:  array[0..X509.MAXNAMES-1] of int;
+  x509.names:  int;
+  x509.toomanynames: bool;   // the certificate has more dNSNames than X509.MAXNAMES
+
+  x509.isca:   bool;      // basicConstraints says this may sign other certificates
+  x509.err:    str;
+
+  // OIDs, as the bytes that appear inside an OBJECT IDENTIFIER.
+  x509.oid: array[0..15] of char;
+
+procedure x509.fail(m: str);
+begin
+  if slen(x509.err) = 0 then x509.err := m;
+end;
+
+// Set x509.oid to a literal, given as up to 16 byte values. Written this way because
+// Wantzel has no array literal and a routine takes at most 10 arguments.
+procedure x509.setoid(s: str);
+var i: int;
+begin
+  i := 0;
+  while i < slen(s) do begin x509.oid[i] := schar(s, i); i := i + 1; end;
+end;
+
+// ---- time ---------------------------------------------------------------------------------
+//
+// UTCTime is YYMMDDHHMMSSZ and GeneralizedTime is YYYYMMDDHHMMSSZ. The two-digit year is
+// read as RFC 5280 §4.1.2.5.1 requires: 50..99 means 19xx, 00..49 means 20xx.
+//
+// DAYS SINCE THE EPOCH BY COUNTING, not by a formula. The formula is short and the ways to
+// get it subtly wrong are many; this is the boring version and it is checked against known
+// timestamps in the test.
+function x509.leap(y: int): bool;
+begin
+  if band(y, 3) <> 0 then return false;
+  if y mod 100 <> 0 then return true;
+  return y mod 400 = 0;
+end;
+
+function x509.mdays(y: int; m: int): int;
+begin
+  if (m = 1) or (m = 3) or (m = 5) or (m = 7) or (m = 8) or (m = 10) or (m = 12) then return 31;
+  if m = 2 then begin if x509.leap(y) then return 29 else return 28; end;
+  return 30;
+end;
+
+// Seconds since 1970-01-01, and NEGATIVE for dates before it.
+//
+// MEASURED 22-09-2026: counting forward from 1970 with `while i < y` silently returns ~0
+// for every earlier year -- x509.epoch(1950,1,1) gave 0 instead of -631152000, because the
+// loop simply never ran. A certificate carrying a pre-1970 notBefore would then look like
+// one starting at the epoch rather than being recognised for what it is. Years before 1970
+// are counted backwards and subtracted.
+function x509.epoch(y: int; mo: int; d: int; h: int; mi: int; s: int): int;
+var days, i: int;
+begin
+  days := 0;
+  if y >= 1970 then
+  begin
+    i := 1970;
+    while i < y do
+    begin
+      if x509.leap(i) then days := days + 366 else days := days + 365;
+      i := i + 1;
+    end;
+  end
+  else
+  begin
+    i := y;
+    while i < 1970 do
+    begin
+      if x509.leap(i) then days := days - 366 else days := days - 365;
+      i := i + 1;
+    end;
+  end;
+  i := 1;
+  while i < mo do
+  begin
+    days := days + x509.mdays(y, i);
+    i := i + 1;
+  end;
+  days := days + d - 1;
+  return ((days * 24 + h) * 60 + mi) * 60 + s;
+end;
+
+function x509.digits(b: array of char; at: int; n: int): int;
+var v, i, c: int;
+begin
+  v := 0;
+  i := 0;
+  while i < n do
+  begin
+    c := ord(b[at + i]);
+    if (c < ord('0')) or (c > ord('9')) then return 0 - 1;
+    v := v * 10 + (c - ord('0'));
+    i := i + 1;
+  end;
+  return v;
+end;
+
+function x509.time(b: array of char; at: int; n: int; utc: bool): int;
+var y, mo, d, h, mi, s: int;
+begin
+  if utc then
+  begin
+    if n < 11 then return 0 - 1;
+    y := x509.digits(b, at, 2);
+    if y < 0 then return 0 - 1;
+    // RFC 5280 §4.1.2.5.1: 50 and above is the twentieth century.
+    if y >= 50 then y := y + 1900 else y := y + 2000;
+    at := at + 2;
+  end
+  else
+  begin
+    if n < 13 then return 0 - 1;
+    y := x509.digits(b, at, 4);
+    if y < 0 then return 0 - 1;
+    at := at + 4;
+  end;
+  mo := x509.digits(b, at, 2); at := at + 2;
+  d  := x509.digits(b, at, 2); at := at + 2;
+  h  := x509.digits(b, at, 2); at := at + 2;
+  mi := x509.digits(b, at, 2); at := at + 2;
+  s  := x509.digits(b, at, 2);
+  if (mo < 1) or (mo > 12) or (d < 1) or (d > 31) or (h > 23) or (mi > 59) or (s > 60) then
+    return 0 - 1;
+  return x509.epoch(y, mo, d, h, mi, s);
+end;
+
+// The dNSName entries inside a subjectAltName extension. They are [2] IMPLICIT IA5String,
+// so the tag is 0x82 and the value is the name with no length prefix of its own.
+procedure x509.altnames(b: array of char; at: int; upto: int);
+var p, inner, innerend: int;
+begin
+  p := der.find(b, at, upto, DER.OCTSTR);
+  if p < 0 then return;
+  inner := der.enter(b, der.vat, der.vend);
+  if inner < 0 then return;
+  innerend := der.vend;
+  while inner < innerend do
+  begin
+    p := der.next(b, inner, innerend);
+    if p < 0 then return;
+    if der.tag = 0x82 then
+    begin
+      if x509.names < X509.MAXNAMES then
+      begin
+        x509.nameat[x509.names] := der.vat;
+        x509.namen[x509.names] := der.vend - der.vat;
+        x509.names := x509.names + 1;
+      end
+      // A CERTIFICATE WITH MORE NAMES THAN WE CAN HOLD IS RECORDED AS SUCH, rather than
+      // quietly truncated. Truncation means the host asked for may be one of the names we
+      // dropped, and then a valid certificate is refused with a message about the wrong
+      // hostname -- which sends the reader looking in entirely the wrong place. That is
+      // exactly what happened with google.com and a limit of 16.
+      else x509.toomanynames := true;
+    end;
+    inner := p;
+  end;
+end;
+
+// basicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }
+//
+// AN ABSENT cA MEANS FALSE. A certificate without this extension, or with it saying nothing,
+// is not a CA -- and treating "absent" as "allowed" is how an ordinary leaf certificate ends
+// up able to sign for any domain.
+procedure x509.basic(b: array of char; at: int; upto: int);
+var p, inner, innerend: int;
+begin
+  p := der.find(b, at, upto, DER.OCTSTR);
+  if p < 0 then return;
+  inner := der.enter(b, der.vat, der.vend);
+  if inner < 0 then return;
+  innerend := der.vend;
+  if der.next(b, inner, innerend) < 0 then return;
+  if (der.tag = DER.BOOL) and (der.vend > der.vat) then
+    x509.isca := ord(b[der.vat]) <> 0;
+end;
+
+// ---- the certificate ------------------------------------------------------------------------
+
+// Parse b[at..upto) as one Certificate. True when every field this client needs was found.
+function x509.parse(b: array of char; at: int; upto: int): bool;
+var p, tbsend, q, r, inner, innerend, algend, t, n, i: int;
+begin
+  x509.err := "";
+  x509.keyalg := 0;
+  x509.sigalg := 0;
+  x509.names := 0;
+  x509.toomanynames := false;
+  x509.isca := false;
+  der.err := false;
+
+  // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+  p := der.enter(b, at, upto);
+  if (p < 0) or (der.tag <> DER.SEQ) then begin x509.fail("not a SEQUENCE"); return false; end;
+  x509.end := der.vend;
+
+  // THE tbsCertificate, WHOLE, INCLUDING ITS TAG AND LENGTH. That is what the signature
+  // covers, so the slice starts at p and not at its contents.
+  x509.tbsat := p;
+  tbsend := der.next(b, p, x509.end);
+  if tbsend < 0 then begin x509.fail("no tbsCertificate"); return false; end;
+  x509.tbsn := tbsend - p;
+  if der.tag <> DER.SEQ then begin x509.fail("tbsCertificate is not a SEQUENCE"); return false; end;
+  q := der.vat;
+  r := der.vend;
+
+  // signatureAlgorithm and signatureValue, after the tbsCertificate.
+  algend := der.next(b, tbsend, x509.end);
+  if algend < 0 then begin x509.fail("no signatureAlgorithm"); return false; end;
+  inner := der.vat;
+  innerend := der.vend;
+  if der.find(b, inner, innerend, DER.OID) < 0 then
+  begin
+    x509.fail("signatureAlgorithm has no OID");
+    return false;
+  end;
+  // 1.2.840.113549.1.1.11 sha256WithRSAEncryption
+  x509.setoid("\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b");
+  if der.oidis(b, x509.oid, 9) then x509.sigalg := 1;
+  // 1.2.840.10045.4.3.2 ecdsa-with-SHA256
+  x509.setoid("\x2a\x86\x48\xce\x3d\x04\x03\x02");
+  if der.oidis(b, x509.oid, 8) then x509.sigalg := 2;
+  // 1.2.840.10045.4.3.3 ecdsa-with-SHA384
+  //
+  // NOT EXOTIC: measured 22-09-2026, the intermediates and roots of github.com,
+  // cloudflare.com and letsencrypt.org all use this. A chain that only knows SHA-256 stops
+  // at the first intermediate.
+  x509.setoid("\x2a\x86\x48\xce\x3d\x04\x03\x03");
+  if der.oidis(b, x509.oid, 8) then x509.sigalg := 4;
+  // 1.2.840.113549.1.1.10 RSASSA-PSS
+  x509.setoid("\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0a");
+  if der.oidis(b, x509.oid, 9) then x509.sigalg := 3;
+
+  if der.next(b, algend, x509.end) < 0 then begin x509.fail("no signature"); return false; end;
+  if der.tag <> DER.BITSTR then begin x509.fail("signature is not a BIT STRING"); return false; end;
+  // A BIT STRING starts with a count of unused bits, which is 0 for a signature.
+  x509.sigat := der.vat + 1;
+  x509.sign := der.vend - der.vat - 1;
+
+  // ---- inside the tbsCertificate ------------------------------------------------------------
+  //
+  // TBSCertificate ::= SEQUENCE {
+  //   version [0] EXPLICIT INTEGER DEFAULT v1, serialNumber, signature, issuer,
+  //   validity, subject, subjectPublicKeyInfo, ... extensions [3] EXPLICIT }
+  //
+  // THE VERSION IS OPTIONAL, which is why this looks at the tag instead of counting. A v1
+  // certificate has no [0] and its first element is the serial number; skipping a fixed
+  // number of elements would then read the serial as the version and everything after it
+  // would be off by one.
+  p := q;
+  if der.next(b, p, r) < 0 then begin x509.fail("empty tbsCertificate"); return false; end;
+  if der.tag = 0xA0 then p := der.vend;     // [0] version: skip it
+  p := der.skip(b, p, r, 1);                // serialNumber
+  if p < 0 then begin x509.fail("no serialNumber"); return false; end;
+  p := der.skip(b, p, r, 1);                // signature (repeats signatureAlgorithm)
+  if p < 0 then begin x509.fail("no inner signature algorithm"); return false; end;
+
+  // issuer, kept as a slice so a chain can match it against the next certificate's subject
+  x509.issat := p;
+  p := der.next(b, p, r);
+  if p < 0 then begin x509.fail("no issuer"); return false; end;
+  x509.issn := p - x509.issat;
+
+  // validity ::= SEQUENCE { notBefore, notAfter }
+  inner := der.enter(b, p, r);
+  if inner < 0 then begin x509.fail("no validity"); return false; end;
+  innerend := der.vend;
+  p := der.vend;
+  t := der.next(b, inner, innerend);
+  if t < 0 then begin x509.fail("no notBefore"); return false; end;
+  x509.notbefore := x509.time(b, der.vat, der.vend - der.vat, der.tag = DER.UTCTIME);
+  if der.next(b, t, innerend) < 0 then begin x509.fail("no notAfter"); return false; end;
+  x509.notafter := x509.time(b, der.vat, der.vend - der.vat, der.tag = DER.UTCTIME);
+  if (x509.notbefore < 0) or (x509.notafter < 0) then
+  begin
+    x509.fail("a validity date does not parse");
+    return false;
+  end;
+
+  // subject, also kept whole
+  x509.subat := p;
+  p := der.next(b, p, r);
+  if p < 0 then begin x509.fail("no subject"); return false; end;
+  x509.subn := p - x509.subat;
+
+  // subjectPublicKeyInfo ::= SEQUENCE { algorithm, subjectPublicKey BIT STRING }
+  inner := der.enter(b, p, r);
+  if inner < 0 then begin x509.fail("no subjectPublicKeyInfo"); return false; end;
+  innerend := der.vend;
+  p := der.vend;
+  t := der.next(b, inner, innerend);
+  if t < 0 then begin x509.fail("no key algorithm"); return false; end;
+  n := der.vat;
+  i := der.vend;
+  if der.find(b, n, i, DER.OID) < 0 then begin x509.fail("no key algorithm OID"); return false; end;
+  // 1.2.840.113549.1.1.1 rsaEncryption
+  x509.setoid("\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01");
+  if der.oidis(b, x509.oid, 9) then x509.keyalg := 1;
+  // 1.2.840.10045.2.1 id-ecPublicKey
+  //
+  // THE ALGORITHM OID DOES NOT SAY WHICH CURVE. A P-256 key and a P-384 key are both
+  // id-ecPublicKey; the curve is a SECOND OID in the parameters beside it. Reading only the
+  // first one gives a key whose size nobody checked -- so the curve is read here and the
+  // two cases get their own keyalg, rather than leaving the caller to guess from the length.
+  x509.setoid("\x2a\x86\x48\xce\x3d\x02\x01");
+  if der.oidis(b, x509.oid, 7) then
+  begin
+    x509.keyalg := 2;                        // EC, curve still unknown
+    // 1.2.840.10045.3.1.7 prime256v1
+    x509.setoid("\x2a\x86\x48\xce\x3d\x03\x01\x07");
+    if der.find(b, der.vend, i, DER.OID) >= 0 then
+    begin
+      if der.oidis(b, x509.oid, 8) then x509.keyalg := 2
+      else
+      begin
+        // 1.3.132.0.34 secp384r1
+        x509.setoid("\x2b\x81\x04\x00\x22");
+        if der.oidis(b, x509.oid, 5) then x509.keyalg := 4
+        else x509.keyalg := 0;               // an EC curve we do not implement
+      end;
+    end;
+  end;
+  if der.next(b, t, innerend) < 0 then begin x509.fail("no subjectPublicKey"); return false; end;
+  if der.tag <> DER.BITSTR then begin x509.fail("the key is not a BIT STRING"); return false; end;
+  x509.keyat := der.vat + 1;                 // past the unused-bits count
+  x509.keyn := der.vend - der.vat - 1;
+
+  // ---- extensions ------------------------------------------------------------------------
+  //
+  // Optional, and tagged [3]. What matters here: subjectAltName for the names the
+  // certificate speaks for, and basicConstraints for whether it may sign others.
+  while p < r do
+  begin
+    t := der.next(b, p, r);
+    if t < 0 then return true;               // nothing else we need; not an error
+    if der.tag = 0xA3 then
+    begin
+      inner := der.enter(b, der.vat, der.vend);
+      if inner < 0 then return true;
+      innerend := der.vend;
+      while inner < innerend do
+      begin
+        n := der.next(b, inner, innerend);
+        if n < 0 then return true;
+        i := der.vat;
+        t := der.vend;
+        inner := n;
+        // Extension ::= SEQUENCE { extnID OID, critical BOOLEAN DEFAULT FALSE, extnValue }
+        if der.find(b, i, t, DER.OID) < 0 then continue;
+        // 2.5.29.17 subjectAltName
+        x509.setoid("\x55\x1d\x11");
+        if der.oidis(b, x509.oid, 3) then x509.altnames(b, i, t);
+        // 2.5.29.19 basicConstraints
+        x509.setoid("\x55\x1d\x13");
+        if der.oidis(b, x509.oid, 3) then x509.basic(b, i, t);
+      end;
+    end;
+    p := t;
+  end;
+  return true;
+end;
+
+// ---- matching a hostname --------------------------------------------------------------------
+//
+// RFC 6125: a wildcard is allowed only as the WHOLE leftmost label, and it matches exactly
+// one label. So *.example.com matches a.example.com but NOT example.com and not
+// a.b.example.com. Comparison is case-insensitive.
+//
+// AND IT MUST NOT MATCH ACROSS A DOT. A wildcard implemented as "anything up to the rest"
+// turns *.example.com into a match for evil.attacker.example.com -- or worse, matches a
+// dot itself and lets one certificate cover every subdomain level.
+function x509.lower(c: char): int;
+var v: int;
+begin
+  v := ord(c);
+  if (v >= 65) and (v <= 90) then return v + 32;
+  return v;
+end;
+
+function x509.hostmatch(b: array of char; at: int; n: int; host: str): bool;
+var i, j, hn, dots: int;
+begin
+  hn := slen(host);
+  if n = 0 then return false;
+  if (n > 2) and (b[at] = '*') and (b[at + 1] = '.') then
+  begin
+    // The host must have at least one label before the first dot, and that label is what
+    // the wildcard eats -- so compare from the host's first dot onward.
+    j := 0;
+    while (j < hn) and (schar(host, j) <> '.') do j := j + 1;
+    if j = 0 then return false;              // nothing before the dot
+    if j >= hn then return false;            // no dot at all: example.com is not *.example.com
+    // What is left must equal the pattern after the '*'.
+    if hn - j <> n - 1 then return false;
+    i := 0;
+    while i < n - 1 do
+    begin
+      if x509.lower(b[at + 1 + i]) <> x509.lower(schar(host, j + i)) then return false;
+      i := i + 1;
+    end;
+    // AND THE PATTERN MUST HAVE AT LEAST TWO LABELS LEFT. *.com would otherwise match every
+    // .com name in existence.
+    dots := 0;
+    i := 1;
+    while i < n do
+    begin
+      if b[at + i] = '.' then dots := dots + 1;
+      i := i + 1;
+    end;
+    return dots >= 2;
+  end;
+  if n <> hn then return false;
+  i := 0;
+  while i < n do
+  begin
+    if x509.lower(b[at + i]) <> x509.lower(schar(host, i)) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// The same comparison with the hostname given as BYTES, for callers whose hostname came
+// from the command line -- Wantzel cannot build a str from characters.
+function x509.hostmatchb(b: array of char; at: int; n: int; hb: array of char; hn: int): bool;
+var i, j, dots: int;
+begin
+  if n = 0 then return false;
+  if (n > 2) and (b[at] = '*') and (b[at + 1] = '.') then
+  begin
+    j := 0;
+    while (j < hn) and (hb[j] <> '.') do j := j + 1;
+    if j = 0 then return false;
+    if j >= hn then return false;
+    if hn - j <> n - 1 then return false;
+    i := 0;
+    while i < n - 1 do
+    begin
+      if x509.lower(b[at + 1 + i]) <> x509.lower(hb[j + i]) then return false;
+      i := i + 1;
+    end;
+    dots := 0;
+    i := 1;
+    while i < n do
+    begin
+      if b[at + i] = '.' then dots := dots + 1;
+      i := i + 1;
+    end;
+    return dots >= 2;
+  end;
+  if n <> hn then return false;
+  i := 0;
+  while i < n do
+  begin
+    if x509.lower(b[at + i]) <> x509.lower(hb[i]) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+function x509.matchesb(b: array of char; hb: array of char; hn: int): bool;
+var i: int;
+begin
+  i := 0;
+  while i < x509.names do
+  begin
+    if x509.hostmatchb(b, x509.nameat[i], x509.namen[i], hb, hn) then return true;
+    i := i + 1;
+  end;
+  // NO MATCH AMONG THE NAMES WE KEPT. If there were more than we could hold, say so: the
+  // host may well be among the ones dropped, and "not valid for this hostname" would then
+  // be a wrong answer dressed as a definite one.
+  if x509.toomanynames then
+    x509.fail("the certificate has more names than this parser holds; it may well cover this host");
+  return false;
+end;
+
+// True when any dNSName in the parsed certificate matches `host`.
+function x509.matches(b: array of char; host: str): bool;
+var i: int;
+begin
+  i := 0;
+  while i < x509.names do
+  begin
+    if x509.hostmatch(b, x509.nameat[i], x509.namen[i], host) then return true;
+    i := i + 1;
+  end;
+  // NO MATCH AMONG THE NAMES WE KEPT. Same guard as x509.matchesb: if there were more names
+  // than we could hold, the host may be among the dropped ones.
+  if x509.toomanynames then
+    x509.fail("the certificate has more names than this parser holds; it may well cover this host");
+  return false;
+end;

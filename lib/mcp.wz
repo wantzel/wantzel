@@ -1,5 +1,9 @@
 // lib/mcp.wz -- Model Context Protocol over JSON-RPC 2.0.
 //
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
 // The envelope and the tools/call parameters are described as schemas, so
 // the compiler generates their parsers: no dynamic objects, no allocation,
 // and method names arrive as integers rather than strings.

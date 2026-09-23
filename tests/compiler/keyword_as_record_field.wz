@@ -1,0 +1,8 @@
+// Must not compile: a keyword cannot name a record field. Used to be "missing end of the
+// record" on this line.
+type R = record
+  a: int;
+  type: int;
+end;
+begin
+end.

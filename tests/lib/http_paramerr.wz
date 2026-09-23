@@ -1,0 +1,43 @@
+// lib/http.wz: http.param/http.form must let a caller tell "key not found" apart from
+// "key found, but its value has bad percent-encoding or does not fit http.pval".
+//
+// http.lookup used to fold both cases into a bare false: a query string with a
+// malformed %-escape looked exactly like the parameter being absent, and the two error
+// messages a caller can build from that ("missing" versus "malformed") are not the
+// same thing.  http.paramerr now says which one happened.
+//
+// The request is written straight into http.inbuf and parsed there; no socket is needed.
+include "http.wz";
+var
+  req: array[0..511] of char;
+  n, i: int;
+// lib/http.wz calls this from its server loop; this test only parses, so it stays empty
+procedure app.request;
+begin
+end;
+procedure show(name: str);
+begin
+  io.puts(STDOUT, name);
+  if http.param(name) then
+  begin
+    io.puts(STDOUT, " -> found [");
+    if http.pvlen > 0 then io.out(STDOUT, addr(http.pval[0]), http.pvlen);
+    io.puts(STDOUT, "]");
+  end
+  else if http.paramerr then io.puts(STDOUT, " -> malformed")
+  else io.puts(STDOUT, " -> absent");
+  io.puts(STDOUT, "\n");
+end;
+begin
+  // "a" is well-formed, "b" has a truncated %-escape, "c" is not present at all
+  n := io.push(req, 0, "GET /x?a=hello&b=bad%2&d=%zz HTTP/1.1\r\n");
+  n := io.push(req, n, "Host: example.invalid\r\n");
+  n := io.push(req, n, "\r\n");
+  for i := 0 to n - 1 do http.inbuf[i] := req[i];
+  n := http.parse(0, n);
+
+  show("a");            // well-formed -> found
+  show("b");             // '%2' has only one hex digit before '&' -> malformed
+  show("c");             // absent -> absent, not malformed
+  show("d");              // '%zz' is not hex at all -> malformed
+end.

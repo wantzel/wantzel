@@ -1,0 +1,336 @@
+// lib/der.wz -- reading DER, and the parts of X.509 a TLS client needs (X.690, RFC 5280).
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// DER IS TAG-LENGTH-VALUE, ALL THE WAY DOWN. One byte of tag, a length that is either one
+// byte or a count-of-bytes followed by that many, and then the value -- which for a
+// constructed type is more TLVs. A reader that understands those three things can walk any
+// certificate, skipping whatever it does not recognise.
+//
+// NOTHING IS COPIED. The caller holds the certificate bytes and this returns positions into
+// them, the same shape as lib/protobuf.wz. A certificate is a few kilobytes and the parts a
+// client wants -- the public key, the validity dates, the subject names -- are each one
+// slice of it.
+//
+// THIS PARSES UNTRUSTED INPUT, which is the whole reason for the bounds checks on every
+// single step. A certificate arrives from whoever answered the socket, before anything
+// about them has been verified; a length field that runs past the buffer is the most
+// obvious attack there is, and it must be a refusal rather than a read past the end.
+// Every routine here returns a negative number rather than trusting a length.
+
+include "io.wz";
+
+const
+  // Universal tags, X.690 §8.
+  DER.BOOL      = 0x01;
+  DER.INT       = 0x02;
+  DER.BITSTR    = 0x03;
+  DER.OCTSTR    = 0x04;
+  DER.NULL      = 0x05;
+  DER.OID       = 0x06;
+  DER.UTF8STR   = 0x0C;
+  DER.SEQ       = 0x30;
+  DER.SET       = 0x31;
+  DER.PRINTSTR  = 0x13;
+  DER.IA5STR    = 0x16;
+  DER.UTCTIME   = 0x17;
+  DER.GENTIME   = 0x18;
+
+var
+  der.tag:  int;    // the tag of the element just read
+  der.vat:  int;    // where its value starts
+  der.vend: int;    // one past the end of its value
+  der.err:  bool;
+
+// Read one TLV at `at`. Fills der.tag/der.vat/der.vend and returns the position just past
+// the WHOLE element, or -1 when it does not fit inside [at, upto).
+function der.next(b: array of char; at: int; upto: int): int;
+var ln, nb, i, v: int;
+begin
+  if at + 2 > upto then begin der.err := true; return 0 - 1; end;
+  der.tag := ord(b[at]);
+  at := at + 1;
+  ln := ord(b[at]);
+  at := at + 1;
+  if ln < 128 then
+  begin
+    // the short form: the length is the byte itself
+    der.vat := at;
+    der.vend := at + ln;
+  end
+  else
+  begin
+    // The long form: the low seven bits say how many length bytes follow.
+    //
+    // 0x80 ALONE IS THE INDEFINITE FORM, which BER allows and DER forbids -- a certificate
+    // using it is malformed, and accepting it would mean scanning for an end-of-contents
+    // marker in attacker-controlled bytes.
+    nb := ln - 128;
+    if (nb = 0) or (nb > 4) or (at + nb > upto) then begin der.err := true; return 0 - 1; end;
+    v := 0;
+    i := 0;
+    while i < nb do
+    begin
+      v := v * 256 + ord(b[at + i]);
+      i := i + 1;
+    end;
+    at := at + nb;
+    der.vat := at;
+    der.vend := at + v;
+  end;
+  // THE BOUNDS CHECK, and it is the point of this file. A length that claims more than the
+  // buffer holds is refused here rather than read.
+  if (der.vend < der.vat) or (der.vend > upto) then begin der.err := true; return 0 - 1; end;
+  return der.vend;
+end;
+
+// Step INTO a constructed element: returns where its contents begin, having set der.vend to
+// where they end. For walking a SEQUENCE the caller then loops der.next from there.
+function der.enter(b: array of char; at: int; upto: int): int;
+begin
+  if der.next(b, at, upto) < 0 then return 0 - 1;
+  return der.vat;
+end;
+
+// Walk forward to the first element with tag `want`, at this level only. Returns the
+// position after it (so der.vat/der.vend describe it), or -1.
+function der.find(b: array of char; at: int; upto: int; want: int): int;
+begin
+  while at < upto do
+  begin
+    at := der.next(b, at, upto);
+    if at < 0 then return 0 - 1;
+    if der.tag = want then return at;
+  end;
+  return 0 - 1;
+end;
+
+// Skip n elements at this level. Returns where the next one starts, or -1.
+function der.skip(b: array of char; at: int; upto: int; n: int): int;
+var i: int;
+begin
+  i := 0;
+  while i < n do
+  begin
+    at := der.next(b, at, upto);
+    if at < 0 then return 0 - 1;
+    i := i + 1;
+  end;
+  return at;
+end;
+
+// Compare the element at der.vat..der.vend to a literal OID given as bytes.
+function der.oidis(b: array of char; oid: array of char; n: int): bool;
+var i: int;
+begin
+  if der.vend - der.vat <> n then return false;
+  i := 0;
+  while i < n do
+  begin
+    if b[der.vat + i] <> oid[i] then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// An INTEGER as an int, for small values (versions, exponents). Refuses anything that
+// would not fit rather than silently truncating.
+//
+// NAMED readint AND NOT int: identifiers are case-insensitive here, so der.int is the same
+// name as the constant DER.INT and the compiler refuses it.
+function der.readint(b: array of char; at: int; upto: int): int;
+var v, i: int;
+begin
+  if der.next(b, at, upto) < 0 then return 0 - 1;
+  if der.tag <> DER.INT then begin der.err := true; return 0 - 1; end;
+  if der.vend - der.vat > 8 then begin der.err := true; return 0 - 1; end;
+  v := 0;
+  i := der.vat;
+  while i < der.vend do
+  begin
+    v := v * 256 + ord(b[i]);
+    i := i + 1;
+  end;
+  return v;
+end;
+
+// ---- writing DER ------------------------------------------------------------------------
+//
+// NEEDED FOR THREE THINGS, and it is the same machinery each time: a certificate signing
+// request (ACME asks for one), a self-signed certificate (the localhost case), and the test
+// CA that issues certificates to our own client.
+//
+// THE LENGTH IS NOT KNOWN WHEN THE TAG IS WRITTEN, which is the whole awkwardness of
+// encoding DER. A SEQUENCE's length counts the bytes of everything inside it, so either you
+// build the contents first and prepend, or you leave a gap and fill it in afterwards.
+//
+// THIS DOES THE SECOND: der.open leaves a four-byte header (tag, 0x82, two length bytes) and
+// der.close fills it in -- and then SHRINKS it to the shortest form, moving the contents
+// down. That last step is not optional. DER allows exactly one length encoding per value,
+// the shortest (X.690 §10.1), so a 10-byte SEQUENCE written as 30 82 00 0A is BER, not DER.
+// OpenSSL reads it anyway; BoringSSL, and with it every Chromium-based browser, refuses the
+// certificate outright, and the browser reports only ERR_SSL_PROTOCOL_ERROR.
+//
+//   at := der.open(b, at);      // start a SEQUENCE, remember where
+//   ... write the contents ...
+//   at := der.close(b, mark, at);
+//
+// der.open returns the position after the placeholder and leaves the mark in der.mark, which
+// the caller must save before nesting another one.
+
+var
+  der.mark: int;     // where the length placeholder of the most recent open() sits
+
+// Start a constructed element. Returns the position after its four-byte placeholder header,
+// and sets der.mark to the header's position -- SAVE IT before opening anything inside.
+function der.opentag(b: array of char; at: int; tag: int): int;
+begin
+  b[at] := chr(tag);
+  b[at + 1] := chr(0x82);         // long form, two length bytes
+  b[at + 2] := chr(0);
+  b[at + 3] := chr(0);
+  der.mark := at;
+  return at + 4;
+end;
+
+function der.open(b: array of char; at: int): int;
+begin
+  return der.opentag(b, at, DER.SEQ);
+end;
+
+// Write a length in its shortest form at `at` and return the position after it: one byte up
+// to 127, then 0x81 and one byte, then 0x82 and two.
+function der.putlen(b: array of char; at: int; n: int): int;
+begin
+  if n > 65535 then io.fatal("der.putlen: an element longer than 65535 bytes");
+  if n < 128 then
+  begin
+    b[at] := chr(n);
+    return at + 1;
+  end;
+  if n < 256 then
+  begin
+    b[at] := chr(0x81);
+    b[at + 1] := chr(n);
+    return at + 2;
+  end;
+  b[at] := chr(0x82);
+  b[at + 1] := chr(band(n shr 8, 255));
+  b[at + 2] := chr(band(n, 255));
+  return at + 3;
+end;
+
+// Close the element that started at `mark`, now that `at` is the end of its contents: write
+// its length in the shortest form and move the contents down to follow it. Returns the new
+// end, which is where the caller continues writing.
+//
+// MOVING IS SAFE because everything inside was closed first, and every mark the caller still
+// holds lies BEFORE this one -- nothing that is still open points into the moved bytes.
+function der.close(b: array of char; mark: int; at: int): int;
+var n, body, dst, i: int;
+begin
+  n := at - mark - 4;
+  body := mark + 4;
+  dst := der.putlen(b, mark + 1, n);
+  if dst < body then
+  begin
+    // forwards, because the destination is lower than the source
+    i := 0;
+    while i < n do begin b[dst + i] := b[body + i]; i := i + 1; end;
+  end;
+  return dst + n;
+end;
+
+// A primitive element with its bytes given: tag, length, value.
+function der.put(b: array of char; at: int; tag: int; src: array of char; from: int; n: int): int;
+var i: int;
+begin
+  b[at] := chr(tag);
+  at := der.putlen(b, at + 1, n);
+  i := 0;
+  while i < n do begin b[at] := src[from + i]; at := at + 1; i := i + 1; end;
+  return at;
+end;
+
+// An OBJECT IDENTIFIER, given as the bytes that go inside it.
+function der.putoid(b: array of char; at: int; oid: array of char; n: int): int;
+begin
+  return der.put(b, at, DER.OID, oid, 0, n);
+end;
+
+// A NULL, which several algorithm identifiers require as their parameter.
+function der.putnull(b: array of char; at: int): int;
+begin
+  b[at] := chr(DER.NULL);
+  b[at + 1] := chr(0);
+  return at + 2;
+end;
+
+// An INTEGER from a plain int. Positive values only, which covers versions and serials.
+//
+// A DER INTEGER IS SIGNED, so a value whose top bit is set needs a leading zero -- otherwise
+// it reads as negative.
+function der.putint(b: array of char; at: int; v: int): int;
+var tmp: array[0..8] of char;
+    n, i: int;
+begin
+  n := 0;
+  if v = 0 then
+  begin
+    tmp[0] := chr(0);
+    n := 1;
+  end
+  else
+  begin
+    while v > 0 do
+    begin
+      tmp[n] := chr(band(v, 255));
+      v := v shr 8;
+      n := n + 1;
+    end;
+    if ord(tmp[n - 1]) >= 128 then
+    begin
+      tmp[n] := chr(0);
+      n := n + 1;
+    end;
+  end;
+  b[at] := chr(DER.INT);
+  b[at + 1] := chr(n);
+  at := at + 2;
+  i := n - 1;
+  while i >= 0 do begin b[at] := tmp[i]; at := at + 1; i := i - 1; end;
+  return at;
+end;
+
+// A BIT STRING holding whole bytes: the leading "unused bits" byte is zero.
+function der.putbits(b: array of char; at: int; src: array of char; from: int; n: int): int;
+var i: int;
+begin
+  b[at] := chr(DER.BITSTR);
+  at := der.putlen(b, at + 1, n + 1);
+  b[at] := chr(0);                 // no unused bits
+  at := at + 1;
+  i := 0;
+  while i < n do begin b[at] := src[from + i]; at := at + 1; i := i + 1; end;
+  return at;
+end;
+
+// A string element (PrintableString, IA5String, UTF8String) from a str.
+function der.putstr(b: array of char; at: int; tag: int; s: str): int;
+var i, n: int;
+begin
+  n := slen(s);
+  b[at] := chr(tag);
+  at := der.putlen(b, at + 1, n);
+  i := 0;
+  while i < n do begin b[at] := schar(s, i); at := at + 1; i := i + 1; end;
+  return at;
+end;
+
+// The same from a byte buffer, for names that came off the command line.
+function der.putstrb(b: array of char; at: int; tag: int; src: array of char; n: int): int;
+begin
+  return der.put(b, at, tag, src, 0, n);
+end;

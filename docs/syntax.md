@@ -1,13 +1,15 @@
 # Syntax
 
-The whole of it. Wantzel is small on purpose: forty keywords, one way to say each
-thing, and no construct that needs a second look.
+**The whole of it: forty keywords, one way to say each thing.**
 
-For what the language *means* rather than how it is written, see
-[`language.md`](language.md), which is binding. For how to write it well, see
-[`writing-wantzel.md`](writing-wantzel.md). For agreements that shape a project without
-being part of the language — how an entry point is named, how a module prefixes its names —
-see [`conventions.md`](conventions.md).
+[README](../README.md) · [Language](language.md) · [Syntax](syntax.md) · [Library](library.md) · [Writing Wantzel](writing-wantzel.md) · [How-to](howto.md) · [Design](design.md) · [Changelog](changelog.md)
+
+---
+
+This page is form only: how to write Wantzel. What it *means* is
+[`language.md`](language.md), which is binding. For idioms and pitfalls see
+[`writing-wantzel.md`](writing-wantzel.md); for project-level agreements (entry points,
+name prefixes) see the Conventions section of [`howto.md`](howto.md).
 
 ## The forty keywords
 
@@ -19,13 +21,12 @@ or        procedure real      record    return    schema    shl       shr
 str       then      to        tools     true      type      var       while
 ```
 
-**Case does not distinguish names.** `Foo`, `foo` and `FOO` are one name, and so are
+Case does not distinguish names: `Foo`, `foo` and `FOO` are one name, and so are
 `STORE.SET` and `store.set` — a constant in capitals beside a routine in lower case is a
 collision, not a convention.
 
-**`local` keeps a name inside its file.** Put it in front of a top-level `var`, `const`,
-`procedure` or `function` and nothing outside that file can see it, which is the way to stop
-two files colliding over the same name. Public is still the default.
+`local` in front of a top-level `var`, `const`, `procedure` or `function` keeps that name
+inside its file; nothing outside can see it. Public is still the default.
 
 ## A program
 
@@ -62,24 +63,23 @@ begin                      // the main block, last
 end.                       // a full stop, not a semicolon
 ```
 
-The order is fixed: includes, then declarations, then the main block. There is no header
-line — a file starts with its first declaration. A routine must be declared before it is
-used, or declared `forward` first.
+Fixed order: includes, then declarations, then the main block. No header line — a file
+starts with its first declaration. A routine must be declared before use, or `forward`.
 
 ## Types
 
 | | |
 |---|---|
-| `int` | a 64-bit signed integer |
-| `real` | a 64-bit float |
+| `int` | 64-bit signed integer |
+| `real` | 64-bit float |
 | `bool` | `true` or `false` |
 | `char` | one byte |
 | `str` | a string **literal**; not a buffer you build |
-| `array[a..b] of T` | fixed size, known when it compiles |
+| `array[a..b] of T` | fixed size, known at compile time |
 | `record ... end` | fields, no methods, no inheritance |
 
-There is one type per concept: no `integer` beside `int`, no `single` beside `real`. Text you
-assemble lives in an `array of char`, and `str` is what you write between quotes.
+One type per concept: no `integer` beside `int`, no `single` beside `real`. Text you
+assemble lives in an `array of char`; `str` is what you write between quotes.
 
 ```pascal
 var
@@ -109,10 +109,28 @@ var
   p: Colour;
 ```
 
+## `schema` and `tools`
+
+```pascal
+type ConvertArgs = schema
+  celsius: real;
+end;
+
+tools
+  convert(ConvertArgs): ConvertResult "Convert Celsius to Fahrenheit." readonly idempotent;
+end;
+```
+
+A `schema` is a JSON-shaped record type; a `tools ... end;` block declares an MCP tool
+table, one line per tool, and the compiler generates its `tools/list`, argument parsing
+and dispatch. Form only, here — what each generates is
+[`language.md`](language.md#7-schema--compiled-json) §7 and
+[§7b](language.md#7b-tools--a-tool-table-as-a-declaration), which are binding.
+
 ## Routines
 
-A `function` returns a value and a `procedure` does not. Parameters are passed by value,
-except an `array of T`, which is passed as a reference and its length travels with it.
+A `function` returns a value; a `procedure` does not. Parameters are by value, except an
+`array of T`, passed as a reference with its length.
 
 ```pascal
 function area(w: int; h: int): int;
@@ -130,7 +148,7 @@ end;
 function later(n: int): int; forward;      // declared now, defined below
 ```
 
-A function that reaches its `end` without a `return` is a runtime error, not a silent zero.
+A function that reaches `end` without `return` is a runtime error, not a silent zero.
 
 ## Statements
 
@@ -163,8 +181,8 @@ return;                                    // from a procedure
 halt(1);                                   // end the program with an exit code
 ```
 
-Note the semicolons: they **separate** statements. The one before `end` is optional, and
-`end.` closes the program.
+Semicolons **separate** statements; the one before `end` is optional. `end.` closes the
+program.
 
 ## Operators
 
@@ -175,11 +193,8 @@ Note the semicolons: they **separate** statements. The one before `end` is optio
 | logical | `and` `or` `not` |
 | bitwise | `shl` `shr`, and `band` `bor` `bxor` as builtins |
 
-`/` is real division and `div` is integer division; mixing them by accident is the kind of
-thing the type check refuses rather than rounds.
-
-**There is no `++`, no `+=`, no `?:` and no assignment inside an expression.** One way per
-concept.
+`/` is real division, `div` is integer division; mixing them by accident is refused, not
+rounded. There is no `++`, no `+=`, no `?:` and no assignment inside an expression.
 
 ## Comments
 
@@ -200,13 +215,13 @@ inside the comment text turned the rest of the sentence into code.
 true        false                          // bools
 ```
 
-`\xHH` takes **exactly two** hex digits, unlike C — so `"\x41BC"` is three characters, and a
-generator can write a byte followed by a literal hex character without ambiguity.
+`\xHH` takes **exactly two** hex digits, unlike C — so `"\x41BC"` is three characters, and
+a generator can write a byte followed by a literal hex character without ambiguity.
 
 ## Names
 
-A name starts with a letter and may contain letters, digits, underscores and dots. The dot is
-an ordinary character, used to group things that belong together:
+A name starts with a letter and may contain letters, digits, underscores and dots — the
+dot is an ordinary character, used to group names that belong together:
 
 ```pascal
 calc.reset;
@@ -214,17 +229,17 @@ io.puts(STDOUT, "hi");
 store.set(k, v);
 ```
 
-That is a naming convention, not a module system — there is one flat namespace, and
-`calc.reset` is simply a name with a dot in it. A part after a dot may start with a digit
+That is a naming convention, not a module system: one flat namespace, and `calc.reset` is
+simply a name with a dot in it. A part after a dot may start with a digit
 (`Reading.level.1`); the first part may not.
 
 ## What is not here
 
 No pointers, no heap, no `new`, no garbage collector. No classes, no inheritance, no
-interfaces. No generics, no overloading, no operator overloading. No exceptions, no threads,
-no closures, no lambdas. No implicit conversion between types.
+interfaces. No generics, no overloading, no operator overloading. No exceptions, no
+threads, no closures, no lambdas. No implicit conversion between types.
 
-Each of those is a decision rather than an omission, and
-[`design.md`](design.md) argues them. The short version: a construct that costs more than it
-gives is left out, because the reader of this code is usually a generator in a loop and every
-extra way to say something is another way to get it wrong.
+Each is a decision, not an omission; [`design.md`](design.md) argues them. Short version:
+a construct that costs more than it gives is left out, because the reader of this code is
+usually a generator in a loop, and every extra way to say something is another way to get
+it wrong.

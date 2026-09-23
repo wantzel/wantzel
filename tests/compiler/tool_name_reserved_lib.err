@@ -1,0 +1,1 @@
+tool_name_reserved_lib.wz:15: tool name "rest" is reserved: lib/tools.wz or lib/toolsmcp.wz declares tool.rest; choose another name

@@ -1,0 +1,7 @@
+// Must not compile: a keyword in the place of a later constant name ended the declaration
+// loop, and the error was "missing begin of the main program" on this same line.
+const
+  a = 1;
+  to = 2;
+begin
+end.

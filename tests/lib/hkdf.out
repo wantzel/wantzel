@@ -1,0 +1,8 @@
+ok   RFC 5869 A.1 the extracted PRK
+ok   RFC 5869 A.1 the expanded output, 42 bytes
+ok   RFC 5869 A.3 an empty salt is 32 zero bytes, not no salt
+ok   RFC 5869 A.3 the expanded output with empty info
+ok   a longer expansion starts with the shorter one
+ok   and its second block differs from its first
+ok   expandlabel builds the HkdfLabel of RFC 8446 7.1
+ok   and a different label gives a different key

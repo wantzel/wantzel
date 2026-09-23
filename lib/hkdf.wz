@@ -1,0 +1,194 @@
+// lib/hkdf.wz -- HKDF (RFC 5869) and the TLS 1.3 key schedule (RFC 8446 §7.1).
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// HKDF IS TWO STEPS AND BOTH ARE JUST HMAC. Extract turns a shared secret of any shape into
+// one uniformly random 32-byte key; Expand stretches that into as many labelled keys as the
+// protocol needs. TLS 1.3 calls them in a fixed order to derive every secret in a
+// connection, and getting the ORDER or a LABEL wrong produces a perfectly valid key that
+// the other side simply does not have -- the handshake then fails at Finished with nothing
+// to point at.
+//
+// WHY THIS FILE EXISTS RATHER THAN CALLING hmac.sha256 DIRECTLY: that routine takes whole
+// arrays and uses len() to find their size. HKDF builds messages of VARYING length in a
+// fixed buffer -- info, a counter byte, the previous block -- so it needs a MAC over "the
+// first n bytes of this buffer", which len() cannot express. The length-aware HMAC is here.
+
+include "io.wz";
+include "sha256.wz";
+
+const
+  HK.HASHLEN = 32;                   // SHA-256
+
+var
+  hk.kb:    array[0..63] of char;    // key block, xored with ipad/opad
+  hk.kh:    array[0..31] of char;    // hash of an over-long key
+  hk.inner: array[0..31] of char;
+  hk.msg:   array[0..255] of char;   // the message being MACed, with its length in hk.msgn
+  hk.msgn:  int;
+  hk.t:     array[0..31] of char;    // the previous Expand block
+  hk.info:  array[0..255] of char;   // the HkdfLabel being built
+  hk.infon: int;
+  hk.prk:   array[0..31] of char;    // the extracted pseudo-random key
+  hk.one:   array[0..0] of char;     // a one-byte window, for feeding a prefix to SHA-256
+
+// ---- feeding SHA-256 a prefix of a buffer ------------------------------------------------
+//
+// sha256.update takes a whole array and uses len() to size it, so "the first n bytes of this
+// buffer" cannot be expressed. Rather than add sha256.updaten to the shared library in
+// passing -- that is a change every program inherits, and it belongs under its own ticket --
+// the prefix is fed a byte at a time here.
+//
+// ONE BYTE AT A TIME IS NOT THE COST IT LOOKS LIKE: sha256.update already loops per byte
+// internally, so this adds a call per byte and no extra hashing work.
+procedure hk.feed(b: array of char; n: int);
+var i: int;
+begin
+  i := 0;
+  while i < n do
+  begin
+    hk.one[0] := b[i];
+    sha256.update(hk.one);
+    i := i + 1;
+  end;
+end;
+
+// ---- a length-aware HMAC-SHA256 --------------------------------------------------------
+//
+// Same construction as lib/hmac.wz, but over key[0..keyn-1] and hk.msg[0..hk.msgn-1].
+procedure hk.mac(key: array of char; keyn: int; digest: array of char);
+var i: int;
+begin
+  i := 0;
+  while i < 64 do begin hk.kb[i] := chr(0); i := i + 1; end;
+  if keyn > 64 then
+  begin
+    sha256.init;
+    hk.feed(key, keyn);
+    sha256.final(hk.kh);
+    i := 0;
+    while i < 32 do begin hk.kb[i] := hk.kh[i]; i := i + 1; end;
+  end
+  else
+  begin
+    i := 0;
+    while i < keyn do begin hk.kb[i] := key[i]; i := i + 1; end;
+  end;
+
+  i := 0;
+  while i < 64 do begin hk.kb[i] := chr(bxor(ord(hk.kb[i]), 0x36)); i := i + 1; end;
+  sha256.init;
+  hk.feed(hk.kb, 64);
+  hk.feed(hk.msg, hk.msgn);
+  sha256.final(hk.inner);
+
+  // 0x36 xor 0x5C = 0x6A, so this turns the ipad block into the opad block in place.
+  i := 0;
+  while i < 64 do begin hk.kb[i] := chr(bxor(ord(hk.kb[i]), 0x6A)); i := i + 1; end;
+  sha256.init;
+  hk.feed(hk.kb, 64);
+  hk.feed(hk.inner, 32);
+  sha256.final(digest);
+
+  // Key material must not stay in a global after the call.
+  i := 0;
+  while i < 64 do begin hk.kb[i] := chr(0); i := i + 1; end;
+end;
+
+// ---- Extract ---------------------------------------------------------------------------
+//
+// PRK = HMAC(salt, ikm). The salt is the KEY and the input keying material is the MESSAGE,
+// which is the other way round from how it reads. Swapping them gives a 32-byte value that
+// looks perfectly random and is wrong.
+procedure hkdf.extract(salt: array of char; saltn: int; ikm: array of char; ikmn: int; prk: array of char);
+var i: int;
+begin
+  i := 0;
+  while i < ikmn do begin hk.msg[i] := ikm[i]; i := i + 1; end;
+  hk.msgn := ikmn;
+  hk.mac(salt, saltn, prk);
+end;
+
+// ---- Expand ----------------------------------------------------------------------------
+//
+// T(1) = HMAC(PRK, info || 0x01), T(n) = HMAC(PRK, T(n-1) || info || n). The counter starts
+// at 1, not 0, and it is a single byte -- so at most 255 blocks, which is far more than TLS
+// ever asks for.
+procedure hkdf.expand(prk: array of char; info: array of char; infon: int; out: array of char; outn: int);
+var done, i, n, blocks, first: int;
+begin
+  done := 0;
+  blocks := 0;
+  first := 1;
+  while done < outn do
+  begin
+    blocks := blocks + 1;
+    n := 0;
+    // THE PREVIOUS BLOCK COMES FIRST, and is absent for the very first one. Including an
+    // all-zero T(0) instead of omitting it is a common way to get output that is stable,
+    // self-consistent and not what anyone else computes.
+    if first = 0 then
+    begin
+      i := 0;
+      while i < HK.HASHLEN do begin hk.msg[n] := hk.t[i]; n := n + 1; i := i + 1; end;
+    end;
+    i := 0;
+    while i < infon do begin hk.msg[n] := info[i]; n := n + 1; i := i + 1; end;
+    hk.msg[n] := chr(blocks);
+    n := n + 1;
+    hk.msgn := n;
+    hk.mac(prk, HK.HASHLEN, hk.t);
+    first := 0;
+    i := 0;
+    while (i < HK.HASHLEN) and (done < outn) do
+    begin
+      out[done] := hk.t[i];
+      done := done + 1;
+      i := i + 1;
+    end;
+  end;
+end;
+
+// ---- the TLS 1.3 labelled form ----------------------------------------------------------
+//
+// HKDF-Expand-Label wraps the label in a structure (RFC 8446 §7.1):
+//
+//     struct { uint16 length; opaque label<7..255>; opaque context<0..255>; }
+//
+// with "tls13 " prefixed to every label. THE PREFIX AND THE LENGTH BYTES ARE PART OF THE
+// INPUT, so an implementation that passes the bare label derives different keys -- valid
+// ones, which the peer does not share. That failure surfaces only at Finished.
+procedure tls.expandlabel(secret: array of char; label: str; ctx: array of char; ctxn: int; out: array of char; outn: int);
+var i, n, ln: int;
+begin
+  n := 0;
+  hk.info[n] := chr(band(outn shr 8, 255)); n := n + 1;
+  hk.info[n] := chr(band(outn, 255));       n := n + 1;
+  ln := 6 + slen(label);                    // "tls13 " is six bytes
+  hk.info[n] := chr(ln); n := n + 1;
+  hk.info[n] := chr(ord('t')); n := n + 1;
+  hk.info[n] := chr(ord('l')); n := n + 1;
+  hk.info[n] := chr(ord('s')); n := n + 1;
+  hk.info[n] := chr(ord('1')); n := n + 1;
+  hk.info[n] := chr(ord('3')); n := n + 1;
+  hk.info[n] := chr(ord(' ')); n := n + 1;
+  i := 0;
+  while i < slen(label) do begin hk.info[n] := schar(label, i); n := n + 1; i := i + 1; end;
+  hk.info[n] := chr(ctxn); n := n + 1;
+  i := 0;
+  while i < ctxn do begin hk.info[n] := ctx[i]; n := n + 1; i := i + 1; end;
+  hk.infon := n;
+  hkdf.expand(secret, hk.info, hk.infon, out, outn);
+end;
+
+// Derive-Secret(secret, label, messages) = Expand-Label(secret, label, Hash(messages), 32).
+//
+// The context is the hash of the handshake transcript SO FAR, which is why the order of
+// calls matters as much as the labels: the same label over a different transcript is a
+// different key.
+procedure tls.derivesecret(secret: array of char; label: str; thash: array of char; out: array of char);
+begin
+  tls.expandlabel(secret, label, thash, 32, out, 32);
+end;

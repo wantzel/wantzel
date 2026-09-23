@@ -26,7 +26,22 @@ if [ -n "$hits" ]; then printf '  a personal home directory:\n'; printf '%s\n' "
 # what the README and the site tell a reader to write to.  Every other address is still
 # refused -- the one this check exists for is a personal address from another project,
 # which is a leak that cannot be taken back once it is in the history.
-hits=$(git ls-files | xargs grep -niE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}' 2>/dev/null | grep -viE 'floris@wantzel\.com' | grep -v '^tests/toolchain/no_foreign_code.sh:')
+#
+# The reserved documentation domains are allowed too: example.com, example.net and
+# example.org (RFC 2606, RFC 6761) can never belong to anyone, so an address there is a
+# placeholder by definition -- `--email you@example.com` in a usage line is exactly what
+# a reader should see. The check looks at each ADDRESS, not at the line: allowing a line
+# because it also carries a placeholder would let a real address beside it through.
+#
+# That precision is not decoration. Before 23-09-2026 the whole line was matched, so the
+# usage line of examples/serve.wz failed this test for its placeholder, and a test passing
+# `f@w.com` -- a short, made-up looking address at a domain somebody does own -- failed it
+# for the same reason and looked like the same false alarm. It was not: that one is now
+# test@example.com.
+hits=$(git ls-files | xargs grep -noiE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-z]{2,}' 2>/dev/null \
+       | grep -v '^tests/toolchain/no_foreign_code.sh:' \
+       | grep -viE ':floris@wantzel\.com$' \
+       | grep -viE '@([a-z0-9-]+\.)*example\.(com|net|org)$')
 if [ -n "$hits" ]; then printf '  an e-mail address:\n'; printf '%s\n' "$hits" | sed 's/^/    /'; fails=$((fails+1)); fi
 
 [ $fails -eq 0 ] || { echo "$fails kind(s) of foreign reference found; see above"; exit 1; }

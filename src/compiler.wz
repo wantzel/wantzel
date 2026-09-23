@@ -1,3 +1,9 @@
+// agent-permissions: read
+//
+// NOT because this file is finished, but because it has a COUNTERPART: bootstrap/boot.c is
+// the same logic in C, and changing one without the other breaks the bootstrap fixed point
+// -- which is discovered much later, by someone else. Change both, in one commit, under a
+// ticket that asks for it.
 // compiler.wz -- the whole compiler, WITHOUT a main program.
 //
 // THIS FILE EXISTS SO THE COMPILER CAN BE A COMPONENT. A source file ending in `end.` is a
@@ -16,7 +22,7 @@
 // control flow, not a refactor, and the bootstrap fixed point is what would quietly break.
 // A host that must survive a failed compile calls compile in a FORK: the child may halt,
 // the parent reads its exit code and whatever went to stderr. fork, shared descriptors and
-// waiting are measured -- see docs/internals/what-the-system-can-already-do.md.
+// waiting are measured -- see docs/design.md.
 // wantzel.wz -- the Wantzel compiler, written in Wantzel.
 //
 // It reads a Wantzel source file and writes a static x86-64 Linux ELF
@@ -32,11 +38,17 @@
 
 
 const
+  // ONE MESSAGE, TWO PLACES THAT RAISE IT. Both mean "this escape has no two hex digits";
+  // which one fires depends on whether the source happens to end first, and that is not a
+  // distinction the reader can act on. They were two different sentences three lines apart,
+  // one with an example and one without -- see docs/conventions.md §5.
+  HEXESC = "a hex escape needs exactly two hex digits, as in x41 or xff after a backslash";
+
   // The release this compiler was built from.  It is reported by --version, and
   // tests/toolchain/release_assets.sh checks it against the git tag: a binary that
   // cannot say which version it is cannot be matched to a published checksum.
   // bootstrap/boot.c carries the same string.
-  VERSION = "0.2.1";
+  VERSION = "0.3.0";
   SRCMAX  = 67108864;
   CODEMAX = 67108864;
   DATMAX  = 33554432;
@@ -57,6 +69,7 @@ const
   MAXENUM = 1024;
   MAXS    = 512;
   JSMAX   = 4194304;
+  DBGMAX  = 16777216; // the debug sidecar, collected in memory; see docs/design.md
   SF_INT   = 1;
   SF_BOOL  = 2;
   SF_TEXT  = 3;     // a view into the parsed buffer
@@ -281,7 +294,7 @@ var
   nsc: int;
   jsbuf: array[0..JSMAX - 1] of char;
   jslen: int;
-  tlnam: array[0..MAXT * 64 - 1] of char;
+  tlnam: array[0..MAXT * 128 - 1] of char;
   tlin, tlout, tldesc, tlro, tlid, tldes: array[0..MAXT - 1] of int;
   // Where the tool was DECLARED, in the real source.  The forward declarations come out
   // of the generated <tools> text, so without this an undefined handler is reported at a
@@ -303,9 +316,34 @@ var
   tphlen: array[0..15] of int;
   tphtxt: array[0..15] of str;       // the message text that heading belongs to
   ntph: int;
+  // THE PLACE OF THE LAST CHECK, so a line with several of them stores one copy.
+  //
+  // MEASURED in bin/wantzel on 22-09-2026: 1016 place strings, 662 of them distinct. A third
+  // of them were duplicates, because one line often holds more than one check --
+  // `a[i] := b[j] + c[k]` is three bounds checks and one place. Each stored copy costs the
+  // text plus an eight-byte length and alignment padding, so twelve characters take 24 bytes.
+  //
+  // ONE ENTRY IS ENOUGH AND MORE WOULD NOT PAY. The duplicates are consecutive by
+  // construction -- they come from one line -- so remembering the last is the whole win; a
+  // real table would cost a lookup per check for the cases this already catches.
+  tplast: int;                       // data offset of the last place written, -1 if none
+  tplastlen: int;                    // its length
+  tplastline: int;                   // the line it was for
+  tplastfile: int;                   // and the file, since two files share line numbers
   trapaddr, argaddr, scanaddr, mainaddr, mainpatch, framepatch: int;
   winmode, sysrawaddr, entryoff: int;
   tgiven: bool;                       // was --target= given? the output name never decides
+  // ---- DEBUG INFORMATION: --debug writes <output>.wzdbg, see docs/design.md
+  //
+  // The binary is untouched; the sidecar is the only difference. The records that come in
+  // address order (line, func, param, local) are collected here as they are produced,
+  // because a routine's locals are gone by the time the file is written; everything the
+  // tables still hold (files, records, globals) is written from them at the end.
+  dbgmode: int;                       // was --debug given? zero for a host that never sets it
+  dbg:    array[0..DBGMAX-1] of char;  dbglen: int;
+  codebase: int;                      // the address of code[0] in the image, known before parsing
+  fend, fhline, fhfile: array[0..MAXF-1] of int;   // where a routine ends, and its header
+  dbdata, dbbss: int;                 // where the writer put the data and the bss
   mi: int;
   lvkind, lvimm, lvoff, lvtype, lvpos, lvfx: int;
   elkind, eloff, eltype: int;
@@ -512,6 +550,68 @@ begin
   halt(1);
 end;
 
+// failkeyword -- a keyword where a NAME was expected, and the word is named.
+//
+// A schema field called `type` used to be reported as "missing end of the schema" on its
+// own line. The loop over the fields stops at the first token that is not an identifier, a
+// keyword is not one, and what the parser then found missing was the end. The line was
+// right and the message was wrong, and that is the worse combination: the reader searches
+// that line for an end that was never missing, while the word that IS the problem sits in
+// front of them looking like an ordinary name. On a real application with 261 schemas it
+// cost a full round in which every schema was suspected before that one word. A record
+// field, a tool and every "name expected" site had the same gap: "variable name expected"
+// with a name plainly there says nothing about WHY it does not count.
+//
+// The repair is derivable for a schema field, so it is given: the wire key may stay, only
+// the program's name for it changes.
+procedure failkeyword(what: str; jsonkey: bool);
+var i: int;
+begin
+  wrs(2, "wantzel: "); wrname(2); wrs(2, ":"); wrnum(2, line); wrs(2, ": ");
+  i := 0;
+  while obuf[i] <> chr(0) do i := i + 1;
+  wrbuf(2, addr(obuf[0]), i);
+  wrs(2, " is a keyword and cannot name "); wrs(2, what);
+  if jsonkey then
+  begin
+    wrs(2, " -- name the field differently and keep the JSON key: kind \"");
+    wrbuf(2, addr(obuf[0]), i);
+    wrs(2, "\": ...");
+  end;
+  wrs(2, "\n");
+  halt(1);
+end;
+
+// iskw -- is the current token a keyword?  Every "name expected" site asks this first, so
+// that a keyword in a name's place is reported as that, and not as whatever the parser
+// then failed to find.
+function iskw: bool;
+begin
+  return (tok >= KW_CONST) and (tok <= KW_TOOLS);
+end;
+
+// kwnamed -- is the current keyword standing where a NAME belongs, judged by the character
+// after it?  A declaration loop ends at the first token that is not a name, and a keyword is
+// not one, so `var a: int; to: int;` used to leave the loop at `to` and fail much later,
+// with "missing begin of the main program" on a line that held no begin at all.  After the
+// first name the keyword check cannot fire on its own: the keyword that normally ends the
+// block (begin, procedure, const ...) is legitimate there.  What tells the two apart is what
+// follows: a keyword that ends a block is never followed by a colon, a comma or an equals
+// sign, a name in a declaration always is.
+function kwnamed(c1, c2: int): bool;
+var p, c: int;
+begin
+  if not iskw then return false;
+  p := pos;
+  while p < srcend do
+  begin
+    c := srcb(p);
+    if (c <> 32) and (c <> 9) and (c <> 13) and (c <> 10) then return (c = c1) or (c = c2);
+    p := p + 1;
+  end;
+  return false;
+end;
+
 // ------------------------------------------------------------------
 // lexer
 // ------------------------------------------------------------------
@@ -683,10 +783,13 @@ begin
   if c = 34  then return 34;
   if (c = 120) or (c = 88) then
   begin
-    if pos + 2 >= srcend then fail("a hex escape needs two digits");
+    // THE SAME MESSAGE AS BELOW, and on purpose: both are "this escape has no two hex
+    // digits". Which of the two fires depends on whether the source happens to end first,
+    // and that is not a distinction the reader can act on differently.
+    if pos + 2 >= srcend then fail(HEXESC);
     h := hexdig(srcb(pos + 1));
     l := hexdig(srcb(pos + 2));
-    if (h < 0) or (l < 0) then fail("a hex escape needs exactly two hex digits, as in x41 or xff after a backslash");
+    if (h < 0) or (l < 0) then fail(HEXESC);
     pos := pos + 2;
     return h * 16 + l;
   end;
@@ -1190,6 +1293,14 @@ end;
 // called, and it needs no cooperation from the caller.  argv[0] stays as the fallback for
 // the case readlink cannot answer (no /proc), because a wrong-but-usual answer beats none.
 //
+// ON WINDOWS THIS FALLBACK IS NOT A RARE CASE, IT IS THE ONLY CASE: there is no
+// /proc/self/exe there at all, so the Windows __wsys shim answers syscall 89 (readlink)
+// with -1 on every call, and the compiler always falls back to argv[0]. A compiler started
+// as C:\tools\wantzel.exe then has an argv[0] with no '/' in it whatsoever, only '\', so
+// the loop below has to split on '\' as well -- not just when the target is Windows, since
+// this same source also runs as the native compiler on a Linux machine, where a stray '\'
+// in a real path is not a realistic concern.
+//
 // If wantzel sits in /x/y/wantzel the search path is /x/y/lib/; that works for a compiler
 // built next to its lib and just as well for an installed binary.
 procedure setlibdir;
@@ -1217,9 +1328,16 @@ begin
   end
   else
   begin
+    // argv[0] as the fallback: on Windows there is no /proc/self/exe at all (see the
+    // Windows __wsys shim for syscall 89), so this branch is not a rare degraded case
+    // there -- it is the ONLY path, every time. A compiler started as C:\tools\wantzel.exe
+    // carries no '/' at all, so '/' alone left cut at 0 and the search collapsed to a
+    // relative "lib/". Accept '\' as a separator too, on every platform: a backslash is a
+    // legal but vanishingly rare byte in a Linux path, and treating it as one here never
+    // costs a real Linux path anything.
     while (argch(0, i) <> chr(0)) and (i < 900) do
     begin
-      if argch(0, i) = '/' then cut := i + 1;
+      if (argch(0, i) = '/') or (argch(0, i) = '\\') then cut := i + 1;
       i := i + 1;
     end;
     i := 0;
@@ -1233,10 +1351,12 @@ begin
   // If the compiler sits in .../bin/, its library belongs in .../lib/ beside it and not
   // in .../bin/lib/.  That is the usual layout (prefix/bin next to prefix/lib), and it is
   // also what happens here now that build.sh writes to bin/.  Recognised by the last
-  // directory name: if the path ends in "bin/", take that off.
+  // directory name: if the path ends in "bin/" (or "bin\" -- see the separator above),
+  // take that off.
   if libdirlen >= 4 then
     if (libdir[libdirlen - 4] = 'b') and (libdir[libdirlen - 3] = 'i')
-       and (libdir[libdirlen - 2] = 'n') and (libdir[libdirlen - 1] = '/') then
+       and (libdir[libdirlen - 2] = 'n')
+       and ((libdir[libdirlen - 1] = '/') or (libdir[libdirlen - 1] = '\\')) then
       libdirlen := libdirlen - 4;
   libdir[libdirlen] := 'l'; libdir[libdirlen + 1] := 'i';
   libdir[libdirlen + 2] := 'b'; libdir[libdirlen + 3] := '/';
@@ -1994,6 +2114,94 @@ begin
   return "void";
 end;
 
+// ---- the debug sidecar -------------------------------------------------------------
+// Text into dbg; the file itself is written by writedbg once the addresses are known.
+procedure dbc(c: int);
+begin
+  if dbglen >= DBGMAX then fail("debug information overflow");
+  dbg[dbglen] := chr(band(c, 255));
+  dbglen := dbglen + 1;
+end;
+
+procedure dbs(s: str);
+var i: int;
+begin
+  i := 0;
+  while sch(s, i) <> 0 do
+  begin
+    dbc(sch(s, i));
+    i := i + 1;
+  end;
+end;
+
+procedure dbnum(v: int);
+var n, i: int;
+begin
+  n := numstr(v);
+  i := 0;
+  while i < n do
+  begin
+    dbc(ord(nbuf[i]));
+    i := i + 1;
+  end;
+end;
+
+procedure dbnam(off: int);
+begin
+  while namesb(off) <> 0 do
+  begin
+    dbc(namesb(off));
+    off := off + 1;
+  end;
+end;
+
+// a type word: int, char, bool, real, str, void, or the name of a record type
+procedure dbtype(t: int);
+begin
+  if t >= T_REC then dbnam(rtnam[t - T_REC]) else dbs(tname(t));
+end;
+
+// the six fields every variable-like record carries: name, where, type, arr, lo, hi
+procedure dbvar(kind: str; nam: int; where: int; t: int; arr: int; lo: int; hi: int);
+begin
+  dbs(kind); dbc(32); dbnam(nam); dbc(32); dbnum(where); dbc(32); dbtype(t); dbc(32);
+  dbnum(arr); dbc(32);
+  if arr = 1 then
+  begin
+    dbnum(lo); dbc(32); dbnum(hi);
+  end
+  else dbs("0 0");
+  dbc(10);
+end;
+
+// a line-table entry for the code about to be emitted: kind is 's', 'p' or 'e'
+procedure dbline(kind: int);
+begin
+  if dbgmode = 0 then return;
+  dbs("line "); dbnum(codebase + codelen); dbc(32); dbnum(curfile); dbc(32); dbnum(line);
+  dbc(32); dbc(kind); dbc(10);
+end;
+
+// the func record of routine fi and its parameters and locals, while they still exist
+procedure dbfunc(fi: int; np: int; t: int);
+var i: int;
+begin
+  if dbgmode = 0 then return;
+  dbs("func "); dbnam(fnam[fi]); dbc(32); dbnum(codebase + fadr[fi]); dbc(32);
+  dbnum(codebase + fend[fi]); dbc(32); dbnum(fhfile[fi]); dbc(32); dbnum(fhline[fi]);
+  dbc(32); dbnum(frame); dbc(32); dbtype(t); dbc(10);
+  i := 0;
+  while i < nloc do
+  begin
+    if lkind[i] = SK_VAR then
+    begin
+      if i < np then dbvar("param", lnam[i], loff[i], ltyp[i], larr[i], 0, 0)
+      else dbvar("local", lnam[i], loff[i], ltyp[i], larr[i], llo[i], lhi[i]);
+    end;
+    i := i + 1;
+  end;
+end;
+
 procedure want(got: int; need: int; ctx: str);
 begin
   if got <> need then
@@ -2235,6 +2443,14 @@ end;
 
 procedure emittrap;
 begin
+  // NO PLACE STORED YET.
+  //
+  // BELT AND BRACES, AND THE BRACES ARE tplastline: it starts at 0 and no source line is 0,
+  // so the guard below cannot match before a real place has been written -- setting tplast
+  // to 0 instead changes nothing, which was measured by trying it. The -1 stays because it
+  // says what is meant, and because a later change that makes line 0 reachable would
+  // otherwise make the first check of a program point at whatever sits at data offset 0.
+  tplast := 0 - 1;
   // Two writes to stderr and then exit(1). The caller passes the shared heading in rdi/rsi
   // and the file-and-line in rdx/rcx -- splitting the sentence is what keeps one copy of
   // "runtime error: array index out of range" instead of one per check.
@@ -2375,7 +2591,21 @@ begin
     mbuf[mlen] := nbuf[i]; mlen := mlen + 1; i := i + 1;
   end;
   mbuf[mlen] := '\n'; mlen := mlen + 1;
-  o := datstr(1, mlen);
+
+  // THE SAME PLACE AS THE PREVIOUS CHECK? Then reuse what is already stored. See tplast.
+  if (tplast >= 0) and (tplastline = line) and (tplastfile = curfile) then
+  begin
+    o := tplast;
+    mlen := tplastlen;
+  end
+  else
+  begin
+    o := datstr(1, mlen);
+    tplast := o;
+    tplastlen := mlen;
+    tplastline := line;
+    tplastfile := curfile;
+  end;
 
   if h < 0 then
   begin
@@ -2791,6 +3021,7 @@ begin
     if tok = 46 then
     begin
       next;
+      if iskw then failkeyword("a field", false);
       if tok <> TK_ID then fail("field name expected after .");
       fplen := 0;
       while tbuf[fplen] <> chr(0) do
@@ -2950,6 +3181,7 @@ end;
 
 function zlen(a: array of char; at: int): int; forward;
 function impname(i: int): str; forward;
+function impargs(i: int): int; forward;
 function extcount(e: int): int; forward;
 function dllname(d: int): str; forward;
 function dllfirst(d: int): int; forward;
@@ -3228,7 +3460,7 @@ begin
 end;
 
 function dowinapi: int;
-var n, i, dn, dl, fn, fl, sl: int;
+var n, i, dn, dl, fn, fl, sl, wantargs, slotwanted: int;
 begin
   if winmode = 0 then fail("winapi() is only available in a Windows executable");
   lparen;
@@ -3284,6 +3516,12 @@ begin
   if tok = TK_INT then
     if (tval < 0) or (tval >= NIMP) then
       fail("winapi(): that import slot does not exist");
+  // REMEMBER WHICH SLOT, so the argument count can be judged against it below. A slot that
+  // is not a literal leaves this at -1 and nothing is claimed -- the compiler only refuses
+  // what it can actually know.
+  wantargs := 0 - 1;
+  slotwanted := 0;
+  if tok = TK_INT then begin wantargs := impargs(tval); slotwanted := tval; end;
   argint; push;
   n := 0;
   while tok = 44 do
@@ -3294,6 +3532,23 @@ begin
     n := n + 1;
   end;
   rparen;
+  // THE ARGUMENT COUNT, WHEN WE KNOW IT. Win32 passes the first four in rcx/rdx/r8/r9, so a
+  // call with too few leaves the callee reading a register nobody set: no crash at a
+  // recognisable place, just wrong behaviour with whatever was there. Measured 22-09-2026,
+  // before this: winapi("kernel32.dll", "CreateFileA", 1, 2) compiled with exit 0.
+  if (wantargs >= 0) and (n <> wantargs) then
+  begin
+    wrs(2, "wantzel: "); wrname(2); wrs(2, ":"); wrnum(2, line);
+    wrs(2, ": winapi(): ");
+    wrs(2, impname(slotwanted));
+    wrs(2, " takes ");
+    wrnum(2, wantargs);
+    // "takes 1 arguments" is the kind of detail a reader notices and a generator copies.
+    if wantargs = 1 then wrs(2, " argument, not ") else wrs(2, " arguments, not ");
+    wrnum(2, n);
+    wrs(2, "\n");
+    halt(1);
+  end;
   return winemit(n);
 end;
 
@@ -4100,6 +4355,9 @@ begin
     next;
     return;
   end;
+  // A statement starts here -- not a begin, which only groups, and not an empty one.
+  if (tok = KW_IF) or (tok = KW_WHILE) or (tok = KW_RETURN) or (tok = KW_BREAK)
+     or (tok = KW_CONTINUE) or (tok = KW_FOR) or (tok = TK_ID) then dbline(115);
   if tok = KW_IF then
   begin
     next;
@@ -4419,6 +4677,7 @@ procedure declvars(islocal: int);
 var n, i, t, sz, nb: int;
 begin
   next;
+  if iskw then failkeyword("a variable", false);
   if tok <> TK_ID then fail("variable name expected");
   while tok = TK_ID do
   begin
@@ -4442,6 +4701,7 @@ begin
       next;
       if tok <> 44 then break;
       next;
+      if iskw then failkeyword("a variable", false);
       if tok <> TK_ID then fail("variable name expected");
     end;
     if tok <> 58 then fail("missing : in declaration");
@@ -4479,6 +4739,7 @@ begin
     if tok <> 59 then fail("missing ; after declaration");
     next;
   end;
+  if kwnamed(58, 44) then failkeyword("a variable", false);
 end;
 
 // type NAME = record <names: type;>... end;
@@ -4490,6 +4751,7 @@ procedure decltypes;
 var r, n, i, t, nb, sz, off, al: int;
 begin
   next;
+  if iskw then failkeyword("a type", false);
   if tok <> TK_ID then fail("type name expected");
   while tok = TK_ID do
   begin
@@ -4552,7 +4814,8 @@ begin
         next;
         if tok <> 44 then break;
         next;
-        if tok <> TK_ID then fail("field name expected");
+        if iskw then failkeyword("a record field", false);
+        if tok <> TK_ID then fail("field name expected in this record declaration");
       end;
       if tok <> 58 then fail("missing : in field declaration");
       next;
@@ -4578,8 +4841,12 @@ begin
       if tok <> 59 then fail("missing ; after a field");
       next;
     end;
+    if (tok <> KW_END) and iskw then failkeyword("a record field", false);
     if tok <> KW_END then fail("missing end of the record");
     next;
+    // `end: int;` -- a field named end reads as the end of the record, and then the
+    // colon is what does not fit
+    if tok = 58 then failkeyword("a record field", false);
     if tok <> 59 then fail("missing ; after the type");
     next;
     while (off mod 8) <> 0 do off := off + 1;
@@ -4587,12 +4854,14 @@ begin
     rtsize[r] := off;
     nrt := nrt + 1;
   end;
+  if kwnamed(61, 61) then failkeyword("a type", false);
 end;
 
 procedure declconsts(islocal: int);
 var o, v, t: int;
 begin
   next;
+  if iskw then failkeyword("a constant", false);
   if tok <> TK_ID then fail("constant name expected");
   while tok = TK_ID do
   begin
@@ -4678,6 +4947,7 @@ begin
     if tok <> 59 then fail("missing ; after constant declaration");
     next;
   end;
+  if kwnamed(61, 61) then failkeyword("a constant", false);
 end;
 
 
@@ -4917,6 +5187,12 @@ end;
 procedure genarm(f: int);
 begin
   gen("    if json.eq(b, k0, k1, \""); genjs(f); gen("\") then\n    begin\n");
+  // Name the field BEFORE reading it.  Every way of failing inside this arm is a plain
+  // `return -1` and there are a dozen of them, so setting it on the way in costs one
+  // line instead of a dozen; the successful '}' clears it again, so it only survives a
+  // parse that actually failed.  An undeclared key no longer lands here -- it is
+  // ignored -- which makes this the key of a DECLARED field the value did not fit.
+  gen("      json.badkey0 := k0; json.badkey1 := k1;\n");
   gen("      if json.isnull(b, at, last) then\n      begin\n");
   gen("        at := json.ws(b, at, last) + 4;\n        "); genr(f); gen("_null := true;\n      end\n      else\n      begin\n");
   if sfarr[f] <> 0 then
@@ -4932,7 +5208,9 @@ begin
     gen("        v1 := v1 + 1;\n        end;\n        "); genr(f); gen("_n := v1;\n");
   end
   else genread(f, 0);
-  gen("      end;\n      "); genr(f); gen("_ok := true;\n    end\n    else ");
+  // read without complaint, so it is not the failing key after all
+  gen("      end;\n      json.badkey0 := 0; json.badkey1 := 0;\n      ");
+  genr(f); gen("_ok := true;\n    end\n    else ");
 end;
 
 // The truncation test that follows every appending call in a generated writer.
@@ -5071,6 +5349,7 @@ begin
   gen("): int;\nvar k0, k1, v0, v1, n: int;\nbegin\n  "); genname; gen(".clear(r);\n");
   gen("  k0 := 0; k1 := 0; v0 := 0; v1 := 0; n := 0;\n");
   gen("  json.badkey0 := 0; json.badkey1 := 0;\n");
+  gen("  json.ignored0 := 0; json.ignored1 := 0; json.ignoredn := 0;\n");
   gen("  at := json.ws(b, at, last);\n");
   gen("  if at >= last then return -1;\n");
   gen("  if b[at] <> '{' then return -1;\n");
@@ -5103,12 +5382,26 @@ begin
     genarm(f);
     f := f + 1;
   end;
-  // An UNKNOWN KEY IS REFUSED, and the chain used to end in a json.skip that swallowed it
-  //.  A caller that sent a renamed or removed field got a normal answer
-  // computed with the default in place of what it asked for: nothing refused, nothing
-  // warned, and the wrong number travelled on.  json.badkey0/1 name the key, because
-  // parse returns -1 for every failure and an unknown key is the one the caller can fix.
-  gen("\n    begin\n      json.badkey0 := k0; json.badkey1 := k1;\n      return -1;\n    end;\n");
+  // An UNDECLARED KEY IS SKIPPED, BUT RECORDED -- the middle road between the two things
+  // that were tried before it.
+  //
+  // A bare json.skip swallowed the key: a caller that sent a renamed or removed field
+  // got a normal answer computed with the default in place of what it asked for, and the
+  // wrong number travelled on unannounced.  Refusing it outright closed that hole but
+  // broke every caller that sends a superset -- which is what a caller written against a
+  // schema-validating server does, because ignoring undeclared input is the default
+  // there.
+  //
+  // So: skip the value, and remember the key.  json.ignored0/1 hold the first one and
+  // json.ignoredn counts them, which is enough for the layer above to report what it
+  // dropped.  A key that is DECLARED but carries the wrong type still returns -1 through
+  // its own arm, and a missing required field still fails the presence check at '}' --
+  // only the undeclared key became tolerable, and only because it is now visible.
+  gen("\n    begin\n");
+  gen("      if json.ignoredn = 0 then\n      begin\n        json.ignored0 := k0; json.ignored1 := k1;\n      end;\n");
+  gen("      json.ignoredn := json.ignoredn + 1;\n");
+  gen("      at := json.skip(b, at, last);\n      if at < 0 then return -1;\n");
+  gen("    end;\n");
   gen("  end;\n  return -1;\nend;\n");
   // --- write ---
   gen("\n// Returns the position after the object, or -1 when it does not fit in dst.\n");
@@ -5339,7 +5632,7 @@ end;
 // The name is in schname/scnam, put there by the caller, and the current token is the
 // first field.
 procedure declschema;
-var i, f, fi, lo, hi: int;
+var i, j, f, fi, lo, hi: int;
 begin
   nfld := 0;
   nenum := 0;
@@ -5359,6 +5652,37 @@ begin
     sfopt[nfld] := 0; sfe0[nfld] := 0; sfen[nfld] := 0; sfarr[nfld] := 0;
     sfcount[nfld] := 0; sftlen[nfld] := 0; sfsub[nfld] := -1; sfdesc[nfld] := -1;
     next;
+
+    // AN OPTIONAL JSON KEY, AS A STRING LITERAL, BEFORE THE COLON:
+    //
+    //     rdx "rdX": int;          the wire says rdX, the program says rdx
+    //     ctype "content-type": text;
+    //
+    // WHY A STRING AND NOT A KEYWORD. `as` would be a forty-first keyword for a case that
+    // occurs in a handful of schemas, and the bar for a language change is evidence. A
+    // literal in the one place a literal cannot otherwise appear needs no new word and
+    // cannot collide with an existing name.
+    //
+    // WHAT IT SOLVES, and neither is reachable otherwise:
+    //   a key that differs only in case -- identifiers are case-insensitive, so rdX and rdx
+    //     are one name in Wantzel and two on the wire
+    //   a key that is not an identifier at all -- "content-type", "$schema", "2"
+    if tok = TK_STR then
+    begin
+      // The literal sits in the data segment; tval is its offset and datlen0 its length.
+      j := datlen0(tval);
+      if j = 0 then fail("an empty JSON key");
+      if j > 62 then fail("that JSON key is too long");
+      i := 0;
+      while i < j do
+      begin
+        sfjson[nfld * 64 + i] := dat[tval + i];
+        i := i + 1;
+      end;
+      sfjson[nfld * 64 + i] := chr(0);
+      next;
+    end;
+
     if tok <> 58 then fail("missing : after a schema field");
     next;
     if tok = KW_ARRAY then
@@ -5468,8 +5792,10 @@ begin
     next;
     nfld := nfld + 1;
   end;
+  if (tok <> KW_END) and iskw then failkeyword("a schema field", true);
   if tok <> KW_END then fail("missing end of the schema");
   next;
+  if tok = 58 then failkeyword("a schema field", true);
   if tok <> 59 then fail("missing ; after the schema");
   // the JSON Schema text and its str constant
   genjsonschema;
@@ -5519,9 +5845,9 @@ procedure gentl(i: int);
 var j: int;
 begin
   j := 0;
-  while tlnam[i * 64 + j] <> chr(0) do
+  while tlnam[i * 128 + j] <> chr(0) do
   begin
-    sput(tlnam[i * 64 + j]);
+    sput(tlnam[i * 128 + j]);
     j := j + 1;
   end;
 end;
@@ -5541,9 +5867,9 @@ procedure jstl(i: int);
 var j: int;
 begin
   j := 0;
-  while tlnam[i * 64 + j] <> chr(0) do
+  while tlnam[i * 128 + j] <> chr(0) do
   begin
-    jsc(ord(tlnam[i * 64 + j]));
+    jsc(ord(tlnam[i * 128 + j]));
     j := j + 1;
   end;
 end;
@@ -5651,9 +5977,112 @@ begin
   gen("  return -1;\nend;\n");
 end;
 
+// Does tool name slot i (in tlnam) equal the string s?
+function tleqs(i: int; s: str): bool;
+var j: int;
+begin
+  j := 0;
+  while true do
+  begin
+    if ord(tlnam[i * 128 + j]) <> sch(s, j) then return false;
+    if tlnam[i * 128 + j] = chr(0) then return true;
+    j := j + 1;
+  end;
+  return false;
+end;
+
+// Do tool name slots a and b (both in tlnam) hold the same name?
+function tlsameas(a: int; b: int): bool;
+var j: int;
+begin
+  j := 0;
+  while true do
+  begin
+    if tlnam[a * 128 + j] <> tlnam[b * 128 + j] then return false;
+    if tlnam[a * 128 + j] = chr(0) then return true;
+    j := j + 1;
+  end;
+  return false;
+end;
+
+// failtoolname -- a tool name that collides with something the tools block itself puts
+// into the tool. namespace, reported at the WRITER'S OWN line of that entry (tlfile[i]:
+// tlline[i]), never at a line of the generated <tools> text or of a library included
+// after it.
+//
+// Before this, "count(A): R" was reported as "<tools>:19: name already used by a variable
+// or constant" (the generated 'const tool.count = ...' colliding with itself) or, for a
+// name a later include declares (tool.rest from lib/tools.wz), as an error deep inside
+// that library file. Neither line is one an agent -- or Floris -- can open and act on;
+// this is the same class of fix as tool_missing_handler.wz above: map the generated
+// collision back to the source line that caused it.
+// 'source' is what generates or declares tool.<name>, e.g. "the tools block generates" or
+// "lib/tools.wz declares" -- the message then reads ...is reserved: <source> tool.<name>;
+// choose another name, with the name written once from tlnam and reused for both spots.
+procedure failtoolname(i: int; source: str);
+var n: int;
+begin
+  n := 0;
+  while tlnam[i * 128 + n] <> chr(0) do n := n + 1;
+  wrs(2, "wantzel: "); wrfile(2, tlfile[i]); wrs(2, ":"); wrnum(2, tlline[i]);
+  wrs(2, ": tool name \""); wrbuf(2, addr(tlnam[i * 128]), n);
+  wrs(2, "\" is reserved: "); wrs(2, source); wrs(2, " tool.");
+  wrbuf(2, addr(tlnam[i * 128]), n);
+  wrs(2, "; choose another name\n");
+  halt(1);
+end;
+
+// A duplicate tool name in the same block: reported at the SECOND entry's line (the one
+// that repeats a name already taken), naming the earlier line so the reader does not have
+// to search the block for it. Before this it surfaced as "<tools>:N: duplicate
+// declaration" -- a line of the generated text, naming neither tool.
+procedure failtooldup(i: int; first: int);
+var n: int;
+begin
+  n := 0;
+  while tlnam[i * 128 + n] <> chr(0) do n := n + 1;
+  wrs(2, "wantzel: "); wrfile(2, tlfile[i]); wrs(2, ":"); wrnum(2, tlline[i]);
+  wrs(2, ": tool name \""); wrbuf(2, addr(tlnam[i * 128]), n);
+  wrs(2, "\" is already used by the tool on line "); wrnum(2, tlline[first]);
+  wrs(2, "; choose another name\n");
+  halt(1);
+end;
+
+// Every name the tools block itself generates in the tool. namespace (see gentools
+// above): tool.count, tool.list, tool.err/errn, tool.vbuf/vn, tool.fail, tool.byname,
+// tool.run, and per tool tool.id_/in_/out_<name>. Kept as one list so a name added there
+// is added here in the same commit.
+function toolgenclash(i: int): bool;
+begin
+  if tleqs(i, "count") or tleqs(i, "list") or tleqs(i, "err") or tleqs(i, "errn")
+     or tleqs(i, "vbuf") or tleqs(i, "vn") or tleqs(i, "fail") or tleqs(i, "byname")
+     or tleqs(i, "run") then return true;
+  if (ord(tlnam[i * 128]) = 105) and (ord(tlnam[i * 128 + 1]) = 100) and (ord(tlnam[i * 128 + 2]) = 95) then return true;   // id_
+  if (ord(tlnam[i * 128]) = 105) and (ord(tlnam[i * 128 + 1]) = 110) and (ord(tlnam[i * 128 + 2]) = 95) then return true;   // in_
+  if (ord(tlnam[i * 128]) = 111) and (ord(tlnam[i * 128 + 1]) = 117) and (ord(tlnam[i * 128 + 2]) = 116) and (ord(tlnam[i * 128 + 3]) = 95) then return true;   // out_
+  return false;
+end;
+
+// Names lib/tools.wz and lib/toolsmcp.wz declare in the tool. namespace, for a program
+// that includes one of them (always AFTER the tools block, so the collision is invisible
+// to findglob at this point -- the include has not been read yet). Read from those files,
+// not guessed: keep this list in step with them by hand, the same discipline as
+// toolgenclash above.
+function toollibclash(i: int): bool;
+begin
+  // lib/toolsmcp.wz
+  if tleqs(i, "out") or tleqs(i, "empty") or tleqs(i, "ign") or tleqs(i, "ignn")
+     or tleqs(i, "ignc") or tleqs(i, "takeignored") then return true;
+  // lib/tools.wz (REST half, on top of toolsmcp.wz)
+  if tleqs(i, "listend") or tleqs(i, "nmatched") or tleqs(i, "wascut") or tleqs(i, "numbuf")
+     or tleqs(i, "numn") or tleqs(i, "cutfields") or tleqs(i, "solelist")
+     or tleqs(i, "restbody") or tleqs(i, "rest") then return true;
+  return false;
+end;
+
 // tools  <name>(<InSchema>): <OutSchema> "<description>" [readonly] [idempotent] [destructive]; ... end;
 procedure decltools;
-var i, f, fi: int;
+var i, f, fi, k: int;
 begin
   if ntl > 0 then fail("tools are declared once");
   next;
@@ -5663,13 +6092,26 @@ begin
     i := 0;
     while tbuf[i] <> chr(0) do
     begin
-      if i >= 62 then fail("tool name too long");
-      tlnam[ntl * 64 + i] := tbuf[i];
+      if i >= 126 then fail("tool name too long");
+      tlnam[ntl * 128 + i] := tbuf[i];
       i := i + 1;
     end;
-    tlnam[ntl * 64 + i] := chr(0);
+    tlnam[ntl * 128 + i] := chr(0);
     tlro[ntl] := 0; tlid[ntl] := 0; tldes[ntl] := 0; tldesc[ntl] := -1;
     tlline[ntl] := line; tlfile[ntl] := curfile;   // the writer's own line, for the error
+    // Check the name BEFORE gentools ever runs: a clash caught here is reported at this
+    // tool's own line, not at a line of the generated <tools> text (toolgenclash) or of a
+    // library included after the block (toollibclash) -- see failtoolname above for why.
+    if toolgenclash(ntl) then
+      failtoolname(ntl, "the tools block generates");
+    if toollibclash(ntl) then
+      failtoolname(ntl, "lib/tools.wz or lib/toolsmcp.wz declares");
+    k := 0;
+    while k < ntl do
+    begin
+      if tlsameas(ntl, k) then failtooldup(ntl, k);
+      k := k + 1;
+    end;
     next;
     if tok <> 40 then fail("a tool is declared as name(InSchema): OutSchema \"description\"");
     next;
@@ -5698,8 +6140,10 @@ begin
     next;
     ntl := ntl + 1;
   end;
+  if (tok <> KW_END) and iskw then failkeyword("a tool", false);
   if tok <> KW_END then fail("missing end of the tools");
   next;
+  if tok = 40 then failkeyword("a tool", false);
   if tok <> 59 then fail("missing ; after the tools");
   if ntl = 0 then fail("the tools block is empty");
   if incdepth >= 16 then fail("includes nested too deeply");
@@ -5746,6 +6190,7 @@ var fi, known, np, t, o, i: int;
     zlea, zcnt, ztop, zdone, parmbytes, endline, saveline, pisarr, nr: int;
 begin
   next;
+  if iskw then failkeyword("a routine", false);
   if tok <> TK_ID then fail("routine name expected");
   if bicode <> 0 then fail("that name is built in");
   if findglob >= 0 then failtaken("name already used by a variable or constant");
@@ -5765,6 +6210,8 @@ begin
     fvis[fi] := declloc;
     findex(fi);
   end;
+  fhline[fi] := line;
+  fhfile[fi] := curfile;
   next;
   nloc := 0;
   frame := 0;
@@ -5774,6 +6221,7 @@ begin
     next;
     while true do
     begin
+      if iskw then failkeyword("a parameter", false);
       if tok <> TK_ID then fail("parameter name expected");
       o := 0;
       while true do
@@ -5888,6 +6336,9 @@ begin
   fdef[fi] := 1;
   curfn := fi;
   curret := t;
+  saveline := line; line := fhline[fi];
+  dbline(112);
+  line := saveline;
   nbrk := 0; ncnt := 0; brkbase := -1; cntbase := -1;
   e(0x55);
   e(0x48); e(0x89); e(0xE5);
@@ -5925,6 +6376,9 @@ begin
   next;
   if tok <> 59 then fail("missing ; after routine body");
   next;
+  saveline := line; line := endline;
+  dbline(101);
+  line := saveline;
   if t = T_VOID then
   begin
     e(0x48); e(0x31); e(0xC0);
@@ -5943,6 +6397,8 @@ begin
   i := (frame - parmbytes) div 8;
   e32at(zcnt, i);
   e32at(zcnt + 4, i shr 32);
+  fend[fi] := codelen;
+  dbfunc(fi, np, t);
   nloc := 0;                                      // locals do not outlive the routine
 end;
 
@@ -5960,7 +6416,7 @@ begin
   gen("  // arguments and does the Windows equivalent; __winit turns the command line\n");
   gen("  // into an argc/argv block.  All of this is ordinary Wantzel, compiled into every\n");
   gen("  // .exe ahead of the program, so the code generator needs no Windows knowledge.\n");
-  gen("  // epoll is emulated over WSAPoll, with a small interest table kept here.\n");
+  gen("  // epoll is emulated over WSAPoll: up to __WMAXEP sets, each with its own interest table.\n");
   gen("const\n");
   gen("  __K_GETSTDHANDLE = 0;\n");
   gen("  __K_WRITEFILE = 1;\n");
@@ -6002,13 +6458,18 @@ begin
   gen("  __W_WSAPOLL = 38;\n");
   gen("  __A_RANDOM = 40;\n");
   gen("  __WMAXFD = 1024;\n");
+  gen("  __WMAXEP = 16;   // epoll sets at once; one more is EMFILE\n");
+  gen("  __WEPBASE = 1000000;   // the fd of epoll set k is __WEPBASE + k\n");
   gen("var\n");
   gen("  __wargv: array[0..63] of int;\n");
   gen("  __wargs: array[0..4095] of char;\n");
   gen("  __wdig: array[0..31] of char;\n");
   gen("  __wcount, __wdummy, __wstarted: int;\n");
   gen("  __wsh: array[0..__WMAXFD - 1] of int;   // socket handle for small fd, or 0\n");
-  gen("  __wev: array[0..__WMAXFD - 1] of int;   // epoll events requested for fd\n");
+  gen("  __wev: array[0..__WMAXEP * __WMAXFD - 1] of int;   // events per set and fd: [set * __WMAXFD + fd]\n");
+  gen("  __wepon: array[0..__WMAXEP - 1] of int;   // 1 = epoll set in use\n");
+  gen("  __wepin: array[0..__WMAXEP * __WMAXEP - 1] of int;   // events for a nested set: [outer * __WMAXEP + inner]\n");
+  gen("  __wepgo: array[0..__WMAXEP - 1] of int;   // during a wait: 1 = the set has something ready\n");
   gen("  __wpoll: array[0..__WMAXFD * 16 - 1] of char;   // WSAPOLLFD array\n");
   gen("  __wrow: array[0..__WMAXFD - 1] of int;   // poll row -> fd\n");
   gen("  __wsa: array[0..15] of char;   // a working sockaddr\n");
@@ -6056,6 +6517,16 @@ begin
   gen("  return (fd > 2) and (fd < __WMAXFD) and (__wdh[fd] <> 0);\n");
   gen("end;\n");
   gen("\n");
+  gen("// A Winsock call that failed: SOCKET_ERROR is a 32-bit -1, and the register does not\n");
+  gen("// sign-extend it, so it must be recognised by its low half -- as a plain 'r < 0' it\n");
+  gen("// looked like 4294967295 bytes received. Only a would-block is EAGAIN; anything else\n");
+  gen("// (a reset, a closed peer) is the error the caller gives us, which is what Linux\n");
+  gen("// reports and what makes an HTTP server drop the connection instead of parsing it.\n");
+  gen("function __wsockerr(other: int): int;\n");
+  gen("begin\n");
+  gen("  if band(winapi(\"ws2_32.dll\", \"WSAGetLastError\"), 0xFFFFFFFF) = 10035 then return 0 - 11;   // WSAEWOULDBLOCK -> EAGAIN\n");
+  gen("  return other;\n");
+  gen("end;\n");
   gen("\n");
   gen("function __wwrite(fd: int; a: int; n: int): int;\n");
   gen("var ok, r: int;\n");
@@ -6063,8 +6534,8 @@ begin
   gen("  if __wissock(fd) then\n");
   gen("  begin\n");
   gen("    r := winapi(__W_SEND, __wsh[fd], a, n, 0);\n");
-  gen("    if r < 0 then return 0 - 11;   // treat as EAGAIN-ish\n");
-  gen("    return r;\n");
+  gen("    if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then return __wsockerr(0 - 32);   // EPIPE\n");
+  gen("    return band(r, 0xFFFFFFFF);\n");
   gen("  end;\n");
   gen("  __wcount := 0;\n");
   gen("  ok := winapi(__K_WRITEFILE, __whandle(fd), a, n, addr(__wcount), 0);\n");
@@ -6078,8 +6549,8 @@ begin
   gen("  if __wissock(fd) then\n");
   gen("  begin\n");
   gen("    r := winapi(__W_RECV, __wsh[fd], a, n, 0);\n");
-  gen("    if r < 0 then return 0 - 11;\n");
-  gen("    return r;\n");
+  gen("    if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then return __wsockerr(0 - 104);  // ECONNRESET\n");
+  gen("    return band(r, 0xFFFFFFFF);\n");
   gen("  end;\n");
   gen("  __wcount := 0;\n");
   gen("  ok := winapi(__K_READFILE, __whandle(fd), a, n, addr(__wcount), 0);\n");
@@ -6173,8 +6644,55 @@ begin
   gen("  return 0;\n");
   gen("end;\n");
   gen("\n");
+  gen("// The epoll set behind fd, or -1 when fd is not an open epoll set.\n");
+  gen("function __wepset(fd: int): int;\n");
+  gen("var k: int;\n");
+  gen("begin\n");
+  gen("  k := fd - __WEPBASE;\n");
+  gen("  if (k < 0) or (k >= __WMAXEP) then return 0 - 1;\n");
+  gen("  if __wepon[k] = 0 then return 0 - 1;\n");
+  gen("  return k;\n");
+  gen("end;\n");
+  gen("\n");
+  gen("// A socket fd closed or reused: it leaves every set, as on Linux.\n");
+  gen("procedure __wepforget(fd: int);\n");
+  gen("var s: int;\n");
+  gen("begin\n");
+  gen("  s := 0;\n");
+  gen("  while s < __WMAXEP do\n");
+  gen("  begin\n");
+  gen("    __wev[s * __WMAXFD + fd] := 0;\n");
+  gen("    s := s + 1;\n");
+  gen("  end;\n");
+  gen("end;\n");
+  gen("\n");
+  gen("// An epoll set closed: its interest goes, and it leaves every set it was nested in.\n");
+  gen("procedure __wepfree(s: int);\n");
+  gen("var i: int;\n");
+  gen("begin\n");
+  gen("  i := 0;\n");
+  gen("  while i < __WMAXFD do\n");
+  gen("  begin\n");
+  gen("    __wev[s * __WMAXFD + i] := 0;\n");
+  gen("    i := i + 1;\n");
+  gen("  end;\n");
+  gen("  i := 0;\n");
+  gen("  while i < __WMAXEP do\n");
+  gen("  begin\n");
+  gen("    __wepin[s * __WMAXEP + i] := 0;\n");
+  gen("    __wepin[i * __WMAXEP + s] := 0;\n");
+  gen("    i := i + 1;\n");
+  gen("  end;\n");
+  gen("  __wepon[s] := 0;\n");
+  gen("end;\n");
+  gen("\n");
   gen("procedure __wclose(fd: int);\n");
   gen("begin\n");
+  gen("  if __wepset(fd) >= 0 then\n");
+  gen("  begin\n");
+  gen("    __wepfree(__wepset(fd));\n");
+  gen("    return;\n");
+  gen("  end;\n");
   gen("  if __wisdir(fd) then\n");
   gen("  begin\n");
   gen("    __wdummy := winapi(__K_FINDCLOSE, __wdh[fd]);\n");
@@ -6186,7 +6704,7 @@ begin
   gen("  begin\n");
   gen("    __wdummy := winapi(__W_CLOSESOCKET, __wsh[fd]);\n");
   gen("    __wsh[fd] := 0;\n");
-  gen("    __wev[fd] := 0;\n");
+  gen("    __wepforget(fd);\n");
   gen("  end\n");
   gen("  else __wdummy := winapi(__K_CLOSEHANDLE, fd);\n");
   gen("end;\n");
@@ -6229,7 +6747,7 @@ begin
   gen("    return 0 - 24;\n");
   gen("  end;\n");
   gen("  __wsh[fd] := h;\n");
-  gen("  __wev[fd] := 0;\n");
+  gen("  __wepforget(fd);\n");
   gen("  return fd;\n");
   gen("end;\n");
   gen("\n");
@@ -6241,7 +6759,7 @@ begin
   gen("begin\n");
   gen("  if not __wissock(fd) then return 0 - 9;\n");
   gen("  r := winapi(__W_BIND, __wsh[fd], sa, sln);\n");
-  gen("  if r < 0 then return 0 - 98;\n");
+  gen("  if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then return 0 - 98;\n");
   gen("  return 0;\n");
   gen("end;\n");
   gen("\n");
@@ -6250,7 +6768,7 @@ begin
   gen("begin\n");
   gen("  if not __wissock(fd) then return 0 - 9;\n");
   gen("  r := winapi(__W_LISTEN, __wsh[fd], backlog);\n");
-  gen("  if r < 0 then return 0 - 98;\n");
+  gen("  if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then return 0 - 98;\n");
   gen("  return 0;\n");
   gen("end;\n");
   gen("\n");
@@ -6267,7 +6785,7 @@ begin
   gen("    return 0 - 24;\n");
   gen("  end;\n");
   gen("  __wsh[nfd] := h;\n");
-  gen("  __wev[nfd] := 0;\n");
+  gen("  __wepforget(nfd);\n");
   gen("  nb := 1;\n");
   gen("  __wp32(__wsa, 0, nb);\n");
   gen("  __wdummy := winapi(__W_IOCTL, h, 0x8004667E, addr(__wsa[0]));   // FIONBIO\n");
@@ -6301,40 +6819,133 @@ begin
   gen("  poke(a + 3, band(v shr 24, 255));\n");
   gen("end;\n");
   gen("\n");
-  gen("// epoll_ctl: op 1=ADD, 2=DEL, 3=MOD.  The event mask sits at [ev+0].\n");
-  gen("function __wepctl(op: int; fd: int; ev: int): int;\n");
-  gen("var mask: int;\n");
+  gen("// epoll_create: a free set, or EMFILE when all __WMAXEP are in use.\n");
+  gen("function __wepnew: int;\n");
+  gen("var k: int;\n");
   gen("begin\n");
-  gen("  if (fd < 3) or (fd >= __WMAXFD) then return 0 - 9;\n");
-  gen("  if op = 2 then\n");
+  gen("  k := 0;\n");
+  gen("  while k < __WMAXEP do\n");
   gen("  begin\n");
-  gen("    __wev[fd] := 0;\n");
+  gen("    if __wepon[k] = 0 then\n");
+  gen("    begin\n");
+  gen("      __wepon[k] := 1;\n");
+  gen("      return __WEPBASE + k;\n");
+  gen("    end;\n");
+  gen("    k := k + 1;\n");
+  gen("  end;\n");
+  gen("  return 0 - 24;\n");
+  gen("end;\n");
+  gen("\n");
+  gen("// Every set reachable from set s through nested sets, s included, as a bit mask.\n");
+  gen("function __wepreach(s: int): int;\n");
+  gen("var r, prev, i, j: int;\n");
+  gen("begin\n");
+  gen("  r := 1 shl s;\n");
+  gen("  prev := 0;\n");
+  gen("  while r <> prev do\n");
+  gen("  begin\n");
+  gen("    prev := r;\n");
+  gen("    i := 0;\n");
+  gen("    while i < __WMAXEP do\n");
+  gen("    begin\n");
+  gen("      if band(r, 1 shl i) <> 0 then\n");
+  gen("      begin\n");
+  gen("        j := 0;\n");
+  gen("        while j < __WMAXEP do\n");
+  gen("        begin\n");
+  gen("          if __wepin[i * __WMAXEP + j] <> 0 then r := bor(r, 1 shl j);\n");
+  gen("          j := j + 1;\n");
+  gen("        end;\n");
+  gen("      end;\n");
+  gen("      i := i + 1;\n");
+  gen("    end;\n");
+  gen("  end;\n");
+  gen("  return r;\n");
+  gen("end;\n");
+  gen("\n");
+  gen("// epoll_ctl on set epfd: op 1=ADD, 2=DEL, 3=MOD.  The event mask sits at [ev+0].\n");
+  gen("  // fd may itself be an epoll set: it is then ready when one of its own fds is.\n");
+  gen("function __wepctl(epfd: int; op: int; fd: int; ev: int): int;\n");
+  gen("var s, t, mask: int;\n");
+  gen("begin\n");
+  gen("  s := __wepset(epfd);\n");
+  gen("  if s < 0 then return 0 - 9;   // EBADF\n");
+  gen("  mask := 0;\n");
+  gen("  if op <> 2 then\n");
+  gen("  begin\n");
+  gen("    mask := bor(peek(ev), peek(ev + 1) shl 8);\n");
+  gen("    mask := bor(mask, peek(ev + 2) shl 16);\n");
+  gen("    mask := bor(mask, peek(ev + 3) shl 24);\n");
+  gen("  end;\n");
+  gen("  t := __wepset(fd);\n");
+  gen("  if t >= 0 then\n");
+  gen("  begin\n");
+  gen("    if t = s then return 0 - 22;   // EINVAL: a set cannot watch itself\n");
+  gen("    if (op <> 2) and (band(__wepreach(t), 1 shl s) <> 0) then return 0 - 40;   // ELOOP\n");
+  gen("    __wepin[s * __WMAXEP + t] := mask;\n");
   gen("    return 0;\n");
   gen("  end;\n");
-  gen("  mask := bor(peek(ev), peek(ev + 1) shl 8);\n");
-  gen("  mask := bor(mask, peek(ev + 2) shl 16);\n");
-  gen("  mask := bor(mask, peek(ev + 3) shl 24);\n");
-  gen("  __wev[fd] := mask;\n");
+  gen("  if (fd < 3) or (fd >= __WMAXFD) then return 0 - 9;\n");
+  gen("  __wev[s * __WMAXFD + fd] := mask;\n");
   gen("  return 0;\n");
   gen("end;\n");
   gen("\n");
-  gen("// epoll_wait: build a WSAPOLLFD array from the interest table, poll it, then\n");
-  gen("  // write ready events into the caller's array (12 bytes each: events, fd).\n");
-  gen("function __wepwait(a: int; maxev: int; timeout: int): int;\n");
-  gen("var i, np, r, k, out, revents, ev, base, pe: int;\n");
+  gen("// The epoll events in the revents of WSAPOLLFD row base.\n");
+  gen("function __wrevents(base: int): int;\n");
+  gen("var revents, ev: int;\n");
   gen("begin\n");
+  gen("  revents := bor(ord(__wpoll[base + 10]), ord(__wpoll[base + 11]) shl 8);\n");
+  gen("  ev := 0;\n");
+  gen("  if band(revents, 0x0300) <> 0 then ev := bor(ev, 1);   // IN\n");
+  gen("  if band(revents, 0x0010) <> 0 then ev := bor(ev, 4);   // OUT\n");
+  gen("  if band(revents, 0x0001) <> 0 then ev := bor(ev, 8);   // ERR\n");
+  gen("  if band(revents, 0x0002) <> 0 then ev := bor(ev, 16);   // HUP\n");
+  gen("  return ev;\n");
+  gen("end;\n");
+  gen("\n");
+  gen("// epoll_wait on set epfd: build one WSAPOLLFD array from the interest of this set and\n");
+  gen("  // of every set nested in it, poll it, then write ready events into the caller's array\n");
+  gen("  // (12 bytes each: events, fd).  A ready nested set is reported first, as its own fd.\n");
+  gen("function __wepwait(epfd: int; a: int; maxev: int; timeout: int): int;\n");
+  gen("var i, j, s, t, nr, np, r, k, out, ev, want, m, fd, pass, base, pe: int;\n");
+  gen("    sets: array[0..__WMAXEP - 1] of int;\n");
+  gen("begin\n");
+  gen("  s := __wepset(epfd);\n");
+  gen("  if s < 0 then return 0 - 9;   // EBADF\n");
+  gen("  r := __wepreach(s);\n");
+  gen("  nr := 0;\n");
+  gen("  j := 0;\n");
+  gen("  while j < __WMAXEP do\n");
+  gen("  begin\n");
+  gen("    if band(r, 1 shl j) <> 0 then\n");
+  gen("    begin\n");
+  gen("      sets[nr] := j;\n");
+  gen("      nr := nr + 1;\n");
+  gen("    end;\n");
+  gen("    j := j + 1;\n");
+  gen("  end;\n");
   gen("  np := 0;\n");
   gen("  i := 3;\n");
   gen("  while i < __WMAXFD do\n");
   gen("  begin\n");
-  gen("    if (__wsh[i] <> 0) and (__wev[i] <> 0) then\n");
+  gen("    want := 0;\n");
+  gen("    if __wsh[i] <> 0 then\n");
+  gen("    begin\n");
+  gen("      j := 0;\n");
+  gen("      while j < nr do\n");
+  gen("      begin\n");
+  gen("        want := bor(want, __wev[sets[j] * __WMAXFD + i]);\n");
+  gen("        j := j + 1;\n");
+  gen("      end;\n");
+  gen("    end;\n");
+  gen("    if want <> 0 then\n");
   gen("    begin\n");
   gen("      base := np * 16;\n");
   gen("      __wp32(__wpoll, base, band(__wsh[i], 0xFFFFFFFF));\n");
   gen("      __wp32(__wpoll, base + 4, __wsh[i] shr 32);\n");
   gen("      ev := 0;\n");
-  gen("      if band(__wev[i], 1) <> 0 then ev := bor(ev, 0x0300);   // IN -> RDNORM|RDBAND\n");
-  gen("      if band(__wev[i], 4) <> 0 then ev := bor(ev, 0x0010);   // OUT -> WRNORM\n");
+  gen("      if band(want, 1) <> 0 then ev := bor(ev, 0x0300);   // IN -> RDNORM|RDBAND\n");
+  gen("      if band(want, 4) <> 0 then ev := bor(ev, 0x0010);   // OUT -> WRNORM\n");
   gen("      __wpoll[base + 8] := chr(band(ev, 255));\n");
   gen("      __wpoll[base + 9] := chr(band(ev shr 8, 255));\n");
   gen("      __wpoll[base + 10] := chr(0);\n");
@@ -6357,21 +6968,71 @@ begin
   gen("  if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then return 0 - 4;\n");
   gen("  if r = 0 then return 0;\n");
   gen("  out := 0;\n");
+  gen("  if nr > 1 then\n");
+  gen("  begin\n");
+  gen("    // which sets have a ready fd of their own, then which contain a ready set\n");
+  gen("    j := 0;\n");
+  gen("    while j < __WMAXEP do\n");
+  gen("    begin\n");
+  gen("      __wepgo[j] := 0;\n");
+  gen("      j := j + 1;\n");
+  gen("    end;\n");
+  gen("    k := 0;\n");
+  gen("    while k < np do\n");
+  gen("    begin\n");
+  gen("      ev := __wrevents(k * 16);\n");
+  gen("      fd := __wrow[k];\n");
+  gen("      j := 0;\n");
+  gen("      while j < nr do\n");
+  gen("      begin\n");
+  gen("        m := __wev[sets[j] * __WMAXFD + fd];\n");
+  gen("        if (m <> 0) and (band(ev, bor(m, 24)) <> 0) then __wepgo[sets[j]] := 1;\n");
+  gen("        j := j + 1;\n");
+  gen("      end;\n");
+  gen("      k := k + 1;\n");
+  gen("    end;\n");
+  gen("    pass := 0;\n");
+  gen("    while pass < nr do\n");
+  gen("    begin\n");
+  gen("      j := 0;\n");
+  gen("      while j < nr do\n");
+  gen("      begin\n");
+  gen("        t := 0;\n");
+  gen("        while t < __WMAXEP do\n");
+  gen("        begin\n");
+  gen("          if (band(__wepin[sets[j] * __WMAXEP + t], 1) <> 0) and (__wepgo[t] <> 0) then __wepgo[sets[j]] := 1;\n");
+  gen("          t := t + 1;\n");
+  gen("        end;\n");
+  gen("        j := j + 1;\n");
+  gen("      end;\n");
+  gen("      pass := pass + 1;\n");
+  gen("    end;\n");
+  gen("    t := 0;\n");
+  gen("    while t < __WMAXEP do\n");
+  gen("    begin\n");
+  gen("      if (band(__wepin[s * __WMAXEP + t], 1) <> 0) and (__wepgo[t] <> 0) then\n");
+  gen("      begin\n");
+  gen("        pe := a + out * 12;\n");
+  gen("        __wput32abs(pe, 1);   // EPOLLIN\n");
+  gen("        __wput32abs(pe + 4, __WEPBASE + t);\n");
+  gen("        __wput32abs(pe + 8, 0);\n");
+  gen("        out := out + 1;\n");
+  gen("        if out >= maxev then return out;\n");
+  gen("      end;\n");
+  gen("      t := t + 1;\n");
+  gen("    end;\n");
+  gen("  end;\n");
   gen("  k := 0;\n");
   gen("  while k < np do\n");
   gen("  begin\n");
-  gen("    base := k * 16;\n");
-  gen("    revents := bor(ord(__wpoll[base + 10]), ord(__wpoll[base + 11]) shl 8);\n");
-  gen("    if revents <> 0 then\n");
+  gen("    fd := __wrow[k];\n");
+  gen("    m := __wev[s * __WMAXFD + fd];\n");
+  gen("    ev := band(__wrevents(k * 16), bor(m, 24));   // what this set asked for, and ERR/HUP\n");
+  gen("    if (m <> 0) and (ev <> 0) then\n");
   gen("    begin\n");
-  gen("      ev := 0;\n");
-  gen("      if band(revents, 0x0300) <> 0 then ev := bor(ev, 1);   // IN\n");
-  gen("      if band(revents, 0x0010) <> 0 then ev := bor(ev, 4);   // OUT\n");
-  gen("      if band(revents, 0x0001) <> 0 then ev := bor(ev, 8);   // ERR\n");
-  gen("      if band(revents, 0x0002) <> 0 then ev := bor(ev, 16);   // HUP\n");
   gen("      pe := a + out * 12;\n");
   gen("      __wput32abs(pe, ev);\n");
-  gen("      __wput32abs(pe + 4, __wrow[k]);\n");
+  gen("      __wput32abs(pe + 4, fd);\n");
   gen("      __wput32abs(pe + 8, 0);\n");
   gen("      out := out + 1;\n");
   gen("      if out >= maxev then return out;\n");
@@ -6545,9 +7206,9 @@ begin
   gen("  if nr = 72 then return __wnonblock(a);   // fcntl F_SETFL\n");
   gen("  if nr = 44 then return __wwrite(a, b, c);   // sendto -> send\n");
   gen("  if nr = 48 then return 0;   // shutdown: no-op\n");
-  gen("  if nr = 291 then return 1000000;   // epoll_create -> token\n");
-  gen("  if nr = 233 then return __wepctl(b, c, d);   // epoll_ctl\n");
-  gen("  if nr = 232 then return __wepwait(b, c, d);   // epoll_wait\n");
+  gen("  if nr = 291 then return __wepnew;   // epoll_create1\n");
+  gen("  if nr = 233 then return __wepctl(a, b, c, d);   // epoll_ctl\n");
+  gen("  if nr = 232 then return __wepwait(a, b, c, d);   // epoll_wait\n");
   gen("  if nr = 228 then   // clock_gettime: fill the timespec\n");
   gen("  begin\n");
   gen("    t := __wnow;\n");
@@ -6822,7 +7483,7 @@ begin
 end;
 
 procedure parseprogram;
-var i, nunres: int;
+var i, nunres, mline, mfile, endline, saveline: int;
 begin
   emitprelude;
   // The Windows runtime is injected BEFORE the first token is read. injectwin saves the
@@ -6891,23 +7552,36 @@ begin
   end;
   if nunres > 0 then halt(1);
   if tok <> KW_BEGIN then fail("missing begin of the main program");
+  mline := line; mfile := curfile;
   next;
   mainaddr := codelen;
   nloc := 0; frame := 0; curfn := -1; curret := T_VOID;
   nbrk := 0; ncnt := 0; brkbase := -1; cntbase := -1;
+  saveline := line; line := mline;
+  dbline(112);
+  line := saveline;
   e(0x55); e(0x48); e(0x89); e(0xE5);
   e(0x48); e(0x81); e(0xEC); framepatch := codelen; e32(0);
   stmtlist;
   if tok <> KW_END then fail("missing end of the main program");
+  endline := line;
   next;
   if tok <> 46 then fail("missing . after the final end");
   next;
   if tok <> TK_EOF then fail("text after the end of the program");
+  saveline := line; line := endline;
+  dbline(101);
+  line := saveline;
   e(0x48); e(0x31); e(0xC0);
   epilogue;
   while (frame mod 16) <> 0 do frame := frame + 8;
   e32at(framepatch, frame);
   e32at(mainpatch, mainaddr - (mainpatch + 4));
+  if dbgmode <> 0 then
+  begin
+    dbs("main "); dbnum(codebase + mainaddr); dbc(32); dbnum(codebase + codelen); dbc(32);
+    dbnum(mfile); dbc(32); dbnum(mline); dbc(32); dbnum(frame); dbs(" void\n");
+  end;
 end;
 
 // ------------------------------------------------------------------
@@ -6979,6 +7653,7 @@ begin
   wrbuf(fd, addr(dat[0]), datlen);
   cls(fd);
   chm(addr(outname[0]), 493);
+  dbdata := datava; dbbss := bssva;
 end;
 
 // ------------------------------------------------------------------
@@ -7131,6 +7806,81 @@ begin
   o := extfn[extat(i - NIMP)]; k := 0;
   while ord(extnam[o + k]) <> 0 do begin pd(ord(extnam[o + k])); k := k + 1; end;
   pd(0);
+end;
+
+// impargs(i) -- how many arguments the imported function at slot i takes, or -1 when we
+// do not pin it down.
+//
+// WHY THE COMPILER CAN KNOW THIS. These 48 names are not data from the source: they are
+// compiled in, and their signatures are documented and fixed. Win32 passes the first four
+// arguments in rcx/rdx/r8/r9, so a call with too few leaves the callee reading a register
+// nobody set -- and that is not a crash at a recognisable place, it is wrong behaviour with
+// whatever happened to be there.
+//
+// MEASURED 22-09-2026, before this existed:
+//     winapi("kernel32.dll", "CreateFileA", 1, 2)    compiled, exit 0
+//     winapi("kernel32.dll", "GetStdHandle")         compiled, exit 0
+// CreateFileA takes seven and GetStdHandle takes one.
+//
+// -1 MEANS "NOT PINNED DOWN", and it is an honest answer rather than a gap: SendMessageA and
+// DefWindowProcA are fixed at four, but a caller may legitimately pass fewer to a function
+// whose trailing arguments are ignored on some paths. Where the count is genuinely variable
+// the entry stays -1 and nothing is claimed.
+function impargs(i: int): int;
+begin
+  // ---- kernel32, slots 0..26 ------------------------------------------------------
+  if i = 0  then return 1;              // GetStdHandle(nStdHandle)
+  if i = 1  then return 5;              // WriteFile(h, buf, n, written, overlapped)
+  if i = 2  then return 5;              // ReadFile(h, buf, n, read, overlapped)
+  if i = 3  then return 7;              // CreateFileA(name, access, share, sa, disp, flags, tmpl)
+  if i = 4  then return 1;              // CloseHandle(h)
+  if i = 5  then return 1;              // ExitProcess(code)
+  if i = 6  then return 0;              // GetCommandLineA()
+  if i = 7  then return 3;              // lstrcpynA(dst, src, n)
+  if i = 8  then return 1;              // GetSystemTimeAsFileTime(out)
+  if i = 9  then return 1;              // Sleep(ms)
+  if i = 10 then return 3;              // GetFileAttributesExA(name, level, out)
+  if i = 11 then return 2;              // FindFirstFileA(name, out)
+  if i = 12 then return 2;              // FindNextFileA(h, out)
+  if i = 13 then return 1;              // FindClose(h)
+  if i = 14 then return 6;              // CreateFileMappingA(h, sa, prot, hi, lo, name)
+  if i = 15 then return 5;              // MapViewOfFile(h, access, hi, lo, bytes)
+  if i = 16 then return 1;              // UnmapViewOfFile(base)
+  if i = 17 then return 2;              // FlushViewOfFile(base, bytes)
+  if i = 18 then return 1;              // FlushFileBuffers(h)
+  if i = 19 then return 3;              // MoveFileExA(from, to, flags)
+  if i = 20 then return 4;              // SetFilePointerEx(h, dist, newpos, method)
+  if i = 21 then return 1;              // SetEndOfFile(h)
+  if i = 22 then return 1;              // DeleteFileA(name)
+  if i = 23 then return 2;              // CreateDirectoryA(name, sa)
+  if i = 24 then return 1;              // RemoveDirectoryA(name)
+  if i = 25 then return 6;              // LockFileEx(h, flags, res, lo, hi, overlapped)
+  if i = 26 then return 5;              // UnlockFileEx(h, res, lo, hi, overlapped)
+  // ---- ws2_32, slots 28..38 -------------------------------------------------------
+  if i = 27 then return 2;              // WSAStartup(version, data)
+  if i = 28 then return 3;              // socket(af, type, proto)
+  if i = 29 then return 1;              // closesocket(s)
+  if i = 30 then return 5;              // setsockopt(s, level, opt, val, len)
+  if i = 31 then return 3;              // ioctlsocket(s, cmd, argp)
+  if i = 32 then return 3;              // bind(s, addr, len)
+  if i = 33 then return 2;              // listen(s, backlog)
+  if i = 34 then return 3;              // accept(s, addr, len)
+  if i = 35 then return 4;              // send(s, buf, len, flags)
+  if i = 36 then return 4;              // recv(s, buf, len, flags)
+  if i = 37 then return 3;              // WSAPoll(fds, n, timeout)
+  // ---- advapi32, slot 40 ----------------------------------------------------------
+  if i = 38 then return 2;              // SystemFunction036(buf, len)  -- RtlGenRandom
+  // ---- user32, slots 42..50 -------------------------------------------------------
+  if i = 39 then return 1;              // RegisterClassExA(wc)
+  if i = 40 then return 12;             // CreateWindowExA -- twelve
+  if i = 41 then return 4;              // DefWindowProcA(h, msg, w, l)
+  if i = 42 then return 4;              // GetMessageA(msg, h, min, max)
+  if i = 43 then return 1;              // TranslateMessage(msg)
+  if i = 44 then return 1;              // DispatchMessageA(msg)
+  if i = 45 then return 1;              // PostQuitMessage(code)
+  if i = 46 then return 2;              // ShowWindow(h, cmd)
+  if i = 47 then return 4;              // SendMessageA(h, msg, w, l)
+  return -1;
 end;
 
 function impname(i: int): str;
@@ -7454,6 +8204,74 @@ begin
   wrbuf(fd, addr(dat[0]), datlen);
   cls(fd);
   chm(addr(outname[0]), 493);
+  dbdata := datava; dbbss := bssva;
+end;
+
+// ------------------------------------------------------------------
+// the debug sidecar: <output>.wzdbg, see docs/design.md
+// ------------------------------------------------------------------
+// The header, the files, the record types and the globals are written from the tables;
+// the line table and the routines were collected in dbg while the code was generated.
+// They go to the end of that same buffer first, so one write path serves both parts.
+
+procedure writedbg;
+var fd, i, k, n, g: int;
+begin
+  n := dbglen;
+  dbs("wzdbg 1\n");
+  if winmode <> 0 then dbs("target windows\n") else dbs("target linux\n");
+  dbs("base "); dbnum(VBASE); dbc(10);
+  dbs("text "); dbnum(codebase); dbc(32); dbnum(codelen); dbc(10);
+  dbs("data "); dbnum(dbdata); dbc(32); dbnum(datlen); dbc(10);
+  dbs("bss "); dbnum(dbbss); dbc(32); dbnum(bsslen); dbc(10);
+  dbs("entry "); dbnum(codebase + entryoff); dbc(10);
+  i := 0;
+  while i < nfiles do
+  begin
+    dbs("file "); dbnum(i); dbc(32);
+    k := 0;
+    while k < filelen[i] do
+    begin
+      dbc(ord(fnpool[filenam[i] + k]));
+      k := k + 1;
+    end;
+    dbc(10);
+    i := i + 1;
+  end;
+  i := 0;
+  while i < nrt do
+  begin
+    dbs("record "); dbnam(rtnam[i]); dbc(32); dbnum(rtsize[i]); dbc(32); dbnum(rtnf[i]); dbc(10);
+    k := rtf0[i];
+    while k < rtf0[i] + rtnf[i] do
+    begin
+      dbvar("field", fdnam[k], fdoff[k], fdtyp[k], fdarr[k], fdlo[k], fdhi[k]);
+      k := k + 1;
+    end;
+    i := i + 1;
+  end;
+  g := 0;
+  while g < ngl do
+  begin
+    if gkind[g] = SK_VAR then
+      dbvar("global", gnam[g], dbbss + gval[g], gtyp[g], garr[g], glo[g], ghi[g]);
+    g := g + 1;
+  end;
+  // the name: the output name with .wzdbg appended, which never collides with the binary
+  if outnamelen + 7 > 255 then fail("output file name too long");
+  i := 0;
+  while i < outnamelen do
+  begin
+    mbuf[i] := outname[i];
+    i := i + 1;
+  end;
+  mbuf[i] := '.'; mbuf[i + 1] := 'w'; mbuf[i + 2] := 'z'; mbuf[i + 3] := 'd';
+  mbuf[i + 4] := 'b'; mbuf[i + 5] := 'g'; mbuf[i + 6] := chr(0);
+  fd := opn(addr(mbuf[0]), 577, 420);
+  if fd < 0 then fail("cannot create the debug file");
+  wrbuf(fd, addr(dbg[n]), dbglen - n);
+  wrbuf(fd, addr(dbg[0]), n);
+  cls(fd);
 end;
 
 function compile: int;
@@ -7474,8 +8292,11 @@ begin
   pos := 0;
   srcend := n;
   bsslen := 8;
+  dbglen := 0;
+  if winmode <> 0 then codebase := VBASE + 0x1000 else codebase := VBASE + HDRLEN;
   parseprogram;
   if winmode <> 0 then writepe else writeelf;
+  if dbgmode <> 0 then writedbg;
   return 0;
 end;
 
