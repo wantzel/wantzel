@@ -106,7 +106,8 @@ end;
 //
 // THE ADDRESS IS FOUR BYTES, NOT A NAME. Resolving a hostname means DNS, which is a protocol
 // of its own over UDP -- a separate job, and one that does not belong inside a connect. Pass
-// 127, 0, 0, 1 for localhost.
+// 127, 0, 0, 1 for localhost; lib/dns.wz resolves a name, and dns.connect(name, port)
+// resolves and then calls this.
 //
 // BLOCKING, unlike net.listen. A listening socket is polled in a loop and must not make
 // accept() wait; a client that has just opened a connection has nothing else to do until it

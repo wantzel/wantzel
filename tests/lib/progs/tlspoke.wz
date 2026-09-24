@@ -1,0 +1,306 @@
+// tlspoke -- the misbehaving and demanding TLS clients that tests/lib/tls_serve.sh needs,
+// which no ordinary client can be made to be.
+//
+//   tlspoke capture <port>                  listen, take one connection, print what it sent
+//   tlspoke half <port> <file> <ms>         send the first half of <file>, then nothing
+//                                           for <ms>
+//   tlspoke trickle <port> <ms>             announce a 16 KB ClientHello record, then send
+//                                           it one byte every 2 ms for <ms>: a handshake
+//                                           that is always almost there
+//   tlspoke bytes <port> <file>             send <file> one byte per segment, then say
+//                                           whether a ServerHello came back
+//   tlspoke garbage <port>                  send plain HTTP, and say what came back
+//   tlspoke hold <port> <count> <ms>        complete <count> handshakes, keep them all open
+//                                           for <ms>, then close them
+//   tlspoke relay <listen> <target> <s>     one connection through, client to server one
+//                                           byte per segment; gives up after <s> seconds
+//   tlspoke slowrelay <listen> <target> <s> <ms>
+//                                           the same, whole reads, but each held back <ms>:
+//                                           a client on a slow network
+//
+// Every mode that waits has a bound, so a server that does not answer makes this exit
+// rather than hang the suite.
+include "io.wz";
+include "net.wz";
+include "tls.wz";
+include "json.wz";
+
+const
+  IPPROTO_TCP = 6;
+  TCP_NODELAY = 1;
+  MAXHOLD     = 900;
+
+var
+  mode: array[0..15] of char;
+  path: array[0..1023] of char;
+  data: array[0..65535] of char;
+  datan: int;
+  buf:  array[0..65535] of char;
+  ts:   array[0..15] of char;
+  one:  array[0..3] of char;
+  held: array[0..MAXHOLD-1] of int;
+  n: int;
+
+procedure nap(ms: int);
+var k, ns: int;
+begin
+  k := 0;
+  while k < 16 do begin ts[k] := chr(0); k := k + 1; end;
+  ns := ms * 1000000;
+  io.put64(ts, 0, ns div 1000000000);
+  io.put64(ts, 8, ns mod 1000000000);
+  k := sys2(SYS.nanosleep, addr(ts[0]), 0);
+end;
+
+procedure nodelay(fd: int);
+var r: int;
+begin
+  one[0] := chr(1);
+  r := sys5(SYS.setsockopt, fd, IPPROTO_TCP, TCP_NODELAY, addr(one[0]), 4);
+end;
+
+function readfile(k: int): int;
+var fd, n, r: int;
+begin
+  n := io.argstr(k, path);
+  fd := sys3(SYS.open, addr(path[0]), O_RDONLY, 0);
+  if fd < 0 then begin io.puts(STDERR, "tlspoke: cannot open the file\n"); halt(2); end;
+  n := 0;
+  while true do
+  begin
+    r := sys3(SYS.read, fd, addr(data[n]), len(data) - n);
+    if r <= 0 then break;
+    n := n + r;
+  end;
+  r := sys1(SYS.close, fd);
+  return n;
+end;
+
+function dial(port: int): int;
+var fd: int;
+begin
+  fd := net.connect(127, 0, 0, 1, port);
+  if fd < 0 then begin io.puts(STDOUT, "NO-CONNECTION\n"); halt(1); end;
+  return fd;
+end;
+
+// Read what arrives on fd for up to ms milliseconds, or until the peer closes, into buf
+// from `from` on. Returns how many bytes buf then holds; stops early once it holds `want`.
+function collect(fd: int; from: int; ms: int; want: int): int;
+var got, r, waited: int;
+begin
+  if not net.nonblock(fd) then halt(2);
+  got := from;
+  waited := 0;
+  while (waited < ms) and (got < want) do
+  begin
+    r := net.recv(fd, addr(buf[got]), len(buf) - got);
+    if r > 0 then got := got + r
+    else if r = EAGAIN then begin nap(5); waited := waited + 5; end
+    else return got;
+  end;
+  return got;
+end;
+
+procedure capture(port: int);
+var lfd, fd, n, waited: int;
+begin
+  lfd := net.listen(port, 4, false);
+  if lfd < 0 then begin io.puts(STDERR, "tlspoke: cannot listen\n"); halt(2); end;
+  fd := 0 - 1;
+  waited := 0;
+  while (fd < 0) and (waited < 10000) do
+  begin
+    fd := net.accept(lfd);
+    if fd < 0 then begin nap(5); waited := waited + 5; end;
+  end;
+  if fd < 0 then halt(1);
+  // one record is what a client sends first; it is in once its header says so
+  n := collect(fd, 0, 2000, 5);
+  if n >= 5 then n := collect(fd, n, 2000, 5 + tls.get16(buf, 3));
+  io.out(STDOUT, addr(buf[0]), n);
+  net.close(fd);
+end;
+
+procedure half(port: int; ms: int);
+var fd, n: int;
+begin
+  datan := readfile(3);
+  fd := dial(port);
+  n := net.send(fd, addr(data[0]), datan div 2);
+  io.puts(STDOUT, "SENT-HALF\n");
+  nap(ms);
+  net.close(fd);
+end;
+
+procedure trickle(port: int; ms: int);
+var fd, n, waited: int;
+begin
+  fd := dial(port);
+  nodelay(fd);
+  data[0] := chr(22); data[1] := chr(3); data[2] := chr(1);
+  tls.put16(data, 3, 16384);                  // a record as large as TLS allows
+  data[5] := chr(1);                          // a ClientHello filling it
+  tls.put24(data, 6, 16380);
+  n := net.send(fd, addr(data[0]), 9);
+  io.puts(STDOUT, "TRICKLING\n");
+  data[0] := chr(0);
+  waited := 0;
+  while waited < ms do
+  begin
+    n := net.send(fd, addr(data[0]), 1);
+    nap(2);
+    waited := waited + 2;
+  end;
+  net.close(fd);
+end;
+
+procedure bytes(port: int);
+var fd, k, n: int;
+begin
+  datan := readfile(3);
+  fd := dial(port);
+  nodelay(fd);
+  k := 0;
+  while k < datan do
+  begin
+    n := net.send(fd, addr(data[k]), 1);
+    if n <> 1 then begin io.puts(STDOUT, "SEND-FAILED\n"); halt(1); end;
+    nap(1);
+    k := k + 1;
+  end;
+  n := collect(fd, 0, 5000, 6);
+  if (n >= 6) and (ord(buf[0]) = 22) and (ord(buf[5]) = 2) then io.puts(STDOUT, "SERVERHELLO\n")
+  else io.puts(STDOUT, "NO-SERVERHELLO\n");
+  net.close(fd);
+end;
+
+procedure garbage(port: int);
+var fd, n: int;
+begin
+  fd := dial(port);
+  n := io.push(data, 0, "GET / HTTP/1.1\r\nHost: local.test\r\n\r\n");
+  n := net.send(fd, addr(data[0]), n);
+  n := collect(fd, 0, 3000, len(buf));
+  if (n >= 7) and (ord(buf[0]) = 21) and (ord(buf[5]) = 2) then
+  begin
+    io.puts(STDOUT, "ALERT ");
+    io.putn(STDOUT, ord(buf[6]));
+    io.puts(STDOUT, "\n");
+  end
+  else if n = 0 then io.puts(STDOUT, "CLOSED\n")
+  else io.puts(STDOUT, "SOMETHING-ELSE\n");
+  net.close(fd);
+end;
+
+procedure hold(port: int; count: int; ms: int);
+var k, ok: int;
+begin
+  if count > MAXHOLD then count := MAXHOLD;
+  ok := 0;
+  k := 0;
+  while k < count do
+  begin
+    held[k] := net.connect(127, 0, 0, 1, port);
+    if held[k] >= 0 then
+    begin
+      if tls.connect(held[k], "local.test") then ok := ok + 1;
+    end;
+    k := k + 1;
+  end;
+  io.puts(STDOUT, "HELD ");
+  io.putn(STDOUT, ok);
+  io.puts(STDOUT, "\n");
+  nap(ms);
+  k := 0;
+  while k < count do
+  begin
+    if held[k] >= 0 then net.close(held[k]);
+    k := k + 1;
+  end;
+end;
+
+// One connection through: what the client sends goes on one byte per segment (or whole, held
+// back `delay` ms), what the server sends comes back as it is.
+procedure relay(lport: int; tport: int; secs: int; delay: int; bytewise: bool);
+var lfd, c, sv, n, k, r, idle, waited: int;
+    busy: bool;
+begin
+  lfd := net.listen(lport, 4, false);
+  if lfd < 0 then begin io.puts(STDERR, "tlspoke: cannot listen\n"); halt(2); end;
+  io.puts(STDOUT, "RELAYING\n");
+  c := 0 - 1;
+  waited := 0;
+  while (c < 0) and (waited < secs * 1000) do
+  begin
+    c := net.accept(lfd);
+    if c < 0 then begin nap(5); waited := waited + 5; end;
+  end;
+  if c < 0 then halt(1);
+  sv := net.connect(127, 0, 0, 1, tport);
+  if sv < 0 then halt(1);
+  nodelay(sv);
+  if not net.nonblock(sv) then halt(2);
+  if not net.nonblock(c) then halt(2);
+  waited := 0;
+  idle := 0;
+  while waited < secs * 1000 do
+  begin
+    busy := false;
+    n := net.recv(c, addr(buf[0]), len(buf));
+    if (n = 0) or ((n < 0) and (n <> EAGAIN)) then break;
+    if (n > 0) and bytewise then
+    begin
+      busy := true;
+      k := 0;
+      while k < n do
+      begin
+        r := net.send(sv, addr(buf[k]), 1);
+        if r = 1 then k := k + 1 else nap(1);
+        nap(1);
+        waited := waited + 1;
+      end;
+    end
+    else if n > 0 then
+    begin
+      busy := true;
+      nap(delay);
+      waited := waited + delay;
+      k := 0;
+      while k < n do
+      begin
+        r := net.send(sv, addr(buf[k]), n - k);
+        if r > 0 then k := k + r else nap(1);
+      end;
+    end;
+    n := net.recv(sv, addr(data[0]), len(data));
+    if (n = 0) or ((n < 0) and (n <> EAGAIN)) then break;
+    if n > 0 then
+    begin
+      busy := true;
+      k := 0;
+      while k < n do
+      begin
+        r := net.send(c, addr(data[k]), n - k);
+        if r > 0 then k := k + r else nap(1);
+      end;
+    end;
+    if not busy then begin nap(2); waited := waited + 2; end;
+  end;
+  net.close(sv);
+  net.close(c);
+end;
+
+begin
+  if argc() < 3 then begin io.puts(STDERR, "usage: tlspoke <mode> <port> ...\n"); halt(2); end;
+  n := io.argstr(1, mode);
+  if json.eq(mode, 0, n, "capture") then capture(io.argn(2))
+  else if json.eq(mode, 0, n, "half") then half(io.argn(2), io.argn(4))
+  else if json.eq(mode, 0, n, "trickle") then trickle(io.argn(2), io.argn(3))
+  else if json.eq(mode, 0, n, "bytes") then bytes(io.argn(2))
+  else if json.eq(mode, 0, n, "garbage") then garbage(io.argn(2))
+  else if json.eq(mode, 0, n, "hold") then hold(io.argn(2), io.argn(3), io.argn(4))
+  else if json.eq(mode, 0, n, "relay") then relay(io.argn(2), io.argn(3), io.argn(4), 0, true)
+  else if json.eq(mode, 0, n, "slowrelay") then relay(io.argn(2), io.argn(3), io.argn(4), io.argn(5), false)
+  else begin io.puts(STDERR, "tlspoke: unknown mode\n"); halt(2); end;
+end.

@@ -1,0 +1,530 @@
+// A client for the lib/http.wz load and robustness tests: many connections at once from one
+// process, on one epoll set. Every mode prints one line of `key=value` pairs and exits 0; a
+// connect that fails exits 2, so a caller can tell "the server is not up" from a result.
+//
+//   httpload bench PORT CONNS MS      keep-alive GET / on CONNS connections for MS milliseconds;
+//                                     requests, requests/second, latency p50/p99/max in us
+//   httpload open  PORT CONNS         open CONNS connections, and only once ALL are open send one
+//                                     GET / on each; count the 200 replies
+//   httpload slow  PORT CONNS GAP MAX slowloris: open CONNS connections, send a request line and
+//                                     then one header byte every GAP ms, never finishing; count
+//                                     how many the SERVER closed within MAX ms, and when
+//   httpload hold  PORT CONNS MODE    open CONNS connections and keep them until killed; MODE 0
+//                                     sends nothing, MODE 1 sends half a request line, MODE 2
+//                                     the headers of a 100-byte POST and 10 bytes of its body.
+//                                     Prints `held=N` once they are all open
+//   httpload cycle PORT N             N rounds of three connections each: a full request and
+//                                     close, a connect and close, half a request and close
+//   httpload pipe  PORT N             N requests written in ONE send on one connection; count
+//                                     the replies that come back, in order
+//   httpload idle  PORT CONNS MAX     CONNS keep-alive connections make one request each, then
+//                                     sit idle; count how many the server closed within MAX ms
+//   httpload bigpart PORT CONNS       CONNS connections each send the headers of a 200000-byte
+//                                     POST and 20000 bytes of its body, then hold (until killed)
+//   httpload pipebig PORT 1           GET /bigslow and GET / in ONE send; read until the server
+//                                     closes; the byte count, and whether "ok" came last
+//   httpload stall PORT CONNS         CONNS connections each ask for GET /bigslow and never read
+//                                     it; prints `stalled=N`, then holds them until killed
+include "net.wz";
+
+const
+  MAXC   = 8192;              // connections this client can hold at once
+  REPLYMAX   = 2048;              // reply bytes kept per connection: the test replies are small
+  HBUCK  = 100000;            // latency histogram: 10 us buckets, up to one second
+
+var
+  cfd:   array[0..MAXC - 1] of int;
+  rlen:  array[0..MAXC - 1] of int;
+  sent:  array[0..MAXC - 1] of int;      // io.now when the request went out
+  done:  array[0..MAXC - 1] of bool;     // closed by the server, or reply complete
+  rbuf:  array[0..MAXC * REPLYMAX - 1] of char;
+  hist:  array[0..HBUCK] of int;
+  evs:   array[0..1023 * 12] of char;
+  req:   array[0..8191] of char;
+  reqn:  int;
+  ep, n, i, mode, port, conns, ok, lat, maxlat, nlat: int;
+  slotof: array[0..65535] of int;        // fd -> connection index + 1
+  ignored: bool;
+
+procedure fail(s: str);
+begin
+  io.puts(STDERR, s);
+  io.puts(STDERR, "\n");
+  halt(2);
+end;
+
+procedure setreq;
+begin
+  reqn := io.push(req, 0, "GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+end;
+
+// open connection k; blocking connect, then non-blocking for the epoll loop
+procedure openc(k: int);
+var fd: int;
+begin
+  fd := net.connect(127, 0, 0, 1, port);
+  if fd < 0 then fail("connect failed");
+  if fd > 65535 then fail("client fd out of range");
+  if not net.nonblock(fd) then fail("nonblock failed");
+  cfd[k] := fd;
+  rlen[k] := 0;
+  done[k] := false;
+  slotof[fd] := k + 1;
+  if not net.watch(ep, EPOLL_ADD, fd, EPOLLIN) then fail("watch failed");
+end;
+
+procedure sendreq(k: int);
+var r: int;
+begin
+  r := net.send(cfd[k], addr(req[0]), reqn);
+  if r <> reqn then fail("short send");
+  sent[k] := io.now;
+end;
+
+// Is the reply in connection k's buffer complete? Returns its total length, 0 if not yet.
+function complete(k: int): int;
+var base, at, eoh, cl, v: int;
+begin
+  base := k * REPLYMAX;
+  at := base;
+  eoh := -1;
+  while at + 3 < base + rlen[k] do
+  begin
+    if (rbuf[at] = chr(13)) and (rbuf[at + 1] = chr(10)) and (rbuf[at + 2] = chr(13)) and (rbuf[at + 3] = chr(10)) then
+    begin
+      eoh := at + 4;
+      break;
+    end;
+    at := at + 1;
+  end;
+  if eoh < 0 then return 0;
+  // Content-Length, found the plain way: the test server always sends it
+  cl := 0;
+  at := base;
+  while at < eoh - 16 do
+  begin
+    if (rbuf[at] = 'C') and (rbuf[at + 8] = 'L') and (rbuf[at + 14] = ':') then
+    begin
+      v := at + 15;
+      while rbuf[v] = ' ' do v := v + 1;
+      while (rbuf[v] >= '0') and (rbuf[v] <= '9') do
+      begin
+        cl := cl * 10 + (ord(rbuf[v]) - 48);
+        v := v + 1;
+      end;
+      break;
+    end;
+    at := at + 1;
+  end;
+  if eoh - base + cl > rlen[k] then return 0;
+  return eoh - base + cl;
+end;
+
+// read what connection k has: false when the server closed it
+function recvall(k: int): bool;
+var r, base: int;
+begin
+  base := k * REPLYMAX;
+  while true do
+  begin
+    if rlen[k] >= REPLYMAX then return true;      // full: the caller takes replies off first
+    r := net.recv(cfd[k], addr(rbuf[base + rlen[k]]), REPLYMAX - rlen[k]);
+    if r = EAGAIN then return true;
+    if r = EINTR then continue;
+    if r <= 0 then return false;
+    rlen[k] := rlen[k] + r;
+  end;
+  return true;
+end;
+
+// take one complete reply off the front of connection k's buffer: its status, 0 if none yet
+function take(k: int): int;
+var t, r, base, st: int;
+begin
+  base := k * REPLYMAX;
+  t := complete(k);
+  if t = 0 then return 0;
+  st := (ord(rbuf[base + 9]) - 48) * 100 + (ord(rbuf[base + 10]) - 48) * 10 + (ord(rbuf[base + 11]) - 48);
+  r := 0;
+  while t + r < rlen[k] do
+  begin
+    rbuf[base + r] := rbuf[base + t + r];
+    r := r + 1;
+  end;
+  rlen[k] := r;
+  return st;
+end;
+
+// read and take one reply: its status, 0 while incomplete, -1 when the server closed first
+function readc(k: int): int;
+var st: int;
+    alive: bool;
+begin
+  alive := recvall(k);
+  st := take(k);
+  if st > 0 then return st;
+  if rlen[k] >= REPLYMAX then fail("reply larger than the client buffer");
+  if not alive then return -1;
+  return 0;
+end;
+
+procedure sendstr(fd: int; s: str);
+var r: int;
+begin
+  r := net.send(fd, sadr(s), slen(s));
+end;
+
+procedure note(k: int);
+var us: int;
+begin
+  us := (io.now - sent[k]) div 1000;
+  if us > maxlat then maxlat := us;
+  if us div 10 < HBUCK then hist[us div 10] := hist[us div 10] + 1
+  else hist[HBUCK] := hist[HBUCK] + 1;
+  nlat := nlat + 1;
+end;
+
+function pct(p: int): int;
+var i, acc, want: int;
+begin
+  want := (nlat * p + 99) div 100;
+  acc := 0;
+  for i := 0 to HBUCK do
+  begin
+    acc := acc + hist[i];
+    if acc >= want then return i * 10;
+  end;
+  return HBUCK * 10;
+end;
+
+procedure closeall;
+var k: int;
+begin
+  for k := 0 to conns - 1 do if cfd[k] > 0 then net.close(cfd[k]);
+end;
+
+// ---- modes
+
+procedure bench(ms: int);
+var t0, tend, k, e, fd, r, total: int;
+begin
+  for k := 0 to conns - 1 do openc(k);
+  t0 := io.now;
+  tend := t0 + ms * 1000000;
+  for k := 0 to conns - 1 do sendreq(k);
+  total := 0;
+  ok := 0;
+  while io.now < tend do
+  begin
+    n := net.wait(ep, addr(evs[0]), 1023, 100);
+    for i := 0 to n - 1 do
+    begin
+      e := io.get32(evs, i * 12);
+      fd := io.get32(evs, i * 12 + 4);
+      k := slotof[fd] - 1;
+      if k < 0 then continue;
+      r := readc(k);
+      if r < 0 then fail("the server closed a keep-alive connection during the benchmark");
+      if r > 0 then
+      begin
+        note(k);
+        total := total + 1;
+        if r = 200 then ok := ok + 1;
+        sendreq(k);
+      end;
+    end;
+  end;
+  t0 := (io.now - t0) div 1000000;
+  io.puts(STDOUT, "conns="); io.putn(STDOUT, conns);
+  io.puts(STDOUT, " requests="); io.putn(STDOUT, total);
+  io.puts(STDOUT, " ok="); io.putn(STDOUT, ok);
+  io.puts(STDOUT, " ms="); io.putn(STDOUT, t0);
+  io.puts(STDOUT, " rps="); io.putn(STDOUT, total * 1000 div t0);
+  io.puts(STDOUT, " p50us="); io.putn(STDOUT, pct(50));
+  io.puts(STDOUT, " p99us="); io.putn(STDOUT, pct(99));
+  io.puts(STDOUT, " maxus="); io.putn(STDOUT, maxlat);
+  io.puts(STDOUT, "\n");
+  closeall;
+end;
+
+procedure openmode;
+var k, e, fd, r, left, closed, t0: int;
+begin
+  for k := 0 to conns - 1 do openc(k);
+  // every connection is open at this point, and only now does any request go out: the
+  // server must hold all of them at once to answer the last ones
+  for k := conns - 1 downto 0 do sendreq(k);
+  left := conns;
+  ok := 0;
+  closed := 0;
+  t0 := io.now;
+  while (left > 0) and (io.now - t0 < 20000000000) do
+  begin
+    n := net.wait(ep, addr(evs[0]), 1023, 200);
+    for i := 0 to n - 1 do
+    begin
+      e := io.get32(evs, i * 12);
+      fd := io.get32(evs, i * 12 + 4);
+      k := slotof[fd] - 1;
+      if (k < 0) or done[k] then continue;
+      r := readc(k);
+      if r <> 0 then
+      begin
+        done[k] := true;
+        left := left - 1;
+        if r = 200 then ok := ok + 1;
+        if r < 0 then closed := closed + 1;
+        ignored := net.watch(ep, EPOLL_DEL, fd, 0);
+      end;
+    end;
+  end;
+  io.puts(STDOUT, "opened="); io.putn(STDOUT, conns);
+  io.puts(STDOUT, " served="); io.putn(STDOUT, ok);
+  io.puts(STDOUT, " closed="); io.putn(STDOUT, closed);
+  io.puts(STDOUT, "\n");
+  closeall;
+end;
+
+procedure slow(gap: int; maxms: int);
+var k, e, fd, r, left, t0, last, nextdrip: int;
+begin
+  for k := 0 to conns - 1 do
+  begin
+    openc(k);
+    sendstr(cfd[k], "GET / HTTP/1.1\r\nX-Slow: ");
+  end;
+  left := conns;
+  t0 := io.now;
+  last := 0;
+  nextdrip := t0 + gap * 1000000;
+  while (left > 0) and (io.now - t0 < maxms * 1000000) do
+  begin
+    n := net.wait(ep, addr(evs[0]), 1023, 50);
+    for i := 0 to n - 1 do
+    begin
+      e := io.get32(evs, i * 12);
+      fd := io.get32(evs, i * 12 + 4);
+      k := slotof[fd] - 1;
+      if (k < 0) or done[k] then continue;
+      r := readc(k);
+      if r < 0 then
+      begin
+        done[k] := true;
+        left := left - 1;
+        last := (io.now - t0) div 1000000;
+        ignored := net.watch(ep, EPOLL_DEL, fd, 0);
+      end;
+    end;
+    if io.now >= nextdrip then
+    begin
+      for k := 0 to conns - 1 do
+        if not done[k] then sendstr(cfd[k], "x");
+      nextdrip := io.now + gap * 1000000;
+    end;
+  end;
+  io.puts(STDOUT, "slow="); io.putn(STDOUT, conns);
+  io.puts(STDOUT, " closed="); io.putn(STDOUT, conns - left);
+  io.puts(STDOUT, " lastms="); io.putn(STDOUT, last);
+  io.puts(STDOUT, "\n");
+  closeall;
+end;
+
+procedure hold(how: int);
+var k: int;
+begin
+  for k := 0 to conns - 1 do
+  begin
+    openc(k);
+    if how = 1 then sendstr(cfd[k], "GET / HT");
+    if how = 2 then sendstr(cfd[k], "POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\n0123456789");
+  end;
+  io.puts(STDOUT, "held="); io.putn(STDOUT, conns); io.puts(STDOUT, "\n");
+  // wait until killed; a server that closes these is not an error here
+  while true do n := net.wait(ep, addr(evs[0]), 1023, 1000);
+end;
+
+procedure cycle(rounds: int);
+var k, fd, r, got, full: int;
+    buf: array[0..4095] of char;
+begin
+  full := 0;
+  for k := 1 to rounds do
+  begin
+    // a whole request, answered, then closed by us
+    fd := net.connect(127, 0, 0, 1, port);
+    if fd < 0 then fail("connect failed");
+    r := net.send(fd, addr(req[0]), reqn);
+    got := net.recv(fd, addr(buf[0]), 4096);
+    if (got > 12) and (buf[9] = '2') then full := full + 1;
+    net.close(fd);
+    // connected, nothing sent, closed
+    fd := net.connect(127, 0, 0, 1, port);
+    if fd < 0 then fail("connect failed");
+    net.close(fd);
+    // half a request, closed
+    fd := net.connect(127, 0, 0, 1, port);
+    if fd < 0 then fail("connect failed");
+    sendstr(fd, "POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\nabc");
+    net.close(fd);
+  end;
+  io.puts(STDOUT, "cycles="); io.putn(STDOUT, rounds);
+  io.puts(STDOUT, " served="); io.putn(STDOUT, full);
+  io.puts(STDOUT, "\n");
+end;
+
+procedure pipe(count: int);
+var k, r, got, st, t0: int;
+    alive: bool;
+begin
+  conns := 1;
+  openc(0);
+  reqn := 0;
+  for k := 1 to count do reqn := io.push(req, reqn, "GET /p HTTP/1.1\r\nHost: t\r\n\r\n");
+  r := net.send(cfd[0], addr(req[0]), reqn);
+  if r <> reqn then fail("short send");
+  got := 0;
+  alive := true;
+  t0 := io.now;
+  while alive and (got < count) and (io.now - t0 < 5000000000) do
+  begin
+    n := net.wait(ep, addr(evs[0]), 1023, 200);
+    if n > 0 then
+    begin
+      alive := recvall(0);
+      st := take(0);
+      while st > 0 do
+      begin
+        if st = 200 then got := got + 1;
+        st := take(0);
+      end;
+    end;
+  end;
+  io.puts(STDOUT, "pipelined="); io.putn(STDOUT, count);
+  io.puts(STDOUT, " answered="); io.putn(STDOUT, got);
+  io.puts(STDOUT, "\n");
+  closeall;
+end;
+
+procedure idle(maxms: int);
+var k, e, fd, r, left, t0, last: int;
+begin
+  for k := 0 to conns - 1 do openc(k);
+  for k := 0 to conns - 1 do sendreq(k);
+  left := conns;
+  ok := 0;
+  t0 := io.now;
+  last := 0;
+  while (left > 0) and (io.now - t0 < maxms * 1000000) do
+  begin
+    n := net.wait(ep, addr(evs[0]), 1023, 50);
+    for i := 0 to n - 1 do
+    begin
+      e := io.get32(evs, i * 12);
+      fd := io.get32(evs, i * 12 + 4);
+      k := slotof[fd] - 1;
+      if (k < 0) or done[k] then continue;
+      r := readc(k);
+      if r = 200 then ok := ok + 1;
+      if r < 0 then
+      begin
+        done[k] := true;
+        left := left - 1;
+        last := (io.now - t0) div 1000000;
+        ignored := net.watch(ep, EPOLL_DEL, fd, 0);
+      end;
+    end;
+  end;
+  io.puts(STDOUT, "idle="); io.putn(STDOUT, conns);
+  io.puts(STDOUT, " served="); io.putn(STDOUT, ok);
+  io.puts(STDOUT, " closed="); io.putn(STDOUT, conns - left);
+  io.puts(STDOUT, " lastms="); io.putn(STDOUT, last);
+  io.puts(STDOUT, "\n");
+  closeall;
+end;
+
+procedure bigpart;
+var k, m, r: int;
+    body: array[0..19999] of char;
+begin
+  for k := 0 to 19999 do body[k] := 'z';
+  for k := 0 to conns - 1 do
+  begin
+    openc(k);
+    sendstr(cfd[k], "POST /part HTTP/1.1\r\nHost: t\r\nContent-Length: 200000\r\n\r\n");
+    m := 0;
+    while m < 20000 do
+    begin
+      r := net.send(cfd[k], addr(body[m]), 20000 - m);
+      if r > 0 then m := m + r
+      else if r <> EAGAIN then fail("send failed");
+    end;
+  end;
+  io.puts(STDOUT, "held="); io.putn(STDOUT, conns); io.puts(STDOUT, "\n");
+  while true do n := net.wait(ep, addr(evs[0]), 1023, 1000);
+end;
+
+procedure stall;
+var k: int;
+begin
+  for k := 0 to conns - 1 do
+  begin
+    openc(k);
+    sendstr(cfd[k], "GET /bigslow HTTP/1.1\r\nHost: t\r\n\r\n");
+  end;
+  // give the server time to write what the sockets take and queue the rest
+  n := net.wait(ep, addr(evs[0]), 1, 300);
+  io.puts(STDOUT, "stalled="); io.putn(STDOUT, conns); io.puts(STDOUT, "\n");
+  while true do n := net.wait(ep, addr(evs[0]), 1, 1000);
+end;
+
+var
+  whole: array[0..1048575] of char;
+
+procedure pipebig;
+var fd, r, got, t0: int;
+begin
+  fd := net.connect(127, 0, 0, 1, port);
+  if fd < 0 then fail("connect failed");
+  sendstr(fd, "GET /bigslow HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+  got := 0;
+  t0 := io.now;
+  while (got < 1048576) and (io.now - t0 < 10000000000) do
+  begin
+    r := net.recv(fd, addr(whole[got]), 1048576 - got);
+    if r <= 0 then break;
+    got := got + r;
+  end;
+  io.puts(STDOUT, "bytes="); io.putn(STDOUT, got);
+  if (got >= 2) and (whole[got - 2] = 'o') and (whole[got - 1] = 'k') then io.puts(STDOUT, " last=ok\n")
+  else io.puts(STDOUT, " last=other\n");
+  net.close(fd);
+end;
+
+// is argument 1 exactly s?
+function ismode(s: str): bool;
+var i: int;
+begin
+  for i := 0 to slen(s) - 1 do if argch(1, i) <> schar(s, i) then return false;
+  return argch(1, slen(s)) = chr(0);
+end;
+
+begin
+  if argc() < 4 then fail("usage: httpload bench|open|slow|hold|cycle|pipe|idle|bigpart|stall PORT N ...");
+  port := io.argn(2);
+  conns := io.argn(3);
+  if conns > MAXC then fail("too many connections for this client");
+  ep := net.epoll;
+  if ep < 0 then fail("epoll failed");
+  setreq;
+  if ismode("bench") then bench(io.argn(4))
+  else if ismode("open") then openmode
+  else if ismode("slow") then slow(io.argn(4), io.argn(5))
+  else if ismode("hold") then hold(io.argn(4))
+  else if ismode("cycle") then cycle(conns)
+  else if ismode("pipe") then pipe(conns)
+  else if ismode("idle") then idle(io.argn(4))
+  else if ismode("bigpart") then bigpart
+  else if ismode("stall") then stall
+  else if ismode("pipebig") then pipebig
+  else fail("unknown mode");
+end.

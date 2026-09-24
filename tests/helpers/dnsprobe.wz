@@ -1,0 +1,193 @@
+// dnsprobe -- lib/dns.wz driven from the command line, for the tests.
+//
+//   dnsprobe <ports> <tryms> <totalms> <word>...
+//
+// <ports> is a comma-separated list of ports on 127.0.0.1 to use as the nameservers, or
+// "-" for the system's own configuration. <tryms> and <totalms> go to dns.settimeout (0
+// keeps the default). Then each word, in order:
+//   <name>          looked up with dns.resolve: "<name> <address>..." or "<name> error
+//                   <code> <message>"; the milliseconds it took go to stderr as "ms <n>"
+//   !flush          dns.flush
+//   !conf=<path>    dns.loadconf: "conf <n> <address>... timeout <ms> attempts <n>"
+//   !cat=<path>     the file itself, as a program reading it sees it
+//   !async          every name after it is started at once with dns.start and collected
+//                   with dns.poll, from an epoll loop of this program's own that watches
+//                   dns.fd and waits no longer than dns.wait; printed in the same form
+include "dns.wz";
+
+var
+  ports, word: array[0..255] of char;
+  addrs: array[0..DNS.MAXADDR - 1] of int;
+  qs: array[0..15] of int;
+  qarg: array[0..15] of int;
+  line: array[0..1023] of char;
+  n, i, k, p, at, t0, w, ep, left, r, nq, fd: int;
+  async: bool;
+  ev: array[0..95] of char;
+
+procedure show(arg: int; r: int);
+var j, m: int;
+begin
+  m := io.argstr(arg, word);
+  at := 0;
+  j := 0;
+  while j < m do begin line[at] := word[j]; at := at + 1; j := j + 1; end;
+  if r > 0 then
+  begin
+    j := 0;
+    while j < r do
+    begin
+      at := io.push(line, at, " ");
+      at := dns.ipstr(line, at, addrs[j]);
+      j := j + 1;
+    end;
+  end
+  else
+  begin
+    at := io.push(line, at, " error ");
+    if r < 0 then begin line[at] := '-'; at := at + 1; r := 0 - r; end;
+    at := io.pushnum(line, at, r);
+    at := io.push(line, at, " ");
+    io.out(STDOUT, addr(line[0]), at);
+    io.puts(STDOUT, dns.error(0 - r));
+    io.puts(STDOUT, "\n");
+    return;
+  end;
+  line[at] := chr(10);
+  io.out(STDOUT, addr(line[0]), at + 1);
+end;
+
+begin
+  if argc() < 4 then
+  begin
+    io.puts(STDERR, "usage: dnsprobe <ports|-> <tryms> <totalms> <name|!flush|!conf=path|!async>...\n");
+    halt(2);
+  end;
+  n := io.argstr(1, ports);
+  if not ((n = 1) and (ports[0] = '-')) then
+  begin
+    dns.noservers;
+    i := 0;
+    while i < n do
+    begin
+      p := 0;
+      while (i < n) and (ports[i] <> ',') do
+      begin
+        p := p * 10 + (ord(ports[i]) - ord('0'));
+        i := i + 1;
+      end;
+      if not dns.addserver(127, 0, 0, 1, p) then io.puts(STDERR, "dnsprobe: too many servers\n");
+      i := i + 1;
+    end;
+  end;
+  dns.settimeout(io.argn(2), io.argn(3));
+
+  async := false;
+  nq := 0;
+  k := 4;
+  while k < argc() do
+  begin
+    n := io.argstr(k, word);
+    if (n = 6) and (word[0] = '!') and (word[1] = 'f') then dns.flush
+    else if (n = 6) and (word[0] = '!') and (word[1] = 'a') then async := true
+    else if (n > 5) and (word[0] = '!') and (word[1] = 'c') and (word[2] = 'a') then
+    begin
+      // !cat=<path>: the file as it reads, byte for byte
+      i := 5;
+      while i < n do begin line[i - 5] := word[i]; i := i + 1; end;
+      line[n - 5] := chr(0);
+      fd := sys3(SYS.open, addr(line[0]), O_RDONLY, 0);
+      if fd < 0 then begin io.puts(STDOUT, "cat: cannot open\n"); end
+      else
+      begin
+        r := sys3(SYS.read, fd, addr(line[0]), len(line));
+        while r > 0 do
+        begin
+          io.out(STDOUT, addr(line[0]), r);
+          r := sys3(SYS.read, fd, addr(line[0]), len(line));
+        end;
+        net.close(fd);
+      end;
+    end
+    else if (n > 6) and (word[0] = '!') and (word[1] = 'c') then
+    begin
+      r := dns.loadconf(word[6..n - 1]);
+      at := io.push(line, 0, "conf ");
+      at := io.pushnum(line, at, r);
+      i := 0;
+      while i < dns.nns do
+      begin
+        at := io.push(line, at, " ");
+        at := dns.ipstr(line, at, dns.nsip[i]);
+        at := io.push(line, at, ":");
+        at := io.pushnum(line, at, dns.nsport[i]);
+        i := i + 1;
+      end;
+      at := io.push(line, at, " timeout ");
+      at := io.pushnum(line, at, dns.tryms);
+      at := io.push(line, at, " attempts ");
+      at := io.pushnum(line, at, dns.attempts);
+      line[at] := chr(10);
+      io.out(STDOUT, addr(line[0]), at + 1);
+    end
+    else if async then
+    begin
+      if nq < len(qs) then
+      begin
+        qs[nq] := dns.start(word[0..n - 1]);
+        qarg[nq] := k;
+        nq := nq + 1;
+      end;
+    end
+    else
+    begin
+      t0 := io.now;
+      r := dns.resolve(word[0..n - 1], addrs);
+      io.puts(STDERR, "ms ");
+      io.putn(STDERR, (io.now - t0) div 1000000);
+      io.puts(STDERR, "\n");
+      show(k, r);
+    end;
+    k := k + 1;
+  end;
+
+  if nq > 0 then
+  begin
+    // AN EPOLL LOOP OF OUR OWN, with the resolver's set inside it: what a server does.
+    ep := net.epoll;
+    if not net.watch(ep, EPOLL_ADD, dns.fd, EPOLLIN) then begin io.puts(STDERR, "dnsprobe: cannot watch dns.fd\n"); halt(1); end;
+    left := nq;
+    t0 := io.now;
+    while (left > 0) and (io.now - t0 < 20000000000) do
+    begin
+      i := 0;
+      while i < nq do
+      begin
+        if qs[i] >= 0 then
+        begin
+          r := dns.poll(qs[i], addrs);
+          if r <> DNS.PENDING then
+          begin
+            show(qarg[i], r);
+            qs[i] := 0 - 1;
+            left := left - 1;
+          end;
+        end
+        else if qs[i] = DNS.BUSY then
+        begin
+          show(qarg[i], DNS.BUSY);
+          qs[i] := 0 - 1;
+          left := left - 1;
+        end;
+        i := i + 1;
+      end;
+      if left > 0 then
+      begin
+        w := dns.wait;
+        if (w < 0) or (w > 1000) then w := 1000;
+        n := net.wait(ep, addr(ev[0]), 8, w);
+      end;
+    end;
+    if left > 0 then begin io.puts(STDOUT, "async: lookups still pending after 20 s\n"); halt(1); end;
+  end;
+end.

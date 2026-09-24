@@ -1,0 +1,76 @@
+// The server for the lib/http.wz load and robustness tests: tiny replies, one large one, and
+// a /stats page that reads the loop's own bookkeeping, so a test can COUNT slots, chunks and
+// mapped reply bytes instead of guessing from the outside.
+//
+//   httpstat PORT MAXCONN IDLE HEADER BODY SEND     (seconds; 0 keeps a default)
+//
+//   GET /        "ok"
+//   GET /big     500000 bytes of 'b'
+//   GET /bigslow the same, on a socket whose send buffer was made small first -- so the reply
+//                cannot go out in one send and has to wait in the slot's pending region
+//   GET /stats   open=.. free=.. chunks=.. chunkmax=.. pend=.. queued=.. refused=.. evicted=.. timedout=.. maxfd=.. slot=..
+//   POST ...     "got N" with N the body length
+include "http.wz";
+
+var
+  big: array[0..499999] of char;
+  maxfd: int;
+  sndbuf: array[0..3] of char;
+
+procedure stat(name: str; v: int);
+begin
+  http.add(name);
+  http.add("=");
+  http.addn(v);
+  http.add(" ");
+end;
+
+procedure app.request;
+var i: int;
+begin
+  if http.fd > maxfd then maxfd := http.fd;
+  if http.method = HTTP.POST then
+  begin
+    http.add("got ");
+    http.addn(http.bodylen);
+    http.finish(200, "text/plain");
+    return;
+  end;
+  if http.pathis("/big") or http.pathis("/bigslow") then
+  begin
+    if http.pathis("/bigslow") then
+    begin
+      io.put32(sndbuf, 0, 8192);
+      i := sys5(SYS.setsockopt, http.fd, SOL_SOCKET, 7, addr(sndbuf[0]), 4);   // SO_SNDBUF
+    end;
+    if big[0] <> 'b' then for i := 0 to 499999 do big[i] := 'b';
+    http.addb(big, 0, 500000);
+    http.finish(200, "text/plain");
+    return;
+  end;
+  if http.pathis("/stats") then
+  begin
+    stat("open", http.nopen);
+    stat("free", http.nfree);
+    stat("chunks", http.ncfree);
+    stat("chunkmax", HTTP.CHUNKS);
+    stat("pend", http.pendbytes);
+    stat("queued", http.queued);
+    stat("refused", http.refused);
+    stat("evicted", http.evicted);
+    stat("timedout", http.timedout);
+    stat("maxfd", maxfd);
+    stat("slot", http.slot);
+    http.add("\n");
+    http.finish(200, "text/plain");
+    return;
+  end;
+  http.add("ok");
+  http.finish(200, "text/plain");
+end;
+
+begin
+  if io.argn(2) > 0 then http.maxconn(io.argn(2));
+  http.timeouts(io.argn(3), io.argn(4), io.argn(5), io.argn(6));
+  http.serve(io.argn(1), 1);
+end.

@@ -1,14 +1,14 @@
 // wget.wz -- fetch a URL over HTTP or HTTPS, and print it.
 //
-//   wget https://93.184.216.34/ example.com     the page, to stdout
+//   wget https://example.com/                   the page, to stdout
 //   wget http://127.0.0.1:8080/hello            plain HTTP, no encryption
+//   wget https://93.184.216.34/ example.com     an address, and the name to check
 //   wget https://10.0.0.1/ host.example --insecure
 //
-// THE ADDRESS IS NUMERIC AND THE HOSTNAME IS SEPARATE, which is unusual and deliberate:
-// there is no DNS resolver in lib/, because DNS is its own protocol over UDP and belongs in
-// its own file rather than inside a connect. So the URL carries the address to dial, and the
-// second argument is the name the certificate has to match. For a real client the two would
-// come from one hostname and a lookup.
+// A HOSTNAME IN THE URL IS LOOKED UP with lib/dns.wz, and it is also the name the
+// certificate has to match. A numeric address is dialled as it is; the certificate then
+// needs a name to be checked against, which the second argument gives -- the same
+// argument overrides the name for a hostname URL too.
 //
 // WHAT THIS DEMONSTRATES, and it is the reason the example exists: a static binary of a
 // couple of hundred kilobytes speaks TLS 1.3 to any modern server. No OpenSSL, no libcurl,
@@ -22,6 +22,7 @@
 
 include "io.wz";
 include "net.wz";
+include "dns.wz";
 include "tls.wz";
 
 const
@@ -36,7 +37,8 @@ var
   req:   array[0..2047] of char;
   body:  array[0..MAXBODY-1] of char;
   bodyn: int;
-  ip:    array[0..3] of int;
+  uhost: array[0..255] of char;         // the host part of the URL: a name or an address
+  uhostn: int;
   port:  int;
   https: bool;
   insecure: bool;
@@ -60,10 +62,11 @@ end;
 procedure usage;
 begin
   io.puts(STDERR, "usage: wget <url> [hostname] [--insecure]\n");
-  io.puts(STDERR, "   eg: wget https://93.184.216.34/ example.com\n");
+  io.puts(STDERR, "   eg: wget https://example.com/\n");
+  io.puts(STDERR, "       wget https://93.184.216.34/ example.com\n");
   io.puts(STDERR, "\n");
-  io.puts(STDERR, "The URL carries a numeric address: there is no DNS resolver here, so the\n");
-  io.puts(STDERR, "hostname is given separately and is what the certificate must match.\n");
+  io.puts(STDERR, "The hostname is what the certificate must match: the one in the URL, or the\n");
+  io.puts(STDERR, "second argument when the URL carries a numeric address.\n");
   halt(1);
 end;
 
@@ -90,29 +93,23 @@ begin
   end
   else return false;
 
-  // ---- four numeric octets ----
-  k := 0;
-  while k < 4 do
+  // ---- the host: a name, or four numeric octets ----
+  uhostn := 0;
+  k := 0;                                // letters seen: none means it must be an address
+  while (i < n) and (url[i] <> ':') and (url[i] <> '/') do
   begin
-    v := 0;
-    oct := 0;
-    while (i < n) and (url[i] >= '0') and (url[i] <= '9') do
-    begin
-      v := v * 10 + (ord(url[i]) - ord('0'));
-      i := i + 1;
-      oct := oct + 1;
-    end;
-    // EVERY OCTET MUST HAVE DIGITS AND FIT IN A BYTE. Without this "http://.../" parses as
-    // four zeros and connects to 0.0.0.0, which fails much later and confusingly.
-    if (oct = 0) or (v > 255) then return false;
-    ip[k] := v;
-    if k < 3 then
-    begin
-      if (i >= n) or (url[i] <> '.') then return false;
-      i := i + 1;
-    end;
-    k := k + 1;
+    if uhostn >= len(uhost) then return false;
+    if ((url[i] >= 'a') and (url[i] <= 'z')) or ((url[i] >= 'A') and (url[i] <= 'Z')) or (url[i] = '-') or (url[i] = '_') then k := k + 1
+    else if not (((url[i] >= '0') and (url[i] <= '9')) or (url[i] = '.')) then return false;
+    uhost[uhostn] := url[i];
+    uhostn := uhostn + 1;
+    i := i + 1;
   end;
+  if uhostn = 0 then return false;
+  // ONLY DIGITS AND DOTS MEANS AN ADDRESS, and then every octet must have digits and fit in
+  // a byte. Without this "http://.../" or "https://999.1.1.1/" would go to the resolver as a
+  // name and fail much later, and confusingly.
+  if (k = 0) and (dns.parseip(uhost[0..uhostn - 1]) < 0) then return false;
 
   // ---- optional port ----
   if (i < n) and (url[i] = ':') then
@@ -225,10 +222,11 @@ end;
 begin
   if argc() < 2 then usage;
   n := io.argstr(1, url);
-  if not parseurl(n) then die("that URL does not parse; it needs a numeric address");
+  if not parseurl(n) then die("that URL does not parse");
 
-  // The hostname: the second argument when given, otherwise the address itself, which will
-  // not match any certificate -- so https without a hostname needs --insecure.
+  // The hostname: the second argument when given, otherwise the name in the URL. A numeric
+  // URL without a second argument has none, and no certificate matches an address -- so
+  // https then needs --insecure.
   hostn := 0;
   insecure := false;
   cafile := 0;
@@ -257,8 +255,22 @@ begin
     i := i + 1;
   end;
 
-  fd := net.connect(ip[0], ip[1], ip[2], ip[3], port);
-  if fd < 0 then die("cannot connect");
+  // A NAME IN THE URL IS ALSO THE NAME TO CHECK, unless the second argument said otherwise.
+  if (hostn = 0) and (dns.parseip(uhost[0..uhostn - 1]) < 0) then
+  begin
+    i := 0;
+    while i < uhostn do begin host[i] := uhost[i]; i := i + 1; end;
+    hostn := uhostn;
+  end;
+
+  fd := dns.connect(uhost[0..uhostn - 1], port);
+  if fd < 0 then
+  begin
+    io.puts(STDERR, "wget: cannot connect: ");
+    io.puts(STDERR, dns.error(fd));
+    io.puts(STDERR, "\n");
+    halt(1);
+  end;
 
   if https then
   begin

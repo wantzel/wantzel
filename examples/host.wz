@@ -1,0 +1,83 @@
+// host.wz -- look a hostname up, the way the `host` command does.
+//
+//   host example.com                     the nameservers in /etc/resolv.conf
+//   host example.com @192.168.1.1        this nameserver
+//   host example.com @127.0.0.1:5353     on another port
+//
+// It prints one line per address, "example.com has address 93.184.216.34", and exits 0;
+// a name that does not resolve gives one line on stderr saying WHY -- it does not exist,
+// the server failed, nobody answered -- and exit 1. Those are different problems with
+// different fixes, and lib/dns.wz keeps them apart so a tool can say which one it is.
+//
+// The whole resolver is lib/dns.wz: UDP to the configured server, TCP when the answer is
+// truncated, CNAME chains followed, a bounded wait. The same source builds a .exe, which
+// asks the DNS servers Windows is configured with.
+include "io.wz";
+include "dns.wz";
+
+var
+  name: array[0..255] of char;
+  srv:  array[0..63] of char;
+  addrs: array[0..DNS.MAXADDR - 1] of int;
+  line: array[0..511] of char;
+  n, sn, i, at, ip, port: int;
+
+procedure usage;
+begin
+  io.puts(STDERR, "usage: host <name> [@<nameserver>[:<port>]]\n");
+  halt(2);
+end;
+
+begin
+  if (argc() < 2) or (argc() > 3) then usage;
+  n := io.argstr(1, name);
+  if argc() = 3 then
+  begin
+    sn := io.argstr(2, srv);
+    if (sn < 2) or (srv[0] <> '@') then usage;
+    // @a.b.c.d or @a.b.c.d:port
+    i := 1;
+    while (i < sn) and (srv[i] <> ':') do i := i + 1;
+    ip := dns.parseip(srv[1..i - 1]);
+    if ip < 0 then
+    begin
+      io.puts(STDERR, "host: the nameserver must be a numeric IPv4 address\n");
+      halt(2);
+    end;
+    port := 53;
+    if i < sn then
+    begin
+      port := 0;
+      i := i + 1;
+      while (i < sn) and (srv[i] >= '0') and (srv[i] <= '9') do
+      begin
+        port := port * 10 + (ord(srv[i]) - ord('0'));
+        i := i + 1;
+      end;
+      if (i < sn) or (port < 1) or (port > 65535) then usage;
+    end;
+    dns.noservers;
+    if not dns.addserver(ip shr 24, band(ip shr 16, 255), band(ip shr 8, 255), band(ip, 255), port) then usage;
+  end;
+
+  n := dns.resolve(name[0..n - 1], addrs);
+  if n < 0 then
+  begin
+    io.puts(STDERR, "host: ");
+    io.out(STDERR, addr(name[0]), io.argstr(1, name));
+    io.puts(STDERR, ": ");
+    io.puts(STDERR, dns.error(n));
+    io.puts(STDERR, "\n");
+    halt(1);
+  end;
+  i := 0;
+  while i < n do
+  begin
+    at := io.argstr(1, line);
+    at := io.push(line, at, " has address ");
+    at := dns.ipstr(line, at, addrs[i]);
+    at := io.push(line, at, "\n");
+    io.out(STDOUT, addr(line[0]), at);
+    i := i + 1;
+  end;
+end.

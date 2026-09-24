@@ -1,11 +1,12 @@
 // serve.wz -- one binary that serves HTTP and HTTPS, gets its own certificate, and keeps it.
 //
-//   serve <port80> <port443> <hostname> [--acme a.b.c.d:port] [--email <address>]
+//   serve <port80> <port443> <hostname>
 //
 // WHAT THIS DEMONSTRATES, and it is an architecture rather than a feature: there is no
-// reverse proxy, no certbot, no cron, no shell hook and no second process. One accept loop
-// answers plain HTTP, terminates TLS, serves the ACME challenge while an order is pending,
-// and renews on a timer -- all in the same event loop, with the key in memory.
+// reverse proxy, no certbot, no cron, no shell hook and no second process. One event loop
+// answers plain HTTP, terminates TLS for many clients at once, serves the ACME challenge
+// while an order is pending, and picks up a renewed certificate -- all in the same loop,
+// with the key in memory.
 //
 // WHY THAT IS WORTH THE TROUBLE. Not microseconds: it is that there is no second thing to
 // misconfigure, forget to upgrade, or have fall over on its own. The same argument as zero
@@ -18,14 +19,23 @@
 // each able to be wrong. Here the listener that is already accepting connections serves the
 // token, because it is the same listener.
 //
-// NO THREADS AND NO FORK, deliberately. One epoll loop, non-blocking sockets, and the
-// handshake driven as part of it. A second concurrency mechanism costs more than the
-// milliseconds it would save -- see the note in the ticket this came from.
+// NO THREADS AND NO FORK, deliberately. One epoll loop and non-blocking sockets. Every TLS
+// connection has its own session in lib/tls.wz, and the loop hands each one the bytes that
+// arrived: a handshake advances as its records come in, so a client that sends half a
+// ClientHello and stops holds its own connection and nobody else's. A second concurrency
+// mechanism would cost more than the milliseconds it saved.
 //
-// WHAT IS NOT HERE: the renewal timer fires and re-runs the order, but this example does
-// not persist the account key across restarts (certstore.wz does that; wiring it in is a
-// line of code and a decision about where the directory lives). And it serves one fixed
-// page rather than files, because the point is the plumbing, not the content.
+// A NEW CERTIFICATE IS PICKED UP WHILE RUNNING. Once a second the loop looks at cert.der
+// and key.hex beside it; when either changed, the pair is loaded and installed with
+// tls.setcert. The next handshake uses it and every open connection carries on. A pair
+// that does not match -- a renewal caught halfway through writing -- is refused, and the
+// old certificate keeps serving until the files agree.
+//
+// WHAT IS NOT HERE: the renewal timer says when renewal is due but does not run the order
+// itself, and this example does not persist the account key across restarts (certstore.wz
+// does that; wiring it in is a line of code and a decision about where the directory
+// lives). And it serves one fixed page rather than files, because the point is the
+// plumbing, not the content.
 
 include "io.wz";
 include "net.wz";
@@ -36,27 +46,41 @@ include "certstore.wz";
 include "fs.wz";
 
 const
-  MAXEV     = 64;
-  MAXCONN   = 64;             // enough for a demonstration; an epoll loop scales far past it
-  BUF       = 16384;
+  MAXEV      = 256;
+  MAXCONN    = 1024;          // connections at once, plain and TLS together
+  MAXFD      = 65536;         // file descriptors are mapped to a slot through a table this big
+  RAWBUF     = 16384;         // one read from a socket; shared, since nothing is left in it
+  INBUF      = 8192;          // a request, decrypted, per connection
+  OUTBUF     = 20480;         // bytes waiting to go out, per connection: at most the handshake
+  DEADLINE   = 10;            // seconds a connection has to deliver its request
   RENEWEVERY = 86400;         // check once a day; Let's Encrypt certificates last 90
 
-  // What a connection is doing. The state machine is the whole reason this fits in one
-  // loop: nothing here ever waits.
+  // What a connection is. The state machine is the whole reason this fits in one loop:
+  // nothing here ever waits.
   ST_FREE   = 0;
   ST_PLAIN  = 1;              // an HTTP connection on port 80
-  ST_TLS    = 2;              // a TLS connection, handshake done
-  ST_CLOSE  = 3;
+  ST_TLS    = 2;              // a TLS connection; its session knows how far it got
 
 var
-  // the connection table, indexed by slot rather than by fd: a fd can be reused the moment
+  // THE CONNECTION TABLE, indexed by slot rather than by fd: a fd can be reused the moment
   // it is closed, and a table keyed on it would hand the new connection the old state.
-  cfd:    array[0..MAXCONN-1] of int;
-  cstate: array[0..MAXCONN-1] of int;
-  cplain: array[0..MAXCONN-1] of bool;
+  // fdslot maps the other way, for the events epoll reports by fd.
+  cfd:      array[0..MAXCONN-1] of int;
+  cstate:   array[0..MAXCONN-1] of int;
+  csess:    array[0..MAXCONN-1] of int;    // the TLS session
+  cinn:     array[0..MAXCONN-1] of int;    // request bytes in cin
+  cosend:   array[0..MAXCONN-1] of int;    // first byte in cout still to send
+  coend:    array[0..MAXCONN-1] of int;    // one past the last
+  cdue:     array[0..MAXCONN-1] of int;    // when this connection is given up, in seconds
+  cclosing: array[0..MAXCONN-1] of bool;   // close once cout is sent
+  cwantout: array[0..MAXCONN-1] of bool;   // epoll is also watching for writability
+  cin:      array[0..MAXCONN * INBUF - 1] of char;
+  cout:     array[0..MAXCONN * OUTBUF - 1] of char;
+  fdslot:   array[0..MAXFD-1] of int;      // slot + 1, 0 = none
+  nconn:    int;
 
-  rbuf:  array[0..BUF-1] of char;
-  wbuf: array[0..BUF-1] of char;
+  rbuf:  array[0..RAWBUF-1] of char;
+  wbuf:  array[0..INBUF-1] of char;
 
   host:   array[0..255] of char;
   hostn:  int;
@@ -69,6 +93,8 @@ var
   evs: array[0..MAXEV * 12 - 1] of char;
   havecert: bool;
   nextrenew: int;
+  lastsweep: int;
+  ignored: bool;
 
 procedure die(m: str);
 begin
@@ -78,15 +104,31 @@ begin
   halt(1);
 end;
 
+function nowsec: int;
+begin
+  return io.now div 1000000000;
+end;
+
+// A slot for a new connection, or -1 when the table is full.
 function slotfor(fd: int): int;
 var i: int;
 begin
+  if (fd < 0) or (fd >= MAXFD) then return 0 - 1;
   i := 0;
   while i < MAXCONN do
   begin
     if cstate[i] = ST_FREE then
     begin
       cfd[i] := fd;
+      cinn[i] := 0;
+      cosend[i] := 0;
+      coend[i] := 0;
+      cclosing[i] := false;
+      cwantout[i] := false;
+      csess[i] := 0 - 1;
+      cdue[i] := nowsec + DEADLINE;
+      fdslot[fd] := i + 1;
+      nconn := nconn + 1;
       return i;
     end;
     i := i + 1;
@@ -95,23 +137,56 @@ begin
 end;
 
 function slotof(fd: int): int;
-var i: int;
 begin
-  i := 0;
-  while i < MAXCONN do
-  begin
-    if (cstate[i] <> ST_FREE) and (cfd[i] = fd) then return i;
-    i := i + 1;
-  end;
-  return 0 - 1;
+  if (fd < 0) or (fd >= MAXFD) then return 0 - 1;
+  return fdslot[fd] - 1;
 end;
 
 procedure closeslot(i: int);
 begin
   if cstate[i] = ST_FREE then return;
+  if csess[i] >= 0 then tls.free(csess[i]);
+  csess[i] := 0 - 1;
+  fdslot[cfd[i]] := 0;
   net.close(cfd[i]);
   cstate[i] := ST_FREE;
   cfd[i] := 0 - 1;
+  nconn := nconn - 1;
+end;
+
+// Send what is waiting in cout. A socket that takes only part of it gets watched for
+// writability, and the rest goes when epoll says there is room -- never a busy retry.
+procedure flush(i: int);
+var r, ob: int;
+begin
+  ob := i * OUTBUF;
+  while cosend[i] < coend[i] do
+  begin
+    r := net.send(cfd[i], addr(cout[ob + cosend[i]]), coend[i] - cosend[i]);
+    if r > 0 then cosend[i] := cosend[i] + r
+    else if r = EAGAIN then
+    begin
+      if not cwantout[i] then
+      begin
+        if not net.watch(ep, EPOLL_MOD, cfd[i], bor(EPOLLIN, EPOLLOUT)) then begin closeslot(i); return; end;
+        cwantout[i] := true;
+      end;
+      return;
+    end
+    else
+    begin
+      closeslot(i);
+      return;
+    end;
+  end;
+  cosend[i] := 0;
+  coend[i] := 0;
+  if cclosing[i] then begin closeslot(i); return; end;
+  if cwantout[i] then
+  begin
+    if not net.watch(ep, EPOLL_MOD, cfd[i], EPOLLIN) then begin closeslot(i); return; end;
+    cwantout[i] := false;
+  end;
 end;
 
 // ---- what we answer ------------------------------------------------------------------------
@@ -207,36 +282,81 @@ begin
     m := io.push(wbuf, m, "/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
   end
   else m := buildreply("wantzel: no certificate yet\n", "text/plain");
-  // THE RESULT IS IGNORED ON PURPOSE: the connection is closed either way, and a partial
-  // send on a reply this small means the peer is gone. Retrying it would be a loop that
-  // never ends for a client that has already left.
-  j := net.send(cfd[i], addr(wbuf[0]), m);
-  closeslot(i);
+  j := 0;
+  while j < m do begin cout[i * OUTBUF + j] := wbuf[j]; j := j + 1; end;
+  coend[i] := m;
+  cclosing[i] := true;
+  flush(i);
 end;
 
-procedure handletls(i: int; n: int);
-var m: int;
+// Has the whole request head arrived? A blank line ends it.
+function requestdone(i: int): bool;
+var b, j: int;
 begin
+  b := i * INBUF;
+  j := 3;
+  while j < cinn[i] do
+  begin
+    if (cin[b + j] = chr(10)) and (cin[b + j - 1] = chr(13)) and (cin[b + j - 2] = chr(10)) then return true;
+    j := j + 1;
+  end;
+  return false;
+end;
+
+// The reply, encrypted into cout, then our close_notify behind it.
+procedure handletls(i: int);
+var m, n, ob: int;
+begin
+  ob := i * OUTBUF;
   m := buildreply("hello from a Wantzel binary, over its own TLS\n", "text/plain");
-  if not tls.write(wbuf, m) then closeslot(i);
-  tls.close;
-  closeslot(i);
+  n := tls.seal(csess[i], wbuf[0..m - 1], cout[ob + coend[i]..ob + OUTBUF - 1]);
+  if n < 0 then begin closeslot(i); return; end;
+  coend[i] := coend[i] + n;
+  coend[i] := coend[i] + tls.shut(csess[i], cout[ob + coend[i]..ob + OUTBUF - 1]);
+  cclosing[i] := true;
+end;
+
+// Bytes arrived on a TLS connection: give them to its session, and act on what comes back.
+procedure handletlsin(i: int; n: int);
+var used, s, ib, ob, j: int;
+begin
+  s := csess[i];
+  ib := i * INBUF;
+  ob := i * OUTBUF;
+  // Whatever still waits to be sent moves to the front, so the session has the most room.
+  if cosend[i] > 0 then
+  begin
+    j := 0;
+    while j < coend[i] - cosend[i] do begin cout[ob + j] := cout[ob + cosend[i] + j]; j := j + 1; end;
+    coend[i] := coend[i] - cosend[i];
+    cosend[i] := 0;
+  end;
+  used := tls.feed(s, rbuf[0..n - 1], cin[ib + cinn[i]..ib + INBUF - 1], cout[ob + coend[i]..ob + OUTBUF - 1]);
+  coend[i] := coend[i] + tls.wiren;
+  cinn[i] := cinn[i] + tls.appn;
+  // A FAILED SESSION STILL HAS SOMETHING TO SAY: the alert is in cout. Send it, then close.
+  if used < 0 then cclosing[i] := true
+  else if tls.state(s) = TLS.ST.CLOSED then cclosing[i] := true
+  else if used < n then cclosing[i] := true      // a request larger than INBUF: refused
+  else if (tls.state(s) = TLS.ST.OPEN) and requestdone(i) then handletls(i);
+  if cstate[i] <> ST_FREE then flush(i);
 end;
 
 // ---- the certificate on disk -------------------------------------------------------------
 //
-// TWO FILES BESIDE THE BINARY: cert.der (the chain, DER) and key.hex (the private scalar as
-// hex). Both are read once at startup and the key then lives only in memory.
+// TWO FILES BESIDE THE BINARY: cert.der (the chain, DER certificates back to back, leaf
+// first) and key.hex (the private scalar as hex). The key then lives only in memory.
 //
 // THE KEY AS HEX AND NOT DER is a simplification this example can afford: a real deployment
 // stores a PKCS#8 file and parses it, which is der.wz work and not architecture. What
 // matters here is that the disk is a CACHE and not a channel -- nothing coordinates through
 // it, and losing it costs a renewal rather than the service.
 var
-  certbuf: array[0..8191] of char;
+  certbuf: array[0..16383] of char;
   keyhex:  array[0..127] of char;
   mykey:   array[0..P.N-1] of int;
   cpath:   array[0..255] of char;
+  seencert, seenkey: int;          // mtime * 1000000 + size of what was last looked at
 
 function readfile(name: str; dst: array of char; max: int): int;
 var base, n, i: int;
@@ -252,6 +372,17 @@ begin
   while i < n do begin dst[i] := chr(peek(base + i)); i := i + 1; end;
   fs.unmap(base, fs.size);
   return n;
+end;
+
+// What a file looks like from outside -- its time and size -- or 0 when it is not there.
+function stamp(name: str): int;
+var i: int;
+begin
+  i := 0;
+  while i < slen(name) do begin cpath[i] := schar(name, i); i := i + 1; end;
+  cpath[i] := chr(0);
+  if not fs.stat(addr(cpath[0])) then return 0;
+  return fs.mtime * 1000000 + fs.size;
 end;
 
 // One hex digit, or -1. A file with anything else in it is refused rather than read as
@@ -290,95 +421,123 @@ begin
   return tls.setcert(certbuf, cn, mykey);
 end;
 
+// Once a second: did cert.der or key.hex change? Then install the pair -- if it matches.
+// The stamps are remembered either way, so a refused pair is tried again only when one of
+// the files changes again, not every second.
+procedure reloadcert;
+var c, k: int;
+begin
+  c := stamp("cert.der");
+  k := stamp("key.hex");
+  if (c = seencert) and (k = seenkey) then return;
+  seencert := c;
+  seenkey := k;
+  if (c = 0) or (k = 0) then return;
+  if loadcert then
+  begin
+    havecert := true;
+    io.puts(STDOUT, "serve: certificate installed; open connections carry on\n");
+  end
+  else
+  begin
+    io.puts(STDERR, "serve: the certificate on disk was not installed: ");
+    io.puts(STDERR, tls.why);
+    io.puts(STDERR, "\n");
+  end;
+end;
+
 // ---- the loop ------------------------------------------------------------------------------
-//
-// ONE epoll, THREE kinds of event: a connection on 80, a connection on 443, and data on an
-// accepted socket. Nothing blocks, so a slow client cannot stall the others and a handshake
-// cannot stall an order.
-//
-// THE TLS HANDSHAKE IS THE ONE PLACE THIS EXAMPLE SIMPLIFIES. tls.accept drives the whole
-// exchange before returning, which on a non-blocking socket means it can fail with nothing
-// read yet. A production server turns that into a state machine like the rest of the loop;
-// doing so here would triple the size of the example without showing anything new about the
-// architecture. The ticket says as much: measure first, and only then split it up.
+
+// Take every connection waiting on a listener: level-triggered epoll would report the rest
+// again, but one wake-up per connection is a wasted system call per connection.
+procedure acceptall(lfd: int; tls443: bool);
+var n, i, k: int;
+begin
+  k := 0;
+  while k < MAXEV do
+  begin
+    n := net.accept(lfd);
+    if n < 0 then return;
+    i := slotfor(n);
+    if i < 0 then net.close(n)
+    else
+    begin
+      // NO CERTIFICATE, NO SESSION: the TLS connection is closed at once, since there is
+      // nothing to shake hands with. tls.open also says -1 when every session is in use.
+      if tls443 then
+      begin
+        cstate[i] := ST_TLS;
+        if havecert then csess[i] := tls.open;
+      end
+      else cstate[i] := ST_PLAIN;
+      // A FAILED nonblock LEAVES A BLOCKING SOCKET IN AN EPOLL LOOP, which is how one slow
+      // client stalls every other -- lib/net.wz says so at the routine. So it is checked,
+      // and a socket that cannot be set is dropped rather than accepted into the loop.
+      if tls443 and (csess[i] < 0) then closeslot(i)
+      else if not net.nonblock(n) then closeslot(i)
+      else if not net.watch(ep, EPOLL_ADD, n, EPOLLIN) then closeslot(i);
+    end;
+    k := k + 1;
+  end;
+end;
+
+// Give up on connections past their deadline: a client that connects and says nothing, or
+// sends half a handshake and stops, holds a slot and a session until then -- and no longer.
+procedure sweep;
+var i, now: int;
+begin
+  now := nowsec;
+  if now = lastsweep then return;
+  lastsweep := now;
+  i := 0;
+  while i < MAXCONN do
+  begin
+    if (cstate[i] <> ST_FREE) and (now > cdue[i]) then closeslot(i);
+    i := i + 1;
+  end;
+  reloadcert;
+end;
+
+// ONE epoll, THREE kinds of event: a connection on 80, a connection on 443, and a socket
+// that is readable or writable. Nothing blocks, so a slow client cannot stall the others
+// and a handshake cannot stall an order.
 procedure loop;
-var nev, k, fd, i, n: int;
+var nev, k, fd, i, n, evmask: int;
 begin
   while true do
   begin
-    // THE TIMEOUT IS NOT DECORATION: a loop that only wakes on I/O never notices that a
-    // certificate is expiring on a quiet server. One second is far more often than needed
-    // and costs nothing.
+    // THE TIMEOUT IS NOT DECORATION: a loop that only wakes on I/O never notices a
+    // deadline passing, a certificate changing, or a renewal falling due on a quiet server.
     nev := net.wait(ep, addr(evs[0]), MAXEV, 1000);
     if nev < 0 then nev := 0;
     k := 0;
     while k < nev do
     begin
+      evmask := io.get32(evs, k * 12);
       fd := io.get32(evs, k * 12 + 4);
-      if fd = lfd80 then
-      begin
-        n := net.accept(lfd80);
-        if n >= 0 then
-        begin
-          i := slotfor(n);
-          if i < 0 then net.close(n)
-          else
-          begin
-            cstate[i] := ST_PLAIN;
-            cplain[i] := true;
-            // A FAILED nonblock LEAVES A BLOCKING SOCKET IN AN EPOLL LOOP, which is how
-            // one slow client stalls every other -- lib/net.wz says so at the routine. So
-            // it is checked, and a socket that cannot be set is dropped rather than
-            // accepted into the loop.
-            if not net.nonblock(n) then closeslot(i)
-            else if not net.watch(ep, EPOLL_ADD, n, EPOLLIN) then closeslot(i);
-          end;
-        end;
-      end
-      else if fd = lfd443 then
-      begin
-        n := net.accept(lfd443);
-        if n >= 0 then
-        begin
-          if not havecert then net.close(n)
-          else
-          begin
-            i := slotfor(n);
-            if i < 0 then net.close(n)
-            else
-            begin
-              // THE HANDSHAKE RUNS ON A BLOCKING SOCKET, on purpose: see the note above.
-              // It is the one thing in this loop that waits, and it is bounded by the
-              // socket's own timeout rather than by us.
-              cstate[i] := ST_TLS;
-              cplain[i] := false;
-              if tls.accept(n) then
-              begin
-                n := tls.read(rbuf, BUF);
-                if n > 0 then handletls(i, n) else closeslot(i);
-              end
-              else closeslot(i);
-            end;
-          end;
-        end;
-      end
+      if fd = lfd80 then acceptall(lfd80, false)
+      else if fd = lfd443 then acceptall(lfd443, true)
       else
       begin
         i := slotof(fd);
         if i >= 0 then
         begin
-          n := net.recv(fd, addr(rbuf[0]), BUF);
-          if n <= 0 then closeslot(i)
-          else if cplain[i] then handleplain(i, n)
-          else closeslot(i);
+          if band(evmask, EPOLLOUT) <> 0 then flush(i);
+          if (cstate[i] <> ST_FREE) and (cfd[i] = fd) and (band(evmask, bor(EPOLLIN, bor(EPOLLHUP, EPOLLERR))) <> 0) then
+          begin
+            n := net.recv(fd, addr(rbuf[0]), RAWBUF);
+            if n = EAGAIN then ignored := true
+            else if n <= 0 then closeslot(i)
+            else if cstate[i] = ST_PLAIN then handleplain(i, n)
+            else handletlsin(i, n);
+          end;
         end;
       end;
       k := k + 1;
     end;
+    sweep;
 
-    // THE RENEWAL TIMER, in the same loop and without a cron. It fires on a clock rather
-    // than on an event, which is why the wait above has a timeout: a loop that only wakes
-    // on I/O never notices that a certificate is expiring on a quiet server.
+    // THE RENEWAL TIMER, in the same loop and without a cron.
     if (nextrenew > 0) and (io.realtime div 1000000000 > nextrenew) then
     begin
       io.puts(STDOUT, "serve: renewal is due\n");
@@ -404,11 +563,11 @@ begin
   ep := net.epoll;
   if ep < 0 then die("cannot make an epoll");
 
-  lfd80 := net.listen(io.argn(1), 128, false);
+  lfd80 := net.listen(io.argn(1), 1024, false);
   if lfd80 < 0 then die("cannot listen on the plain port");
   if not net.watch(ep, EPOLL_ADD, lfd80, EPOLLIN) then die("cannot watch the plain port");
 
-  lfd443 := net.listen(io.argn(2), 128, false);
+  lfd443 := net.listen(io.argn(2), 1024, false);
   if lfd443 < 0 then die("cannot listen on the TLS port");
   if not net.watch(ep, EPOLL_ADD, lfd443, EPOLLIN) then die("cannot watch the TLS port");
 
@@ -416,6 +575,8 @@ begin
   // obtained a certificate yesterday must come back up serving it, without asking the
   // authority again. The files are a CACHE -- the key lives in memory once loaded, and a
   // read-only disk means no renewal rather than no service.
+  seencert := stamp("cert.der");
+  seenkey := stamp("key.hex");
   havecert := loadcert;
   if havecert then io.puts(STDOUT, "serve: certificate loaded from disk\n");
   tokenn := 0;

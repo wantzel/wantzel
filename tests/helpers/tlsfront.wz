@@ -1,0 +1,174 @@
+// tlsfront.wz -- HTTPS in front of a plain HTTP server, for tests that need a client to
+// verify a real certificate chain.
+//
+//   tlsfront <port> <backend-port> <cert.der> <key-hex>
+//
+// WHY IT EXISTS. The ACME fixture (acmesrv.wz) speaks plain HTTP, and a client that talks
+// to an authority must not: it has to see a certificate, check it chains to a root it
+// trusts, and refuse the connection otherwise. This terminates TLS with a certificate the
+// test made (signed by a test CA), and passes each request through to the fixture
+// unchanged -- so the client under test takes exactly the path it takes against the real
+// authority, verification included.
+//
+// ONE CONNECTION AT A TIME, request and reply in full, then close. The client under test
+// sends one request per connection, and a fixture has no reason to be cleverer than that.
+//
+// Linux only, like the rest of the fixture: it blocks the accepted socket and bounds its
+// reads with SO_RCVTIMEO.
+
+include "io.wz";
+include "net.wz";
+include "tls.wz";
+
+var
+  cert:  array[0..8191] of char;
+  certn: int;
+  key:   array[0..P.N-1] of int;
+  kb:    array[0..31] of char;
+  arg:   array[0..1023] of char;
+  req:   array[0..65535] of char;
+  reqn:  int;
+  rep:   array[0..131071] of char;
+  repn:  int;
+  tv:    array[0..15] of char;
+  ts:    array[0..15] of char;
+  lfd, fd, bfd, bport, i, n, r: int;
+
+function hexval(c: char): int;
+begin
+  if (c >= '0') and (c <= '9') then return ord(c) - ord('0');
+  if (c >= 'a') and (c <= 'f') then return ord(c) - ord('a') + 10;
+  if (c >= 'A') and (c <= 'F') then return ord(c) - ord('A') + 10;
+  return 0;
+end;
+
+// Where the headers of b[0..n) end, or -1.
+function hdrend(b: array of char; n: int): int;
+var k: int;
+begin
+  k := 0;
+  while k + 3 < n do
+  begin
+    if (b[k] = chr(13)) and (b[k+1] = chr(10)) and (b[k+2] = chr(13)) and (b[k+3] = chr(10)) then return k + 4;
+    k := k + 1;
+  end;
+  return 0 - 1;
+end;
+
+function lower(c: char): char;
+begin
+  if (c >= 'A') and (c <= 'Z') then return chr(ord(c) + 32);
+  return c;
+end;
+
+// The Content-Length of the message in b[0..he), or 0.
+function clen(b: array of char; he: int): int;
+var k, j, v: int;
+    name: str;
+begin
+  name := "content-length:";
+  k := 0;
+  while k + 15 < he do
+  begin
+    if (k = 0) or (b[k - 1] = chr(10)) then
+    begin
+      j := 0;
+      while (j < 15) and (lower(b[k + j]) = schar(name, j)) do j := j + 1;
+      if j = 15 then
+      begin
+        j := k + 15;
+        while b[j] = ' ' do j := j + 1;
+        v := 0;
+        while (b[j] >= '0') and (b[j] <= '9') do begin v := v * 10 + (ord(b[j]) - ord('0')); j := j + 1; end;
+        return v;
+      end;
+    end;
+    k := k + 1;
+  end;
+  return 0;
+end;
+
+// Is the message in b[0..n) complete?
+function whole(b: array of char; n: int): bool;
+var he: int;
+begin
+  he := hdrend(b, n);
+  if he < 0 then return false;
+  return n >= he + clen(b, he);
+end;
+
+procedure serve(fd: int);
+var he: int;
+begin
+  // BLOCKING, with a short receive timeout: a client that verifies a chain takes a while
+  // between its handshake messages, and a non-blocking read here would give up first.
+  if sys3(SYS.fcntl, fd, F_SETFL, 0) < 0 then return;
+  io.put64(tv, 0, 0);
+  io.put64(tv, 8, 1000);
+  r := sys5(SYS.setsockopt, fd, SOL_SOCKET, 20, addr(tv[0]), 16);
+  if not tls.accept(fd) then return;
+  reqn := 0;
+  while (reqn < len(req)) and (not whole(req, reqn)) do
+  begin
+    n := tls.read(req[reqn..len(req) - 1], len(req) - reqn);
+    if n <= 0 then return;
+    reqn := reqn + n;
+  end;
+  bfd := net.connect(127, 0, 0, 1, bport);
+  if bfd < 0 then return;
+  i := 0;
+  while i < reqn do
+  begin
+    n := net.send(bfd, addr(req[i]), reqn - i);
+    if n <= 0 then begin net.close(bfd); return; end;
+    i := i + n;
+  end;
+  repn := 0;
+  while (repn < len(rep)) and (not whole(rep, repn)) do
+  begin
+    n := net.recv(bfd, addr(rep[repn]), len(rep) - repn);
+    if n <= 0 then break;
+    repn := repn + n;
+  end;
+  net.close(bfd);
+  he := hdrend(rep, repn);
+  if he < 0 then return;
+  if tls.write(rep, repn) then tls.close;
+end;
+
+begin
+  if argc() < 5 then
+  begin
+    io.puts(STDERR, "usage: tlsfront <port> <backend-port> <cert.der> <key-hex>\n");
+    halt(2);
+  end;
+  bport := io.argn(2);
+  n := io.argstr(3, arg);
+  arg[n] := chr(0);
+  fd := sys3(SYS.open, addr(arg[0]), O_RDONLY, 0);
+  if fd < 0 then begin io.puts(STDERR, "tlsfront: cannot read the certificate\n"); halt(1); end;
+  certn := sys3(SYS.read, fd, addr(cert[0]), len(cert));
+  sys1(SYS.close, fd);
+  n := io.argstr(4, arg);
+  if n <> 64 then begin io.puts(STDERR, "tlsfront: the key must be 64 hex digits\n"); halt(1); end;
+  i := 0;
+  while i < 32 do begin kb[i] := chr(hexval(arg[2 * i]) * 16 + hexval(arg[2 * i + 1])); i := i + 1; end;
+  p256.setup;
+  p256.frombytes(key, kb, 0);
+  if not tls.setcert(cert, certn, key) then begin io.puts(STDERR, "tlsfront: the key does not fit\n"); halt(1); end;
+  lfd := net.listen(io.argn(1), 16, false);
+  if lfd < 0 then begin io.puts(STDERR, "tlsfront: cannot listen\n"); halt(1); end;
+  io.puts(STDOUT, "LISTENING\n");
+  io.put64(ts, 0, 0);
+  io.put64(ts, 8, 2000000);
+  while true do
+  begin
+    fd := net.accept(lfd);
+    if fd < 0 then sys2(SYS.nanosleep, addr(ts[0]), 0)
+    else
+    begin
+      serve(fd);
+      net.close(fd);
+    end;
+  end;
+end.

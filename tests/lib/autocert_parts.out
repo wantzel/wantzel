@@ -1,0 +1,37 @@
+ok   an https URL: host, default port, path
+ok   a port, and no path means /
+ok   plain http is refused
+ok   a user part is refused
+ok   a port above 65535 is refused
+ok   a port with no digits is refused
+ok   no host is refused
+ok   a space in the path is refused
+ok   an IPv6 literal is refused rather than misread
+ok   a literal address
+ok   three octets are not an address
+ok   an octet above 255 is not an address
+ok   a name can be pinned
+ok   a pinned name, in any case
+ok   localhost
+ok   an unknown name is not guessed
+ok   a reply with a length: status, complete, body
+ok   a header is found whatever its case
+ok   a reply shorter than its length is not complete
+ok   a chunked body is put back together
+ok   a chunked body without its last chunk is not complete
+ok   a chunk that claims more than there is is refused
+ok   a 204 without a length is complete at its headers
+ok   a key to store
+ok   a key written as PEM reads back as the same key
+ok   a key whose scalar was damaged is refused
+ok   a PEM block that does not fit is refused, not truncated
+ok   no order, no answer
+ok   the token of the order is answered
+ok   a prefix of the token is not
+ok   nor a longer path
+ok   nor the token in another case
+ok   nor the token under another path
+ok   the error type is recognised
+ok   and not by a suffix of it
+ok   type and detail, with the escapes undone
+all passed

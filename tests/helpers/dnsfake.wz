@@ -1,0 +1,416 @@
+// dnsfake -- a nameserver small enough to be a test fixture, for lib/dns.wz.
+//
+//   dnsfake <port> <mode>      mode: normal | silent | sfail
+//
+// It listens on <port> over UDP and TCP on every address and answers from a fixed table
+// keyed on the name asked for. Every query it receives is printed as "udp <name>" or "tcp
+// <name>", so a test can count what reached the server (a cache hit must not). "silent"
+// logs and never answers; "sfail" answers everything with SERVFAIL. It stops by itself
+// after 60 seconds, so a test that dies without cleaning up leaves nothing running.
+//
+// THE NAMES, and what each is for:
+//   a.test          two A records, 10.1.2.3 and 10.1.2.4, TTL 60
+//   chain.test      CNAME c1.test, CNAME c2.test, A 10.9.8.7 -- compressed throughout, and
+//                   an unrelated A record for evil.test first, which must not be taken
+//   partial.test    CNAME a.test and no address: the resolver must ask for a.test itself
+//   nx.test         NXDOMAIN
+//   fail.test       SERVFAIL
+//   refused.test    REFUSED
+//   empty.test      no error and no answer: the name has no IPv4 address
+//   big.test        by UDP only the TC bit; by TCP three A records, 10.5.5.5..7
+//   wrongid.test    first a reply under the WRONG id (A 6.6.6.6), then one for the WRONG
+//                   question (A 6.6.6.7), then the real one, A 10.7.7.7
+//   loop.test       an answer whose owner name is a compression pointer to itself
+//   loop2.test      a label followed by a pointer back to that label
+//   cnameloop.test  CNAME l2.test, and l2.test CNAME cnameloop.test
+//   ttl0.test       A 10.0.0.9 with TTL 0, which must not be cached
+//   nxsoa.test      NXDOMAIN with the zone's SOA in the authority section, as real servers
+//                   send it: the owner a pointer, MNAME and RNAME ending in pointers, the
+//                   RNAME's pointing into the MNAME of the same record
+//   nodatasoa.test  no error, no answer, and that SOA: the name has no IPv4 address
+//   unknown.test    a record of a type the resolver does not know, whose RDATA holds bytes
+//                   that look like pointers, before A 10.6.6.6: skipped by its RDLENGTH
+//   opt.test        A 10.4.4.4 and an OPT record (EDNS, with a cookie) in the additional
+//                   section
+//   referral.test   A 10.3.3.3, two NS records in the authority section and their glue in
+//                   the additional section (A 6.6.6.1, A 6.6.6.2) -- glue is not an answer
+//   anything else   NXDOMAIN
+
+include "io.wz";
+include "net.wz";
+
+var
+  port, mode, udp, lfd, ep, n, i, fd, t0, salen: int;
+  qb: array[0..4095] of char;       // the query as received
+  qn: int;
+  rb: array[0..4095] of char;       // the reply being built, after two bytes of TCP length
+  rn: int;
+  nm: array[0..255] of char;        // the question name, lower case, dotted
+  nmn, qend: int;
+  sa: array[0..15] of char;
+  sl: array[0..7] of char;
+  ev: array[0..95] of char;
+  ts: array[0..15] of char;
+  modes: array[0..15] of char;
+
+procedure nap(ms: int);
+var k: int;
+begin
+  k := 0;
+  while k < 16 do begin ts[k] := chr(0); k := k + 1; end;
+  io.put64(ts, 8, ms * 1000000);
+  sys2(SYS.nanosleep, addr(ts[0]), 0);
+end;
+
+function isname(s: str): bool;
+var k: int;
+begin
+  if nmn <> slen(s) then return false;
+  k := 0;
+  while k < nmn do
+  begin
+    if nm[k] <> schar(s, k) then return false;
+    k := k + 1;
+  end;
+  return true;
+end;
+
+// The question: its name into nm, and qend just past its type and class. False when the
+// query does not parse -- the fixture only has to read what the resolver sends.
+function readq: bool;
+var p, l, k: int;
+    c: char;
+begin
+  if qn < 17 then return false;
+  p := 12;
+  nmn := 0;
+  while true do
+  begin
+    if p >= qn then return false;
+    l := ord(qb[p]);
+    if l = 0 then break;
+    if (l > 63) or (p + 1 + l > qn) then return false;
+    if nmn > 0 then begin nm[nmn] := '.'; nmn := nmn + 1; end;
+    k := 0;
+    while k < l do
+    begin
+      c := qb[p + 1 + k];
+      if (c >= 'A') and (c <= 'Z') then c := chr(ord(c) + 32);
+      nm[nmn] := c;
+      nmn := nmn + 1;
+      k := k + 1;
+    end;
+    p := p + 1 + l;
+  end;
+  qend := p + 5;
+  return qend <= qn;
+end;
+
+procedure b(v: int);
+begin
+  rb[rn] := chr(band(v, 255));
+  rn := rn + 1;
+end;
+
+procedure b16(v: int);
+begin
+  b(v shr 8);
+  b(v);
+end;
+
+procedure lit(s: str);                 // bytes of a literal, as they are
+var k: int;
+begin
+  k := 0;
+  while k < slen(s) do begin b(ord(schar(s, k))); k := k + 1; end;
+end;
+
+// The header (id, flags, rcode, an answers) and the question copied from the query.
+procedure head(id: int; tc: bool; rcode: int; an: int);
+var k: int;
+begin
+  rn := 2;
+  b16(id);
+  if tc then b(0x83) else b(0x81);     // QR, RD, and TC when asked
+  b(0x80 + rcode);                     // RA
+  b16(1); b16(an); b16(0); b16(0);
+  k := 12;
+  while k < qend do begin b(ord(qb[k])); k := k + 1; end;
+end;
+
+// Set the authority and additional counts of the reply being built.
+procedure counts(ns: int; ar: int);
+begin
+  rb[10] := chr(ns shr 8); rb[11] := chr(band(ns, 255));
+  rb[12] := chr(ar shr 8); rb[13] := chr(band(ar, 255));
+end;
+
+// The SOA of the zone "test", owner and names compressed. tst is the message offset of the
+// "test" label in the question; the RNAME points back into the MNAME just written.
+procedure soa(tst: int);
+var mn: int;
+begin
+  b16(0xC000 + tst); b16(6); b16(1); b16(0); b16(3600);
+  b16(6 + 13 + 20);
+  mn := rn - 2;                        // where the MNAME starts, as a message offset
+  lit("\x03ns1"); b16(0xC000 + tst);  // ns1.test
+  lit("\x0ahostmaster"); b16(0xC000 + mn);   // hostmaster.ns1.test
+  b16(0); b16(2026);                   // serial
+  b16(0); b16(7200); b16(0); b16(900); b16(0x0012); b16(0x7500); b16(0); b16(300);
+end;
+
+// An A record whose owner is the compression pointer ptr (0xC00C is the question name).
+procedure arec(ptr: int; ttl: int; a1: int; a2: int; a3: int; a4: int);
+begin
+  b16(ptr); b16(1); b16(1);
+  b16(ttl shr 16); b16(ttl);
+  b16(4); b(a1); b(a2); b(a3); b(a4);
+end;
+
+// The reply for the current question into rb[2..rn), under id; tcp says how it will go.
+procedure answer(id: int; tcp: bool);
+var p1, p2, rd: int;
+begin
+  if mode = 2 then begin head(id, false, 2, 0); return; end;
+  if isname("a.test") then
+  begin
+    head(id, false, 0, 2);
+    arec(0xC00C, 60, 10, 1, 2, 3);
+    arec(0xC00C, 60, 10, 1, 2, 4);
+  end
+  else if isname("chain.test") then
+  begin
+    head(id, false, 0, 4);
+    // evil.test A 6.6.6.6, off the chain: "evil" and a pointer to the "test" label at 18
+    lit("\x04evil\xc0\x12"); b16(1); b16(1); b16(0); b16(300); b16(4); lit("\x06\x06\x06\x06");
+    // chain.test CNAME c1.test -- the rdata is "c1" and a pointer to "test"
+    b16(0xC00C); b16(5); b16(1); b16(0); b16(300);
+    p1 := rn - 2;                      // where c1's name will start, as a message offset
+    b16(5); lit("\x02c1\xc0\x12");
+    // c1.test CNAME c2.test
+    b16(0xC000 + p1 + 2); b16(5); b16(1); b16(0); b16(200);
+    p2 := rn - 2;
+    b16(5); lit("\x02c2\xc0\x12");
+    // c2.test A 10.9.8.7
+    arec(0xC000 + p2 + 2, 100, 10, 9, 8, 7);
+  end
+  else if isname("partial.test") then
+  begin
+    head(id, false, 0, 1);
+    b16(0xC00C); b16(5); b16(1); b16(0); b16(300);
+    b16(3); lit("\x01a\xc0\x14");      // a.test: "a" and a pointer to "test" (at 12 + 8)
+  end
+  else if isname("nx.test") then head(id, false, 3, 0)
+  else if isname("fail.test") then head(id, false, 2, 0)
+  else if isname("refused.test") then head(id, false, 5, 0)
+  else if isname("empty.test") then head(id, false, 0, 0)
+  else if isname("big.test") then
+  begin
+    if not tcp then head(id, true, 0, 0)
+    else
+    begin
+      head(id, false, 0, 3);
+      arec(0xC00C, 60, 10, 5, 5, 5);
+      arec(0xC00C, 60, 10, 5, 5, 6);
+      arec(0xC00C, 60, 10, 5, 5, 7);
+    end;
+  end
+  else if isname("loop.test") then
+  begin
+    head(id, false, 0, 1);
+    rd := rn - 2;                      // the owner is a pointer to where it itself stands
+    b16(0xC000 + rd); b16(1); b16(1); b16(0); b16(60); b16(4); lit("\x06\x06\x06\x06");
+  end
+  else if isname("loop2.test") then
+  begin
+    head(id, false, 0, 1);
+    rd := rn - 2;                      // the label "x", then a pointer back to it
+    lit("\x01x"); b16(0xC000 + rd); b16(1); b16(1); b16(0); b16(60); b16(4); lit("\x06\x06\x06\x06");
+  end
+  else if isname("cnameloop.test") then
+  begin
+    head(id, false, 0, 2);
+    b16(0xC00C); b16(5); b16(1); b16(0); b16(60);
+    p1 := rn - 2;
+    b16(5); lit("\x02l2\xc0\x16");     // l2.test: "test" is at 12 + 10
+    b16(0xC000 + p1 + 2); b16(5); b16(1); b16(0); b16(60);
+    b16(2); b16(0xC00C);               // back to cnameloop.test
+  end
+  else if isname("ttl0.test") then
+  begin
+    head(id, false, 0, 1);
+    arec(0xC00C, 0, 10, 0, 0, 9);
+  end
+  else if isname("nxsoa.test") then
+  begin
+    head(id, false, 3, 0);
+    counts(1, 0);
+    soa(qend - 10);                    // "\x04test\x00", type and class end the question
+  end
+  else if isname("nodatasoa.test") then
+  begin
+    head(id, false, 0, 0);
+    counts(1, 0);
+    soa(qend - 10);
+  end
+  else if isname("unknown.test") then
+  begin
+    head(id, false, 0, 2);
+    b16(0xC00C); b16(0xFF00); b16(1); b16(0); b16(60);
+    b16(7); lit("\xc0\x0c\xff\xc0\x00\x01\x02");
+    arec(0xC00C, 60, 10, 6, 6, 6);
+  end
+  else if isname("opt.test") then
+  begin
+    head(id, false, 0, 1);
+    counts(0, 1);
+    arec(0xC00C, 60, 10, 4, 4, 4);
+    b(0); b16(41); b16(1232); b16(0); b16(0);            // OPT: root owner, payload size
+    b16(12); b16(10); b16(8); lit("\x01\x02\x03\x04\x05\x06\x07\x08");   // a cookie
+  end
+  else if isname("referral.test") then
+  begin
+    head(id, false, 0, 1);
+    counts(2, 3);
+    arec(0xC00C, 60, 10, 3, 3, 3);
+    rd := qend - 10;                   // the "test" label
+    b16(0xC000 + rd); b16(2); b16(1); b16(0); b16(3600);
+    p1 := rn - 2;
+    b16(6); lit("\x03ns1"); b16(0xC000 + rd);
+    b16(0xC000 + rd); b16(2); b16(1); b16(0); b16(3600);
+    p2 := rn - 2;
+    b16(6); lit("\x03ns2"); b16(0xC000 + rd);
+    arec(0xC000 + p1 + 2, 3600, 6, 6, 6, 1);
+    arec(0xC000 + p2 + 2, 3600, 6, 6, 6, 2);
+    b(0); b16(41); b16(1232); b16(0); b16(0); b16(0);    // OPT without options
+  end
+  else head(id, false, 3, 0);
+end;
+
+procedure logq(s: str);
+begin
+  io.puts(STDOUT, s);
+  io.out(STDOUT, addr(nm[0]), nmn);
+  io.puts(STDOUT, "\n");
+end;
+
+procedure sendudp;
+var r: int;
+begin
+  r := sys6(SYS.sendto, udp, addr(rb[2]), rn - 2, 0, addr(sa[0]), salen);
+end;
+
+procedure onudp;
+var id: int;
+begin
+  io.put32(sl, 0, 16);
+  qn := sys6(45, udp, addr(qb[0]), len(qb), 0, addr(sa[0]), addr(sl[0]));   // recvfrom
+  if qn <= 0 then return;
+  salen := io.get32(sl, 0);
+  if not readq then return;
+  logq("udp ");
+  if mode = 1 then return;
+  id := ord(qb[0]) shl 8 + ord(qb[1]);
+  if (mode = 0) and isname("wrongid.test") then
+  begin
+    // under the wrong id, with an address that must never be taken
+    head(bxor(id, 0x5555), false, 0, 1);
+    arec(0xC00C, 60, 6, 6, 6, 6);
+    sendudp;
+    // under the right id, but for another question: "wrongid.tesu"
+    head(id, false, 0, 1);
+    rb[2 + qend - 6] := 'u';
+    arec(0xC00C, 60, 6, 6, 6, 7);
+    sendudp;
+    head(id, false, 0, 1);
+    arec(0xC00C, 60, 10, 7, 7, 7);
+    sendudp;
+    return;
+  end;
+  answer(id, false);
+  sendudp;
+end;
+
+// One TCP connection: a two-byte length and the query, then the reply the same way.
+procedure ontcp;
+var c, got, want, r, tries: int;
+begin
+  c := net.accept(lfd);
+  if c < 0 then return;
+  got := 0;
+  want := 0 - 1;
+  tries := 0;
+  while tries < 2000 do
+  begin
+    r := net.recv(c, addr(qb[got]), len(qb) - got);
+    if r > 0 then
+    begin
+      got := got + r;
+      if (want < 0) and (got >= 2) then want := ord(qb[0]) shl 8 + ord(qb[1]);
+      if (want >= 0) and (got >= want + 2) then break;
+    end
+    else if r = EAGAIN then begin nap(1); tries := tries + 1; end
+    else break;
+  end;
+  if (want < 0) or (got < want + 2) then begin net.close(c); return; end;
+  // the query without its length, where readq expects it
+  r := 0;
+  while r < want do begin qb[r] := qb[r + 2]; r := r + 1; end;
+  qn := want;
+  if readq then
+  begin
+    logq("tcp ");
+    if mode <> 1 then
+    begin
+      answer(ord(qb[0]) shl 8 + ord(qb[1]), true);
+      rb[0] := chr((rn - 2) shr 8);
+      rb[1] := chr(band(rn - 2, 255));
+      r := net.send(c, addr(rb[0]), rn);
+    end;
+  end;
+  net.close(c);
+end;
+
+begin
+  port := io.argn(1);
+  n := io.argstr(2, modes);
+  mode := 0;
+  if (n > 0) and (modes[0] = 's') and (modes[1] = 'i') then mode := 1;
+  if (n > 0) and (modes[0] = 's') and (modes[1] = 'f') then mode := 2;
+
+  udp := sys3(SYS.socket, AF_INET, 2, 0);
+  if udp < 0 then begin io.puts(STDERR, "dnsfake: no UDP socket\n"); halt(1); end;
+  net.setopt(udp, SO_REUSEADDR);
+  i := 0;
+  while i < 16 do begin sa[i] := chr(0); i := i + 1; end;
+  sa[0] := chr(AF_INET);
+  sa[2] := chr(port shr 8);
+  sa[3] := chr(band(port, 255));
+  if sys3(SYS.bind, udp, addr(sa[0]), 16) < 0 then begin io.puts(STDERR, "dnsfake: UDP port in use\n"); halt(1); end;
+  if not net.nonblock(udp) then halt(1);
+  lfd := net.listen(port, 16, false);
+  if lfd < 0 then begin io.puts(STDERR, "dnsfake: TCP port in use\n"); halt(1); end;
+  ep := net.epoll;
+  if not net.watch(ep, EPOLL_ADD, udp, EPOLLIN) then halt(1);
+  if not net.watch(ep, EPOLL_ADD, lfd, EPOLLIN) then halt(1);
+  io.puts(STDOUT, "ready\n");
+
+  t0 := io.now;
+  while io.now - t0 < 60000000000 do
+  begin
+    n := net.wait(ep, addr(ev[0]), 8, 200);
+    i := 0;
+    while i < n do
+    begin
+      fd := io.get32(ev, i * 12 + 4);
+      if fd = udp then
+      begin
+        // drain: several queries can be waiting
+        qn := 1;
+        while qn > 0 do onudp;
+      end
+      else ontcp;
+      i := i + 1;
+    end;
+  end;
+end.

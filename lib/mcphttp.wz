@@ -16,6 +16,11 @@
 // so no GET stream, and no sessions, so nothing to DELETE).  Every reply
 // carries Mcp-Protocol-Version with the version negotiated by initialize
 // (the newest we support until a client has initialized).
+//
+// Large messages: a request body over 256 kB needs http.maxbody(n) before http.serve, a
+// reply over 512 kB http.maxreply(n), and a reply larger than that becomes a JSON-RPC error
+// naming the size (see mcp.httproom) -- an MCP client cannot read the plain-text 500 it
+// would otherwise get.
 
 include "mcp.wz";
 include "http.wz";
@@ -29,9 +34,45 @@ begin
     else http.hdradd("Mcp-Protocol-Version: 2024-11-05");
 end;
 
+// Bytes of body the HTTP reply can still take (http.replyroom: up to http.maxreply, 512 kB
+// unless the program raised it).  http.addb past this point would set http.overflowed, and
+// http.finish would answer a plain-text 500 that an MCP client cannot read.  Asking first
+// lets the reply become a JSON-RPC error instead.
+function mcp.httproom: int;
+begin
+  return http.replyroom;
+end;
+
+// Answer the MCP message in b[at..last) into the HTTP reply.
+procedure mcp.httpanswer(b: array of char; at: int; last: int);
+var n, room: int;
+begin
+  n := mcp.handle(b, at, last);
+  mcp.pvheader;
+  if n = 0 then
+  begin
+    http.finish(202, "application/json");
+    return;
+  end;
+  room := mcp.httproom;
+  if n > room then
+  begin
+    mcp.over := MCP.OVER_REPLY;
+    mcp.overlimit := room;
+    n := mcp.limiterror(b);
+  end;
+  http.addb(view(mcp.obase, n), 0, n);
+  mcp.done;
+  http.finish(200, "application/json");
+end;
+
 // handle the current request as an MCP message and write the reply
+//
+// A body larger than the input buffer is in a region of its connection's (http.maxbody)
+// rather than in http.inbuf, so a server that accepts large MCP requests calls
+// http.maxbody before http.serve; without it such a request is refused by lib/http.wz
+// with 413.
 procedure mcp.http;
-var n: int;
 begin
   if http.method <> HTTP.POST then
   begin
@@ -40,13 +81,6 @@ begin
     http.finish(405, "text/plain");
     return;
   end;
-  n := mcp.handle(http.inbuf, http.bodyat, http.bodyat + http.bodylen);
-  mcp.pvheader;
-  if n = 0 then
-  begin
-    http.finish(202, "application/json");
-    return;
-  end;
-  http.addb(mcp.buf, 0, n);
-  http.finish(200, "application/json");
+  if http.bodyinbig then mcp.httpanswer(view(http.bigbase, http.bodylen), 0, http.bodylen)
+  else mcp.httpanswer(http.inbuf, http.bodyat, http.bodyat + http.bodylen);
 end;

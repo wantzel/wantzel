@@ -149,7 +149,7 @@ begin
     io.puts(STDOUT, "NOT A TOOL\n");
     return;
   end;
-  io.out(STDOUT, addr(http.outbuf[http.osend[0]]), http.oend[0] - http.osend[0]);
+  io.out(STDOUT, addr(http.outbuf[http.rstart]), http.rend - http.rstart);
   io.puts(STDOUT, "\n----\n");
 end;
 begin

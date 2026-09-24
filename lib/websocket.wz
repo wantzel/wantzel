@@ -199,7 +199,8 @@ end;
 // through http.header, same as any other header lib/http.wz exposes), send the 101,
 // and start watching fd on this module's own epoll set. Returns false when the
 // header is missing or malformed -- a non-browser client, or a plain GET with
-// Upgrade set but no key -- in which case the caller should close fd itself (it is
+// Upgrade set but no key -- and when the connection came over TLS (http.istls), which
+// this module cannot speak; in each case the caller should close fd itself (it is
 // NOT added to ws.open, so ws.dropconn/ws.poll never touch it).
 //
 // MUST BE CALLED AFTER http.detach := true AND BEFORE app.request RETURNS: that is
@@ -209,6 +210,9 @@ end;
 function ws.take(fd: int): bool;
 var n, i, acceptn: int;
 begin
+  // NOT OVER TLS: this module reads and writes the socket in the clear, and a TLS
+  // connection's session stays with lib/http.wz. Refused, so the caller closes it.
+  if http.istls then return false;
   if not http.header("sec-websocket-key") then return false;
   // THE VALUE IS ALWAYS 24 CHARACTERS: the key is 16 random bytes and base64 of 16
   // bytes is 24 with padding. Taking a fixed 24 rather than the whole header value

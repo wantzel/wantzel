@@ -1,6 +1,6 @@
-# lib/http.wz: http.maxbody(cap) lets ONE connection at a time read a body bigger than
-# INBUF (256 kB), through a single shared region reserved once with mmap -- not one region
-# per connection.
+# lib/http.wz: http.maxbody(cap) lets a connection read a body bigger than INBUF (256 kB)
+# into a region mapped for that body alone, released once it is answered -- nothing is
+# reserved up front, and nothing is multiplied by MAXCONN.
 #
 # TOETSGROEP: lib
 # DEKT: lib/http.wz
@@ -54,8 +54,8 @@ delta=$((after - before))
 echo "declared memory: without http.maxbody = $before bytes, with a 4 MB cap = $after bytes (delta $delta)"
 # The 4 MB asked for must NOT show up multiplied by MAXCONN (256) in the static image --
 # that would be >1 GB of delta.  A few hundred bytes for the new global fields is fine;
-# the 4 MB itself comes from mmap at run time, invisible to this measurement, which is
-# the point: one shared region, not 256 of them.
+# the 4 MB itself comes from mmap at run time, per body, invisible to this measurement,
+# which is the point.
 if [ "$delta" -gt 1048576 ]; then
   echo "http.maxbody(4 MB) grew the declared memory size by $delta bytes -- looks like it is being multiplied per connection, not shared"
   exit 1
@@ -83,15 +83,14 @@ code=$(curl -s -o "$T/big_out" -w '%{http_code}' -X POST --data-binary "@$T/big.
 assert_eq "a body within the configured cap is accepted" "$code" "200"
 assert_eq "the handler saw the whole body, not a truncated prefix" "$(cat "$T/big_out")" "$wantsize"
 
-# A normal small request right after must still work: the shared region is released after
-# use, not left owned by the connection that used it.
+# A normal small request right after must still work: the body's region is released after
+# use, not left with the connection that used it.
 small=$(curl -s "http://127.0.0.1:$port/small")
 assert_eq "a small request after the big one is still served" "$small" "small"
 
-# A SECOND big body while nothing else is using the region must also succeed -- proving the
-# region really is freed, not merely surviving because it was never reused.
+# A SECOND big body on another connection must also succeed.
 code2=$(curl -s -o "$T/big_out2" -w '%{http_code}' -X POST --data-binary "@$T/big.bin" "http://127.0.0.1:$port/big2")
-assert_eq "the shared region serves a second big body after the first" "$code2" "200"
+assert_eq "a second big body after the first is accepted" "$code2" "200"
 assert_eq "the second big body is also read in full" "$(cat "$T/big_out2")" "$wantsize"
 
-echo "http.maxbody lets one connection at a time read a body bigger than INBUF, without multiplying static memory by MAXCONN"
+echo "http.maxbody lets a connection read a body bigger than INBUF, without multiplying static memory by MAXCONN"

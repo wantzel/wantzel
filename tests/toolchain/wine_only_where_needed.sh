@@ -16,6 +16,11 @@
 # MEASURED 22-09-2026: 5 tests use wine, 5 do not, and --toolchain runs in 8 seconds.
 # The sixth, win_recv_reset.sh, has to run the program: whether a peer's reset reaches
 # recv as an error or as a byte count is invisible in the bytes of the executable.
+# The seventh, win_dns.sh, runs the resolver of lib/dns.wz: whether a UDP socket is UDP, a
+# non-blocking connect says EINPROGRESS, and GetNetworkParams answers are all questions about
+# what the program DOES.
+# The eighth, win_mcp_big.sh, runs an MCP server on a 10 MB message: whether an anonymous
+# mapping of that size is usable and really given back is invisible in the bytes too.
 . "$ROOT/tests/helpers.sh"
 cd "$ROOT"
 
@@ -37,7 +42,7 @@ done
 # THE CEILING IS A NUMBER HERE, not derived from the tests it guards. A limit read from the
 # thing it is watching grows with it and stops meaning anything -- which is exactly what a
 # gate elsewhere in this project did before it was caught by sabotage.
-CEILING=6
+CEILING=8
 if [ "$wine" -gt "$CEILING" ]; then
   echo "$wine Windows tests use wine, and the ceiling is $CEILING:"
   printf '%s\n' "$winelist" | tr ' ' '\n' | grep . | sed 's/^/  /'

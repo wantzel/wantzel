@@ -1,0 +1,71 @@
+// The blocking TLS client keeps a wall-clock deadline: a peer that goes silent before the
+// handshake, or in the middle of a record, costs tls.deadline and not forever. The peer is
+// this same process -- a connection it accepts and then never serves -- so nothing runs in
+// the background and nothing is left behind.
+include "io.wz";
+include "net.wz";
+include "proc.wz";
+include "tls.wz";
+
+var
+  lfd, port, tries, c, sv, t0, ms, n: int;
+  half: array[0..15] of char;
+
+procedure say(s: str; b: bool);
+begin
+  if b then io.puts(STDOUT, "ok   ") else io.puts(STDOUT, "FAIL ");
+  io.puts(STDOUT, s);
+  io.puts(STDOUT, "\n");
+end;
+
+// A connected pair: c is the client's end, sv the server's, accepted and never read.
+procedure pair;
+begin
+  c := net.connect(127, 0, 0, 1, port);
+  sv := 0 - 1;
+  tries := 0;
+  while (sv < 0) and (tries < 1000) do begin sv := net.accept(lfd); tries := tries + 1; end;
+  if (c < 0) or (sv < 0) then begin io.puts(STDOUT, "no connection\n"); halt(1); end;
+end;
+
+begin
+  // A FREE PORT, found by trying: two runs of this test must not need the same one.
+  port := 41000 + proc.self mod 7000;
+  lfd := net.listen(port, 4, false);
+  tries := 0;
+  while (lfd < 0) and (tries < 50) do
+  begin
+    port := port + 1;
+    lfd := net.listen(port, 4, false);
+    tries := tries + 1;
+  end;
+  if lfd < 0 then begin io.puts(STDOUT, "no port\n"); halt(1); end;
+
+  // ---- 1. the peer never says anything ----
+  pair;
+  tls.deadline := 400;
+  t0 := io.now;
+  say("a handshake with a silent peer fails", not tls.connect(c, "local.test"));
+  ms := (io.now - t0) div 1000000;
+  say("after the deadline, not before it", ms >= 380);
+  say("and not long after it", ms < 1500);
+  say("with the timeout as the reason", tls.err = 0 - 110);
+  net.close(c);
+  net.close(sv);
+
+  // ---- 2. the peer stops in the middle of a record ----
+  // A ServerHello record header promising 90 bytes, and 3 of them: the client has the
+  // header, waits for the rest, and it never comes.
+  pair;
+  half[0] := chr(22); half[1] := chr(3); half[2] := chr(3); half[3] := chr(0); half[4] := chr(90);
+  half[5] := chr(2); half[6] := chr(0); half[7] := chr(0);
+  n := net.send(sv, addr(half[0]), 8);
+  tls.deadline := 300;
+  t0 := io.now;
+  say("a peer that stops mid-record fails the handshake", not tls.connect(c, "local.test"));
+  ms := (io.now - t0) div 1000000;
+  say("within the deadline", (ms >= 280) and (ms < 1500));
+  say("with the timeout as the reason", tls.err = 0 - 110);
+  net.close(c);
+  net.close(sv);
+end.

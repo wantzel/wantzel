@@ -1,0 +1,40 @@
+ok   no session before a certificate is installed
+ok   a certificate with the wrong key is refused
+ok   and no certificate is installed by it
+ok   the right pair is installed
+ok   a session opens
+ok   and is handshaking
+ok   a ClientHello split into 7-byte records, fed a byte at a time, completes a handshake
+ok   the server sent nothing until the last byte of the ClientHello
+ok   the certificate it sent is the one installed
+ok   client to server: application data arrives
+ok   server to client: tls.seal produces a record the client opens
+ok   a KeyUpdate is taken
+ok   and answered with our own, under the old key
+ok   data after it, client to server, under the new key
+ok   and server to client, under the new key
+ok   plain HTTP on a TLS session fails that session
+ok   with an unexpected_message alert, in the clear
+ok   a record claiming 65535 bytes is refused before anything is buffered
+ok   a second handshake, the ClientHello in one piece
+ok   a tampered record fails its session with bad_record_mac
+ok   and the alert goes out encrypted
+ok   the first session is still established
+ok   and still carries data
+ok   a new chain of two certificates is installed while a session is open
+ok   a new handshake after the swap
+ok   presents the new leaf
+ok   and the whole chain, one entry per certificate
+ok   the session opened before the swap still carries data
+ok   in both directions
+ok   a mismatched pair does not replace the installed one
+ok   so the next handshake still presents the second chain
+ok   close_notify from the client closes the session
+ok   tls.shut answers with ours
+ok   and nothing is sealed after it
+ok   a session still handshaking cannot seal
+ok   the pool holds TLS.MAXSESS sessions
+ok   and says why when it is empty
+ok   a freed session is handed out again
+ok   freeing twice gives nothing back twice
+ok   a freed session has no state

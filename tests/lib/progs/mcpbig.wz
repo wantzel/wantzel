@@ -1,0 +1,188 @@
+// An MCP server for the large-message tests (mcp_big_stdio.sh, mcp_big_http.sh and the
+// Windows one): a tool that measures its argument, a tool that returns as many bytes as it
+// is asked for, and a tool that reports the mappings the library holds.
+//
+//   mcpbig [maxin maxout toolmax [port]]     0 keeps a default; with a port it serves
+//                                            MCP over HTTP at /mcp instead of stdio
+include "json.wz";
+include "sha256.wz";
+
+type DigestArgs = schema
+  payload: text[50331648] "the bytes to measure";
+end;
+
+type DigestResult = schema
+  bytes: int;
+  sha256: text[64];
+end;
+
+type BlobArgs = schema
+  size: int "how many bytes to return";
+end;
+
+type BlobResult = schema
+  data: text[50331648];
+end;
+
+type ProbeArgs = schema
+  note: int? "ignored";
+end;
+
+type ProbeResult = schema
+  mapped: int;
+  mappedbytes: int;
+  vmsize: int;
+  toolpages: int;
+end;
+
+tools
+  digest(DigestArgs): DigestResult "Length and SHA-256 of the payload." readonly;
+  blob(BlobArgs): BlobResult "A result of the given size: 0123456789abcd, a quote and a backslash, repeated." readonly;
+  probe(ProbeArgs): ProbeResult "The mappings the MCP library holds, the process's VmSize, and the resident pages of the tool result mapping." readonly;
+end;
+
+include "tools.wz";
+include "mcphttp.wz";
+
+const
+  PATTERN = "0123456789abcd\"\\";
+
+var
+  digest.raw: array[0..31] of char;
+  probe.buf: array[0..65535] of char;
+  probe.path: array[0..31] of char;
+  probe.vec: array[0..16383] of char;     // one byte per page of up to 64 MB
+
+function tool.digest(a: array of DigestArgs; r: array of DigestResult): int;
+begin
+  sha256.init;
+  sha256.updateat(a[0].payload, 0, a[0].payload_n);
+  sha256.final(digest.raw);
+  r[0].sha256_n := sha256.hex(digest.raw, r[0].sha256, 0);
+  r[0].bytes := a[0].payload_n;
+  return 0;
+end;
+
+function tool.blob(a: array of BlobArgs; r: array of BlobResult): int;
+var i: int;
+begin
+  if (a[0].size < 0) or (a[0].size > len(r[0].data)) then return tool.fail("size out of range");
+  i := 0;
+  while i < a[0].size do
+  begin
+    r[0].data[i] := schar(PATTERN, i mod 16);
+    i := i + 1;
+  end;
+  r[0].data_n := a[0].size;
+  return 0;
+end;
+
+// VmSize from /proc/self/status, in kB: every mapping the process holds, measured by the
+// kernel rather than by the library being tested
+function probe.vmsize: int;
+var fd, r, n, i, v: int;
+begin
+  n := io.push(probe.path, 0, "/proc/self/status");
+  probe.path[n] := chr(0);
+  fd := sys3(SYS.open, addr(probe.path[0]), 0, 0);
+  if fd < 0 then return -1;
+  n := 0;
+  while n < len(probe.buf) do
+  begin
+    r := io.read(fd, addr(probe.buf[n]), len(probe.buf) - n);
+    if r <= 0 then break;
+    n := n + r;
+  end;
+  sys1(SYS.close, fd);
+  i := 0;
+  while i + 7 < n do
+  begin
+    if json.eq(probe.buf, i, i + 7, "VmSize:") then
+    begin
+      i := i + 7;
+      while (i < n) and ((probe.buf[i] < '0') or (probe.buf[i] > '9')) do i := i + 1;
+      v := 0;
+      while (i < n) and (probe.buf[i] >= '0') and (probe.buf[i] <= '9') do
+      begin
+        v := v * 10 + (ord(probe.buf[i]) - ord('0'));
+        i := i + 1;
+      end;
+      return v;
+    end;
+    i := i + 1;
+  end;
+  return -1;
+end;
+
+// Resident pages of the mapping tool results are written into, asked of the kernel with
+// mincore: a region that kept the pages of a large result shows them here.  0 when there
+// is no mapping.
+function probe.toolpages: int;
+var n, i, c: int;
+begin
+  if tool.omap = 0 then return 0;
+  n := tool.omapn;
+  if n > len(probe.vec) * 4096 then n := len(probe.vec) * 4096;
+  if sys3(27, tool.omap, n, addr(probe.vec[0])) < 0 then return -1;
+  c := 0;
+  i := 0;
+  while i < (n + 4095) div 4096 do
+  begin
+    if band(ord(probe.vec[i]), 1) <> 0 then c := c + 1;
+    i := i + 1;
+  end;
+  return c;
+end;
+
+// True on Linux.  The Windows runtime answers readlink with -1 (there is no
+// /proc/self/exe), and it stops a program that asks for a system call it does not
+// translate -- mincore is one -- so the kernel's counts are only asked for on Linux.  An
+// open of /proc/self/status is no test: under Wine a path starting with / is a Unix path,
+// and the file is there.
+function probe.linux: bool;
+var n: int;
+begin
+  n := io.push(probe.path, 0, "/proc/self/exe");
+  probe.path[n] := chr(0);
+  return sys3(89, addr(probe.path[0]), addr(probe.buf[0]), len(probe.buf)) > 0;
+end;
+
+function tool.probe(a: array of ProbeArgs; r: array of ProbeResult): int;
+begin
+  r[0].mapped := mcp.mapped;
+  r[0].mappedbytes := mcp.mappedbytes;
+  r[0].vmsize := -1;
+  r[0].toolpages := -1;
+  if probe.linux then
+  begin
+    r[0].vmsize := probe.vmsize;
+    r[0].toolpages := probe.toolpages;
+  end;
+  return 0;
+end;
+
+procedure app.request;
+begin
+  if http.pathis("/mcp") then mcp.http
+  else
+  begin
+    http.add("not here\n");
+    http.finish(404, "text/plain");
+  end;
+end;
+
+begin
+  if argc() > 3 then
+  begin
+    mcp.maxin := io.argn(1);
+    mcp.maxout := io.argn(2);
+    tool.maxout := io.argn(3);
+  end;
+  if argc() > 4 then
+  begin
+    http.maxbody(50331648 + 65536);
+    http.maxreply(4194304);                  // 4 MB: a 2.5 MB reply goes out whole, 5 MB does not
+    http.serve(io.argn(4), 1);
+  end
+  else mcp.stdio;
+end.

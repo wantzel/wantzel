@@ -70,48 +70,20 @@ begin
   http.finish(200, "text/plain");
 end;
 
-// THE SERVER'S OWN LOOP, NOT http.serve -- exactly the shape docs/library.md
-// documents and src/server/main.wz uses in the studio: http.serve blocks in
-// epoll_wait forever and never gives the application a place to also drive
-// ws.poll, so a program that wants both protocols runs the three http.wz routines
-// (http.accept, http.readable, http.flush) itself and calls ws.poll on every wake.
-var
-  ev: array[0..255 * 12 - 1] of char;
-
+// THE SERVER'S OWN LOOP, NOT http.serve -- the shape docs/library.md documents:
+// http.serve never returns and so never gives the application a place to also drive
+// ws.poll, so a program that wants both protocols binds with http.listen and then calls
+// http.poll and ws.poll on every wake.
 procedure runloop(port: int);
-var n, i, e, fd: int;
+var n: int;
 begin
-  http.lfd := net.listen(port, 128, false);
-  if http.lfd < 0 then io.fatal("cannot bind the port");
-  http.ep := net.epoll;
-  if http.ep < 0 then io.fatal("cannot create the epoll set");
-  if not net.watch(http.ep, EPOLL_ADD, http.lfd, EPOLLIN) then
-    io.fatal("cannot watch the listening socket");
+  http.listen(port, 1);
   while true do
   begin
-    n := net.wait(http.ep, addr(ev[0]), 255, 50);
-    if n < 0 then begin if n <> EINTR then io.fatal("epoll_wait failed"); n := 0; end;
-    i := 0;
-    while i < n do
-    begin
-      e := io.get32(ev, i * 12);
-      fd := io.get32(ev, i * 12 + 4);
-      if fd = http.lfd then http.accept
-      else if (fd >= 0) and (fd < MAXCONN) and http.open[fd] then
-      begin
-        if band(e, bor(EPOLLERR, EPOLLHUP)) <> 0 then http.drop(fd)
-        else
-        begin
-          if band(e, EPOLLOUT) <> 0 then http.flush(fd);
-          if http.open[fd] and (band(e, EPOLLIN) <> 0) then http.readable(fd);
-        end;
-      end;
-      i := i + 1;
-    end;
-    // Every wake, not just on http's own fds -- the studio does the same from
-    // srv.tick. ws.poll(0) does not block: any WebSocket activity found on http's
-    // wake above already has fresh data waiting, and a 50ms wake is frequent
-    // enough that a push queued between wakes is never held up noticeably.
+    n := http.poll(50);
+    // ws.poll(0) does not block: any WebSocket activity found on http's wake above
+    // already has fresh data waiting, and a 50ms wake is frequent enough that a push
+    // queued between wakes is never held up noticeably.
     n := ws.poll(0);
   end;
 end;

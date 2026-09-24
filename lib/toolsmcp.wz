@@ -18,14 +18,32 @@
 //
 // The generated tool.run writes the result JSON; this file wraps it as an MCP tool
 // result (content + structuredContent + isError).
+//
+// THE RESULT OF ONE CALL may be up to tool.maxout bytes (0 = TOOL.MAXOUT_DEFAULT, 64 MB).
+// tool.run writes it in one go and cannot be asked to continue, so its destination has to
+// be the whole limit from the start: an anonymous mapping of that size, made at the first
+// call and kept for the next -- a small result touches a page or two of it.  After a
+// result larger than TOOLBUF it is given back, so what stays resident between calls is
+// never more than the static buffer used to hold.  With tool.maxout at TOOLBUF or below
+// the static tool.out is used and nothing is ever mapped.  A result over the limit is a
+// JSON-RPC error that names it (lib/mcp.wz), and 500 over REST (lib/tools.wz).
+//
+// The result is at view(tool.obase, n) after tool.run -- in tool.out only in that
+// small-limit case.  A program that calls tool.run itself can still pass tool.out.
 
 include "mcp.wz";
 
 const
   TOOLBUF = 1048576;
+  TOOL.MAXOUT_DEFAULT = 67108864;
 
 var
-  tool.out: array[0..TOOLBUF - 1] of char;   // the result JSON of one call
+  tool.out: array[0..TOOLBUF - 1] of char;   // the result JSON, when tool.maxout <= TOOLBUF
+  tool.maxout: int;                          // largest result JSON; 0 = TOOL.MAXOUT_DEFAULT
+  tool.obase: int;                           // where tool.run writes the result
+  tool.ocap: int;                            // bytes usable there
+  tool.omap: int;                            // the mapping, 0 when there is none
+  tool.omapn: int;                           // its size
   tool.empty: array[0..1] of char;           // "{}" for calls without arguments
   // The undeclared keys of the call being answered, copied out of the request buffer
   // because the reply is written while that buffer is still the request's.
@@ -36,6 +54,53 @@ var
 procedure app.tools;
 begin
   mcp.add(tool.list);
+end;
+
+function tool.outlimit: int;
+begin
+  if tool.maxout > 0 then return tool.maxout;
+  return TOOL.MAXOUT_DEFAULT;
+end;
+
+// Point tool.obase/tool.ocap at room for a whole result; false when the memory for it
+// cannot be had.
+function tool.outready: bool;
+var m, p: int;
+begin
+  m := tool.outlimit;
+  if m <= TOOLBUF then
+  begin
+    tool.obase := addr(tool.out[0]);
+    tool.ocap := m;
+    return true;
+  end;
+  if (tool.omap <> 0) and (tool.omapn <> m) then
+  begin
+    mcp.unmap(tool.omap, tool.omapn);   // the limit was changed between calls
+    tool.omap := 0;
+  end;
+  if tool.omap = 0 then
+  begin
+    p := mcp.map(m);
+    if p < 0 then return false;
+    tool.omap := p;
+    tool.omapn := m;
+  end;
+  tool.obase := tool.omap;
+  tool.ocap := tool.omapn;
+  return true;
+end;
+
+// The result of n bytes has been copied out.  A large one gave its pages to the mapping,
+// and the mapping goes back with them; the next call maps a fresh one.
+procedure tool.outdone(n: int);
+begin
+  if (tool.omap <> 0) and (n > TOOLBUF) then
+  begin
+    mcp.unmap(tool.omap, tool.omapn);
+    tool.omap := 0;
+    tool.omapn := 0;
+  end;
 end;
 
 // Take the undeclared keys the parse recorded, before anything else can overwrite them.
@@ -88,15 +153,21 @@ begin
     mcp.text("no such tool");
     return;
   end;
+  if not tool.outready then
+  begin
+    mcp.over := MCP.OVER_NOMEM;
+    mcp.overlimit := tool.outlimit;
+    return;
+  end;
   if mcp.callp.arguments_ok then
   begin
-    n := tool.run(idx, b, mcp.callp.arguments_at, mcp.callp.arguments_end, tool.out);
+    n := tool.run(idx, b, mcp.callp.arguments_at, mcp.callp.arguments_end, view(tool.obase, tool.ocap));
     tool.takeignored(b);
   end
   else
   begin
     tool.empty[0] := '{'; tool.empty[1] := '}';
-    n := tool.run(idx, tool.empty, 0, 2, tool.out);
+    n := tool.run(idx, tool.empty, 0, 2, view(tool.obase, tool.ocap));
     tool.takeignored(tool.empty);
   end;
   if n = -1 then
@@ -105,14 +176,16 @@ begin
     mcp.text("the arguments do not match the tool's input schema");
     return;
   end;
-  // -3: the generated writer refused because the result does not fit in tool.out.  It
+  // -3: the generated writer refused because the result is larger than tool.maxout.  It
   // refuses rather than truncating, since half an object would leave the peer with an
-  // unparseable envelope instead of one failed call.  Reported separately because -1
-  // would blame the caller's arguments for a limit on our side.
+  // unparseable envelope instead of one failed call.  It is a JSON-RPC error that names
+  // the limit, not a tool error: the call was valid and the limit is ours.  The writer may
+  // have filled the whole mapping before it gave up, so that goes back too.
   if n = -3 then
   begin
-    mcp.failed := true;
-    mcp.text("the result does not fit in the tool output buffer");
+    tool.outdone(tool.ocap);
+    mcp.over := MCP.OVER_RESULT;
+    mcp.overlimit := tool.ocap;
     return;
   end;
   if n < 0 then
@@ -122,9 +195,10 @@ begin
     return;
   end;
   mcp.add("{\"content\":[{\"type\":\"text\",\"text\":");
-  mcp.addqslice(tool.out, 0, n);
+  mcp.addqslice(view(tool.obase, n), 0, n);
   mcp.add("}],\"structuredContent\":");
-  mcp.addslice(tool.out, 0, n);
+  mcp.addslice(view(tool.obase, n), 0, n);
+  tool.outdone(n);
   // The report rides in _meta and NOT in structuredContent, which has to keep the shape
   // the tool's output schema declares -- a field the schema does not name would make a
   // validating client reject an answer that is otherwise correct.  _meta is the place

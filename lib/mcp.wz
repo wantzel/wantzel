@@ -13,6 +13,24 @@
 //   procedure app.call;    -- handles one tool call
 // and uses the mcp.* helpers to write its replies.  Transports: mcp.stdio
 // (below) and mcp.http in lib/mcphttp.wz (one call from app.request).
+//
+// LARGE MESSAGES.  A request or a reply that fits the two static 4 MB buffers (mcp.in,
+// mcp.buf) is handled there without a system call.  One that does not moves, once, into an
+// anonymous mapping as large as its limit, and that mapping is given back as soon as the
+// message has been answered.  The limits are variables an application may set before it
+// starts a transport:
+//
+//   mcp.maxin   largest request message, in bytes   0 = MCP.MAXIN_DEFAULT  (64 MB)
+//   mcp.maxout  largest reply message, in bytes     0 = MCP.MAXOUT_DEFAULT (160 MB)
+//
+// A reply carries a tool's result twice (once escaped, as text) so the reply limit is
+// larger than the result limit (tool.maxout, lib/toolsmcp.wz).  Past a limit the peer gets
+// a JSON-RPC error that names it -- never a cut-off message, never a dead server.
+//
+// THE REPLY IS AT view(mcp.obase, n), not always in mcp.buf.  mcp.handle returns its length
+// n; it is in mcp.buf exactly when it fits there (n < MCPBUF), which is every reply a
+// program written before these limits could produce.  A transport of its own reads
+// view(mcp.obase, n) and calls mcp.done once the bytes have been sent.
 
 include "json.wz";
 
@@ -23,6 +41,25 @@ const
   // input that is unusual but entirely legal. 4 MB covers 256 kB at the worst rate with
   // the envelope to spare; it is a static array, so it costs address space and not work.
   MCPBUF = 4194304;
+
+  // The defaults of mcp.maxin and mcp.maxout.  A request of a year of minute values is
+  // 2-5 MB of JSON; 64 MB leaves an order of magnitude to spare.  The reply limit is two
+  // and a half times the largest tool result (lib/toolsmcp.wz), because a result travels
+  // twice -- as structuredContent and escaped inside a text block -- and escaping grows a
+  // quote to two bytes.
+  MCP.MAXIN_DEFAULT  = 67108864;
+  MCP.MAXOUT_DEFAULT = 167772160;
+
+  // MAP_NORESERVE: the mapping takes address space, and a page of memory only when it is
+  // written.  The Windows runtime ignores the flags of an anonymous mapping.
+  MCP.NORESERVE = 16384;
+  MCP.EINTR     = 0 - 4;
+
+  // why mcp.over replaced the reply with an error
+  MCP.OVER_REQUEST = 1;           // the request is larger than mcp.maxin
+  MCP.OVER_REPLY   = 2;           // the reply grew past mcp.maxout
+  MCP.OVER_RESULT  = 3;           // a tool result is larger than tool.maxout
+  MCP.OVER_NOMEM   = 4;           // the operating system refused the mapping
 
   RPC.parse_error      = 0 - 32700;
   RPC.invalid_request  = 0 - 32600;
@@ -78,50 +115,225 @@ var
   mcp.pvcode: int;                // the same as a number: 0 = 2024-11-05, 1 = 2025-03-26, 2 = 2025-06-18
   mcp.inited: bool;               // an initialize has been answered (before that, assume 2025-06-18)
 
-// ------------------------------------------------------------- writing
+  // the limits; 0 means the default (MCP.MAXIN_DEFAULT, MCP.MAXOUT_DEFAULT)
+  mcp.maxin, mcp.maxout: int;
+  // where the reply is being written: mcp.buf, or a mapping once it outgrew mcp.buf
+  mcp.obase: int;                 // address of the reply; 0 before the first one
+  mcp.ocap: int;                  // bytes usable there
+  mcp.omap: int;                  // the mapping, 0 when the reply is in mcp.buf
+  mcp.omapn: int;                 // its size
+  mcp.over: int;                  // MCP.OVER_*, 0 while the reply is within its limits
+  mcp.overlimit: int;             // the limit that was hit, for the error message
+  // mappings held by lib/mcp.wz and lib/toolsmcp.wz right now, and their bytes: a program
+  // (or a test) can read them to see that a large message left nothing behind
+  mcp.mapped, mcp.mappedbytes: int;
 
-procedure mcp.add(s: str);
+// ------------------------------------------------------------- memory
+
+// Map n bytes of zeroed memory: the address, or -1 when the system refused.
+function mcp.map(n: int): int;
+var p: int;
 begin
-  mcp.wp := io.push(mcp.buf, mcp.wp, s);
+  p := sys6(SYS.mmap, 0, n, bor(PROT_READ, PROT_WRITE),
+            bor(bor(MAP_PRIVATE, MAP_ANONYMOUS), MCP.NORESERVE), 0 - 1, 0);
+  if p <= 0 then return 0 - 1;
+  mcp.mapped := mcp.mapped + 1;
+  mcp.mappedbytes := mcp.mappedbytes + n;
+  return p;
 end;
 
-procedure mcp.addn(v: int);
+procedure mcp.unmap(p: int; n: int);
 begin
-  mcp.wp := io.pushnum(mcp.buf, mcp.wp, v);
+  if p <= 0 then return;
+  sys2(SYS.munmap, p, n);
+  mcp.mapped := mcp.mapped - 1;
+  mcp.mappedbytes := mcp.mappedbytes - n;
 end;
 
-procedure mcp.addq(s: str);
-begin
-  mcp.wp := json.putstr(mcp.buf, mcp.wp, s);
-end;
-
-procedure mcp.addslice(b: array of char; from: int; upto: int);
+procedure mcp.movew(d: array of int; s: array of int; n: int);
 var i: int;
 begin
-  i := from;
-  while i < upto do
+  i := 0;
+  while i < n do
   begin
-    mcp.buf[mcp.wp] := b[i];
-    mcp.wp := mcp.wp + 1;
+    d[i] := s[i];
     i := i + 1;
   end;
 end;
 
-// If it does not fit, mcp.wp stays where it was and the answer is truncated rather than
-// broken: json.putslice returns -1, and using that as a position would destroy
-// everything.  The overflow itself should be noticed elsewhere -- what matters here is
-// that an over-long value does not write a buffer outside its bounds.
-procedure mcp.addqslice(b: array of char; from: int; upto: int);
-var at: int;
+procedure mcp.moveb(d: array of char; s: array of char; n: int);
+var i: int;
 begin
-  at := json.putslice(mcp.buf, mcp.wp, b, from, upto);
-  if at >= 0 then mcp.wp := at;
+  i := 0;
+  while i < n do
+  begin
+    d[i] := s[i];
+    i := i + 1;
+  end;
+end;
+
+// Copy n bytes from address src to address dst, eight at a time, front to back: safe when
+// the two do not overlap and when dst lies before src (moving leftover input down).
+procedure mcp.move(dst: int; src: int; n: int);
+var w: int;
+begin
+  if n <= 0 then return;
+  w := n div 8;
+  if w > 0 then mcp.movew(view(dst, w), view(src, w), w);
+  if n - w * 8 > 0 then mcp.moveb(view(dst + w * 8, n - w * 8), view(src + w * 8, n - w * 8), n - w * 8);
+end;
+
+function mcp.inlimit: int;
+begin
+  if mcp.maxin > 0 then return mcp.maxin;
+  return MCP.MAXIN_DEFAULT;
+end;
+
+function mcp.outlimit: int;
+begin
+  if mcp.maxout > 0 then return mcp.maxout;
+  return MCP.MAXOUT_DEFAULT;
+end;
+
+// Give back the mapping a reply outgrew mcp.buf into, and write the next reply in mcp.buf
+// again.  A transport calls this once the reply has been sent; mcp.handle calls it too,
+// so a transport that does not still holds at most one mapping.
+procedure mcp.done;
+var m: int;
+begin
+  if mcp.omap <> 0 then
+  begin
+    mcp.unmap(mcp.omap, mcp.omapn);
+    mcp.omap := 0;
+    mcp.omapn := 0;
+  end;
+  mcp.obase := addr(mcp.buf[0]);
+  m := mcp.outlimit + 1;            // + 1: stdio ends the reply with a newline
+  if m > MCPBUF then m := MCPBUF;
+  mcp.ocap := m;
+end;
+
+// Make room for n more bytes of reply.  False when the reply would pass mcp.maxout (or
+// memory for it cannot be had); mcp.over then says which, every later write is dropped,
+// and mcp.handle answers with an error instead of the half-written reply.
+//
+// THE FIRST TIME A REPLY OUTGROWS mcp.buf IT MOVES ONCE, into a mapping of the whole
+// limit, rather than doubling: nothing is copied more than once, and on Linux a page of it
+// costs memory only when it is written.  One byte stays free behind the reply for the
+// newline mcp.stdio adds.
+function mcp.room(n: int): bool;
+var m, p: int;
+begin
+  if mcp.over <> 0 then return false;
+  if mcp.obase = 0 then mcp.done;
+  if mcp.wp + n + 1 <= mcp.ocap then return true;
+  m := mcp.outlimit;
+  if (mcp.wp + n > m) or (mcp.omap <> 0) then
+  begin
+    mcp.over := MCP.OVER_REPLY;
+    mcp.overlimit := m;
+    return false;
+  end;
+  p := mcp.map(m + 1);
+  if p < 0 then
+  begin
+    mcp.over := MCP.OVER_NOMEM;
+    mcp.overlimit := m + 1;
+    return false;
+  end;
+  mcp.move(p, mcp.obase, mcp.wp);
+  mcp.omap := p;
+  mcp.omapn := m + 1;
+  mcp.obase := p;
+  mcp.ocap := m + 1;
+  return true;
+end;
+
+// The length of b[from..upto) escaped as json.putslice/json.escslice write it, without
+// the quotes -- so a large value asks for the room it needs and not six times that.
+function mcp.esclen(b: array of char; from: int; upto: int): int;
+var n: int;
+    c: char;
+begin
+  n := 0;
+  while from < upto do
+  begin
+    c := b[from];
+    if (c = '"') or (c = '\\') or (c = chr(10)) or (c = chr(9)) or (c = chr(13)) then n := n + 2
+    else if ord(c) < 32 then n := n + 6
+    else n := n + 1;
+    from := from + 1;
+  end;
+  return n;
+end;
+
+// ------------------------------------------------------------- writing
+
+// Every writer asks mcp.room first, so none of them can cut a reply short: a value either
+// goes in whole, or the reply becomes an error that says why.
+
+procedure mcp.add(s: str);
+begin
+  if mcp.room(slen(s)) then mcp.wp := io.push(view(mcp.obase, mcp.ocap), mcp.wp, s);
+end;
+
+procedure mcp.addn(v: int);
+begin
+  if mcp.room(21) then mcp.wp := io.pushnum(view(mcp.obase, mcp.ocap), mcp.wp, v);
+end;
+
+procedure mcp.addq(s: str);
+begin
+  if mcp.room(6 * slen(s) + 8) then mcp.wp := json.putstr(view(mcp.obase, mcp.ocap), mcp.wp, s);
+end;
+
+procedure mcp.copyin(s: array of char);
+begin
+  mcp.move(mcp.obase + mcp.wp, addr(s[0]), len(s));
+  mcp.wp := mcp.wp + len(s);
+end;
+
+procedure mcp.addslice(b: array of char; from: int; upto: int);
+begin
+  if upto <= from then return;
+  // the slice is bounds-checked where it is made, so a range outside b still traps here
+  // rather than copying whatever lies behind it
+  if mcp.room(upto - from) then mcp.copyin(b[from..upto - 1]);
+end;
+
+// A quoted, escaped JSON string.  The escaped length is counted first, so the room asked
+// for is what the value needs: a 40 MB value asks for 40 MB and a bit, not 240.  The six
+// bytes on top are json.putslice's own margin, which tests for its heaviest case (\u00XX)
+// before every byte.
+procedure mcp.addqslice(b: array of char; from: int; upto: int);
+var n, at: int;
+begin
+  n := mcp.esclen(b, from, upto);
+  if not mcp.room(n + 2 + 6) then return;
+  at := json.putslice(view(mcp.obase, mcp.ocap), mcp.wp, b, from, upto);
+  if at <> mcp.wp + n + 2 then
+  begin
+    mcp.over := MCP.OVER_REPLY;
+    mcp.overlimit := mcp.outlimit;
+    return;
+  end;
+  mcp.wp := at;
 end;
 
 // escaped, but without quotes: for building one long text value in pieces
 procedure mcp.addesc(b: array of char; from: int; upto: int);
+var n, at: int;
 begin
-  mcp.wp := json.escslice(mcp.buf, mcp.wp, b, from, upto);
+  n := mcp.esclen(b, from, upto);
+  if not mcp.room(n + 6) then return;
+  at := json.escslice(view(mcp.obase, mcp.ocap), mcp.wp, b, from, upto);
+  if at <> mcp.wp + n then
+  begin
+    mcp.over := MCP.OVER_REPLY;
+    mcp.overlimit := mcp.outlimit;
+    return;
+  end;
+  mcp.wp := at;
 end;
 
 // ------------------------------------------------------- reply envelopes
@@ -207,14 +419,10 @@ procedure app.call(b: array of char; last: int); forward;
 
 // ---------------------------------------------------------- dispatch
 
-// Handle one JSON-RPC message in b[at..last).  Returns the number of bytes
-// of reply in mcp.buf, or 0 when the message is a notification.
-function mcp.handle(b: array of char; at: int; last: int): int;
+// Answer one JSON-RPC message in b[at..last); mcp.handle below is the entry point.
+function mcp.dispatch(b: array of char; at: int; last: int): int;
 var r, p0, p1: int;
 begin
-  mcp.wp := 0;
-  mcp.hasid := false;
-  mcp.failed := false;
   r := Rpc.parse(b, at, last, mcp.req);
   if r < 0 then
   begin
@@ -361,64 +569,249 @@ begin
   return mcp.wp;
 end;
 
+// Replace the reply with the error for mcp.over: code, a message that names the limit in
+// bytes, and the limit again as data.limit for a program to read.  It is written in
+// mcp.buf, which always has room for it.  An id longer than 1 kB is answered as null
+// rather than risk the error not fitting either -- a real client sends a number or a
+// short string.
+function mcp.limiterror(b: array of char): int;
+var why, lim: int;
+begin
+  why := mcp.over;
+  lim := mcp.overlimit;
+  mcp.done;
+  mcp.ocap := MCPBUF;             // the error fits whatever mcp.maxout says
+  mcp.over := 0;
+  mcp.wp := 0;
+  mcp.add("{\"jsonrpc\":\"2.0\",\"id\":");
+  if mcp.hasid and (mcp.idend - mcp.idat <= 1024) then mcp.addslice(b, mcp.idat, mcp.idend)
+  else mcp.add("null");
+  mcp.add(",\"error\":{\"code\":");
+  if why = MCP.OVER_REQUEST then
+  begin
+    mcp.addn(RPC.invalid_request);
+    mcp.add(",\"message\":\"the request is larger than the maximum of ");
+  end
+  else if why = MCP.OVER_RESULT then
+  begin
+    mcp.addn(RPC.internal_error);
+    mcp.add(",\"message\":\"the tool result is larger than the maximum of ");
+  end
+  else if why = MCP.OVER_NOMEM then
+  begin
+    mcp.addn(RPC.internal_error);
+    mcp.add(",\"message\":\"the server could not get memory for a message of ");
+  end
+  else
+  begin
+    mcp.addn(RPC.internal_error);
+    mcp.add(",\"message\":\"the reply is larger than the maximum of ");
+  end;
+  mcp.addn(lim);
+  mcp.add(" bytes\",\"data\":{\"limit\":");
+  mcp.addn(lim);
+  mcp.add("}}}");
+  return mcp.wp;
+end;
+
+// Handle one JSON-RPC message in b[at..last).  Returns the number of bytes of reply at
+// view(mcp.obase, n) -- in mcp.buf unless it outgrew it -- or 0 when the message is a
+// notification.  A message or reply past its limit is answered with a JSON-RPC error.
+function mcp.handle(b: array of char; at: int; last: int): int;
+var n: int;
+begin
+  mcp.done;
+  mcp.wp := 0;
+  mcp.over := 0;
+  mcp.hasid := false;
+  mcp.failed := false;
+  if last - at > mcp.inlimit then
+  begin
+    // the id is still worth finding: a client matches the error to its call by it
+    if Rpc.parse(b, at, last, mcp.req) >= 0 then
+    begin
+      if mcp.req.id_ok then
+      begin
+        mcp.hasid := true;
+        mcp.idat := mcp.req.id_at;
+        mcp.idend := mcp.req.id_end;
+      end;
+    end;
+    mcp.over := MCP.OVER_REQUEST;
+    mcp.overlimit := mcp.inlimit;
+    return mcp.limiterror(b);
+  end;
+  n := mcp.dispatch(b, at, last);
+  if mcp.over <> 0 then n := mcp.limiterror(b);
+  return n;
+end;
+
 // ------------------------------------------------------ stdio transport
 
 var
-  mcp.in: array[0..MCPBUF - 1] of char;
+  mcp.in: array[0..MCPBUF - 1] of char;   // the input while no line outgrows it
   mcp.inlen: int;
+  mcp.ibase: int;                 // where the input is: mcp.in, or a mapping
+  mcp.icap: int;                  // bytes usable there
+  mcp.imap: int;                  // the mapping, 0 when the input is in mcp.in
+  mcp.imapn: int;                 // its size
+  mcp.iscan: int;                 // input before this has been searched for a newline
+  mcp.iskip: bool;                // dropping the rest of a line that passed mcp.maxin
+
+// Write the reply and its newline, all of it: a pipe can take a large write in pieces.
+procedure mcp.sendline(fd: int; n: int);
+var sent, r: int;
+begin
+  mcp.moveb(view(mcp.obase + n, 1), "\n", 1);
+  sent := 0;
+  while sent < n + 1 do
+  begin
+    r := io.write(fd, mcp.obase + sent, n + 1 - sent);
+    if r = MCP.EINTR then continue;
+    if r <= 0 then return;
+    sent := sent + r;
+  end;
+end;
+
+procedure mcp.istatic;
+var m: int;
+begin
+  mcp.ibase := addr(mcp.in[0]);
+  m := mcp.inlimit + 1;             // + 1: the newline that ends the largest message
+  if m > MCPBUF then m := MCPBUF;
+  mcp.icap := m;
+end;
+
+// The input is full and holds no newline.  Move it, once, into a mapping as large as the
+// limit; when it already is that large the line is over the limit: answer so, and drop
+// the line up to its newline -- the rest of it would otherwise arrive as a second,
+// broken message and earn a second error for one request.
+procedure mcp.igrow;
+var p, m: int;
+begin
+  m := mcp.inlimit + 1;
+  if (mcp.imap = 0) and (m > mcp.icap) then
+  begin
+    p := mcp.map(m);
+    if p > 0 then
+    begin
+      mcp.move(p, mcp.ibase, mcp.inlen);
+      mcp.imap := p;
+      mcp.imapn := m;
+      mcp.ibase := p;
+      mcp.icap := m;
+      return;
+    end;
+    mcp.over := MCP.OVER_NOMEM;
+    mcp.overlimit := m;
+  end
+  else
+  begin
+    mcp.over := MCP.OVER_REQUEST;
+    mcp.overlimit := mcp.inlimit;
+  end;
+  mcp.done;
+  mcp.wp := 0;
+  mcp.hasid := false;
+  mcp.sendline(STDOUT, mcp.limiterror(mcp.in));
+  mcp.done;
+  mcp.iskip := true;
+  mcp.inlen := 0;
+  mcp.iscan := 0;
+end;
+
+// Answer the complete lines in b[0..mcp.inlen), then move what is left to the front.
+// True when it stopped with a line still waiting: while the input is in a mapping it
+// answers ONE line and returns, so the caller can move the rest back into mcp.in before
+// the next -- otherwise a large line followed by thousands of small ones (a read from a
+// file returns them all at once) would keep the mapping for all of them.
+function mcp.lines(b: array of char): bool;
+var at, nl, n: int;
+    more: bool;
+begin
+  at := 0;
+  more := false;
+  while true do
+  begin
+    nl := scan(b, mcp.iscan, mcp.inlen, chr(10));
+    if nl >= mcp.inlen then break;
+    if mcp.iskip then mcp.iskip := false
+    else if nl > at then
+    begin
+      n := mcp.handle(b, at, nl);
+      if n > 0 then mcp.sendline(STDOUT, n);
+      mcp.done;
+    end;
+    at := nl + 1;
+    mcp.iscan := at;
+    if mcp.imap <> 0 then
+    begin
+      more := at < mcp.inlen;
+      break;
+    end;
+  end;
+  // no newline yet: while dropping a line, everything read so far belongs to it
+  if mcp.iskip then at := mcp.inlen;
+  if at > 0 then
+  begin
+    mcp.move(mcp.ibase, mcp.ibase + at, mcp.inlen - at);
+    mcp.inlen := mcp.inlen - at;
+  end;
+  if more then mcp.iscan := 0 else mcp.iscan := mcp.inlen;
+  return more;
+end;
+
+// After a large line: when what is left fits in mcp.in again, move it there and give the
+// mapping back.
+procedure mcp.ishrink;
+var p, n: int;
+begin
+  if mcp.imap = 0 then return;
+  if mcp.inlen >= MCPBUF then return;
+  p := mcp.imap;
+  n := mcp.imapn;
+  mcp.istatic;
+  if mcp.inlen >= mcp.icap then
+  begin
+    mcp.ibase := p;               // the limit is below MCPBUF; keep the mapping
+    mcp.icap := n;
+    return;
+  end;
+  mcp.move(mcp.ibase, p, mcp.inlen);
+  mcp.unmap(p, n);
+  mcp.imap := 0;
+  mcp.imapn := 0;
+end;
 
 // Read newline-delimited JSON-RPC messages from standard input and write
 // the replies to standard output.  This is how editors start an MCP server.
+//
+// A line that does not fit in mcp.in moves into a mapping of mcp.maxin bytes and moves
+// back once it has been answered; a line longer than mcp.maxin is answered with an error
+// and dropped, and the server reads on.  Only the part read since the last search is
+// searched for a newline, so a 40 MB line costs one pass and not one per read.
 procedure mcp.stdio;
-var r, at, nl, n: int;
+var r: int;
 begin
   mcp.inlen := 0;
+  mcp.iscan := 0;
+  mcp.iskip := false;
+  mcp.imap := 0;
+  mcp.istatic;
   while true do
   begin
-    r := io.read(STDIN, addr(mcp.in[mcp.inlen]), MCPBUF - mcp.inlen);
-    if r <= 0 then return;
+    if mcp.inlen >= mcp.icap then mcp.igrow;
+    r := io.read(STDIN, mcp.ibase + mcp.inlen, mcp.icap - mcp.inlen);
+    if r = MCP.EINTR then continue;
+    if r <= 0 then
+    begin
+      if mcp.imap <> 0 then mcp.unmap(mcp.imap, mcp.imapn);
+      mcp.imap := 0;
+      mcp.istatic;
+      return;
+    end;
     mcp.inlen := mcp.inlen + r;
-    at := 0;
-    while true do
-    begin
-      nl := scan(mcp.in, at, mcp.inlen, chr(10));
-      if nl >= mcp.inlen then break;
-      if nl > at then
-      begin
-        n := mcp.handle(mcp.in, at, nl);
-        if n > 0 then
-        begin
-          mcp.buf[n] := chr(10);
-          io.out(STDOUT, addr(mcp.buf[0]), n + 1);
-        end;
-      end;
-      at := nl + 1;
-    end;
-    if at > 0 then
-    begin
-      n := 0;
-      while at + n < mcp.inlen do
-      begin
-        mcp.in[n] := mcp.in[at + n];
-        n := n + 1;
-      end;
-      mcp.inlen := n;
-    end;
-    // A LINE THAT FILLS THE BUFFER USED TO END THE SERVER SILENTLY, and a client then waits
-    // for a reply that will never come -- the worst failure this transport can have, because
-    // nothing says anything is wrong. Answer with a parse error instead and drop the line:
-    // the connection stays usable, and the caller learns what happened.
-    if mcp.inlen >= MCPBUF then
-    begin
-      mcp.wp := 0;
-      mcp.hasid := false;
-      mcp.error(mcp.in, RPC.parse_error, "a single line exceeded the input buffer and was discarded");
-      if mcp.wp > 0 then
-      begin
-        mcp.buf[mcp.wp] := chr(10);
-        io.out(STDOUT, addr(mcp.buf[0]), mcp.wp + 1);
-      end;
-      mcp.inlen := 0;
-    end;
+    while mcp.lines(view(mcp.ibase, mcp.icap)) do mcp.ishrink;
+    mcp.ishrink;
   end;
 end;

@@ -38,39 +38,39 @@ var
 // Read the keys after the result value, starting at the comma at `from`.  True when
 // they are only total_matched/truncated (their values are picked up on the way); false
 // for any other key, which makes the answer stay wrapped.
-function tool.cutfields(from: int; n: int): bool;
+function tool.cutfieldsin(o: array of char; from: int; n: int): bool;
 var i, v, sign: int;
 begin
   i := from;
   while i < n do
   begin
-    if tool.out[i] <> ',' then return false;
+    if o[i] <> ',' then return false;
     i := i + 1;
-    while (i < n) and (tool.out[i] = ' ') do i := i + 1;
-    if json.eq(tool.out, i, i + 15, "\"total_matched\"") then
+    while (i < n) and (o[i] = ' ') do i := i + 1;
+    if json.eq(o, i, i + 15, "\"total_matched\"") then
     begin
       i := i + 15;
-      while (i < n) and ((tool.out[i] = ':') or (tool.out[i] = ' ')) do i := i + 1;
+      while (i < n) and ((o[i] = ':') or (o[i] = ' ')) do i := i + 1;
       sign := 1;
-      if (i < n) and (tool.out[i] = '-') then begin sign := -1; i := i + 1; end;
+      if (i < n) and (o[i] = '-') then begin sign := -1; i := i + 1; end;
       v := 0;
-      while (i < n) and (tool.out[i] >= '0') and (tool.out[i] <= '9') do
+      while (i < n) and (o[i] >= '0') and (o[i] <= '9') do
       begin
-        v := v * 10 + (ord(tool.out[i]) - ord('0'));
+        v := v * 10 + (ord(o[i]) - ord('0'));
         i := i + 1;
       end;
       tool.nmatched := sign * v;
     end
-    else if json.eq(tool.out, i, i + 11, "\"truncated\"") then
+    else if json.eq(o, i, i + 11, "\"truncated\"") then
     begin
       i := i + 11;
-      while (i < n) and ((tool.out[i] = ':') or (tool.out[i] = ' ')) do i := i + 1;
-      tool.wascut := json.eq(tool.out, i, i + 4, "true");
-      while (i < n) and (tool.out[i] <> ',') and (tool.out[i] <> '}') do i := i + 1;
+      while (i < n) and ((o[i] = ':') or (o[i] = ' ')) do i := i + 1;
+      tool.wascut := json.eq(o, i, i + 4, "true");
+      while (i < n) and (o[i] <> ',') and (o[i] <> '}') do i := i + 1;
     end
     else return false;
-    while (i < n) and (tool.out[i] = ' ') do i := i + 1;
-    if (i < n) and (tool.out[i] = '}') then
+    while (i < n) and (o[i] = ' ') do i := i + 1;
+    if (i < n) and (o[i] = '}') then
     begin
       if i <> n - 1 then return false;
       return true;
@@ -79,18 +79,18 @@ begin
   return false;
 end;
 
-function tool.solelist(n: int): int;
+function tool.solelistin(o: array of char; n: int): int;
 var i, at, depth: int;
     instr, esc: bool;
     c: char;
 begin
   tool.listend := -1; tool.nmatched := -1; tool.wascut := false;
   if n < 12 then return -1;
-  if tool.out[0] <> '{' then return -1;
+  if o[0] <> '{' then return -1;
   // json.eq compares the raw slice, so the quotes are part of it
-  if not json.eq(tool.out, 1, 9, "\"result\"") then return -1;
+  if not json.eq(o, 1, 9, "\"result\"") then return -1;
   i := 9;
-  while (i < n) and ((tool.out[i] = ':') or (tool.out[i] = ' ')) do i := i + 1;
+  while (i < n) and ((o[i] = ':') or (o[i] = ' ')) do i := i + 1;
   if i >= n then return -1;
   at := i;
   // Walk the value.  depth starts at 1 for the object we are inside, so the value's
@@ -99,7 +99,7 @@ begin
   depth := 1; instr := false; esc := false;
   while i < n do
   begin
-    c := tool.out[i];
+    c := o[i];
     if instr then
     begin
       if esc then esc := false
@@ -121,7 +121,7 @@ begin
     else if (c = ',') and (depth = 1) then
     begin
       tool.listend := i;
-      if not tool.cutfields(i, n) then return -1;
+      if not tool.cutfieldsin(o, i, n) then return -1;
       return at;
     end;
     i := i + 1;
@@ -144,18 +144,44 @@ end;
 // The truncation fields cannot ride along in the body without putting the wrapper back,
 // so they go out as headers instead (X-Total-Matched, X-Truncated) -- the body keeps
 // that shape and a cut answer still says it was cut.
-procedure tool.restbody(n: int);
+procedure tool.restbodyof(o: array of char; n: int);
 var at: int;
 begin
-  at := tool.solelist(n);
-  if (at < 0) or (tool.listend <= at) then begin http.addb(tool.out, 0, n); return; end;
+  at := tool.solelistin(o, n);
+  if (at < 0) or (tool.listend <= at) then begin http.addb(o, 0, n); return; end;
   if tool.nmatched >= 0 then
   begin
     tool.numn := io.pushnum(tool.numbuf, 0, tool.nmatched);
     http.hdraddslice("X-Total-Matched", tool.numbuf, 0, tool.numn);
   end;
   if tool.wascut then http.hdradd("X-Truncated: true");
-  http.addb(tool.out, at, tool.listend - at);
+  http.addb(o, at, tool.listend - at);
+end;
+
+// The three above over tool.out, for a program that calls tool.run with tool.out itself.
+function tool.cutfields(from: int; n: int): bool;
+begin
+  return tool.cutfieldsin(tool.out, from, n);
+end;
+
+function tool.solelist(n: int): int;
+begin
+  return tool.solelistin(tool.out, n);
+end;
+
+procedure tool.restbody(n: int);
+begin
+  tool.restbodyof(tool.out, n);
+end;
+
+// Run tool idx on the arguments in b[at..upto) into the result room, and take the
+// ignored keys from b.
+function tool.runin(idx: int; b: array of char; at: int; upto: int): int;
+var n: int;
+begin
+  n := tool.run(idx, b, at, upto, view(tool.obase, tool.ocap));
+  tool.takeignored(b);
+  return n;
 end;
 
 // REST: POST <prefix>/<name> with the arguments as the body.  Returns
@@ -181,28 +207,35 @@ begin
     http.finish(405, "application/json");
     return true;
   end;
+  if not tool.outready then
+  begin
+    http.add("{\"detail\":\"the server could not get memory for the result\"}");
+    http.finish(500, "application/json");
+    return true;
+  end;
+  // A body larger than the input buffer is in the region http.maxbody reserved, not in
+  // http.inbuf (see lib/http.wz).
   if http.bodylen = 0 then
   begin
     tool.empty[0] := '{'; tool.empty[1] := '}';
-    n := tool.run(idx, tool.empty, 0, 2, tool.out);
-    tool.takeignored(tool.empty);
+    n := tool.runin(idx, tool.empty, 0, 2);
   end
-  else
-  begin
-    n := tool.run(idx, http.inbuf, http.bodyat, http.bodyat + http.bodylen, tool.out);
-    tool.takeignored(http.inbuf);
-  end;
+  else if http.bodyinbig then n := tool.runin(idx, view(http.bigbase, http.bodylen), 0, http.bodylen)
+  else n := tool.runin(idx, http.inbuf, http.bodyat, http.bodyat + http.bodylen);
   if n = -1 then
   begin
     http.add("{\"detail\":\"the body does not match the tool's input schema\"}");
     http.finish(422, "application/json");
     return true;
   end;
-  // -3: the result does not fit in tool.out; see app.call for why that is not a -1.
+  // -3: the result is larger than tool.maxout; see app.call for why that is not a -1.
   // 500, because the limit is ours and the request was valid.
   if n = -3 then
   begin
-    http.add("{\"detail\":\"the result does not fit in the tool output buffer\"}");
+    tool.outdone(tool.ocap);
+    http.add("{\"detail\":\"the tool result is larger than the maximum of ");
+    http.addn(tool.ocap);
+    http.add(" bytes\"}");
     http.finish(500, "application/json");
     return true;
   end;
@@ -217,7 +250,8 @@ begin
     http.finish(400, "application/json");
     return true;
   end;
-  tool.restbody(n);
+  tool.restbodyof(view(tool.obase, n), n);
+  tool.outdone(n);
   // The report goes out as headers and NOT in the body, for the same reason the
   // truncation fields do: a list tool's body is a bare array here, and there is nowhere
   // in it to put a note without putting the wrapper back and changing the shape every

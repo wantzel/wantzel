@@ -1,0 +1,132 @@
+// httpsapp -- an application on lib/http.wz served over HTTPS, for tests/lib/http_https.sh
+// and tests/lib/http_large.sh.
+//
+//   httpsapp <tlsport> <plainport> <cert.pem> <key.pem> <hdrsecs> <maxbody> [name=value ...]
+//
+// The TLS port serves the routes below; the plain port is http.redirect's. A certificate of
+// "-" loads none, so every handshake is refused. maxbody 0 keeps bodies to INBUF. The
+// options: cert2=, key2= (what /reload installs), app=<port> (the application on a plain
+// port too), maxreply=<bytes>, bodymem=<bytes>.
+//
+//   GET  /            "ok"
+//   GET  /tls         "tls" or "plain": what http.istls says
+//   POST /echo        "<length> <sha256 of the body>"
+//   GET  /big?n=N     N bytes, 'a'..'z' over and over (the pattern repeats every 26)
+//   GET  /stats       the counters a leak or a deadline shows up in
+//   GET  /reload      install cert2/key2 with http.httpsfiles, while serving
+include "io.wz";
+include "http.wz";
+include "sha256.wz";
+
+var
+  pat: array[0..65519] of char;          // 2520 times 'a'..'z': a whole number of patterns
+  opt: array[0..1023] of char;
+  optn, k, v: int;
+  dig: array[0..31] of char;
+  hx:  array[0..63] of char;
+  path: array[0..1023] of char;
+  path2: array[0..1023] of char;
+  pn, pn2, i, n, keep, tlsport, plainport, maxbody: int;
+
+procedure num(label: str; v: int);
+begin
+  http.add(label);
+  http.addn(v);
+end;
+
+procedure app.request;
+begin
+  if http.pathis("/") then begin http.add("ok\n"); http.finish(200, "text/plain"); return; end;
+  if http.pathis("/tls") then
+  begin
+    if http.istls then http.add("tls\n") else http.add("plain\n");
+    http.finish(200, "text/plain");
+    return;
+  end;
+  if http.pathis("/echo") and (http.method = HTTP.POST) then
+  begin
+    if http.bodyinbig then sha256.hash(view(http.bigbase, http.bodylen), dig)
+    else if http.bodylen > 0 then sha256.hash(http.inbuf[http.bodyat..http.bodyat + http.bodylen - 1], dig)
+    else sha256.hash(http.inbuf[0..-1], dig);
+    n := sha256.hex(dig, hx, 0);
+    http.addn(http.bodylen);
+    http.add(" ");
+    http.addb(hx, 0, n);
+    http.add("\n");
+    http.finish(200, "text/plain");
+    return;
+  end;
+  if http.pathis("/big") then
+  begin
+    n := 0;
+    if http.param("n") then
+      for i := 0 to http.pvlen - 1 do n := n * 10 + (ord(http.pval[i]) - 48);
+    while n >= len(pat) do begin http.addb(pat, 0, len(pat)); n := n - len(pat); end;
+    http.addb(pat, 0, n);
+    http.finish(200, "application/octet-stream");
+    return;
+  end;
+  if http.pathis("/stats") then
+  begin
+    keep := http.keepbytes;
+    num("live=", tls.live);
+    num(" open=", http.nopen);
+    num(" refused=", http.tlsrefused);
+    num(" failed=", http.tlsfailed);
+    num(" timedout=", http.timedout);
+    num(" pend=", http.pendbytes);
+    num(" keep=", keep);
+    num(" kept=", http.tlskept);
+    num(" bodies=", http.bigbytes);
+    num(" replies=", http.replybytes);
+    http.add("\n");
+    http.finish(200, "text/plain");
+    return;
+  end;
+  if http.pathis("/reload") then
+  begin
+    if http.httpsfiles(path[0..pn - 1], path2[0..pn2 - 1]) then http.add("reloaded\n")
+    else http.add("refused\n");
+    http.finish(200, "text/plain");
+    return;
+  end;
+  http.add("not found\n");
+  http.finish(404, "text/plain");
+end;
+
+begin
+  tlsport := io.argn(1);
+  plainport := io.argn(2);
+  pn := io.argstr(3, path);
+  pn2 := io.argstr(4, path2);
+  if (pn = 1) and (path[0] = '-') then http.tlsmain := true
+  else if not http.httpsfiles(path[0..pn - 1], path2[0..pn2 - 1]) then
+  begin
+    io.puts(STDERR, "httpsapp: ");
+    io.puts(STDERR, http.tlswhy);
+    io.puts(STDERR, "\n");
+    halt(2);
+  end;
+  http.timeouts(0, io.argn(5), 0, 0);
+  maxbody := io.argn(6);
+  if maxbody > 0 then http.maxbody(maxbody);
+  for i := 0 to len(pat) - 1 do pat[i] := chr(97 + i mod 26);
+  k := 7;
+  while k < argc() do
+  begin
+    optn := io.argstr(k, opt);
+    i := 0;
+    while (i < optn) and (opt[i] <> '=') do i := i + 1;
+    v := 0;
+    for n := i + 1 to optn - 1 do if (opt[n] >= '0') and (opt[n] <= '9') then v := v * 10 + (ord(opt[n]) - 48);
+    if json.eq(opt, 0, i, "cert2") then begin pn := optn - i - 1; for n := 0 to pn - 1 do path[n] := opt[i + 1 + n]; end
+    else if json.eq(opt, 0, i, "key2") then begin pn2 := optn - i - 1; for n := 0 to pn2 - 1 do path2[n] := opt[i + 1 + n]; end
+    else if json.eq(opt, 0, i, "app") then http.addport(v)
+    else if json.eq(opt, 0, i, "maxreply") then http.maxreply(v)
+    else if json.eq(opt, 0, i, "bodymem") then http.maxbodymem(v)
+    else begin io.puts(STDERR, "httpsapp: unknown option\n"); halt(2); end;
+    k := k + 1;
+  end;
+  http.redirect(plainport);
+  http.serve(tlsport, 1);
+end.

@@ -18,6 +18,135 @@ first on every upgrade.
 
 Newest first. Dates are the day the change landed.
 
+## 0.3.2 — 24 September 2026
+
+**A patch release for servers that face the internet.** A program that includes `lib/http.wz`
+now terminates TLS in its own event loop, obtains and renews its Let's Encrypt certificate
+from that loop, resolves hostnames, and carries requests and replies of many megabytes over
+thousands of connections at once — with no reverse proxy, no certbot, no second process.
+The language is unchanged.
+
+**What may need your attention** if your program compiles today:
+
+- `lib/http.wz` includes `lib/autocert.wz`, and with it the TLS stack and `lib/dns.wz`. A
+  server that never asks for HTTPS pays only in binary size. `http.osend` and `http.oend` are
+  gone: the finished reply is `http.outbuf[http.rstart..http.rend)`.
+- `tls.connect` and `tls.accept` switch the socket to non-blocking and keep a wall-clock
+  deadline (`tls.deadline`, 30 s). A caller that read the socket directly afterwards has to
+  expect `EAGAIN`.
+- `ch.verify` no longer tries every root in the store when none is named as the issuer: a
+  chain whose issuer is not in the store is refused at once.
+- The reply of `mcp.handle` is at `view(mcp.obase, n)`; it is still in `mcp.buf` whenever it
+  fits there.
+- Every Windows executable imports `iphlpapi.dll`, for the nameservers.
+
+**Library**
+
+- `lib/http.wz` keeps connections in slots instead of at their fd: 4096 at once per worker
+  (was 256, and any fd from 256 up was closed on sight), any fd up to 65536. Static memory
+  drops from 192 MB to 82 MB: each connection owns 16 kB of input, a larger request borrows
+  one of 64 shared 256 kB areas, and a reply waits in memory of its own only while the
+  socket cannot take it. Largest request and reply are unchanged.
+- `http.serve` raises the soft open-file limit to 65536 (at most the hard limit) on Linux.
+- New deadlines close stalled connections: headers 10 s from the first byte (never
+  extended), body 30 s plus 1 s per 16 kB, idle keep-alive 60 s, sending 30 s without
+  progress. `http.timeouts(idle, header, body, send)` changes them.
+- When every slot is busy, an idle connection is closed to make room; if there is none, the
+  new connection gets `503` with `Retry-After: 1`. `http.maxconn(n)` sets a lower limit.
+  Counters: `http.nopen`, `http.refused`, `http.evicted`, `http.timedout`, `http.queued`.
+- Fixed: pipelined requests are answered in order. Bytes after the first request of a read
+  were dropped, and the next request could overwrite a reply still being sent.
+- New: `http.listen(port, workers)` and `http.poll(timeout)` for a program with its own
+  loop, `http.addport(port)` for more listening ports, `http.lis` and `http.slis` for the
+  listener a connection came in on. The finished reply is `http.outbuf[http.rstart..http.rend)`;
+  `http.osend`/`http.oend` are gone. `http.accept`, `http.readable`, `http.flush`,
+  `http.drop` and `http.open[fd]` still work.
+- `lib/dns.wz`: hostnames to IPv4 addresses, over UDP to the nameservers in
+  `/etc/resolv.conf` and TCP when an answer is truncated; CNAME chains, a TTL cache, and
+  distinct failures (`DNS.NXDOMAIN`, `DNS.SERVFAIL`, `DNS.TIMEOUT`, ...). Blocking
+  (`dns.resolve`, `dns.connect`, at most 5 s) or from an epoll loop (`dns.start`, `dns.poll`).
+- `examples/host.wz`: a `host`-like lookup tool. `examples/wget.wz` takes a hostname in the
+  URL, looks it up, and checks the certificate against it.
+
+- New `lib/autocert.wz`: a server gets and renews its own Let's Encrypt certificate from
+  inside its event loop — one HTTPS request per tick, the HTTP-01 answer from memory,
+  verified chain, atomic store, backoff that survives a restart, and the new certificate
+  handed to `tls.setcert` without a restart. `examples/autocert.wz` is a complete server.
+- `ch.verify` builds the path by name only: the roots whose subject is the certificate's
+  issuer are tried, and a chain whose issuer is no root in the store is refused at once. It
+  used to fall back to trying the signature against every root, which cost seconds of CPU
+  per handshake with a system bundle (28 s for one certificate nobody issued) -- in the
+  caller's thread, which for a server is a way to be stalled by anyone who connects.
+- `lib/tls.wz` serves many TLS connections from one event loop: `tls.open`, `tls.feed`,
+  `tls.seal`, `tls.shut`, `tls.free` and `tls.state` drive a session per connection without
+  touching the socket, so a slow client no longer holds up the others. Up to 4096 sessions.
+- The server answers KeyUpdate, drops the compatibility change_cipher_spec, and fails only
+  the session that sent malformed input, with an alert.
+- `tls.setcert` takes a chain (DER certificates back to back, leaf first) and refuses a key
+  that does not belong to the leaf, keeping the pair it had. It is safe while sessions are
+  open.
+- `tls.accept` runs on the same session code; its callers are unchanged.
+- The blocking calls (`tls.connect`, `tls.accept`, `tls.read`, `tls.write`, `tls.close`)
+  each end within `tls.deadline` milliseconds, 30 s by default, instead of retrying a
+  stalled peer without a time limit. They put the socket in non-blocking mode.
+- `examples/serve.wz` uses the new server, gives each connection a deadline, and picks up a
+  new certificate from disk while running.
+
+- MCP messages of many megabytes: a request up to `mcp.maxin` (64 MB), a tool result up to
+  `tool.maxout` (64 MB) and a reply up to `mcp.maxout` (160 MB). A message larger than the
+  static buffers moves into a mapping that is given back afterwards; static memory is
+  unchanged. Past a limit the answer is a JSON-RPC error that names it (`data.limit`).
+- Fixed: a reply larger than 4 MB was cut short or stopped the server, and a stdio line
+  longer than 4 MB earned two errors. A tool result past its limit is now a JSON-RPC error
+  (`-32603`), no longer a tool result with `isError`.
+- The reply of `mcp.handle` is at `view(mcp.obase, n)` — in `mcp.buf` whenever it fits
+  there, as before. A transport of its own calls `mcp.done` after sending.
+- Fixed: `mcp.http` and `tool.rest` read a body larger than the HTTP input buffer (the
+  `http.maxbody` region) from the wrong buffer. An MCP reply larger than the HTTP layer
+  can send is a JSON-RPC error instead of a plain-text 500.
+
+- `lib/http.wz` serves HTTPS itself, in the same loop: `http.https(host, email, store,
+  staging)` gets and renews a Let's Encrypt certificate through `lib/autocert.wz`, and
+  `http.httpsfiles(cert, key)` takes one from PEM files (reloadable while serving). The port
+  given to `http.serve` then speaks TLS; `app.request` is unchanged (`http.istls`).
+- In HTTPS mode a plain listener (port 80, `http.redirect`) answers the ACME challenge,
+  redirects to `https://` once there is a certificate (`301`, `308` for other methods than
+  GET and HEAD) and answers `503` before — never the application.
+- The header deadline covers the TLS handshake; a refused TLS request lingers briefly so the
+  client reads the `413`/`503`; counters `http.tlsrefused`, `http.tlsfailed`, `http.tlskept`.
+- `lib/http.wz` now includes `lib/autocert.wz` (and with it the TLS stack and `lib/dns.wz`):
+  every program on it is about 0.5 MB larger.
+- `lib/autocert.wz` installs the whole chain instead of only the leaf, which browsers
+  refused; resolves the authority through `lib/dns.wz` (`autocert.pin` still overrides);
+  bounds its TLS calls with `tls.deadline`; reads PKCS #8 (`PRIVATE KEY`) keys too.
+- `ws.take` refuses a TLS connection instead of writing to it in the clear.
+- `examples/autocert.wz` is `http.https` plus options; `--pin` is no longer needed.
+
+- Large requests: `http.maxbody(cap)` now reads each body past `INBUF` into a region of its
+  own connection's, freed once answered, so several arrive at once (was: one region per
+  worker, a second big body got `413`). `http.maxbodymem(total)` bounds them together
+  (256 MB); past it, `503` with `Retry-After`. `http.bigowner`, `http.biglen` and
+  `http.bigtotal` are gone; `http.bodyinbig` and `http.bigbase` work as before.
+- Large replies: `http.maxreply(cap)` allows replies past `OUTBUF` (512 kB); the reply moves
+  to a region that grows as needed and, in the clear, becomes the queued output itself. Past
+  the limit, still a clean `500`.
+- `Expect: 100-continue` is answered once a body is accepted; curl no longer waits a second
+  before sending a body over 1 MB.
+- An MCP reply over HTTP is limited by `http.maxreply`, no longer by 512 kB (`mcp.httproom`
+  asks `http.replyroom`).
+
+**Compiler**
+
+- A Windows executable opens UDP sockets (`socket` with `SOCK_DGRAM`), a non-blocking
+  `connect` reports `EINPROGRESS` instead of a refusal, and an open of `/etc/resolv.conf` is
+  answered with the DNS servers Windows uses, from `GetNetworkParams` — so `lib/dns.wz`
+  runs unchanged there. Every `.exe` now imports `iphlpapi.dll`.
+- Fixed: the C bootstrap (`bin/wantzel0`) compiles `for` loops. It refused every one, so it
+  could not build any program that includes `lib/http.wz`, `lib/sha256.wz` or another
+  module with a `for`.
+- `test.sh` no longer reports "identical output" when a compiler refused the source (it
+  compared the previous source's files); both targets are checked, and a refusal is shown.
+
 ## 0.3.1 — 24 September 2026
 
 **A patch release for Windows.** A Windows executable now starts a server that writes its

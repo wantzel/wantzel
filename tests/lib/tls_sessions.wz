@@ -1,0 +1,597 @@
+// lib/tls.wz, the server sessions, driven in one process with no socket at all: a
+// ClientHello split into many records and fed one byte at a time, a full handshake checked
+// from the client's side, application data both ways, a KeyUpdate, close_notify, garbage and
+// a tampered record failing only their own session, the pool running out, and a certificate
+// swap while a session is open.
+//
+// THE CLIENT HALF IS WRITTEN OUT HERE, from RFC 8446, rather than borrowed from tls.connect:
+// the server has to be driven one byte at a time, and a blocking client cannot do that. It
+// shares the key schedule primitives with the server, so it proves the MECHANICS (state,
+// buffering, record boundaries, isolation) and not interoperability -- tests/lib/tls.sh and
+// tests/lib/tls_serve.sh do that against openssl, curl and a browser.
+include "io.wz";
+include "tls.wz";
+include "csr.wz";
+include "json.wz";
+
+var
+  // the certificates the server is given
+  k1d, k1x, k1y, k2d, k2x, k2y: array[0..P.N-1] of int;
+  cert1, cert2, chain: array[0..4095] of char;
+  cert1n, cert2n, chainn: int;
+  host: array[0..63] of char;
+  hostn: int;
+
+  // the client
+  t.priv, t.pub, t.peer, t.shared: array[0..31] of char;
+  t.early, t.hs, t.ms, t.chs, t.shs, t.cap, t.sap: array[0..31] of char;
+  t.th, t.fk, t.mac, t.zeros, t.derived, t.tmp: array[0..31] of char;
+  t.rkey, t.wkey: array[0..31] of char;
+  t.riv, t.wiv: array[0..11] of char;
+  t.rseq, t.wseq: int;
+  t.nonce: array[0..11] of char;
+  t.aad: array[0..4] of char;
+  t.tag: array[0..15] of char;
+  t.tr: array[0..65535] of char;
+  t.trn: int;
+  t.ch: array[0..2047] of char;
+  t.chn: int;
+  t.out: array[0..65535] of char;       // client to server, not yet fed
+  t.outn: int;
+  t.in: array[0..65535] of char;        // server to client, not yet read
+  t.inn, t.inat: int;
+  t.plain: array[0..16383] of char;
+  t.plainn, t.ptype: int;
+  t.msgs: array[0..32767] of char;      // the server's handshake messages, decrypted
+  t.msgn: int;
+  t.app: array[0..65535] of char;       // what the server handed to the application
+  t.appn: int;
+  t.certs: int;                         // entries in the last Certificate message
+  t.leafat, t.leafn: int;               // where the leaf sits in t.msgs
+  t.qx, t.qy: array[0..P.N-1] of int;   // the key the server should sign with
+  t.feeds: int;                         // how many feed calls produced output before the last byte
+  wire: array[0..TLS.MAXREC-1] of char;
+  app: array[0..16383] of char;
+  s1, s2, s3, s4, s5, s6, n, i, r: int;
+  ok: bool;
+  // the client's side of the first session, kept while other sessions are driven
+  sv.wkey, sv.rkey, sv.cap, sv.sap: array[0..31] of char;
+  sv.wiv, sv.riv: array[0..11] of char;
+  sv.wseq, sv.rseq: int;
+
+procedure say(s: str; b: bool);
+begin
+  if b then io.puts(STDOUT, "ok   ") else io.puts(STDOUT, "FAIL ");
+  io.puts(STDOUT, s);
+  io.puts(STDOUT, "\n");
+end;
+
+procedure t.tradd(b: array of char; at: int; cnt: int);
+begin
+  tls.copyin(t.tr[t.trn..t.trn + cnt - 1], b, at, cnt);
+  t.trn := t.trn + cnt;
+end;
+
+procedure t.hash(out: array of char);
+begin
+  sha256.init;
+  if t.trn > 0 then sha256.updateat(t.tr, 0, t.trn);
+  sha256.final(out);
+end;
+
+procedure t.mkmac(key: array of char; th: array of char; out: array of char);
+begin
+  tls.copyin(hk.msg, th, 0, 32);
+  hk.msgn := 32;
+  hk.mac(key, 32, out);
+end;
+
+procedure t.mknonce(iv: array of char; seq: int);
+var k, sq: int;
+begin
+  tls.copyin(t.nonce, iv, 0, 12);
+  sq := seq;
+  k := 11;
+  while k >= 4 do
+  begin
+    t.nonce[k] := chr(bxor(ord(t.nonce[k]), band(sq, 255)));
+    sq := sq shr 8;
+    k := k - 1;
+  end;
+end;
+
+// A plaintext record into t.out.
+procedure t.plainrec(ctype: int; b: array of char; at: int; cnt: int);
+begin
+  t.out[t.outn] := chr(ctype);
+  tls.put16(t.out, t.outn + 1, 0x0301);
+  tls.put16(t.out, t.outn + 3, cnt);
+  tls.copyin(t.out[t.outn + 5..t.outn + 5 + cnt - 1], b, at, cnt);
+  t.outn := t.outn + 5 + cnt;
+end;
+
+// An encrypted record into t.out, under the client's write key.
+procedure t.seal(ctype: int; b: array of char; at: int; cnt: int);
+var w: int;
+begin
+  w := t.outn;
+  t.out[w] := chr(23);
+  tls.put16(t.out, w + 1, 0x0303);
+  tls.put16(t.out, w + 3, cnt + 17);
+  if cnt > 0 then tls.copyin(t.out[w + 5..w + 5 + cnt - 1], b, at, cnt);
+  t.out[w + 5 + cnt] := chr(ctype);
+  tls.copyin(t.aad, t.out, w, 5);
+  t.mknonce(t.wiv, t.wseq);
+  ae.setkey(t.wkey);
+  ae.setnonce(t.nonce);
+  ae.seal(t.aad, 5, t.out, w + 5, cnt + 1, t.tag);
+  tls.copyin(t.out[w + 6 + cnt..w + 21 + cnt], t.tag, 0, 16);
+  t.wseq := t.wseq + 1;
+  t.outn := w + 22 + cnt;
+end;
+
+// The next record from the server, into t.plain; decrypted when it is encrypted.
+function t.next: bool;
+var ctype, cnt, k: int;
+begin
+  if t.inat + 5 > t.inn then return false;
+  ctype := ord(t.in[t.inat]);
+  cnt := tls.get16(t.in, t.inat + 3);
+  if t.inat + 5 + cnt > t.inn then return false;
+  if ctype <> 23 then
+  begin
+    tls.copyin(t.plain, t.in, t.inat + 5, cnt);
+    t.plainn := cnt;
+    t.ptype := ctype;
+    t.inat := t.inat + 5 + cnt;
+    return true;
+  end;
+  tls.copyin(t.aad, t.in, t.inat, 5);
+  tls.copyin(t.tag, t.in, t.inat + 5 + cnt - 16, 16);
+  tls.copyin(t.plain, t.in, t.inat + 5, cnt - 16);
+  t.mknonce(t.riv, t.rseq);
+  ae.setkey(t.rkey);
+  ae.setnonce(t.nonce);
+  if not ae.open(t.aad, 5, t.plain, 0, cnt - 16, t.tag) then return false;
+  t.rseq := t.rseq + 1;
+  k := cnt - 16;
+  while (k > 0) and (t.plain[k - 1] = chr(0)) do k := k - 1;
+  t.ptype := ord(t.plain[k - 1]);
+  t.plainn := k - 1;
+  t.inat := t.inat + 5 + cnt;
+  return true;
+end;
+
+// Feed t.out to session s -- whole, or one byte per call -- and collect what comes back.
+function t.feed(s: int; bytewise: bool): int;
+var k, res: int;
+begin
+  t.feeds := 0;
+  res := 0;
+  if bytewise then
+  begin
+    k := 0;
+    while k < t.outn do
+    begin
+      res := tls.feed(s, t.out[k..k], app, wire);
+      if (tls.wiren > 0) and (k < t.outn - 1) then t.feeds := t.feeds + 1;
+      tls.copyin(t.in[t.inn..t.inn + tls.wiren], wire, 0, tls.wiren);
+      t.inn := t.inn + tls.wiren;
+      tls.copyin(t.app[t.appn..t.appn + tls.appn], app, 0, tls.appn);
+      t.appn := t.appn + tls.appn;
+      if res < 0 then begin t.outn := 0; return res; end;
+      k := k + 1;
+    end;
+    t.outn := 0;
+    return 0;
+  end;
+  res := tls.feed(s, t.out[0..t.outn - 1], app, wire);
+  tls.copyin(t.in[t.inn..t.inn + tls.wiren], wire, 0, tls.wiren);
+  t.inn := t.inn + tls.wiren;
+  tls.copyin(t.app[t.appn..t.appn + tls.appn], app, 0, tls.appn);
+  t.appn := t.appn + tls.appn;
+  t.outn := 0;
+  return res;
+end;
+
+procedure t.put(v: int);
+begin
+  t.ch[t.chn] := chr(v);
+  t.chn := t.chn + 1;
+end;
+
+procedure t.put2(v: int);
+begin
+  tls.put16(t.ch, t.chn, v);
+  t.chn := t.chn + 2;
+end;
+
+// A ClientHello: TLS 1.3, ChaCha20-Poly1305, ECDSA P-256, one X25519 share, and a session
+// id so the server answers in compatibility mode.
+procedure t.buildch;
+var extat: int;
+begin
+  t.chn := 0;
+  t.put(1); t.put(0); t.put(0); t.put(0);
+  t.put2(0x0303);
+  rand.bytes(t.tmp);
+  tls.copyin(t.ch[t.chn..t.chn + 31], t.tmp, 0, 32); t.chn := t.chn + 32;
+  t.put(32);
+  rand.bytes(t.tmp);
+  tls.copyin(t.ch[t.chn..t.chn + 31], t.tmp, 0, 32); t.chn := t.chn + 32;
+  t.put2(4); t.put2(0x1301); t.put2(0x1303);
+  t.put(1); t.put(0);
+  extat := t.chn; t.chn := t.chn + 2;
+  t.put2(43); t.put2(3); t.put(2); t.put2(0x0304);
+  t.put2(13); t.put2(4); t.put2(2); t.put2(0x0403);
+  t.put2(10); t.put2(4); t.put2(2); t.put2(29);
+  t.put2(51); t.put2(38); t.put2(36); t.put2(29); t.put2(32);
+  tls.copyin(t.ch[t.chn..t.chn + 31], t.pub, 0, 32); t.chn := t.chn + 32;
+  tls.put16(t.ch, extat, t.chn - extat - 2);
+  tls.put24(t.ch, 1, t.chn - 4);
+end;
+
+// The server's CertificateVerify, checked against t.qx/t.qy: SEQUENCE { r, s }.
+function t.checkcv(b: array of char; at: int): bool;
+var e, rr, ss: array[0..P.N-1] of int;
+    buf: array[0..31] of char;
+    tmp: array[0..63] of char;
+    p, rl, sl, k: int;
+    ctx: str;
+begin
+  ctx := "TLS 1.3, server CertificateVerify";
+  sha256.init;
+  k := 0;
+  while k < 64 do begin tmp[k] := chr(32); k := k + 1; end;
+  sha256.updateat(tmp, 0, 64);
+  k := 0;
+  while k < slen(ctx) do begin tmp[k] := schar(ctx, k); k := k + 1; end;
+  tmp[k] := chr(0);
+  sha256.updateat(tmp, 0, k + 1);
+  sha256.updateat(t.th, 0, 32);
+  sha256.final(buf);
+  p256.frombytes(e, buf, 0);
+  if tls.get16(b, at + 4) <> 0x0403 then return false;
+  p := at + 8;                               // the DER signature
+  if ord(b[p]) <> 0x30 then return false;
+  p := p + 2;
+  rl := ord(b[p + 1]);
+  while (rl > 32) do begin p := p + 1; rl := rl - 1; end;
+  tls.zero32(buf);
+  tls.copyin(buf[32 - rl..31], b, p + 2, rl);
+  p256.frombytes(rr, buf, 0);
+  p := p + 2 + rl;
+  sl := ord(b[p + 1]);
+  while (sl > 32) do begin p := p + 1; sl := sl - 1; end;
+  tls.zero32(buf);
+  tls.copyin(buf[32 - sl..31], b, p + 2, sl);
+  p256.frombytes(ss, buf, 0);
+  return p256.verify(t.qx, t.qy, e, rr, ss);
+end;
+
+// A whole handshake with session s: the ClientHello cut into records of `frag` bytes and
+// fed whole or one byte at a time, the server's flight checked message by message, and our
+// Finished sent back. True when the session ends up established.
+function t.handshake(s: int; frag: int; bytewise: bool): bool;
+var at, k, mt, ml, cnt, ext, elen: int;
+    one: array[0..0] of char;
+    fin: array[0..35] of char;
+    sawsig, sawfin: bool;
+begin
+  rand.bytes(t.priv);
+  x.base(t.pub, t.priv);
+  t.buildch;
+  t.trn := 0;
+  t.tradd(t.ch, 0, t.chn);
+  t.outn := 0;
+  at := 0;
+  while at < t.chn do
+  begin
+    k := t.chn - at;
+    if k > frag then k := frag;
+    t.plainrec(22, t.ch, at, k);
+    at := at + k;
+  end;
+  t.inn := 0;
+  t.inat := 0;
+  if t.feed(s, bytewise) < 0 then begin io.puts(STDOUT, tls.why); io.puts(STDOUT, "\n"); return false; end;
+  if t.feeds <> 0 then begin io.puts(STDOUT, "the server answered before the ClientHello was complete\n"); return false; end;
+
+  // ServerHello, in the clear
+  if not t.next then return false;
+  if (t.ptype <> 22) or (ord(t.plain[0]) <> 2) then return false;
+  t.tradd(t.plain, 0, t.plainn);
+  at := 4 + 2 + 32;
+  at := at + 1 + ord(t.plain[at]);           // the echoed session id
+  at := at + 3;                              // suite, compression
+  cnt := at + 2 + tls.get16(t.plain, at);
+  at := at + 2;
+  while at < cnt do
+  begin
+    ext := tls.get16(t.plain, at);
+    elen := tls.get16(t.plain, at + 2);
+    if ext = 51 then tls.copyin(t.peer, t.plain, at + 8, 32);
+    at := at + 4 + elen;
+  end;
+  x.scalarmult(t.shared, t.priv, t.peer);
+
+  // the key schedule, the client's way round
+  tls.zero32(t.zeros);
+  hkdf.extract(t.zeros, 0, t.zeros, 32, t.early);
+  sha256.init; sha256.final(t.th);
+  tls.derivesecret(t.early, "derived", t.th, t.derived);
+  hkdf.extract(t.derived, 32, t.shared, 32, t.hs);
+  t.hash(t.th);
+  tls.derivesecret(t.hs, "c hs traffic", t.th, t.chs);
+  tls.derivesecret(t.hs, "s hs traffic", t.th, t.shs);
+  sha256.init; sha256.final(t.th);
+  tls.derivesecret(t.hs, "derived", t.th, t.derived);
+  hkdf.extract(t.derived, 32, t.zeros, 32, t.ms);
+  tls.keys(t.shs, t.rkey, t.riv); t.rseq := 0;
+  tls.keys(t.chs, t.wkey, t.wiv); t.wseq := 0;
+
+  // the compatibility change_cipher_spec, because we sent a session id
+  if not t.next then return false;
+  if t.ptype <> 20 then begin io.puts(STDOUT, "no change_cipher_spec after the ServerHello\n"); return false; end;
+
+  // the encrypted flight, message by message
+  t.msgn := 0;
+  sawfin := false;
+  sawsig := false;
+  while not sawfin do
+  begin
+    if not t.next then begin io.puts(STDOUT, "the flight ended early or did not decrypt\n"); return false; end;
+    if t.ptype <> 22 then return false;
+    tls.copyin(t.msgs[t.msgn..t.msgn + t.plainn], t.plain, 0, t.plainn);
+    t.msgn := t.msgn + t.plainn;
+    at := 0;
+    while (at + 4 <= t.msgn) and (not sawfin) do
+    begin
+      mt := ord(t.msgs[at]);
+      ml := tls.get24(t.msgs, at + 1);
+      if at + 4 + ml > t.msgn then break;
+      if mt = 11 then
+      begin
+        // the list of certificates: count them and remember the leaf
+        t.certs := 0;
+        k := at + 4 + 1 + 3;
+        t.leafat := k + 3;
+        t.leafn := tls.get24(t.msgs, k);
+        while k < at + 4 + ml do
+        begin
+          k := k + 3 + tls.get24(t.msgs, k);
+          k := k + 2 + tls.get16(t.msgs, k);
+          t.certs := t.certs + 1;
+        end;
+      end;
+      if mt = 15 then
+      begin
+        t.hash(t.th);
+        sawsig := t.checkcv(t.msgs, at);
+        if not sawsig then begin io.puts(STDOUT, "the CertificateVerify does not verify\n"); return false; end;
+      end;
+      if mt = 20 then
+      begin
+        tls.expandlabel(t.shs, "finished", t.th, 0, t.fk, 32);
+        t.hash(t.th);
+        t.mkmac(t.fk, t.th, t.mac);
+        k := 0;
+        while k < 32 do
+        begin
+          if t.mac[k] <> t.msgs[at + 4 + k] then begin io.puts(STDOUT, "the server's Finished is wrong\n"); return false; end;
+          k := k + 1;
+        end;
+        sawfin := true;
+      end;
+      t.tradd(t.msgs, at, 4 + ml);
+      at := at + 4 + ml;
+    end;
+    // what is left of a message split across records moves to the front
+    tls.copyin(t.msgs[0..t.msgn - at], t.msgs, at, t.msgn - at);
+    t.msgn := t.msgn - at;
+  end;
+  if not sawsig then return false;
+
+  // our Finished, and the application keys
+  t.hash(t.th);
+  tls.derivesecret(t.ms, "c ap traffic", t.th, t.cap);
+  tls.derivesecret(t.ms, "s ap traffic", t.th, t.sap);
+  tls.expandlabel(t.chs, "finished", t.th, 0, t.fk, 32);
+  t.mkmac(t.fk, t.th, t.mac);
+  fin[0] := chr(20);
+  tls.put24(fin, 1, 32);
+  tls.copyin(fin[4..35], t.mac, 0, 32);
+  one[0] := chr(1);
+  t.plainrec(20, one, 0, 1);
+  t.seal(22, fin, 0, 36);
+  tls.keys(t.cap, t.wkey, t.wiv); t.wseq := 0;
+  tls.keys(t.sap, t.rkey, t.riv); t.rseq := 0;
+  if t.feed(s, bytewise) < 0 then begin io.puts(STDOUT, tls.why); io.puts(STDOUT, "\n"); return false; end;
+  return tls.state(s) = TLS.ST.OPEN;
+end;
+
+// Application data from the client: returns whether the server handed exactly it over.
+function t.ping(s: int; msg: str): bool;
+var b: array[0..63] of char;
+    k, before: int;
+begin
+  k := io.push(b, 0, msg);
+  t.seal(23, b, 0, k);
+  before := t.appn;
+  if t.feed(s, false) < 0 then return false;
+  if t.appn - before <> k then return false;
+  return json.eq(t.app, before, t.appn, msg);
+end;
+
+// Application data from the server: sealed by the session, opened by the client.
+function t.pong(s: int; msg: str): bool;
+var b: array[0..63] of char;
+    k, w: int;
+begin
+  k := io.push(b, 0, msg);
+  w := tls.seal(s, b[0..k - 1], wire);
+  if w <> k + 22 then return false;
+  tls.copyin(t.in[t.inn..t.inn + w], wire, 0, w);
+  t.inn := t.inn + w;
+  if not t.next then return false;
+  if (t.ptype <> 23) or (t.plainn <> k) then return false;
+  return json.eq(t.plain, 0, k, msg);
+end;
+
+procedure t.save;
+begin
+  tls.copyin(sv.wkey, t.wkey, 0, 32); tls.copyin(sv.rkey, t.rkey, 0, 32);
+  tls.copyin(sv.cap, t.cap, 0, 32); tls.copyin(sv.sap, t.sap, 0, 32);
+  tls.copyin(sv.wiv, t.wiv, 0, 12); tls.copyin(sv.riv, t.riv, 0, 12);
+  sv.wseq := t.wseq; sv.rseq := t.rseq;
+end;
+
+procedure t.restore;
+begin
+  tls.copyin(t.wkey, sv.wkey, 0, 32); tls.copyin(t.rkey, sv.rkey, 0, 32);
+  tls.copyin(t.cap, sv.cap, 0, 32); tls.copyin(t.sap, sv.sap, 0, 32);
+  tls.copyin(t.wiv, sv.wiv, 0, 12); tls.copyin(t.riv, sv.riv, 0, 12);
+  t.wseq := sv.wseq; t.rseq := sv.rseq;
+  t.inn := 0; t.inat := 0; t.outn := 0;
+end;
+
+// Is the leaf in the last Certificate message the same bytes as b[0..bn)?
+function t.leafis(b: array of char; bn: int): bool;
+var k: int;
+begin
+  if t.leafn <> bn then return false;
+  k := 0;
+  while k < bn do
+  begin
+    if t.msgs[t.leafat + k] <> b[k] then return false;
+    k := k + 1;
+  end;
+  return true;
+end;
+
+begin
+  p256.setup;
+  csr.setvalidity(1790000000, 1);
+  hostn := io.push(host, 0, "first.test");
+  if not p256.genkey(k1d, k1x, k1y) then halt(1);
+  if not csr.selfsign(host, hostn, k1d, k1x, k1y) then halt(1);
+  cert1n := csr.n;
+  tls.copyin(cert1, csr.buf, 0, cert1n);
+  hostn := io.push(host, 0, "second.test");
+  if not p256.genkey(k2d, k2x, k2y) then halt(1);
+  if not csr.selfsign(host, hostn, k2d, k2x, k2y) then halt(1);
+  cert2n := csr.n;
+  tls.copyin(cert2, csr.buf, 0, cert2n);
+
+  say("no session before a certificate is installed", tls.open < 0);
+  say("a certificate with the wrong key is refused", not tls.setcert(cert1, cert1n, k2d));
+  say("and no certificate is installed by it", tls.open < 0);
+  say("the right pair is installed", tls.setcert(cert1, cert1n, k1d));
+  p256.copy(t.qx, k1x);
+  p256.copy(t.qy, k1y);
+
+  // ---- a ClientHello in 7-byte records, fed one byte per call ----
+  s1 := tls.open;
+  say("a session opens", s1 >= 0);
+  say("and is handshaking", tls.state(s1) = TLS.ST.HANDSHAKE);
+  ok := t.handshake(s1, 7, true);
+  say("a ClientHello split into 7-byte records, fed a byte at a time, completes a handshake", ok);
+  say("the server sent nothing until the last byte of the ClientHello", t.feeds = 0);
+  say("the certificate it sent is the one installed", t.leafis(cert1, cert1n));
+  say("client to server: application data arrives", t.ping(s1, "GET / HTTP/1.1\r\n\r\n"));
+  say("server to client: tls.seal produces a record the client opens", t.pong(s1, "HTTP/1.1 200 OK\r\n\r\n"));
+
+  // ---- a KeyUpdate that asks for ours as well ----
+  t.out[0] := chr(24); t.out[1] := chr(0); t.out[2] := chr(0); t.out[3] := chr(1); t.out[4] := chr(1);
+  tls.copyin(t.tmp, t.out, 0, 5);
+  t.outn := 0;
+  t.seal(22, t.tmp, 0, 5);
+  tls.expandlabel(t.cap, "traffic upd", t.th, 0, t.fk, 32);
+  tls.copyin(t.cap, t.fk, 0, 32);
+  tls.keys(t.cap, t.wkey, t.wiv); t.wseq := 0;
+  r := t.feed(s1, false);
+  say("a KeyUpdate is taken", (r >= 0) and (tls.state(s1) = TLS.ST.OPEN));
+  ok := t.next;
+  say("and answered with our own, under the old key", ok and (t.ptype = 22) and (ord(t.plain[0]) = 24));
+  tls.expandlabel(t.sap, "traffic upd", t.th, 0, t.fk, 32);
+  tls.copyin(t.sap, t.fk, 0, 32);
+  tls.keys(t.sap, t.rkey, t.riv); t.rseq := 0;
+  say("data after it, client to server, under the new key", t.ping(s1, "new key"));
+  say("and server to client, under the new key", t.pong(s1, "new key back"));
+
+  t.save;
+
+  // ---- one session failing leaves the others alone ----
+  s2 := tls.open;
+  t.outn := io.push(t.out, 0, "GET / HTTP/1.1\r\n");
+  r := tls.feed(s2, t.out[0..t.outn - 1], app, wire);
+  t.outn := 0;
+  say("plain HTTP on a TLS session fails that session", (r < 0) and (tls.state(s2) = TLS.ST.FAILED));
+  say("with an unexpected_message alert, in the clear",
+      (tls.wiren = 7) and (ord(wire[0]) = 21) and (ord(wire[5]) = 2) and (ord(wire[6]) = 10));
+  s3 := tls.open;
+  t.out[0] := chr(22); t.out[1] := chr(3); t.out[2] := chr(1); t.out[3] := chr(255); t.out[4] := chr(255);
+  r := tls.feed(s3, t.out[0..4], app, wire);
+  say("a record claiming 65535 bytes is refused before anything is buffered", (r < 0) and (tls.code(s3) = 22));
+  s4 := tls.open;
+  ok := t.handshake(s4, 16384, false);
+  say("a second handshake, the ClientHello in one piece", ok);
+  t.seal(23, t.tmp, 0, 8);
+  t.out[t.outn - 3] := chr(bxor(ord(t.out[t.outn - 3]), 1));   // one bit of the tag
+  r := t.feed(s4, false);
+  say("a tampered record fails its session with bad_record_mac", (r < 0) and (tls.code(s4) = 20));
+  say("and the alert goes out encrypted", (tls.wiren = 24) and (ord(wire[0]) = 23));
+  say("the first session is still established", tls.state(s1) = TLS.ST.OPEN);
+  t.restore;
+  say("and still carries data", t.ping(s1, "still here"));
+  t.save;
+
+  // ---- the certificate is swapped while s1 is open ----
+  chainn := 0;
+  tls.copyin(chain, cert2, 0, cert2n); chainn := cert2n;
+  tls.copyin(chain[chainn..chainn + cert1n - 1], cert1, 0, cert1n); chainn := chainn + cert1n;
+  say("a new chain of two certificates is installed while a session is open", tls.setcert(chain, chainn, k2d));
+  p256.copy(t.qx, k2x);
+  p256.copy(t.qy, k2y);
+  s5 := tls.open;
+  ok := t.handshake(s5, 16384, false);
+  say("a new handshake after the swap", ok);
+  say("presents the new leaf", t.leafis(cert2, cert2n));
+  say("and the whole chain, one entry per certificate", t.certs = 2);
+  t.restore;
+  say("the session opened before the swap still carries data", t.ping(s1, "after the swap"));
+  say("in both directions", t.pong(s1, "after the swap, back"));
+  t.save;
+  say("a mismatched pair does not replace the installed one", not tls.setcert(cert1, cert1n, k2d));
+  s6 := tls.open;
+  ok := t.handshake(s6, 16384, false);
+  say("so the next handshake still presents the second chain", ok and t.leafis(cert2, cert2n));
+
+  // ---- close_notify ----
+  t.restore;
+  t.out[0] := chr(1); t.out[1] := chr(0);
+  tls.copyin(t.tmp, t.out, 0, 2);
+  t.outn := 0;
+  t.seal(21, t.tmp, 0, 2);
+  r := t.feed(s1, false);
+  say("close_notify from the client closes the session", tls.state(s1) = TLS.ST.CLOSED);
+  say("tls.shut answers with ours", tls.shut(s1, wire) = 24);
+  say("and nothing is sealed after it", tls.seal(s1, "late", wire) < 0);
+  say("a session still handshaking cannot seal", tls.seal(tls.open, "early", wire) < 0);
+
+  // ---- the pool ----
+  tls.free(s1); tls.free(s2); tls.free(s3); tls.free(s4); tls.free(s5); tls.free(s6);
+  n := tls.live;
+  i := 0;
+  // BOUNDED, so a pool that never runs out ends this loop instead of hanging it.
+  while (i <= TLS.MAXSESS) and (tls.open >= 0) do i := i + 1;
+  say("the pool holds TLS.MAXSESS sessions", i + n = TLS.MAXSESS);
+  say("and says why when it is empty", slen(tls.why) > 0);
+  tls.free(17);
+  s1 := tls.open;
+  say("a freed session is handed out again", s1 = 17);
+  tls.free(17);
+  tls.free(17);
+  say("freeing twice gives nothing back twice", tls.open = 17);
+  say("a freed session has no state", tls.state(TLS.MAXSESS + 5) = TLS.ST.UNUSED);
+end.

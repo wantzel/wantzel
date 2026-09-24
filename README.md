@@ -78,7 +78,7 @@ wantzel: oops.wz:6: type error in assignment: expected int, found str
 | **No dependencies** | One static binary, and every program it produces is one too. Nothing to install per agent, nothing to tear down. |
 | **Small at run time** | No runtime, no garbage collector, no virtual machine. |
 | **Strict and verbose** | What it refuses, nobody has to review. What it accepts, it accepts in silence. Otherwise: the file, the line and the reason. |
-| **HTTPS with nothing linked** | TLS 1.3 written in the language itself: X25519, ChaCha20-Poly1305, ECDSA P-256/P-384, RSA, chain verification and a trust store. [`examples/serve.wz`](examples/serve.wz) serves HTTP and HTTPS and renews its own Let's Encrypt certificate from one event loop. |
+| **HTTPS with nothing linked** | TLS 1.3 written in the language itself: X25519, ChaCha20-Poly1305, ECDSA P-256/P-384, RSA, chain verification and a trust store. [`examples/autocert.wz`](examples/autocert.wz) serves HTTP and HTTPS and gets and renews its own Let's Encrypt certificate from one event loop. |
 
 ## What is in the box
 

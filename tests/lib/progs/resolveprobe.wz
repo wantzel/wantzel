@@ -1,0 +1,50 @@
+// resolveprobe -- lib/autocert.wz's one DNS call site (autocert.resolve), against the fake
+// nameserver on 127.0.0.1:<port>, for tests/lib/autocert_resolve.sh.
+//
+//   resolveprobe <port>
+//
+// One line per name: "<name> <a.b.c.d>", or "<name> FAIL <why>: <detail>".
+include "io.wz";
+include "autocert.wz";
+
+var
+  port: int;
+  ok: bool;
+  line: array[0..1023] of char;
+
+procedure ask(name: str);
+var n, i: int;
+begin
+  n := io.push(line, 0, name);
+  n := io.push(line, n, " ");
+  if autocert.resolve(line[0..slen(name) - 1], slen(name)) then
+  begin
+    for i := 0 to 3 do
+    begin
+      n := io.pushnum(line, n, autocert.ip[i]);
+      if i < 3 then n := io.push(line, n, ".");
+    end;
+  end
+  else
+  begin
+    n := io.push(line, n, "FAIL ");
+    n := io.push(line, n, autocert.why);
+    n := io.push(line, n, ": ");
+    for i := 0 to autocert.detailn - 1 do begin line[n] := autocert.detail[i]; n := n + 1; end;
+  end;
+  n := io.push(line, n, "\n");
+  io.out(STDOUT, addr(line[0]), n);
+end;
+
+begin
+  port := io.argn(1);
+  dns.noservers;
+  ok := dns.addserver(127, 0, 0, 1, port);
+  // a pin wins over DNS, which knows a.test as 10.1.2.3
+  ok := autocert.pin("a.test", 10, 20, 30, 40);
+  ask("a.test");
+  ask("chain.test");
+  ask("nx.test");
+  ask("192.0.2.7");
+  ask("localhost");
+end.

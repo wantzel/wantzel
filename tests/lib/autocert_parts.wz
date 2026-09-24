@@ -1,0 +1,187 @@
+// lib/autocert.wz: the parts that need no network -- URLs, addresses, reading a reply
+// (chunked or not), the key file, the challenge answer and the authority's error document.
+//
+// tests/lib/autocert.sh runs the whole lifecycle against a local authority; this checks the
+// pieces one at a time, where a wrong answer names the piece. Every input that should be
+// REFUSED is here beside one that should be accepted, because a parser that accepts
+// everything passes every positive case.
+include "autocert.wz";
+
+var
+  failures: int;
+  b: array[0..4095] of char;
+  n, i: int;
+  d, qx, qy: array[0..P.N-1] of int;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ")
+  else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+function hostis(s: str): bool;
+var k: int;
+begin
+  if autocert.uhostn <> slen(s) then return false;
+  k := 0;
+  while k < slen(s) do
+  begin
+    if autocert.uhost[k] <> schar(s, k) then return false;
+    k := k + 1;
+  end;
+  return true;
+end;
+
+function pathis(s: str): bool;
+var k: int;
+begin
+  if autocert.upathn <> slen(s) then return false;
+  k := 0;
+  while k < slen(s) do
+  begin
+    if autocert.upath[k] <> schar(s, k) then return false;
+    k := k + 1;
+  end;
+  return true;
+end;
+
+function url(s: str): bool;
+begin
+  n := io.push(b, 0, s);
+  return autocert.parseurl(b, n);
+end;
+
+function ipis(a: int; c: int; e: int; f: int): bool;
+begin
+  return (autocert.ip[0] = a) and (autocert.ip[1] = c) and (autocert.ip[2] = e) and (autocert.ip[3] = f);
+end;
+
+function resolves(s: str): bool;
+begin
+  n := io.push(b, 0, s);
+  return autocert.resolve(b, n);
+end;
+
+// Put a raw reply in place and read it as fetch does.
+function reply(s: str): bool;
+begin
+  autocert.repn := io.push(autocert.rep, 0, s);
+  autocert.hdrend := autocert.findend(autocert.repn);
+  if autocert.hdrend < 0 then return false;
+  autocert.readhead;
+  return true;
+end;
+
+function bodyis(s: str): bool;
+var k: int;
+begin
+  if autocert.bodn <> slen(s) then return false;
+  k := 0;
+  while k < slen(s) do
+  begin
+    if autocert.bod[k] <> schar(s, k) then return false;
+    k := k + 1;
+  end;
+  return true;
+end;
+
+function answers(s: str): int;
+var dst: array[0..255] of char;
+begin
+  n := io.push(b, 0, s);
+  return autocert.answer(b[0..n - 1], dst);
+end;
+
+function detailis(s: str): bool;
+var k: int;
+begin
+  if autocert.detailn <> slen(s) then return false;
+  k := 0;
+  while k < slen(s) do
+  begin
+    if autocert.detail[k] <> schar(s, k) then return false;
+    k := k + 1;
+  end;
+  return true;
+end;
+
+begin
+  failures := 0;
+  autocert.quiet := true;
+
+  // ---- URLs: https only, a host of plain characters, an optional port, a path ----
+  expect(url("https://acme-v02.api.letsencrypt.org/directory") and hostis("acme-v02.api.letsencrypt.org")
+         and (autocert.uport = 443) and pathis("/directory"), "an https URL: host, default port, path");
+  expect(url("https://ca.example.com:14000") and hostis("ca.example.com") and (autocert.uport = 14000)
+         and pathis("/"), "a port, and no path means /");
+  expect(not url("http://ca.example.com/directory"), "plain http is refused");
+  expect(not url("https://user@ca.example.com/"), "a user part is refused");
+  expect(not url("https://ca.example.com:99999/"), "a port above 65535 is refused");
+  expect(not url("https://ca.example.com:/x"), "a port with no digits is refused");
+  expect(not url("https:///directory"), "no host is refused");
+  expect(not url("https://ca.example.com/a b"), "a space in the path is refused");
+  expect(not url("https://[::1]/"), "an IPv6 literal is refused rather than misread");
+
+  // ---- from a name to an address ----
+  expect(resolves("10.1.2.3") and ipis(10, 1, 2, 3), "a literal address");
+  expect(not resolves("10.1.2"), "three octets are not an address");
+  expect(not resolves("256.0.0.1"), "an octet above 255 is not an address");
+  expect(autocert.pin("ca.example.com", 127, 0, 0, 7), "a name can be pinned");
+  expect(resolves("CA.Example.COM") and ipis(127, 0, 0, 7), "a pinned name, in any case");
+  expect(resolves("localhost") and ipis(127, 0, 0, 1), "localhost");
+  expect(not resolves("elsewhere.example.net"), "an unknown name is not guessed");
+
+  // ---- reading a reply ----
+  expect(reply("HTTP/1.1 201 Created\r\nReplay-Nonce: abc\r\nLOCATION: https://ca.example.com/acct/9\r\nContent-Length: 4\r\n\r\n{}{}")
+         and (autocert.status = 201) and autocert.complete(autocert.repn) and autocert.takebody and bodyis("{}{}"),
+         "a reply with a length: status, complete, body");
+  autocert.locn := autocert.header("location", autocert.loc);
+  expect(autocert.locn = 29, "a header is found whatever its case");
+  expect(reply("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n{}") and (not autocert.complete(autocert.repn)),
+         "a reply shorter than its length is not complete");
+  expect(reply("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n")
+         and autocert.complete(autocert.repn) and autocert.takebody and bodyis("Wikipedia"),
+         "a chunked body is put back together");
+  expect(reply("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n")
+         and (not autocert.complete(autocert.repn)), "a chunked body without its last chunk is not complete");
+  expect(reply("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nff\r\nshort\r\n0\r\n\r\n")
+         and (not autocert.takebody), "a chunk that claims more than there is is refused");
+  expect(reply("HTTP/1.1 204 No Content\r\nReplay-Nonce: x\r\n\r\n") and autocert.complete(autocert.repn),
+         "a 204 without a length is complete at its headers");
+
+  // ---- the key file: written, read back, and a damaged one refused ----
+  p256.setup;
+  expect(p256.genkey(d, qx, qy), "a key to store");
+  autocert.keyder(d, qx, qy);
+  n := autocert.pemput(b, 0, "EC PRIVATE KEY", autocert.der, AUTOCERT.KEYLEN);
+  expect((n > 0) and autocert.readkey(b, n) and (p256.cmp(autocert.kd, d) = 0) and (p256.cmp(autocert.kx, qx) = 0),
+         "a key written as PEM reads back as the same key");
+  // one character of the scalar changed: still valid base64, still the right shape -- only
+  // the check that the public half belongs to the private half can see it
+  i := 31 + 20;                        // past the 31-character BEGIN line: DER byte 15, in the scalar
+  if b[i] = 'A' then b[i] := 'B' else b[i] := 'A';
+  expect(not autocert.readkey(b, n), "a key whose scalar was damaged is refused");
+  expect(autocert.pemput(b, 4000, "EC PRIVATE KEY", autocert.der, AUTOCERT.KEYLEN) < 0,
+         "a PEM block that does not fit is refused, not truncated");
+
+  // ---- the challenge answer: the exact token of the order in progress, nothing else ----
+  expect(answers("/.well-known/acme-challenge/abc") < 0, "no order, no answer");
+  autocert.tokenn := io.push(autocert.token, 0, "Tok_en-1");
+  autocert.keyauthn := io.push(autocert.keyauth, 0, "Tok_en-1.thumbprint");
+  expect(answers("/.well-known/acme-challenge/Tok_en-1") = 19, "the token of the order is answered");
+  expect(answers("/.well-known/acme-challenge/Tok_en-") < 0, "a prefix of the token is not");
+  expect(answers("/.well-known/acme-challenge/Tok_en-1x") < 0, "nor a longer path");
+  expect(answers("/.well-known/acme-challenge/tok_en-1") < 0, "nor the token in another case");
+  expect(answers("/elsewhere/acme-challenge/Tok_en-1") < 0, "nor the token under another path");
+
+  // ---- the authority's error document ----
+  autocert.bodn := io.push(autocert.bod, 0, "{\"type\": \"urn:ietf:params:acme:error:badNonce\", \"detail\": \"said \\\"no\\\"\"}");
+  expect(autocert.problemis("badNonce"), "the error type is recognised");
+  expect(not autocert.problemis("Nonce"), "and not by a suffix of it");
+  autocert.readproblem;
+  expect(detailis("urn:ietf:params:acme:error:badNonce: said \"no\""), "type and detail, with the escapes undone");
+
+  if failures = 0 then io.puts(STDOUT, "all passed\n");
+end.

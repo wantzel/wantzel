@@ -35,8 +35,11 @@ begin
     net.close(http.fd);
     return;
   end;
+  // how many connections the loop still counts as its own: a detached one must not be
   http.start;
-  http.add("plain\n");
+  http.add("plain open=");
+  http.addn(http.nopen);
+  http.add("\n");
   http.finish(200, "text/plain");
 end;
 
@@ -82,6 +85,7 @@ while [ $i -lt 20 ]; do
 done
 body3=$(curl -s "http://127.0.0.1:$port/")
 assert_contains "and the server is still healthy after twenty detaches" "$body3" "plain"
+assert_contains "and every detached connection gave its slot back" "$body3" "open=1"
 
 # ---- SABOTAGE: remove the http.detach check from http.readable so app.request's
 # flag is never acted on. This is the same mechanism tests/lib/websocket.sh's own

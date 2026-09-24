@@ -1,0 +1,7 @@
+ok   a handshake with a silent peer fails
+ok   after the deadline, not before it
+ok   and not long after it
+ok   with the timeout as the reason
+ok   a peer that stops mid-record fails the handshake
+ok   within the deadline
+ok   with the timeout as the reason

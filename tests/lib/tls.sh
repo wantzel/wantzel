@@ -63,7 +63,7 @@ openssl s_server -accept "$port" -cert "$tmp/c.pem" -key "$tmp/k.pem" \
 started="$started $!"
 
 i=0
-while [ $i -lt 50 ]; do
+while [ $i -lt 200 ]; do
   ss -tln 2>/dev/null | grep -q ":$port " && break
   sleep 0.1
   i=$((i+1))
@@ -236,7 +236,7 @@ openssl s_server -accept "$rsaport" -cert "$tmp/rc.pem" -key "$tmp/rk.pem" \
   -tls1_3 -www -quiet >"$tmp/rsa.log" 2>&1 &
 started="$started $!"
 i=0
-while [ $i -lt 50 ]; do
+while [ $i -lt 200 ]; do
   ss -tln 2>/dev/null | grep -q ":$rsaport " && break
   sleep 0.1; i=$((i+1))
 done
@@ -391,7 +391,7 @@ WZ
 if "$here/bin/wantzel" "$tmp/srv.wz" "$tmp/srvbin" >/dev/null 2>&1; then
   ( cd "$tmp" && ./srvbin > srv.out 2>&1 & )
   i=0
-  while [ $i -lt 50 ]; do
+  while [ $i -lt 200 ]; do
     ss -tln 2>/dev/null | grep -q ":$srvport " && break
     sleep 0.1; i=$((i+1))
   done

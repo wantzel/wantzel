@@ -82,6 +82,51 @@ else
   bad "our body differs from curl's" "ours: $oursbody frames, curl: $theirsbody"
 fi
 
+# ---- 2b. A HOSTNAME IN THE URL: looked up (lib/dns.wz), and the name the certificate is
+# checked against when no second argument names one. "localhost" needs no nameserver, so
+# this stays off the network.
+byname=$("$tmp/wget" "https://localhost:$port/" "--cafile=$tmp/c.pem" 2>"$tmp/err" || true)
+case "$byname" in
+  *"HTTP/1.0 200"*) ok "a hostname URL is resolved, and its name is the one the certificate is checked against" ;;
+  *) bad "the hostname URL failed" "$(head -2 "$tmp/err")" "got: $(echo "$byname" | head -2)" ;;
+esac
+
+# ---- 2c. A ROOT THAT IS NOT IN THE CHAIN: found by its name, proved by its signature ---------
+#
+# The server sends ONLY the leaf; the root is in --cafile and nowhere else. So the chain
+# check has to pick the root whose subject is the leaf's issuer and verify the signature
+# with its key. That is the ordinary shape of a public site (the browser holds the root,
+# the server does not send it), and the one case that exercises the by-name lookup: a
+# self-signed certificate in --cafile IS the chain's top and is found by comparing bytes.
+caport=$(( port + 3 ))
+openssl ecparam -name prime256v1 -genkey -noout -out "$tmp/ca.key" 2>/dev/null
+openssl req -x509 -key "$tmp/ca.key" -out "$tmp/ca.pem" -days 1 -subj "/CN=Test Root" \
+  -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
+openssl ecparam -name prime256v1 -genkey -noout -out "$tmp/leaf.key" 2>/dev/null
+openssl req -new -key "$tmp/leaf.key" -out "$tmp/leaf.csr" -subj "/CN=localhost" >/dev/null 2>&1
+printf 'subjectAltName=DNS:localhost\nbasicConstraints=CA:FALSE\n' > "$tmp/leaf.ext"
+openssl x509 -req -in "$tmp/leaf.csr" -CA "$tmp/ca.pem" -CAkey "$tmp/ca.key" -CAcreateserial \
+  -out "$tmp/leaf.pem" -days 1 -extfile "$tmp/leaf.ext" >/dev/null 2>&1 \
+  || { echo "  FAIL  cannot make a CA-signed test certificate"; exit 1; }
+openssl s_server -accept "$caport" -cert "$tmp/leaf.pem" -key "$tmp/leaf.key" \
+  -tls1_3 -www -quiet >"$tmp/ca.log" 2>&1 &
+started="$started $!"
+i=0
+while [ $i -lt 50 ]; do
+  ss -tln 2>/dev/null | grep -q ":$caport " && break
+  sleep 0.1; i=$((i+1))
+done
+issued=$("$tmp/wget" "https://127.0.0.1:$caport/" localhost "--cafile=$tmp/ca.pem" 2>"$tmp/err" || true)
+case "$issued" in
+  *"HTTP/1.0 200"*) ok "a leaf whose root is only in the store is verified through that root, found by name" ;;
+  *) bad "the root was not found by the leaf's issuer name" "$(head -2 "$tmp/err")" "got: $(echo "$issued" | head -2)" ;;
+esac
+unissued=$("$tmp/wget" "https://127.0.0.1:$caport/" localhost "--cafile=$tmp/c.pem" 2>&1 || true)
+case "$unissued" in
+  *"HTTP/1.0 200"*) bad "a leaf whose issuer is not in the store was accepted" ;;
+  *) ok "and with another root in the store the same leaf is refused" ;;
+esac
+
 # ---- 3. THE REFUSAL, which is what makes the rest worth having ---------------------------------
 #
 # A client that fetches happily but accepts any certificate has TLS and no security: an
@@ -121,7 +166,15 @@ while [ $i -lt 50 ]; do
   ss -tln 2>/dev/null | grep -q ":$rsaport " && break
   sleep 0.1; i=$((i+1))
 done
+# AND IT MUST BE REFUSED FAST. With the system bundle loaded, the refusal once cost 28 s of
+# CPU: no root had issued this certificate, so the chain check tried the signature against
+# every root in the bundle. Path building goes by the issuer's name, and a certificate
+# nobody issued is refused in milliseconds; a walk over every root would put this back.
+rsa_t0=$(date +%s)
 rsa=$("$tmp/wget" "https://127.0.0.1:$rsaport/" localhost 2>&1 || true)
+rsa_dt=$(( $(date +%s) - rsa_t0 ))
+[ "$rsa_dt" -le 5 ] && ok "and refused in ${rsa_dt} s, not by a walk over every root" \
+                    || bad "refusing an unissued certificate took ${rsa_dt} s" "a walk over every root is back"
 case "$rsa" in
   # THE WORDING CHANGED when the message started saying WHICH half failed -- signature or
   # chain. Matched on the stable part rather than the whole sentence.

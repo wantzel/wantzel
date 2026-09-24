@@ -125,17 +125,121 @@ answer — except one configured to re-encrypt to you (Cloudflare "Full (strict)
 you back in case 3.
 
 **3. A public address.** Real name, A record, ports 80 and 443 reachable — ACME works and the
-program does it itself: no certbot, no cron, no reverse proxy. See `examples/serve.wz`. The
-challenge arrives on port 80 while your server already listens there; renewal runs on a timer
-in the same event loop; the key stays in memory, disk is only a cache. **HTTP-01, not
-DNS-01** — DNS-01 needs API credentials for your DNS provider (a dependency this stack
-avoids) and is only required for a wildcard certificate.
+program does it itself: no certbot, no cron, no reverse proxy, no second process. A server on
+`lib/http.wz` needs one call more than a plain one:
 
-`ch.addsystem` must be called before any of this trusts a peer: it reads the machine's bundle
-(`/etc/ssl/certs/ca-certificates.crt`) or falls back to two built-in roots (ISRG Root X1/X2)
-on a scratch container with none. `lib/tls.wz` never calls it itself, so including it trusts
-nothing quietly — an empty trust store leaves `tls.verified` false rather than waving a peer
-through.
+```pascal
+include "http.wz";
+
+procedure app.request;
+begin
+  http.add("hello over https\n");
+  http.finish(200, "text/plain");
+end;
+
+begin
+  // the name, a contact address, where the certificate is kept, staging or not
+  http.https("www.example.com", "you@example.com", "/var/lib/hello/certs", true);
+  http.serve(443, 1);
+end.
+```
+
+```bash
+./bin/wantzel hello.wz hello
+sudo ./hello        # ports 80 and 443; or grant the binary cap_net_bind_service
+```
+
+Try it against **staging** first (the `true`) — its certificates are not trusted by browsers,
+but its rate limits are generous; change it to `false` for a real certificate. The
+authority's address is found through DNS (`lib/dns.wz`, with the machine's nameservers).
+`examples/autocert.wz` is the same server with command-line options for every setting.
+
+What the program does, in one loop:
+
+- **At start** it opens both ports, then reads the store (here `/var/lib/hello/certs`; `""`
+  means `certs/` beside the binary). A certificate that is for this host, matches its key and
+  has more than 30 days left is served at once and **not** ordered again — so restarts are
+  free, which matters: Let's Encrypt limits certificates per name per week.
+- **Port 80** never serves the application. It answers the authority's
+  `/.well-known/acme-challenge/<token>` from memory while an order is pending, redirects
+  everything else to `https://` (`301`, or `308` for a method other than GET and HEAD) once a
+  certificate is installed, and says `503` before that.
+- **The order** runs one HTTPS request per loop turn, so port 80 keeps answering between
+  them — the authority fetches the token while the order is pending.
+- **The certificate** gets a new key, is checked before use (right host, our key, in date,
+  each link of the chain signed by the next), saved with its key in one atomic write, and
+  installed with its intermediate. The next handshake uses it; nothing restarts.
+- **Renewal** is checked daily and happens when fewer than 30 days are left.
+- **When the authority fails** the current certificate stays in service, and the next attempt
+  comes after 1 h, 6 h, then every 24 h. The schedule is stored, so a restart does not retry
+  early.
+
+TLS terminates in that same loop, for many clients at once: each connection's session is fed
+the bytes that arrived, so a handshake advances as its records come in, and a client that
+stalls halfway holds only its own connection until the header deadline closes it. A renewed
+certificate goes in while connections are open: the next handshake uses it, open connections
+carry on. For development without an authority, `http.httpsfiles("cert.pem", "key.pem")`
+serves a certificate from files on any port; the details are in
+[library.md](library.md#http--a-non-blocking-http11-server-on-epoll).
+
+The log is one line per step on stderr, and says what is served and when the next attempt
+is:
+
+```
+autocert: www.example.com: certificate loaded from the store, valid until 2026-12-01 (68 days left)
+autocert: www.example.com: renewing: 29 days left
+autocert: www.example.com: order failed: the authority did not answer in time; the current certificate stays in use; next attempt in 1 h
+```
+
+**HTTP-01, not DNS-01** — DNS-01 needs API credentials for your DNS provider (a dependency this
+stack avoids) and is only required for a wildcard certificate.
+
+**Every request to the authority is verified HTTPS.** `autocert.start` fills the trust store
+with `ch.addsystem` when the program has not put roots in it: the machine's bundle
+(`/etc/ssl/certs/ca-certificates.crt`), or two built-in roots (ISRG Root X1/X2) on a scratch
+container with none. A connection whose certificate does not chain to one of them is refused,
+not used. For a private ACME authority, give its root with `--ca <file.pem>` — then that root
+is the whole trust store. `lib/tls.wz` never fills the store itself, so including it trusts
+nothing quietly.
+
+## Reaching a server by name
+
+`net.connect` takes four numbers; `lib/dns.wz` turns a name into them. Pick the form by
+where the call sits:
+
+| where | call |
+|---|---|
+| a command-line tool, or start-up | `fd := dns.connect("example.com", 443)` — resolve, then connect to the first address that accepts |
+| you want the addresses | `n := dns.resolve("example.com", addrs)` — blocks for at most the lookup's total time, 5 s |
+| inside an event loop | `q := dns.start(name)`, `dns.fd` in your epoll set, `dns.poll(q, addrs)` after each wake — nothing blocks |
+
+In an event loop a blocking lookup stops every other connection for as long as the
+nameserver takes, so a server that looks something up while it serves uses the third form —
+unless the lookup is rare and its stop bounded: `lib/autocert.wz` resolves the authority with
+`dns.resolve` for each of the handful of requests an order makes, every two months or so. `dns.wait` is the timeout to hand
+`epoll_wait`, so a lookup whose server went silent still moves on in time:
+
+```pascal
+if not net.watch(ep, EPOLL_ADD, dns.fd, EPOLLIN) then ...   // once
+q := dns.start("acme-v02.api.letsencrypt.org");
+...
+n := net.wait(ep, addr(ev[0]), 64, dns.wait);                // -1 when nothing is pending
+n := dns.poll(q, addrs);          // DNS.PENDING (0), a count, or a DNS.* code
+```
+
+Pitfalls:
+
+- **The connect after the lookup is a separate step.** `dns.connect` resolves and then calls
+  `net.connect`, which blocks; in an event loop, resolve with `dns.start`/`dns.poll` and
+  connect however your loop connects.
+- **Say which failure it was.** `dns.error(code)` gives a sentence; `DNS.NXDOMAIN` (no such
+  name) and `DNS.TIMEOUT` (nobody answered) are different problems with different fixes.
+- **Test against a server of your own.** `dns.noservers` and `dns.addserver(127, 0, 0, 1,
+  port)` replace the system's nameservers, so a test never depends on the network —
+  `tests/lib/dns.sh` does exactly this.
+- **Windows is the same source.** The runtime answers an open of `/etc/resolv.conf` with the
+  DNS servers Windows is configured with (from `GetNetworkParams`), so nothing differs per
+  platform.
 
 ## Signing a Windows exe
 

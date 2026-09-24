@@ -4,37 +4,207 @@
 // changes every program that includes it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
-// One process, one event loop, no threads and no allocation: every
-// connection owns a fixed slice of two static buffers, indexed by its file
-// descriptor.  The application supplies app.request, which is called once
-// per complete request.
+// One process, one event loop, no threads and no allocation per request.  The application
+// supplies app.request, which is called once per complete request.
+//
+// CONNECTIONS LIVE IN SLOTS, NOT AT THEIR FD.  A connection gets one of MAXCONN slots when it
+// is accepted and gives it back on every way it can end -- a close, an error, a deadline, a
+// detach -- through one routine, http.slotfree.  http.slotof maps an fd to its slot, so any
+// fd value up to HTTP.MAXFD works; the slot number is what the per-connection tables are
+// indexed by.
+//
+// MEMORY IS SIZED FOR THE COMMON REQUEST AND BORROWED FOR THE RARE ONE:
+//   - every slot owns HTTP.SLOTIN bytes of input (http.inbuf), enough for a request with a
+//     body of a few kB;
+//   - a request that outgrows it borrows one of HTTP.CHUNKS shared INBUF-sized areas, also in
+//     http.inbuf, and gives it back once the request is answered -- only HTTP.CHUNKS
+//     connections can be reading one at the same moment;
+//   - a body larger than INBUF (after http.maxbody) gets a region of its own connection's,
+//     for as long as it is read and answered, within http.bodymem for all of them;
+//   - a reply is built in ONE buffer, http.outbuf (only one request runs at a time), and sent
+//     straight from there; only what the socket does not take at once is copied into a region
+//     of its own (mmap), released as soon as it is sent.  A reply that outgrows http.outbuf
+//     (after http.maxreply) moves to a region of its own, which is then sent from directly.
+// Pages of a static array cost nothing until touched, so a slot that never sees a large
+// request never makes its area resident.
+//
+// DEADLINES.  A connection that is not making progress is closed, so slow or idle clients
+// cannot hold slots forever: http.hdrsecs for the request line and headers (counted from the
+// first byte, never extended), http.bodysecs plus one second per 16 kB for the body,
+// http.idlesecs between keep-alive requests, http.sendsecs without progress while a reply is
+// going out.  When every slot is taken, a connection with nothing in flight is closed to make
+// room; when none is, the new connection gets a 503 and is closed.
+//
+// HTTPS IS TERMINATED HERE, IN THE SAME LOOP.  No proxy in front, no second process, no
+// thread: a connection accepted on a TLS listener gets a lib/tls.wz session with its slot,
+// and the session only ever sees bytes this loop hands it.  Two calls choose it:
+//
+//   http.https(host, email, store, staging)   a certificate from Let's Encrypt, obtained and
+//                                             renewed by lib/autocert.wz from this loop; the
+//                                             port given to http.serve speaks TLS, and a
+//                                             plain listener on 80 (http.redirect) answers
+//                                             the authority's challenge and sends everyone
+//                                             else to https://
+//   http.httpsfiles(cert, key)                a certificate from PEM files (development, a
+//                                             private authority); call it again to reload
+//
+// Nothing else in an application changes: app.request sees the same parsed request either
+// way (http.istls says which it was).  In https mode the application is NEVER served over
+// plain HTTP -- the plain listener answers challenges, redirects, or says 503 until a
+// certificate is there.
+//
+// TLS SITS AT TWO PLACES, both marked "THE WIRE" below: http.pull is the only read of
+// request bytes from a connection, and decrypts; http.emit is the only hand-over of a
+// finished reply, and encrypts.  Everything between them -- parsing, pipelining, slots,
+// chunks, deadlines, the big-body region -- is the same code for both.  Each connection
+// records the listener it came from (http.slis), and http.addport opens more than one.
 
 include "net.wz";
 include "json.wz";
+include "autocert.wz";
 
 const
-  MAXCONN = 256;
-  INBUF   = 262144;         // largest request (headers + body) per connection
-  OUTBUF  = 524288;         // largest reply per connection
+  MAXCONN = 4096;           // connections open at once, per worker (http.maxconn lowers it)
+  INBUF   = 262144;         // largest request (headers + body), unless http.maxbody is called
+  OUTBUF  = 524288;         // largest reply body
   HDRROOM = 2048;           // space reserved in front of the body for the status line and headers
   MAXEV   = 256;
+
+  HTTP.SLOTIN = 16384;      // input every connection owns; a larger request borrows a chunk
+  HTTP.CHUNKS = 64;         // INBUF-sized input areas shared by all connections
+  HTTP.MAXFD  = 65536;      // file descriptors the fd -> slot map covers
+  HTTP.MAXLIS = 4;          // listening sockets
+  HTTP.TICKMS = 1000;       // milliseconds between two deadline checks
+  HTTP.BODYRATE = 16384;    // bytes per second a body is given on top of http.bodysecs
+
+  // TLS.  One read from a TLS socket is at most HTTP.TLSRAW bytes, decrypted into a staging
+  // area of HTTP.TLSPLAIN.  A read can complete a record the session held half of from the
+  // read before (at most TLS.SINBUF bytes), so the staging area is that much larger: the
+  // records a read completes ALWAYS fit, and tls.feed takes all of them at once.  What the
+  // slot's input has no room for yet is kept for it (http.kbase), in a region of
+  // HTTP.TLSPLAIN bytes mapped the first time it is needed.  A reply is sealed whole, in
+  // records of TLS.MAXPLAIN, into http.tout: the largest reply plus every record's 22 bytes.
+  HTTP.TLSRAW   = 32768;
+  HTTP.TLSPLAIN = HTTP.TLSRAW + TLS.SINBUF;
+  HTTP.TLSRECS  = 33;       // records in the largest reply: (HDRROOM + OUTBUF) / TLS.MAXPLAIN, up
+  HTTP.TLSOUT   = HDRROOM + OUTBUF + 22 * HTTP.TLSRECS;
+  HTTP.EPROTO   = -71;      // http.pull's answer for a TLS session that failed
+  HTTP.KEEPMAX  = 33554432; // decrypted bytes kept for later, all slots together: 32 MB
+
+  // what a listener is for (http.lrole)
+  HTTP.LAPP   = 0;          // the application: app.request
+  HTTP.LREDIR = 1;          // https mode's plain port: challenges, redirects, 503 before a certificate
 
   // http.method values
   HTTP.GET = 1;  HTTP.POST = 2;  HTTP.PUT = 3;  HTTP.DELETE = 4;
   HTTP.PATCH = 5;  HTTP.OPTIONS = 6;  HTTP.HEAD = 7;
 
+  // what a slot is waiting for (http.sphase)
+  HTTP.PQUIET = 0;          // nothing: a new connection, or between keep-alive requests
+  HTTP.PHEAD  = 1;          // the rest of a request line and headers
+  HTTP.PBODY  = 2;          // the rest of a body
+  HTTP.PSEND  = 3;          // the socket, to take the rest of a reply
+  HTTP.PLINGER = 4;         // TLS, after a refusal: swallowing the rest of the request, then close
+  HTTP.LINGERSECS = 5;      // how long at most
+
+  HTTP.CONTINUE = "HTTP/1.1 100 Continue\r\n\r\n";
+
+  // the answer to a connection there is no slot for
+  HTTP.FULL = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 19\r\nRetry-After: 1\r\nConnection: close\r\n\r\nserver at capacity\n";
+
 var
-  http.inbuf:  array[0..MAXCONN * INBUF - 1] of char;
-  http.outbuf: array[0..MAXCONN * OUTBUF - 1] of char;
-  http.inlen:  array[0..MAXCONN - 1] of int;
-  http.osend:  array[0..MAXCONN - 1] of int;   // first byte still to send
-  http.oend:   array[0..MAXCONN - 1] of int;   // one past the last byte
-  http.open:   array[0..MAXCONN - 1] of bool;
+  // http.inbuf: HTTP.CHUNKS shared areas of INBUF bytes, then one HTTP.SLOTIN area per slot.
+  // A request is parsed in place, so http.pathat, http.bodyat and friends index this array.
+  http.inbuf:  array[0..HTTP.CHUNKS * INBUF + MAXCONN * HTTP.SLOTIN - 1] of char;
+  http.outbuf: array[0..HDRROOM + OUTBUF - 1] of char;   // the reply being built
   http.evs:    array[0..MAXEV * 12 - 1] of char;
   http.hdr:    array[0..HDRROOM - 1] of char;
 
+  // by fd
+  http.open:   array[0..HTTP.MAXFD - 1] of bool;         // one of this loop's connections
+  http.slotof: array[0..HTTP.MAXFD - 1] of int;          // its slot + 1; 0 = none
+
+  // by slot
+  http.sfd:    array[0..MAXCONN - 1] of int;    // the connection's fd, -1 = slot free
+  http.sbase:  array[0..MAXCONN - 1] of int;    // where its input starts in http.inbuf
+  http.scap:   array[0..MAXCONN - 1] of int;    // HTTP.SLOTIN, or INBUF while it holds a chunk
+  http.sused:  array[0..MAXCONN - 1] of int;    // input bytes held
+  http.schunk: array[0..MAXCONN - 1] of int;    // the chunk it borrowed, -1 = none
+  http.sphase: array[0..MAXCONN - 1] of int;    // HTTP.PQUIET .. HTTP.PLINGER
+  http.sdl:    array[0..MAXCONN - 1] of int;    // io.now after which it is closed
+  http.sreqs:  array[0..MAXCONN - 1] of int;    // requests answered on it
+  http.slis:   array[0..MAXCONN - 1] of int;    // the listener it was accepted on
+  http.spos:   array[0..MAXCONN - 1] of int;    // its place in http.act
+  http.sclose: array[0..MAXCONN - 1] of bool;   // close once the pending reply is out
+  http.slinger: array[0..MAXCONN - 1] of bool;  // TLS: linger instead (http.linger)
+  http.pbase:  array[0..MAXCONN - 1] of int;    // pending output: region address
+  http.psize:  array[0..MAXCONN - 1] of int;    //   its mapped size, 0 = nothing pending
+  http.pat:    array[0..MAXCONN - 1] of int;    //   first byte still to send
+  http.pend:   array[0..MAXCONN - 1] of int;    //   one past the last
+  http.stls:   array[0..MAXCONN - 1] of int;    // its TLS session, -1 = plain
+  http.shs:    array[0..MAXCONN - 1] of int;    // TLS: io.now by which the handshake AND the
+                                                //   first request's headers are in; 0 = done
+  http.kbase:  array[0..MAXCONN - 1] of int;    // TLS: decrypted bytes kept for later: region
+  http.kat:    array[0..MAXCONN - 1] of int;    //   (HTTP.TLSPLAIN bytes, 0 = none), first byte
+  http.kend:   array[0..MAXCONN - 1] of int;    //   and one past the last
+
+  http.freeslot: array[0..MAXCONN - 1] of int;  // a stack of free slots
+  http.nfree: int;
+  http.act:    array[0..MAXCONN - 1] of int;    // the open slots, in no particular order
+  http.cfree:  array[0..HTTP.CHUNKS - 1] of int;
+  http.ncfree: int;
+  http.inited: bool;
+
+  // listening sockets: 0 is the port given to http.serve/http.listen, then http.addport's
+  http.lports: array[0..HTTP.MAXLIS - 1] of int;
+  http.lfds:   array[0..HTTP.MAXLIS - 1] of int;
+  http.ltls:   array[0..HTTP.MAXLIS - 1] of bool;   // the listener speaks TLS
+  http.lrole:  array[0..HTTP.MAXLIS - 1] of int;    // HTTP.LAPP or HTTP.LREDIR
+  http.nlis, http.nextra: int;
+  http.lpaused: bool;                           // accepting stopped: out of descriptors
+
+  // HTTPS.  http.tlsmain makes listener 0 (the port given to http.serve/http.listen) a TLS
+  // listener; http.https and http.httpsfiles set it, and a program that installs its own
+  // certificate with tls.setcert may set it directly.  http.redirport > 0 adds the plain
+  // listener that answers challenges and redirects to listener 0.
+  http.tlsmain: bool;
+  http.acme: bool;                              // lib/autocert.wz runs from this loop
+  http.redirport: int;
+  http.istls: bool;                             // the request being served came over TLS
+  http.tlswhy: str;                             // why http.httpsfiles refused
+  http.tlsrefused: int;                         // TLS connections closed at once: no
+                                                //   certificate yet, or no session free
+  http.tlsfailed: int;                          // TLS sessions that failed: not TLS, a bad
+                                                //   record, an alert
+  http.tlskept: int;                            // TLS reads that decrypted to more than the
+                                                //   slot's input could take at once
+  http.keepbytes: int;                          // mapped now for such bytes, all slots
+  http.traw:   array[0..HTTP.TLSRAW - 1] of char;     // one read from a TLS socket
+  http.tplain: array[0..HTTP.TLSPLAIN - 1] of char;   // what it decrypted to
+  http.twire:  array[0..TLS.MAXREC - 1] of char;      // handshake and alert bytes to send
+  http.tout:   array[0..HTTP.TLSOUT - 1] of char;     // a sealed reply
+  http.tshut:  array[0..63] of char;                  // a close_notify
+  http.chal:   array[0..511] of char;                 // a challenge answer
+  http.loc:    array[0..HDRROOM - 1] of char;         // a redirect's Location
+  http.file:   array[0..65535] of char;               // a PEM file being read
+
+  // limits and deadlines; set them before http.serve, 0 means the default
+  http.limit: int;                              // connections at once (http.maxconn)
+  http.idlesecs, http.hdrsecs, http.bodysecs, http.sendsecs: int;
+  http.pendmax: int;                            // bytes of unsent replies held, all slots
+  http.now, http.nextsweep: int;
+
+  // counters, for a health or metrics endpoint
+  http.nopen: int;                              // connections open now
+  http.refused: int;                            // answered 503 because every slot was busy
+  http.evicted: int;                            // idle connections closed to make room
+  http.timedout: int;                           // closed by a deadline
+  http.pendbytes: int;                          // bytes mapped for unsent replies now
+  http.queued: int;                             // replies the socket did not take in one go
+
   http.ep, http.lfd: int;
   http.fd, http.ibase, http.obase: int;        // the connection being served
+  http.slot, http.lis: int;                    // its slot, and the listener it came in on
   http.method: int;                            // HTTP.GET .. HTTP.HEAD, 0 = other
   http.pathat, http.pathlen: int;              // the path without the query string
   http.queryat, http.querylen: int;            // the query string after '?', may be empty
@@ -43,6 +213,7 @@ var
   http.keep: bool;
   http.ignored: bool;                          // a result that is deliberately not acted on
   http.wpos: int;                              // write cursor for the reply body
+  http.rstart, http.rend: int;                 // the finished reply in http.outbuf
   http.requests: int;
   http.xhdr: array[0..HDRROOM - 1] of char;    // extra response headers for the current reply
   http.xlen: int;
@@ -59,6 +230,7 @@ var
   http.started: int;                           // io.now at the start of the request
   http.logging: bool;                          // one JSON line per request on stderr
   http.hdrseen: bool;                          // http.parse found the end of the headers
+  http.hdrsize: int;                           // the request line and headers, in bytes
   http.clen: int;                              // the Content-Length it read there, 0 if absent
 
   // ------------------------------------------------------------ handing a connection off
@@ -66,72 +238,197 @@ var
   // http.detach lets app.request give fd to another module (lib/websocket.wz, on a
   // WebSocket upgrade) WITHOUT this file knowing that module exists. Set it to true
   // and return from app.request without writing a reply; http.wz then removes fd
-  // from ITS OWN bookkeeping (out of http.open, out of http.ep) and closes nothing,
-  // so the fd is still a live, connected socket that the caller (app.request, or
-  // whatever it called before returning) now owns outright. See lib/websocket.wz's
+  // from ITS OWN bookkeeping (frees its slot, takes it out of http.ep) and closes
+  // nothing, so the fd is still a live, connected socket that the caller (app.request,
+  // or whatever it called before returning) now owns outright. See lib/websocket.wz's
   // file header for why this is a plain variable and not a second forward hook: a
   // program that never sets it sees no change at all in this file's behaviour.
   http.detach: bool;
 
-  // ------------------------------------------------------------ the big-body path
+  // ------------------------------------------------------------ large bodies and replies
   //
   // A request whose Content-Length is larger than fits in INBUF is not, by itself, a bad
-  // request -- a year of minute values is about 2.1 MB of JSON.  Before this the request
-  // was silently dropped once its bytes filled INBUF: no 413, no message, a bare
-  // 'connection reset' at the client.  http.maxbody(cap), called once before http.serve,
-  // reserves ONE extra region of `cap` bytes with mmap for the body of the ONE connection
-  // that is currently reading past INBUF -- not `cap * MAXCONN`.  A second connection that
-  // also overflows while the region is in use gets the 413 instead: there is one slot, not
-  // one per connection, which is the whole point of asking for it explicitly rather than
-  // raising INBUF itself.
-  http.bigbase: int;                           // address of the overflow region, -1 = none requested
-  http.bigcap:  int;                           // its size in bytes, 0 = the feature is off
-  http.bigowner: int;                          // fd currently using it, -1 = free
-  http.biglen:  int;                           // bytes of the body copied into it so far
-  http.bigtotal: int;                          // the Content-Length the owner is reading towards
+  // request -- a year of minute values is about 2.1 MB of JSON.  After http.maxbody(cap), a
+  // body up to `cap` bytes is read into a region of ITS CONNECTION'S OWN, mapped when its
+  // headers arrive and unmapped as soon as it is answered (or the connection ends).  So
+  // several large uploads can arrive at once, and none of them costs anything once
+  // answered.  What all of them together may hold is http.bodymem (http.maxbodymem): a body
+  // that would go past it waits its turn -- 503 with Retry-After -- and a body larger than
+  // `cap`, or than http.bodymem itself, gets 413.
+  //
+  // A REPLY is built in http.outbuf until it outgrows it; then the whole reply moves to a
+  // region of its own (http.xbase), which doubles as it grows, up to http.replymax
+  // (http.maxreply).  Past that, http.overflowed and a clean 500, as before.  Plain, the
+  // region itself becomes the reply's pending output, so nothing is copied again; over
+  // TLS it is sealed into one region that does.  Either way, what waits for a slow reader
+  // counts against http.pendmax.
+  //
+  // Code that writes into http.outbuf itself (json.putstr(http.outbuf, http.wpos, ...))
+  // must stay within its first OUTBUF bytes; past that, append with http.add/addb/addc/addn.
+  http.bbase:  array[0..MAXCONN - 1] of int;    // the slot's body region, 0 = none
+  http.bsize:  array[0..MAXCONN - 1] of int;    //   its mapped size
+  http.blen:   array[0..MAXCONN - 1] of int;    //   body bytes read into it
+  http.btotal: array[0..MAXCONN - 1] of int;    //   the Content-Length it is read towards
+  http.bigcap:  int;                           // the largest body, http.maxbody; 0 = INBUF is the limit
+  http.bodymem: int;                           // what all body regions may hold together
+  http.bigbytes: int;                          // what they hold now (mapped)
+  http.bigbase: int;                           // while app.request runs: the body's region
   http.bodyinbig: bool;                        // true while app.request runs: the body is in
-                                                // http.bigbase[0..http.bodylen), not http.inbuf
-  http.overflowed: bool;                       // the current reply did not fit in OUTBUF
+                                                // view(http.bigbase, http.bodylen), not http.inbuf
+  http.replymax: int;                          // the largest reply body, http.maxreply
+  http.xbase, http.xsize: int;                 // the reply's own region once it outgrew http.outbuf
+  http.replybytes: int;                        // mapped for replies being built now
+  http.overflowed: bool;                       // the current reply did not fit in http.replymax
 
 // the application must define this; it is called with a parsed request
 procedure app.request; forward;
 
-// Reserve a shared overflow region for request bodies larger than INBUF (256 kB).  Call
-// this once, before http.serve -- after fork, so each worker gets its own mapping rather
-// than one worker's writes racing another's through a shared page.  Only one connection at
-// a time can be reading into it; a second oversized request while it is in use is answered
-// with 413, the same as when this is never called at all.
+// Accept request bodies up to `cap` bytes (above INBUF, 256 kB, which is always accepted).
+// Each large body gets a region of its own connection's, for as long as it is being read
+// and answered.  Call before http.serve.
 procedure http.maxbody(cap: int);
 begin
   if cap <= 0 then io.fatal("http.maxbody needs a positive size");
-  http.bigbase := sys6(SYS.mmap, 0, cap, bor(PROT_READ, PROT_WRITE), bor(MAP_PRIVATE, MAP_ANONYMOUS), -1, 0);
-  if http.bigbase < 0 then io.fatal("http.maxbody: cannot map memory");
   http.bigcap := cap;
-  http.bigowner := -1;
 end;
 
-// copy n bytes of the body read so far, out of this connection's ordinary slot in
-// http.inbuf, into the front of the shared overflow region -- so the bytes already read
-// before the switch are not re-requested from the client
-procedure http.copytobig(from: int; n: int; dst: array of char);
+// What the regions of all large bodies being read at once may hold together (256 MB unless
+// this is called); a body that would go past it gets 503 with Retry-After.  Call before
+// http.serve.
+procedure http.maxbodymem(total: int);
+begin
+  if total <= 0 then io.fatal("http.maxbodymem needs a positive size");
+  http.bodymem := total;
+end;
+
+// Allow reply bodies up to `cap` bytes (OUTBUF, 512 kB, unless this is called); a larger
+// reply becomes a 500.  Call before http.serve.
+procedure http.maxreply(cap: int);
+begin
+  if cap < OUTBUF then io.fatal("http.maxreply: the limit cannot be below OUTBUF");
+  http.replymax := cap;
+end;
+
+// ---------------------------------------------------------------- moving bytes
+
+procedure http.movew(d: array of int; s: array of int; n: int);
 var i: int;
 begin
   i := 0;
   while i < n do
   begin
-    dst[i] := http.inbuf[from + i];
+    d[i] := s[i];
     i := i + 1;
   end;
 end;
 
+procedure http.moveb(d: array of char; s: array of char; n: int);
+var i: int;
+begin
+  i := 0;
+  while i < n do
+  begin
+    d[i] := s[i];
+    i := i + 1;
+  end;
+end;
+
+// Copy n bytes from address src to address dst, eight at a time, front to back.  Safe when
+// the two do not overlap, and when dst lies before src -- which is how leftover input is
+// moved to the front of its area.  Raw addresses: nothing checks them but the caller.
+procedure http.move(dst: int; src: int; n: int);
+var w: int;
+begin
+  if n <= 0 then return;
+  w := n div 8;
+  if w > 0 then http.movew(view(dst, w), view(src, w), w);
+  if n > w * 8 then http.moveb(view(dst + w * 8, n - w * 8), view(src + w * 8, n - w * 8), n - w * 8);
+end;
+
 // ---------------------------------------------------------------- replies
+
+// Let go of the reply region, if the reply had one.
+procedure http.xfree;
+begin
+  if http.xbase = 0 then return;
+  sys2(SYS.munmap, http.xbase, http.xsize);
+  http.replybytes := http.replybytes - http.xsize;
+  http.xbase := 0;
+  http.xsize := 0;
+end;
+
+// Where the reply is being built: http.outbuf, or its own region once it outgrew that.
+function http.rbuf: int;
+begin
+  if http.xbase <> 0 then return http.xbase;
+  return addr(http.outbuf[0]);
+end;
+
+// Room for the reply to reach `upto` bytes, header room included.  False when that is past
+// http.replymax, or no memory can be had.  The first time a reply outgrows http.outbuf it
+// moves, whole, to a region of its own; the region doubles from then on.
+function http.room(upto: int): bool;
+var size, lim, region: int;
+begin
+  if http.xbase = 0 then
+  begin
+    if upto <= len(http.outbuf) then return true;
+    size := 2 * len(http.outbuf);
+  end
+  else
+  begin
+    if upto <= http.xsize then return true;
+    size := 2 * http.xsize;
+  end;
+  if upto > HDRROOM + http.replymax then return false;
+  if size < upto then size := upto;
+  lim := ((HDRROOM + http.replymax + 4095) div 4096) * 4096;
+  size := ((size + 4095) div 4096) * 4096;
+  if size > lim then size := lim;
+  region := sys6(SYS.mmap, 0, size, bor(PROT_READ, PROT_WRITE), bor(MAP_PRIVATE, MAP_ANONYMOUS), -1, 0);
+  if region < 0 then return false;
+  http.move(region, http.rbuf, http.wpos);
+  http.xfree;
+  http.xbase := region;
+  http.xsize := size;
+  http.replybytes := http.replybytes + size;
+  return true;
+end;
+
+// How many more bytes of body the current reply can take before http.replymax -- what a
+// caller asks before adding something large it would rather refuse in its own way (an MCP
+// reply becomes a JSON-RPC error) than turn into http.finish's 500.
+function http.replyroom: int;
+var cap: int;
+begin
+  cap := http.replymax;
+  if cap < OUTBUF then cap := OUTBUF;
+  return HDRROOM + cap - http.wpos;
+end;
+
+// Append n bytes at address src to the reply.  Past http.replymax nothing more is taken and
+// http.overflowed is set: http.finish turns the reply into a clean 500.
+procedure http.append(src: int; n: int);
+begin
+  if n <= 0 then return;
+  if not http.room(http.wpos + n) then
+  begin
+    http.overflowed := true;
+    return;
+  end;
+  http.move(http.rbuf + http.wpos, src, n);
+  http.wpos := http.wpos + n;
+end;
 
 procedure http.start;
 begin
+  http.xfree;                                // what a request that never finished left
   http.wpos := http.obase + HDRROOM;
   http.xlen := 0;
   http.overflowed := false;
   http.detach := false;
+  http.rstart := 0;
+  http.rend := 0;
 end;
 
 // add a response header to the current reply: http.hdradd("Cache-Control: no-store")
@@ -193,51 +490,45 @@ begin
   io.out(STDERR, addr(http.logbuf[0]), n);
 end;
 
-// io.push and io.pushnum already stop at len(http.outbuf) rather than trap, but a reply
-// that stopped mid-write is wrong in a way nothing downstream can see -- so a short push
-// (the position did not advance by the full amount) is treated the same as the checked
-// writers below: http.overflowed, and http.finish turns that into a clean 500.
+// Append to the reply body.  Every writer goes through http.append, which checks the length
+// against http.replymax: a reply that runs past it used to be a runtime trap that took the
+// whole worker down with every connection it served, then a truncated reply with a
+// Content-Length that lied.  Now it is http.overflowed, and http.finish answers a clean 500.
 procedure http.add(s: str);
-var want: int;
 begin
-  want := http.wpos + slen(s);
-  http.wpos := io.push(http.outbuf, http.wpos, s);
-  if http.wpos < want then http.overflowed := true;
+  http.append(sadr(s), slen(s));
 end;
 
 procedure http.addn(v: int);
-var want: int;
+var t: array[0..23] of char;
+    k: int;
 begin
-  want := http.wpos + io.digits(v);
-  http.wpos := io.pushnum(http.outbuf, http.wpos, v);
-  if http.wpos < want then http.overflowed := true;
+  k := io.pushnum(t, 0, v);
+  http.append(addr(t[0]), k);
 end;
 
-// http.outbuf[http.wpos] := c without a check used to be a runtime array-bounds trap the
-// moment a reply ran past OUTBUF (512 kB) -- the whole worker process died on one large
-// reply, taking every OTHER connection it was serving down with it.  These two are the
-// only writers here that touch http.outbuf directly instead of going through io.push,
-// which already bounds-checks; http.finish turns http.overflowed into a clean 500 instead
-// of the truncated, wrong-Content-Length body that silently dropping the write would leave
-// behind.
 procedure http.addc(c: char);
+var t: array[0..0] of char;
 begin
-  if http.wpos >= http.obase + OUTBUF then begin http.overflowed := true; return; end;
-  http.outbuf[http.wpos] := c;
-  http.wpos := http.wpos + 1;
+  if (http.xbase = 0) and (http.wpos < len(http.outbuf)) then
+  begin
+    http.outbuf[http.wpos] := c;
+    http.wpos := http.wpos + 1;
+    return;
+  end;
+  t[0] := c;
+  http.append(addr(t[0]), 1);
 end;
 
+// b[at..at+n).  The two ends are read first, so a range outside b stops the program at this
+// line, as indexing b would -- the copy itself goes by address.
 procedure http.addb(b: array of char; at: int; n: int);
-var i: int;
+var c: char;
 begin
-  i := 0;
-  while i < n do
-  begin
-    if http.wpos >= http.obase + OUTBUF then begin http.overflowed := true; return; end;
-    http.outbuf[http.wpos] := b[at + i];
-    http.wpos := http.wpos + 1;
-    i := i + 1;
-  end;
+  if n <= 0 then return;
+  c := b[at];
+  c := b[at + n - 1];
+  http.append(addr(b[at]), n);
 end;
 
 // write the status line and headers directly in front of the body, so the
@@ -245,15 +536,13 @@ end;
 procedure http.finish(status: int; ctype: str);
 var n, blen, i, start: int;
 begin
-  // A reply that ran past OUTBUF (512 kB) got here anyway before this: http.wpos still
-  // pointed past the true end of what was written, so Content-Length promised bytes that
-  // were never there and the client hung waiting for them.  Replace whatever partial body
-  // exists with a short, honest one instead of shipping a lie with the right status code
-  // on it.  This is deliberately not "raise OUTBUF": that buffer is declared per
-  // connection and multiplied by MAXCONN, so doubling it doubles that much static memory
-  // whether or not any connection ever needs it.
+  // A reply that ran past its limit got here anyway before this: http.wpos still pointed
+  // past the true end of what was written, so Content-Length promised bytes that were never
+  // there and the client hung waiting for them.  Replace whatever partial body exists with
+  // a short, honest one instead of shipping a lie with the right status code on it.
   if http.overflowed then
   begin
+    http.xfree;
     http.wpos := http.obase + HDRROOM;
     http.wpos := io.push(http.outbuf, http.wpos, "the reply did not fit\n");
     status := 500;
@@ -271,6 +560,7 @@ begin
   else if status = 301 then n := io.push(http.hdr, n, " Moved Permanently\r\n")
   else if status = 302 then n := io.push(http.hdr, n, " Found\r\n")
   else if status = 304 then n := io.push(http.hdr, n, " Not Modified\r\n")
+  else if status = 308 then n := io.push(http.hdr, n, " Permanent Redirect\r\n")
   else if status = 400 then n := io.push(http.hdr, n, " Bad Request\r\n")
   else if status = 401 then n := io.push(http.hdr, n, " Unauthorized\r\n")
   else if status = 403 then n := io.push(http.hdr, n, " Forbidden\r\n")
@@ -278,6 +568,7 @@ begin
   else if status = 405 then n := io.push(http.hdr, n, " Method Not Allowed\r\n")
   else if status = 409 then n := io.push(http.hdr, n, " Conflict\r\n")
   else if status = 413 then n := io.push(http.hdr, n, " Payload Too Large\r\n")
+  else if status = 414 then n := io.push(http.hdr, n, " URI Too Long\r\n")
   else if status = 415 then n := io.push(http.hdr, n, " Unsupported Media Type\r\n")
   else if status = 422 then n := io.push(http.hdr, n, " Unprocessable Entity\r\n")
   else if status = 429 then n := io.push(http.hdr, n, " Too Many Requests\r\n")
@@ -300,15 +591,13 @@ begin
   if http.keep then n := io.push(http.hdr, n, "Connection: keep-alive\r\n\r\n")
   else n := io.push(http.hdr, n, "Connection: close\r\n\r\n");
   start := http.obase + HDRROOM - n;
-  i := 0;
-  while i < n do
-  begin
-    http.outbuf[start + i] := http.hdr[i];
-    i := i + 1;
-  end;
-  http.osend[http.fd] := start;
-  if http.method = HTTP.HEAD then http.oend[http.fd] := http.obase + HDRROOM   // headers only
-  else http.oend[http.fd] := http.wpos;
+  http.move(http.rbuf + start, addr(http.hdr[0]), n);
+  // The finished reply is [http.rstart..http.rend) of http.outbuf -- or of the reply's own
+  // region, http.xbase, when it outgrew that; the loop sends it once app.request returns
+  // (http.emitreply).
+  http.rstart := start;
+  if http.method = HTTP.HEAD then http.rend := http.obase + HDRROOM   // headers only
+  else http.rend := http.wpos;
   if http.logging then http.log(status, blen);
 end;
 
@@ -423,6 +712,7 @@ begin
 
   if clen < 0 then return -1;
   http.hdrseen := true;
+  http.hdrsize := eoh - base;
   http.clen := clen;
   if eoh - base + clen > n then return 0;
   http.bodyat := eoh;
@@ -570,262 +860,1326 @@ begin
   return true;
 end;
 
-// ---------------------------------------------------------------- the loop
+// ---------------------------------------------------------------- slots
 
-procedure http.drop(fd: int);
+local const
+  HTTP.SYSREADLINK  = 89;
+  HTTP.SYSGETRLIMIT = 97;
+  HTTP.SYSSETRLIMIT = 160;
+  HTTP.RLIMITNOFILE = 7;
+
+// Set up the slot tables and the defaults.  Called by http.listen, and by http.accept and
+// http.poll too, so a program running its own loop gets the same starting state.
+procedure http.init;
+var i: int;
 begin
-  // A failing DEL is deliberately ignored: it means the fd is already out of the
-  // set (ENOENT), which is the state this routine is trying to reach.  Closing the
-  // fd removes it from the set anyway.  The result goes into http.ignored because
-  // the language refuses a discarded function result -- so "I am ignoring this on
-  // purpose" has to be written down rather than left to the reader.
-  http.ignored := net.watch(http.ep, EPOLL_DEL, fd, 0);
-  net.close(fd);
+  if http.inited then return;
+  http.inited := true;
+  http.nfree := 0;
+  for i := MAXCONN - 1 downto 0 do
+  begin
+    http.sfd[i] := -1;
+    http.schunk[i] := -1;
+    http.freeslot[http.nfree] := i;
+    http.nfree := http.nfree + 1;
+  end;
+  http.ncfree := 0;
+  for i := HTTP.CHUNKS - 1 downto 0 do
+  begin
+    http.cfree[http.ncfree] := i;
+    http.ncfree := http.ncfree + 1;
+  end;
+  http.nopen := 0;
+  if (http.limit <= 0) or (http.limit > MAXCONN) then http.limit := MAXCONN;
+  if http.idlesecs <= 0 then http.idlesecs := 60;
+  if http.hdrsecs <= 0 then http.hdrsecs := 10;
+  if http.bodysecs <= 0 then http.bodysecs := 30;
+  if http.sendsecs <= 0 then http.sendsecs := 30;
+  if http.pendmax <= 0 then http.pendmax := 134217728;
+  if http.bodymem <= 0 then http.bodymem := 268435456;
+  if http.replymax <= 0 then http.replymax := OUTBUF;
+  http.obase := 0;
+  http.now := io.now;
+  http.nextsweep := http.now + HTTP.TICKMS * 1000000;
+end;
+
+// At most n connections at once (1..MAXCONN); call before http.serve.  For a server that
+// should stay below what its memory or its file-descriptor limit allows.
+procedure http.maxconn(n: int);
+begin
+  if (n < 1) or (n > MAXCONN) then io.fatal("http.maxconn: the limit must be between 1 and MAXCONN");
+  http.limit := n;
+end;
+
+// The four deadlines, in seconds; call before http.serve.  0 keeps a default.
+//   idle    between keep-alive requests (default 60)
+//   header  from the first byte of a request -- or from the accept -- to the end of its
+//           headers; never extended, so a client sending a byte now and then cannot hold a
+//           connection with it (default 10)
+//   body    for the body once the headers are in, plus one second per HTTP.BODYRATE bytes of
+//           Content-Length (default 30)
+//   send    without progress while a reply is going out (default 30)
+procedure http.timeouts(idle: int; header: int; body: int; send: int);
+begin
+  http.idlesecs := idle;
+  http.hdrsecs := header;
+  http.bodysecs := body;
+  http.sendsecs := send;
+end;
+
+// Listen on one more port; call before http.serve or http.listen.  It becomes listener 1,
+// 2, ... in the order of the calls (0 is http.serve's own port), and every connection
+// records the listener it came in on (http.slis, and http.lis while its request runs).
+procedure http.addport(port: int);
+begin
+  if http.nextra + 1 >= HTTP.MAXLIS then io.fatal("http.addport: too many listening ports");
+  http.nextra := http.nextra + 1;
+  http.lports[http.nextra] := port;
+  http.ltls[http.nextra] := false;
+  http.lrole[http.nextra] := HTTP.LAPP;
+end;
+
+// ---------------------------------------------------------------- choosing HTTPS
+
+// The plain listener of https mode, on `port` (80 unless this is called; a test uses any
+// port).  It never runs the application: it answers
+//   /.well-known/acme-challenge/<token>   from lib/autocert.wz during an order (404 otherwise)
+//   anything else                         301 (GET, HEAD) or 308 to https://<host><path>
+//                                         once a certificate is installed, 503 before
+// The host is http.https's; with http.httpsfiles it is the request's Host header.  The
+// port in the Location is listener 0's, left out when it is 443.  Call before http.serve.
+procedure http.redirect(port: int);
+begin
+  http.redirport := port;
+end;
+
+// HTTPS with a certificate from Let's Encrypt, obtained and renewed from this loop.
+//   host     the name the certificate is for; its A record must point at this machine, and
+//            ports 80 and 443 must be reachable from the internet
+//   email    a contact address for the account ("" for none)
+//   store    the directory for keys and certificates ("" for certs/ beside the binary); it
+//            is what makes a restart free -- a certificate on disk is not ordered again
+//   staging  Let's Encrypt's staging authority: test certificates, generous rate limits
+// Then http.serve(443, 1): that port speaks TLS, and port 80 (http.redirect) is added.
+// lib/autocert.wz's own settings (autocert.setdirectory, autocert.settiming, autocert.pin,
+// autocert.quiet) can be set between this call and http.serve.  One worker only: two
+// processes would each order a certificate.
+procedure http.https(host: array of char; email: array of char; store: array of char; staging: bool);
+begin
+  autocert.sethost(host);
+  if len(email) > 0 then autocert.setemail(email);
+  if len(store) > 0 then autocert.setstore(store);
+  autocert.usestaging := staging;
+  http.acme := true;
+  http.tlsmain := true;
+  if http.redirport <= 0 then http.redirport := 80;
+end;
+
+// Read the file at path (a NUL is added) into http.file.  The length, or -1.
+function http.readfile(path: array of char): int;
+var fd, n, r: int;
+    p: array[0..1023] of char;
+begin
+  if (len(path) = 0) or (len(path) >= len(p)) then return 0 - 1;
+  for n := 0 to len(path) - 1 do p[n] := path[n];
+  p[len(path)] := chr(0);
+  fd := sys3(SYS.open, addr(p[0]), O_RDONLY, 0);
+  if fd < 0 then return 0 - 1;
+  n := 0;
+  while n < len(http.file) do
+  begin
+    r := sys3(SYS.read, fd, addr(http.file[n]), len(http.file) - n);
+    if r <= 0 then break;
+    n := n + r;
+  end;
+  sys1(SYS.close, fd);
+  return n;
+end;
+
+// HTTPS with the certificate chain and the key in PEM files: the port given to
+// http.serve speaks TLS.  certfile holds one or more CERTIFICATE blocks, the server's own
+// first (a "fullchain" file); keyfile a P-256 key, "EC PRIVATE KEY" or "PRIVATE KEY" --
+// it may be the same file.  False, with http.tlswhy saying why, when either does not load
+// or they do not belong together; the certificate served until then stays.  Safe to call
+// again while serving: the next handshake uses the new pair, open connections carry on.
+function http.httpsfiles(certfile: array of char; keyfile: array of char): bool;
+var n, total: int;
+begin
+  n := http.readfile(keyfile);
+  if n < 0 then begin http.tlswhy := "cannot read the key file"; return false; end;
+  if not autocert.readkey(http.file, n) then
+  begin
+    http.tlswhy := "the key file holds no P-256 key this can read";
+    return false;
+  end;
+  n := http.readfile(certfile);
+  if n < 0 then begin http.tlswhy := "cannot read the certificate file"; return false; end;
+  if autocert.readchain(http.file, n) <= 0 then
+  begin
+    http.tlswhy := "the certificate file holds no certificate this can read";
+    return false;
+  end;
+  total := autocert.cat[autocert.ncerts - 1] + autocert.cn[autocert.ncerts - 1];
+  if not tls.setcert(autocert.chain, total, autocert.kd) then
+  begin
+    http.tlswhy := tls.why;
+    return false;
+  end;
+  http.tlsmain := true;
+  return true;
+end;
+
+// Raise the soft limit on open files towards HTTP.MAXFD, so the slots can be used at all:
+// a service started with the usual soft limit of 1024 runs out of descriptors long before
+// it runs out of slots.  Never lowers the limit, never goes above the hard limit, and a
+// refusal only means fewer connections -- not a reason to stop.
+//
+// WINDOWS HAS NO RLIMIT_NOFILE: its runtime keeps a fixed table of descriptors, and an
+// unknown system call there stops the program.  So the call is made only when a Linux
+// kernel is known to be listening, and the test for that is one that fails safe on both
+// sides: reading the link /proc/self/exe succeeds on Linux, and the Windows runtime answers
+// every readlink with -1.  A Linux without /proc keeps its limit, which is merely the
+// situation before this routine existed.
+procedure http.nofile;
+var cur, hard, want: int;
+    lim: array[0..15] of char;
+    probe: array[0..255] of char;
+begin
+  if sys3(HTTP.SYSREADLINK, sadr("/proc/self/exe\0"), addr(probe[0]), 256) <= 0 then return;
+  if sys2(HTTP.SYSGETRLIMIT, HTTP.RLIMITNOFILE, addr(lim[0])) < 0 then return;
+  cur := io.get64(lim, 0);
+  hard := io.get64(lim, 8);
+  want := HTTP.MAXFD;
+  if (hard >= 0) and (hard < want) then want := hard;   // a negative hard limit is RLIM_INFINITY
+  if (cur < 0) or (cur >= want) then return;
+  io.put64(lim, 0, want);
+  if sys2(HTTP.SYSSETRLIMIT, HTTP.RLIMITNOFILE, addr(lim[0])) < 0 then return;
+end;
+
+// the slot of fd, or -1
+function http.slotfd(fd: int): int;
+begin
+  if (fd < 0) or (fd >= HTTP.MAXFD) then return -1;
+  return http.slotof[fd] - 1;
+end;
+
+procedure http.slotfree(s: int); forward;
+
+// Give fd a slot; -1 when none is free (or fd is past what the map covers), -2 when it came
+// in on a TLS listener and no TLS session can be opened for it -- no certificate yet, or
+// every session in use -- in which case it holds no slot either.
+function http.slotopen(fd: int; li: int): int;
+var s, t: int;
+begin
+  if (fd < 0) or (fd >= HTTP.MAXFD) then return -1;
+  if (http.nfree = 0) or (http.nopen >= http.limit) then return -1;
+  http.nfree := http.nfree - 1;
+  s := http.freeslot[http.nfree];
+  http.sfd[s] := fd;
+  http.sbase[s] := HTTP.CHUNKS * INBUF + s * HTTP.SLOTIN;
+  http.scap[s] := HTTP.SLOTIN;
+  http.sused[s] := 0;
+  http.schunk[s] := -1;
+  http.sphase[s] := HTTP.PQUIET;
+  http.sdl[s] := http.now + http.hdrsecs * 1000000000;
+  http.sreqs[s] := 0;
+  http.slis[s] := li;
+  http.sclose[s] := false;
+  http.slinger[s] := false;
+  http.pbase[s] := 0;
+  http.psize[s] := 0;
+  http.pat[s] := 0;
+  http.pend[s] := 0;
+  http.spos[s] := http.nopen;
+  http.act[http.nopen] := s;
+  http.nopen := http.nopen + 1;
+  http.slotof[fd] := s + 1;
+  http.open[fd] := true;
+  // TLS: a connection accepted on a TLS listener starts its session here.  The handshake
+  // and the first request's headers share the header deadline, counted from now and never
+  // extended -- a queued server flight (http.sendq) does not buy the client more time.
+  http.stls[s] := -1;
+  http.shs[s] := 0;
+  http.bbase[s] := 0;
+  http.bsize[s] := 0;
+  http.kbase[s] := 0;
+  http.kat[s] := 0;
+  http.kend[s] := 0;
+  if http.ltls[li] then
+  begin
+    t := tls.open;
+    if t < 0 then
+    begin
+      http.slotfree(s);
+      http.tlsrefused := http.tlsrefused + 1;
+      return 0 - 2;
+    end;
+    http.stls[s] := t;
+    http.shs[s] := http.sdl[s];
+  end;
+  return s;
+end;
+
+// Let go of slot s's region of kept bytes.
+procedure http.tunkeep(s: int);
+begin
+  if http.kbase[s] = 0 then return;
+  sys2(SYS.munmap, http.kbase[s], HTTP.TLSPLAIN);
+  http.keepbytes := http.keepbytes - HTTP.TLSPLAIN;
+  http.kbase[s] := 0;
+  http.kat[s] := 0;
+  http.kend[s] := 0;
+end;
+
+// Let go of slot s's body region, if it has one.
+procedure http.bfree(s: int);
+begin
+  if http.bbase[s] = 0 then return;
+  sys2(SYS.munmap, http.bbase[s], http.bsize[s]);
+  http.bigbytes := http.bigbytes - http.bsize[s];
+  http.bbase[s] := 0;
+  http.bsize[s] := 0;
+end;
+
+// Give slot s back, with everything it held: its borrowed chunk, its unsent reply, the big
+// region, its place in http.act and in the fd map.  EVERY way a connection ends goes through
+// here -- close, error, deadline, eviction, detach -- so no path can forget one of them.
+// Closing the fd is the caller's business (a detach must not).
+procedure http.slotfree(s: int);
+var fd, i, last: int;
+begin
+  fd := http.sfd[s];
+  if fd < 0 then return;                     // already free: a second release does nothing
+  // TLS: the session of this connection ends here, its keys wiped, and what it kept goes.
+  if http.stls[s] >= 0 then
+  begin
+    tls.free(http.stls[s]);
+    http.stls[s] := -1;
+  end;
+  http.shs[s] := 0;
+  http.tunkeep(s);
+  if http.schunk[s] >= 0 then
+  begin
+    http.cfree[http.ncfree] := http.schunk[s];
+    http.ncfree := http.ncfree + 1;
+    http.schunk[s] := -1;
+  end;
+  if http.psize[s] > 0 then
+  begin
+    sys2(SYS.munmap, http.pbase[s], http.psize[s]);
+    http.pendbytes := http.pendbytes - http.psize[s];
+    http.psize[s] := 0;
+  end;
+  http.bfree(s);
+  i := http.spos[s];
+  last := http.act[http.nopen - 1];
+  http.act[i] := last;
+  http.spos[last] := i;
+  http.nopen := http.nopen - 1;
+  http.slotof[fd] := 0;
   http.open[fd] := false;
-  // The event loop can drop a connection directly on EPOLLERR/EPOLLHUP without ever
-  // calling http.readbig again -- if that connection owned the overflow region, nothing
-  // else would ever free it, and the region would answer every later oversized request
-  // with 413 for the rest of the process's life.
-  if http.bigowner = fd then http.bigowner := -1;
+  http.sfd[s] := -1;
+  http.freeslot[http.nfree] := s;
+  http.nfree := http.nfree + 1;
+end;
+
+procedure http.closeslot(s: int);
+var fd, t, st, w, r: int;
+begin
+  fd := http.sfd[s];
+  if fd < 0 then return;
+  // TLS: say goodbye with close_notify -- but only when everything before it went out.  A
+  // close_notify after a reply that is still queued would make a cut-off reply look like a
+  // complete one, which is exactly what the alert exists to rule out.
+  t := http.stls[s];
+  if (t >= 0) and (http.psize[s] = 0) then
+  begin
+    st := tls.state(t);
+    if (st = TLS.ST.OPEN) or (st = TLS.ST.CLOSED) then
+    begin
+      w := tls.shut(t, http.tshut);
+      if w > 0 then r := net.send(fd, addr(http.tshut[0]), w);
+    end;
+  end;
+  // A failing DEL is deliberately ignored: it means the fd is already out of the set
+  // (ENOENT), which is the state this routine is trying to reach.  Closing the fd removes
+  // it from the set anyway.  The result goes into http.ignored because the language refuses
+  // a discarded function result -- so "I am ignoring this on purpose" is written down.
+  http.ignored := net.watch(http.ep, EPOLL_DEL, fd, 0);
+  http.slotfree(s);
+  net.close(fd);
+end;
+
+// Close fd and free its slot.  Kept for a program running its own loop.
+procedure http.drop(fd: int);
+var s: int;
+begin
+  s := http.slotfd(fd);
+  if s >= 0 then http.closeslot(s)
+  else
+  begin
+    http.ignored := net.watch(http.ep, EPOLL_DEL, fd, 0);
+    net.close(fd);
+  end;
 end;
 
 // http.dropdetach(fd) -- let go of fd after app.request set http.detach, WITHOUT
 // closing it: the opposite of http.drop, which always closes. fd comes out of
-// http.ep and http.open so this file's own loop never touches it again; the socket
-// itself, and everything still buffered in the kernel for it, is untouched.
+// http.ep and its slot is freed, so this file's own loop never touches it again; the
+// socket itself, and everything still buffered in the kernel for it, is untouched.
 //
-// A failing DEL is ignored the same way http.drop ignores one (see there): it means
+// A failing DEL is ignored the same way http.closeslot ignores one (see there): it means
 // fd is already out of the set, which is the state this routine wants to reach.
 procedure http.dropdetach(fd: int);
+var s: int;
 begin
   http.ignored := net.watch(http.ep, EPOLL_DEL, fd, 0);
-  http.open[fd] := false;
-  if http.bigowner = fd then http.bigowner := -1;
+  s := http.slotfd(fd);
+  if s >= 0 then http.slotfree(s);
 end;
 
-// push whatever is pending; ask for EPOLLOUT if the socket is full
-procedure http.flush(fd: int);
-var n, r: int;
+// ---------------------------------------------------------------- THE WIRE
+//
+// The only two places bytes cross between a connection and this file.  A TLS connection
+// changes these two and nothing else: http.pull decrypts records into the slot's input,
+// http.emit encrypts a reply and queues the records with http.sendq.
+
+function http.mask(s: int; events: int): bool;
 begin
-  while http.osend[fd] < http.oend[fd] do
+  return net.watch(http.ep, EPOLL_MOD, http.sfd[s], events);
+end;
+
+function http.waitout(s: int): bool; forward;
+
+// Queue bytes a[0..n) on slot s: send what the socket takes now, and keep the rest in a
+// region of the slot's own until EPOLLOUT, sent by http.drain.  False when the connection
+// could not keep them and was closed.
+function http.sendq(s: int; a: int; n: int): bool;
+var r, sent, old, size, region: int;
+begin
+  sent := 0;
+  if http.psize[s] = 0 then
   begin
-    n := http.oend[fd] - http.osend[fd];
-    r := net.send(fd, addr(http.outbuf[http.osend[fd]]), n);
-    if r > 0 then http.osend[fd] := http.osend[fd] + r
-    else if r = EAGAIN then
+    // nothing queued before: straight from the caller's buffer, the usual case
+    while sent < n do
     begin
-      // Without EPOLLOUT this connection is never woken to finish writing, so a
-      // failed MOD is a stall.  It costs this one client, not the server: drop it.
-      if not net.watch(http.ep, EPOLL_MOD, fd, bor(EPOLLIN, EPOLLOUT)) then
-        http.drop(fd);
-      return;
-    end
+      r := net.send(http.sfd[s], a + sent, n - sent);
+      if r > 0 then sent := sent + r
+      else if r = EAGAIN then break
+      else if r <> EINTR then
+      begin
+        http.closeslot(s);
+        return false;
+      end;
+    end;
+    if sent = n then return true;
+    http.queued := http.queued + 1;
+  end;
+  if http.pend[s] + (n - sent) > http.psize[s] then
+  begin
+    // a region for what is already queued plus the rest of this
+    old := http.pend[s] - http.pat[s];
+    size := ((old + n - sent + 4095) div 4096) * 4096;
+    if http.pendbytes + size > http.pendmax then
+    begin
+      http.closeslot(s);
+      return false;
+    end;
+    region := sys6(SYS.mmap, 0, size, bor(PROT_READ, PROT_WRITE), bor(MAP_PRIVATE, MAP_ANONYMOUS), -1, 0);
+    if region < 0 then
+    begin
+      http.closeslot(s);
+      return false;
+    end;
+    http.move(region, http.pbase[s] + http.pat[s], old);
+    if http.psize[s] > 0 then
+    begin
+      sys2(SYS.munmap, http.pbase[s], http.psize[s]);
+      http.pendbytes := http.pendbytes - http.psize[s];
+    end;
+    http.pbase[s] := region;
+    http.psize[s] := size;
+    http.pat[s] := 0;
+    http.pend[s] := old;
+    http.pendbytes := http.pendbytes + size;
+  end;
+  http.move(http.pbase[s] + http.pend[s], a + sent, n - sent);
+  http.pend[s] := http.pend[s] + (n - sent);
+  return http.waitout(s);
+end;
+
+// Slot s has output pending: wait for the socket to take more.  Without EPOLLOUT this
+// connection is never woken to finish writing, so a failed MOD is a stall: it costs this
+// one client, not the server.  EPOLLIN is off meanwhile -- the next request waits until
+// this reply is out.
+function http.waitout(s: int): bool;
+begin
+  if not http.mask(s, EPOLLOUT) then
+  begin
+    http.closeslot(s);
+    return false;
+  end;
+  http.sphase[s] := HTTP.PSEND;
+  http.sdl[s] := http.now + http.sendsecs * 1000000000;
+  return true;
+end;
+
+// Send region[from..upto) on slot s, and hand the region itself over: what the socket does
+// not take now is sent from it by http.drain, which unmaps it at the end -- so a large reply
+// is never copied into a queue.  The region is this routine's from the call on, whatever it
+// returns.  False when the connection was closed (and the region unmapped).
+function http.sendown(s: int; region: int; size: int; from: int; upto: int): bool;
+var r, sent: int;
+    ok: bool;
+begin
+  if http.psize[s] > 0 then
+  begin
+    // something is queued already: this goes behind it, by copy
+    ok := http.sendq(s, region + from, upto - from);
+    sys2(SYS.munmap, region, size);
+    return ok;
+  end;
+  sent := from;
+  while sent < upto do
+  begin
+    r := net.send(http.sfd[s], region + sent, upto - sent);
+    if r > 0 then sent := sent + r
+    else if r = EAGAIN then break
     else if r <> EINTR then
     begin
-      http.drop(fd);
+      sys2(SYS.munmap, region, size);
+      http.closeslot(s);
+      return false;
+    end;
+  end;
+  if (sent = upto) or (http.pendbytes + size > http.pendmax) then
+  begin
+    sys2(SYS.munmap, region, size);
+    if sent = upto then return true;
+    http.closeslot(s);                        // over http.pendmax: one client, not the server
+    return false;
+  end;
+  http.queued := http.queued + 1;
+  http.pbase[s] := region;
+  http.psize[s] := size;
+  http.pat[s] := sent;
+  http.pend[s] := upto;
+  http.pendbytes := http.pendbytes + size;
+  return http.waitout(s);
+end;
+
+// A finished reply a[0..n) leaves for slot s.  THE ONE PLACE A REPLY ENTERS THE WIRE: a TLS
+// connection encrypts here and queues the records instead.  False when the connection was
+// closed.
+function http.emit(s: int; a: int; n: int): bool;
+var w, size, region: int;
+begin
+  if http.stls[s] < 0 then return http.sendq(s, a, n);
+  // Sealed whole, in records of TLS.MAXPLAIN, and sent as one: a reply up to OUTBUF and its
+  // records' overhead fit http.tout.  A larger one is sealed into a region of its own, which
+  // then IS the pending output (http.sendown) -- nothing is copied a second time.
+  if n + 22 * (n div TLS.MAXPLAIN + 1) <= len(http.tout) then
+  begin
+    w := tls.seal(http.stls[s], view(a, n), http.tout);
+    if w < 0 then
+    begin
+      http.closeslot(s);
+      return false;
+    end;
+    return http.sendq(s, addr(http.tout[0]), w);
+  end;
+  size := (((n + 22 * (n div TLS.MAXPLAIN + 1)) + 4095) div 4096) * 4096;
+  region := sys6(SYS.mmap, 0, size, bor(PROT_READ, PROT_WRITE), bor(MAP_PRIVATE, MAP_ANONYMOUS), -1, 0);
+  if region < 0 then
+  begin
+    http.closeslot(s);
+    return false;
+  end;
+  w := tls.seal(http.stls[s], view(a, n), view(region, size));
+  if w < 0 then
+  begin
+    sys2(SYS.munmap, region, size);
+    http.closeslot(s);
+    return false;
+  end;
+  return http.sendown(s, region, size, 0, w);
+end;
+
+// The finished reply of the current request leaves for slot s: from http.outbuf, or from
+// its own region, which goes with it (plain) or is let go once sealed (TLS).  False when
+// the connection was closed.
+function http.emitreply(s: int): bool;
+var region, size: int;
+    ok: bool;
+begin
+  if http.xbase = 0 then return http.emit(s, addr(http.outbuf[http.rstart]), http.rend - http.rstart);
+  region := http.xbase;
+  size := http.xsize;
+  http.xbase := 0;
+  http.xsize := 0;
+  http.replybytes := http.replybytes - size;
+  if http.stls[s] < 0 then return http.sendown(s, region, size, http.rstart, http.rend);
+  ok := http.emit(s, region + http.rstart, http.rend - http.rstart);
+  sys2(SYS.munmap, region, size);
+  return ok;
+end;
+
+// Decrypt src (all of it) for TLS slot s into dst: the number of bytes of request stream it
+// gave, or HTTP.EPROTO when the session failed or the connection was closed.  Handshake,
+// KeyUpdate and alert bytes the session produced are sent on the way.
+function http.tlsin(s: int; src: array of char; dst: array of char): int;
+var t, used, got: int;
+begin
+  t := http.stls[s];
+  used := tls.feed(t, src, dst, http.twire);
+  got := tls.appn;
+  if tls.wiren > 0 then
+    if not http.sendq(s, addr(http.twire[0]), tls.wiren) then return HTTP.EPROTO;
+  // A read's records always fit dst (see HTTP.TLSPLAIN), so feed takes all of src; taking
+  // less would mean bytes of the stream going missing, and that is a closed connection.
+  if (used < 0) or (used < len(src)) then
+  begin
+    http.tlsfailed := http.tlsfailed + 1;
+    return HTTP.EPROTO;
+  end;
+  return got;
+end;
+
+// Keep n decrypted bytes at address src for slot s, for the next http.pull.  The region is
+// mapped for the occasion and let go once the bytes are taken, and all of them together
+// stay within HTTP.KEEPMAX -- otherwise many connections pipelining at once could each hold
+// one.  False when there is no room for them; the slot is closed then.
+function http.tkeep(s: int; src: int; n: int): bool;
+var region: int;
+begin
+  if http.kbase[s] = 0 then
+  begin
+    region := -1;
+    if http.keepbytes + HTTP.TLSPLAIN <= HTTP.KEEPMAX then
+      region := sys6(SYS.mmap, 0, HTTP.TLSPLAIN, bor(PROT_READ, PROT_WRITE),
+                     bor(MAP_PRIVATE, MAP_ANONYMOUS), -1, 0);
+    if region < 0 then
+    begin
+      http.closeslot(s);
+      return false;
+    end;
+    http.kbase[s] := region;
+    http.keepbytes := http.keepbytes + HTTP.TLSPLAIN;
+  end;
+  http.move(http.kbase[s], src, n);
+  http.kat[s] := 0;
+  http.kend[s] := n;
+  http.tlskept := http.tlskept + 1;
+  return true;
+end;
+
+// Read up to n bytes of the request stream of slot s to address a: the count, 0 when the
+// peer closed, or a negative errno (EAGAIN: nothing more now).  THE ONE PLACE REQUEST BYTES
+// LEAVE THE WIRE.
+//
+// On a TLS connection the count is DECRYPTED bytes, and the contract is the same as a
+// read's: never more than n, and nothing lost -- what does not fit is kept (http.tkeep) and
+// comes first next time, before the socket is read again.  A read of HTTP.TLSRAW bytes is
+// decrypted into http.tplain, which is large enough for everything it can complete (a
+// record held half from the previous read included); when a itself is that large, it is
+// decrypted straight into a.
+function http.pull(s: int; a: int; n: int): int;
+var r, k, got: int;
+begin
+  if http.stls[s] < 0 then return net.recv(http.sfd[s], a, n);
+  if n <= 0 then return HTTP.EPROTO;
+  if http.kend[s] > http.kat[s] then
+  begin
+    k := http.kend[s] - http.kat[s];
+    if k > n then k := n;
+    http.move(a, http.kbase[s] + http.kat[s], k);
+    http.kat[s] := http.kat[s] + k;
+    if http.kat[s] = http.kend[s] then http.tunkeep(s);
+    return k;
+  end;
+  while true do
+  begin
+    // After the peer's close_notify nothing more counts, whatever else arrives.
+    if tls.state(http.stls[s]) = TLS.ST.CLOSED then return 0;
+    r := net.recv(http.sfd[s], addr(http.traw[0]), HTTP.TLSRAW);
+    if r <= 0 then return r;
+    if n >= HTTP.TLSPLAIN then got := http.tlsin(s, http.traw[0..r - 1], view(a, n))
+    else
+    begin
+      got := http.tlsin(s, http.traw[0..r - 1], http.tplain);
+      if got > n then
+      begin
+        http.move(a, addr(http.tplain[0]), n);
+        if not http.tkeep(s, addr(http.tplain[n]), got - n) then return HTTP.EPROTO;
+        got := n;
+      end
+      else if got > 0 then http.move(a, addr(http.tplain[0]), got);
+    end;
+    // Request bytes, or the session failed.  Zero is a handshake step or an empty record:
+    // read on, until the socket has nothing more.
+    if got <> 0 then return got;
+  end;
+  return 0;
+end;
+
+// A refused TLS connection, its refusal sent: close_notify, then swallow what the client
+// still sends for at most HTTP.LINGERSECS, and close when it stops.  Closing at once, with
+// the rest of its body unread, makes the kernel answer with a reset -- and a TLS client
+// that is still writing its body then never reads the 413 that was sent to it.
+procedure http.linger(s: int);
+var w, r: int;
+begin
+  w := tls.shut(http.stls[s], http.tshut);
+  if w > 0 then r := net.send(http.sfd[s], addr(http.tshut[0]), w);
+  http.sphase[s] := HTTP.PLINGER;
+  http.shs[s] := 0;
+  http.sdl[s] := http.now + HTTP.LINGERSECS * 1000000000;
+  if not http.mask(s, EPOLLIN) then http.closeslot(s);
+end;
+
+// Slot s is done: closed, or lingering when it was refused over TLS.
+procedure http.endslot(s: int);
+begin
+  if http.slinger[s] then http.linger(s) else http.closeslot(s);
+end;
+
+// Read and drop what a lingering slot is sent; close it at the end of the stream.
+procedure http.swallow(s: int);
+var r: int;
+begin
+  while true do
+  begin
+    r := net.recv(http.sfd[s], addr(http.traw[0]), HTTP.TLSRAW);
+    if r = EAGAIN then return;
+    if (r <= 0) and (r <> EINTR) then
+    begin
+      http.closeslot(s);
       return;
     end;
   end;
-  // Back to read-only.  A failed MOD would leave EPOLLOUT armed on an idle socket,
-  // spinning the loop on a writable fd with nothing to write: drop it instead.
-  if not net.watch(http.ep, EPOLL_MOD, fd, EPOLLIN) then
+end;
+
+// ---------------------------------------------------------------- serving a slot
+
+procedure http.input(s: int); forward;
+
+// Slot s waits for its next request: a deadline for the headers if part of one is already
+// here (pipelined), the idle deadline otherwise.
+procedure http.rest(s: int);
+begin
+  if http.sused[s] > 0 then
   begin
-    http.drop(fd);
+    http.sphase[s] := HTTP.PHEAD;
+    http.sdl[s] := http.now + http.hdrsecs * 1000000000;
+  end
+  else
+  begin
+    http.sphase[s] := HTTP.PQUIET;
+    http.sdl[s] := http.now + http.idlesecs * 1000000000;
+  end;
+end;
+
+// EPOLLOUT on slot s: push the pending reply.  Once it is out, the region goes back, the
+// slot listens again, and a request that arrived behind the answered one is served.
+procedure http.drain(s: int);
+var r: int;
+begin
+  if http.psize[s] = 0 then return;          // nothing pending: a stale wake-up
+  while http.pat[s] < http.pend[s] do
+  begin
+    r := net.send(http.sfd[s], http.pbase[s] + http.pat[s], http.pend[s] - http.pat[s]);
+    if r > 0 then
+    begin
+      http.pat[s] := http.pat[s] + r;
+      http.sdl[s] := http.now + http.sendsecs * 1000000000;
+    end
+    else if r = EAGAIN then return
+    else if r <> EINTR then
+    begin
+      http.closeslot(s);
+      return;
+    end;
+  end;
+  sys2(SYS.munmap, http.pbase[s], http.psize[s]);
+  http.pendbytes := http.pendbytes - http.psize[s];
+  http.pbase[s] := 0;
+  http.psize[s] := 0;
+  http.pat[s] := 0;
+  http.pend[s] := 0;
+  if http.sclose[s] then
+  begin
+    http.endslot(s);
     return;
   end;
-  if not http.keep then http.drop(fd);
+  // Back to read-only.  A failed MOD would leave EPOLLOUT armed on an idle socket, spinning
+  // the loop on a writable fd with nothing to write: close it instead.
+  if not http.mask(s, EPOLLIN) then
+  begin
+    http.closeslot(s);
+    return;
+  end;
+  http.rest(s);
+  http.input(s);
 end;
 
-// Send a clean 413 and close: a request whose body will never fit is answered rather than
-// reset.  Called once headers are known complete (http.hdrseen), so http.method, the path
-// and the headers themselves are already valid -- only the body is the problem.
-procedure http.reply413(fd: int);
+// Push whatever is pending on fd.  Kept for a program running its own loop.
+procedure http.flush(fd: int);
+var s: int;
 begin
+  s := http.slotfd(fd);
+  if s >= 0 then http.drain(s);
+end;
+
+// Borrow a shared INBUF-sized area for slot s: its request outgrew HTTP.SLOTIN.  False when
+// every chunk is in use.
+function http.grow(s: int): bool;
+var c: int;
+begin
+  if http.schunk[s] >= 0 then return false;
+  if http.ncfree = 0 then return false;
+  http.ncfree := http.ncfree - 1;
+  c := http.cfree[http.ncfree];
+  http.move(addr(http.inbuf[c * INBUF]), addr(http.inbuf[http.sbase[s]]), http.sused[s]);
+  http.schunk[s] := c;
+  http.sbase[s] := c * INBUF;
+  http.scap[s] := INBUF;
+  return true;
+end;
+
+// The first `total` bytes of slot s's input were a request, now answered: what came after
+// it moves to the front, and a borrowed chunk goes back once the rest fits the slot's own
+// area again.
+procedure http.consume(s: int; total: int);
+var left, own: int;
+begin
+  left := http.sused[s] - total;
+  if left < 0 then left := 0;
+  own := HTTP.CHUNKS * INBUF + s * HTTP.SLOTIN;
+  if (http.schunk[s] >= 0) and (left <= HTTP.SLOTIN) then
+  begin
+    if left > 0 then http.move(addr(http.inbuf[own]), addr(http.inbuf[http.sbase[s]]) + total, left);
+    http.cfree[http.ncfree] := http.schunk[s];
+    http.ncfree := http.ncfree + 1;
+    http.schunk[s] := -1;
+    http.sbase[s] := own;
+    http.scap[s] := HTTP.SLOTIN;
+  end
+  else if left > 0 then
+    http.move(addr(http.inbuf[http.sbase[s]]), addr(http.inbuf[http.sbase[s]]) + total, left);
+  http.sused[s] := left;
+end;
+
+// Run app.request for the request at the front of slot s (`total` bytes of it are input),
+// and send its reply.  True when the slot can go on to its next request right away; false
+// when it is closed, detached, or waiting for the reply to drain.
+// A short plain-text answer to the current request.
+procedure http.plain(status: int; msg: str);
+begin
+  http.add(msg);
+  http.finish(status, "text/plain");
+end;
+
+// The request on https mode's plain listener (http.redirect).  The application is never
+// run here: this answers the authority's challenge, and sends everyone else to https://.
+procedure http.redirected;
+var n, i, h: int;
+    c: char;
+begin
+  // THE CHALLENGE: only the token of the order in progress, exactly (autocert.answer).
+  if http.pathstarts(AUTOCERT.PREFIX) then
+  begin
+    n := 0 - 1;
+    if http.acme then n := autocert.answer(http.inbuf[http.pathat..http.pathat + http.pathlen - 1], http.chal);
+    if n < 0 then begin http.plain(404, "no such challenge\n"); return; end;
+    http.addb(http.chal, 0, n);
+    http.finish(200, "text/plain");
+    return;
+  end;
+  // BEFORE THE FIRST CERTIFICATE there is nowhere to send anyone -- and serving the
+  // application in the clear instead is exactly what https mode rules out.
+  if not tls.haveserverkey then
+  begin
+    http.hdradd("Retry-After: 10");
+    http.plain(503, "no certificate yet: this server answers over https once it has one\n");
+    return;
+  end;
+  // THE REDIRECT: https://<host>[:<port>]<path>[?<query>].
+  n := io.push(http.loc, 0, "https://");
+  if http.acme then
+  begin
+    for i := 0 to autocert.hostn - 1 do begin http.loc[n] := autocert.host[i]; n := n + 1; end;
+  end
+  else
+  begin
+    // The request's own Host, name only: a port there is the plain one, and anything that
+    // is not a hostname is not copied into a header.
+    if not http.header("host") then begin http.plain(400, "a Host header is needed\n"); return; end;
+    h := http.hvat;
+    while (h < http.hvend) and (http.inbuf[h] <> ':') do
+    begin
+      c := http.inbuf[h];
+      if not (((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or ((c >= '0') and (c <= '9'))
+              or (c = '.') or (c = '-')) then
+      begin
+        http.plain(400, "the Host header is not a hostname\n");
+        return;
+      end;
+      h := h + 1;
+    end;
+    if (h = http.hvat) or (h - http.hvat > 253) then begin http.plain(400, "the Host header is not a hostname\n"); return; end;
+    for i := http.hvat to h - 1 do begin http.loc[n] := http.inbuf[i]; n := n + 1; end;
+  end;
+  if http.lports[0] <> 443 then
+  begin
+    n := io.push(http.loc, n, ":");
+    n := io.pushnum(http.loc, n, http.lports[0]);
+  end;
+  // The path and query as they were sent, printable bytes only: a line break copied into a
+  // Location header would let a request write headers of its own into the reply.
+  if n + http.pathlen + http.querylen + 1 > HDRROOM - 300 then begin http.plain(414, "the address is too long\n"); return; end;
+  for i := http.pathat to http.pathat + http.pathlen - 1 do
+  begin
+    c := http.inbuf[i];
+    if (ord(c) < 33) or (ord(c) > 126) then begin http.plain(400, "the path holds a byte a URL may not\n"); return; end;
+    http.loc[n] := c;
+    n := n + 1;
+  end;
+  if http.querylen > 0 then
+  begin
+    http.loc[n] := '?';
+    n := n + 1;
+    for i := http.queryat to http.queryat + http.querylen - 1 do
+    begin
+      c := http.inbuf[i];
+      if (ord(c) < 33) or (ord(c) > 126) then begin http.plain(400, "the query holds a byte a URL may not\n"); return; end;
+      http.loc[n] := c;
+      n := n + 1;
+    end;
+  end;
+  http.hdraddslice("Location", http.loc, 0, n);
+  // 301 for a GET or HEAD, what every client follows; 308 for the rest, which keeps the
+  // method and the body where a 301 lets a client turn a POST into a GET.
+  if (http.method = HTTP.GET) or (http.method = HTTP.HEAD) then http.plain(301, "moved to https\n")
+  else http.plain(308, "moved to https\n");
+end;
+
+function http.answer(s: int; total: int): bool;
+var fd: int;
+begin
+  fd := http.sfd[s];
   http.fd := fd;
-  http.obase := fd * OUTBUF;
+  http.slot := s;
+  http.lis := http.slis[s];
+  http.istls := http.stls[s] >= 0;
+  http.shs[s] := 0;                          // the headers are in: the handshake deadline is met
+  http.ibase := http.sbase[s];
+  http.obase := 0;
   http.requests := http.requests + 1;
+  http.sreqs[s] := http.sreqs[s] + 1;
   http.started := io.now;
   http.start;
-  http.keep := false;
-  http.add("request body too large\n");
-  http.finish(413, "text/plain");
-  http.inlen[fd] := 0;
-  http.flush(fd);
+  if http.lrole[http.lis] = HTTP.LREDIR then http.redirected
+  else app.request;
+  http.bodyinbig := false;
+  http.now := io.now;
+  http.bfree(s);                             // a large body is answered: its memory goes back
+  // http.detach means app.request handed fd to another module (a WebSocket upgrade)
+  // instead of writing a reply through http.add/http.finish -- there is nothing here to
+  // send, and sending would write whatever sits in http.outbuf onto a socket the new owner
+  // is about to start reading frames from.  Just let go of it.
+  if http.detach then
+  begin
+    http.dropdetach(fd);
+    return false;
+  end;
+  http.consume(s, total);
+  if not http.keep then http.sclose[s] := true;
+  if http.rend > http.rstart then
+    if not http.emitreply(s) then return false;
+  if http.psize[s] > 0 then return false;
+  if http.sclose[s] then
+  begin
+    http.closeslot(s);
+    return false;
+  end;
+  http.rest(s);
+  return true;
 end;
 
-// Continue a request whose body is being read into the shared overflow region rather than
-// http.inbuf: called instead of the normal read once http.bigowner = fd.  Everything about
-// the request except the body (method, path, headers) was already parsed into http.inbuf
-// while the region was still empty, and stays valid there -- only the body bytes move.
+// Answer slot s with a short error and close it: a 413 for a body that will never fit, a 503
+// when there is no room to read a request right now.  `parsed` says whether the headers are
+// known, for the log line.
+procedure http.refuse(s: int; status: int; msg: str; parsed: bool);
+begin
+  http.fd := http.sfd[s];
+  http.slot := s;
+  http.lis := http.slis[s];
+  http.istls := http.stls[s] >= 0;
+  http.obase := 0;
+  http.requests := http.requests + 1;
+  http.started := io.now;
+  if not parsed then
+  begin
+    http.method := 0;
+    http.pathat := 0;
+    http.pathlen := 0;
+  end;
+  http.start;
+  http.keep := false;
+  if status = 503 then http.hdradd("Retry-After: 1");
+  http.add(msg);
+  http.finish(status, "text/plain");
+  http.sused[s] := 0;
+  http.sclose[s] := true;
+  http.slinger[s] := http.stls[s] >= 0;
+  if http.emitreply(s) then
+    if http.psize[s] = 0 then http.endslot(s);
+end;
+
+// the body deadline, once the headers of a request with this Content-Length are in
+procedure http.bodystart(s: int);
+var ok: bool;
+begin
+  if http.sphase[s] = HTTP.PBODY then return;
+  http.shs[s] := 0;                          // TLS: the headers are in
+  http.sphase[s] := HTTP.PBODY;
+  http.sdl[s] := http.now + (http.bodysecs + http.clen div HTTP.BODYRATE) * 1000000000;
+  // A client that asked to hear first (curl does, for a body over 1 MB) is told to go on;
+  // unanswered, it waits a second before sending anyway.  Only when the body is accepted:
+  // a refusal (413, 503) is the answer to the same question.
+  if http.header("expect") then
+    if (http.hvend - http.hvat = 12) and http.hdreq(http.hvat, http.hvend, "100-continue") then
+      ok := http.emit(s, sadr(HTTP.CONTINUE), slen(HTTP.CONTINUE));
+end;
+
+// A region of slot s's own for the body whose headers were just parsed (http.clen bytes):
+// the body bytes read so far move into it, the request line and headers stay in the slot's
+// input.  False when http.bodymem would be exceeded, or no memory can be had.
+function http.bopen(s: int): bool;
+var size, region, have: int;
+begin
+  size := ((http.clen + 4095) div 4096) * 4096;
+  if http.bigbytes + size > http.bodymem then return false;
+  region := sys6(SYS.mmap, 0, size, bor(PROT_READ, PROT_WRITE), bor(MAP_PRIVATE, MAP_ANONYMOUS), -1, 0);
+  if region < 0 then return false;
+  http.bbase[s] := region;
+  http.bsize[s] := size;
+  http.bigbytes := http.bigbytes + size;
+  // Less than the body: the headers and the body together did not fit the slot's input.
+  have := http.sused[s] - http.hdrsize;
+  if have > 0 then http.move(region, addr(http.inbuf[http.sbase[s]]) + http.hdrsize, have);
+  http.blen[s] := have;
+  http.btotal[s] := http.clen;
+  http.sused[s] := http.hdrsize;
+  return true;
+end;
+
+// Continue a request whose body is being read into the slot's body region rather than
+// http.inbuf.  The request line and headers stay in the slot's input and are parsed again
+// just before app.request -- the globals http.parse filled when the body started have been
+// overwritten by every other connection served since.
 //
-// http.bigbase is a raw address from mmap, not an index into any Wantzel array -- net.recv
-// takes a plain address (see net.wz), so it is used directly rather than through addr().
-// The body is NOT in http.inbuf, so http.bodyat/http.bodylen here are an offset and a
-// length into http.bigbase, not into http.inbuf: an application must check
-// http.bodyinbig and read view(http.bigbase, http.bodylen) instead of http.inbuf when it
-// is set. See docs/library.md.
-procedure http.readbig(fd: int);
+// The region is a raw address from mmap, not an index into any Wantzel array, so the body
+// is NOT in http.inbuf: while app.request runs, http.bigbase is the region, http.bodyat 0
+// and http.bodylen its length, and an application checks http.bodyinbig and reads
+// view(http.bigbase, http.bodylen).  See docs/library.md.
+procedure http.readbig(s: int);
 var r, room: int;
 begin
   while true do
   begin
-    room := http.bigtotal - http.biglen;
+    room := http.btotal[s] - http.blen[s];
     if room <= 0 then break;
-    r := net.recv(fd, http.bigbase + http.biglen, room);
-    if r > 0 then http.biglen := http.biglen + r
+    r := http.pull(s, http.bbase[s] + http.blen[s], room);
+    if r > 0 then http.blen[s] := http.blen[s] + r
     else if r = EAGAIN then return
     else if r <> EINTR then
     begin
-      http.bigowner := -1;
-      http.drop(fd);
+      http.closeslot(s);
       return;
     end;
-    // r = EINTR falls through to the top of the loop and retries the same recv, the same
-    // way http.readable and http.flush already do.
   end;
-  // Reaching here (rather than one of the returns above) means the loop left through
-  // "room <= 0", i.e. http.biglen = http.bigtotal: the body is complete.
-  http.fd := fd;
-  http.obase := fd * OUTBUF;
-  http.requests := http.requests + 1;
-  http.started := io.now;
+  // the body is complete
+  if http.parse(http.sbase[s], http.sused[s]) < 0 then
+  begin
+    http.closeslot(s);
+    return;
+  end;
   http.bodyinbig := true;
+  http.bigbase := http.bbase[s];
   http.bodyat := 0;
-  http.bodylen := http.bigtotal;
-  http.start;
-  app.request;
-  http.bodyinbig := false;
-  // Same detach path as http.readable's ordinary case: see the comment there. A
-  // detach after a big-body request is not a real scenario (a WebSocket upgrade is
-  // a GET with no body) but is covered the same way rather than left unguarded.
-  if http.detach then begin http.dropdetach(fd); return; end;
-  http.bigowner := -1;
-  http.inlen[fd] := 0;
-  http.flush(fd);
+  http.bodylen := http.btotal[s];
+  if http.answer(s, http.sused[s]) then http.input(s);
 end;
 
-procedure http.readable(fd: int);
-var r, used, total, base: int;
+// Everything slot s can do with the input it has and the socket can give: parse, answer,
+// and read more, until the socket has nothing more (EAGAIN), the connection ends, or a reply
+// has to drain first.
+procedure http.input(s: int);
+var total, need, r: int;
 begin
-  if http.bigowner = fd then begin http.readbig(fd); return; end;
-  base := fd * INBUF;
-  while true do
+  while http.sfd[s] >= 0 do
   begin
-    used := http.inlen[fd];
-    if used >= INBUF then
+    if http.psize[s] > 0 then return;        // a reply is still going out: the next waits
+    if http.sphase[s] = HTTP.PLINGER then
     begin
-      // The buffer is full and http.parse never returned a complete request (that path
-      // returns above, in the r > 0 branch).  Before this was always a bare http.drop --
-      // a reset with no status code, indistinguishable from a crash at the client.  What
-      // to do now depends on what http.parse already learned about the headers:
-      if not http.hdrseen then
-      begin
-        // The headers themselves do not fit in INBUF (256 kB).  That is not a legitimate
-        // large body, so treat it like any other malformed request.
-        http.drop(fd);
-        return;
-      end;
-      if (http.bigcap > 0) and (http.bigowner < 0) and (http.clen <= http.bigcap) then
-      begin
-        // Move the body bytes read so far into the shared region and keep reading there.
-        // The request line and headers stay put in http.inbuf -- http.pathat and friends
-        // still point at this connection's ordinary slot, which nothing here overwrites
-        // until http.inlen[fd] is reset for the NEXT request.
-        //
-        // used - (http.bodyat - base) <= http.clen always holds here: this branch is only
-        // reached with used = INBUF (the slot is completely full) while http.parse still
-        // called the request incomplete, which means the WHOLE request (headers + body)
-        // is already known to be bigger than INBUF -- so there is no room left in this
-        // buffer for bytes belonging to any request after this one.
-        http.biglen := used - (http.bodyat - base);
-        http.copytobig(http.bodyat, http.biglen, view(http.bigbase, http.bigcap));
-        http.bigowner := fd;
-        http.bigtotal := http.clen;
-        http.readbig(fd);
-        return;
-      end;
-      // No overflow region configured, too small for this body, or already busy with
-      // another connection's big body: answer honestly instead of resetting.
-      http.reply413(fd);
+      http.swallow(s);
       return;
     end;
-    r := net.recv(fd, addr(http.inbuf[base + used]), INBUF - used);
-    if r > 0 then
+    if http.bbase[s] <> 0 then
     begin
-      http.inlen[fd] := used + r;
-      total := http.parse(base, http.inlen[fd]);
+      http.readbig(s);
+      return;
+    end;
+    if http.sused[s] > 0 then
+    begin
+      total := http.parse(http.sbase[s], http.sused[s]);
       if total < 0 then
       begin
-        http.drop(fd);
+        http.closeslot(s);
         return;
       end;
       if total > 0 then
       begin
-        http.fd := fd;
-        http.ibase := base;
-        http.obase := fd * OUTBUF;
-        http.requests := http.requests + 1;
-        http.started := io.now;
-        http.start;
-        app.request;
-        // http.detach means app.request handed fd to another module (a WebSocket
-        // upgrade) instead of writing a reply through http.add/http.finish -- there
-        // is nothing here to flush, and calling http.flush would write whatever
-        // garbage happens to sit in this connection's http.outbuf onto a socket the
-        // new owner is about to start reading frames from. Just let go of it.
-        if http.detach then begin http.dropdetach(fd); return; end;
-        http.inlen[fd] := 0;
-        http.flush(fd);
-        if not http.open[fd] then return;
+        if not http.answer(s, total) then return;
+        continue;                           // a pipelined request may be next in line
       end;
+      if http.hdrseen then
+      begin
+        need := http.hdrsize + http.clen;
+        if need > http.scap[s] then
+        begin
+          if need <= INBUF then
+          begin
+            if not http.grow(s) then
+            begin
+              http.refuse(s, 503, "no room for this request right now\n", true);
+              return;
+            end;
+          end
+          else if (http.clen <= http.bigcap) and (http.clen <= http.bodymem) then
+          begin
+            if not http.bopen(s) then
+            begin
+              // Allowed, but not now: the large bodies already arriving hold what they may.
+              http.refuse(s, 503, "no room for this body right now; try again\n", true);
+              return;
+            end;
+            http.bodystart(s);
+            http.readbig(s);
+            return;
+          end
+          else
+          begin
+            // Larger than http.maxbody allows (or none was set): answer honestly instead of
+            // resetting.
+            http.refuse(s, 413, "request body too large\n", true);
+            return;
+          end;
+        end;
+        http.bodystart(s);
+      end
+      else if http.sused[s] >= http.scap[s] then
+      begin
+        // The headers alone fill the area.  Past INBUF that is not a request any more.
+        if http.scap[s] >= INBUF then
+        begin
+          http.closeslot(s);
+          return;
+        end;
+        if not http.grow(s) then
+        begin
+          http.refuse(s, 503, "no room for this request right now\n", false);
+          return;
+        end;
+      end;
+    end;
+    r := http.pull(s, addr(http.inbuf[http.sbase[s]]) + http.sused[s], http.scap[s] - http.sused[s]);
+    if r > 0 then
+    begin
+      if http.sphase[s] = HTTP.PQUIET then
+      begin
+        // The first byte of a request starts its header deadline -- except on a new
+        // connection, whose deadline already runs from the accept.
+        http.sphase[s] := HTTP.PHEAD;
+        if http.sreqs[s] > 0 then http.sdl[s] := http.now + http.hdrsecs * 1000000000;
+      end;
+      http.sused[s] := http.sused[s] + r;
     end
     else if r = EAGAIN then return
     else if r <> EINTR then
     begin
-      http.drop(fd);
+      http.closeslot(s);                    // 0: the peer closed; negative: an error
       return;
     end;
   end;
 end;
 
-procedure http.accept;
-var fd: int;
+// Read what fd has and answer what is complete.  Kept for a program running its own loop.
+procedure http.readable(fd: int);
+var s: int;
 begin
+  s := http.slotfd(fd);
+  if s >= 0 then http.input(s);
+end;
+
+// ---------------------------------------------------------------- accepting
+
+// Every slot is taken: close the quiet connection nearest its deadline -- one between
+// requests, or one that has not sent anything yet -- to make room.  False when every
+// connection is in the middle of a request.
+function http.evict: bool;
+var i, s, best: int;
+begin
+  best := -1;
+  for i := 0 to http.nopen - 1 do
+  begin
+    s := http.act[i];
+    if ((http.sphase[s] = HTTP.PQUIET) or (http.sphase[s] = HTTP.PLINGER)) and (http.psize[s] = 0)
+       and (http.bbase[s] = 0) then
+    begin
+      if (best < 0) or (http.sdl[s] < http.sdl[best]) then best := s;
+    end;
+  end;
+  if best < 0 then return false;
+  http.evicted := http.evicted + 1;
+  http.closeslot(best);
+  return true;
+end;
+
+// No slot for fd: a 503 and closed at once.  Best effort -- the reply fits any socket
+// buffer, but a client that already sent its request may see a reset instead, because
+// closing a socket with unread input resets it.  Plain listeners only: http.acceptfd closes
+// a TLS connection without it.
+procedure http.shed(fd: int);
+var r: int;
+begin
+  http.refused := http.refused + 1;
+  r := net.send(fd, sadr(HTTP.FULL), slen(HTTP.FULL));
+  net.close(fd);
+end;
+
+// Stop accepting until the next deadline check: accept failed for want of descriptors or
+// memory, and a listening socket left in the set would wake the loop again at once, for
+// ever, with the same failure.
+procedure http.pause;
+var i: int;
+begin
+  if (http.nlis = 0) or http.lpaused then return;
+  for i := 0 to http.nlis - 1 do http.ignored := net.watch(http.ep, EPOLL_DEL, http.lfds[i], 0);
+  http.lpaused := true;
+end;
+
+procedure http.resume;
+var i: int;
+begin
+  if not http.lpaused then return;
+  for i := 0 to http.nlis - 1 do
+    if not net.watch(http.ep, EPOLL_ADD, http.lfds[i], EPOLLIN) then
+      io.fatal("cannot watch the listening socket again");
+  http.lpaused := false;
+end;
+
+// Accept every waiting connection on listening socket lfd (listener li).
+procedure http.acceptfd(lfd: int; li: int);
+var fd, s: int;
+begin
+  http.init;
   while true do
   begin
-    fd := net.accept(http.lfd);
-    if fd < 0 then return;
-    if fd >= MAXCONN then
+    fd := net.accept(lfd);
+    if fd < 0 then
     begin
-      net.close(fd);
-      return;
+      // -24 EMFILE, -23 ENFILE: out of descriptors; -105 ENOBUFS, -12 ENOMEM: out of memory
+      if (fd = -24) or (fd = -23) or (fd = -105) or (fd = -12) then
+      begin
+        http.pause;
+        return;
+      end;
+      // -103 ECONNABORTED, -71 EPROTO, -1 EPERM: that one connection died in the queue
+      if (fd = -103) or (fd = -71) or (fd = -1) or (fd = EINTR) then continue;
+      return;                               // EAGAIN: nothing more waiting
     end;
-    http.inlen[fd] := 0;
-    http.osend[fd] := 0;
-    http.oend[fd] := 0;
-    http.open[fd] := true;
-    // A missed ADD means this connection is never served: the client waits forever
-    // and the fd leaks.  That is one client, not the server, so close it here
-    // rather than stopping a process that is serving others.
-    if not net.watch(http.ep, EPOLL_ADD, fd, EPOLLIN) then http.drop(fd);
+    s := http.slotopen(fd, li);
+    if (s = -1) and (fd < HTTP.MAXFD) then
+    begin
+      if http.evict then s := http.slotopen(fd, li);
+    end;
+    // No TLS session (-2): no certificate yet, or every session in use -- closed at once,
+    // which a client reports as a failed handshake.  Making room would not help it.
+    if s = -2 then net.close(fd)
+    else if s < 0 then
+    begin
+      // No slot.  A TLS client cannot read a plaintext 503: it is closed without one.
+      if http.ltls[li] then
+      begin
+        http.refused := http.refused + 1;
+        net.close(fd);
+      end
+      else http.shed(fd);
+    end
+    else if not net.watch(http.ep, EPOLL_ADD, fd, EPOLLIN) then
+      // A missed ADD means this connection is never served: the client waits forever and
+      // the fd leaks.  That is one client, not the server: close it.
+      http.closeslot(s);
   end;
 end;
 
-// Run the event loop in `workers` independent processes.  Each opens its own
-// listening socket with SO_REUSEPORT, so the kernel spreads incoming
-// connections across them: all cores, no threads, no locks, nothing shared.
-procedure http.serve(port: int; workers: int);
-var n, i, fd, ev, pid: int;
+// Accept on http.lfd.  Kept for a program running its own loop.
+procedure http.accept;
 begin
-  // Global arrays and ints start zeroed, and fd 0 is a real descriptor -- so without this,
-  // http.bigowner would read 0 and every check against it would treat stdin as the owner
-  // of a region that was never even mapped.  Set unconditionally: a program that never
-  // calls http.maxbody still needs http.bigowner to read as "free" and http.bigcap as "off".
-  if http.bigcap = 0 then
+  http.acceptfd(http.lfd, 0);
+end;
+
+// ---------------------------------------------------------------- the loop
+
+// Close every connection whose deadline has passed, and accept again if accepting was
+// paused.  http.poll calls this once per HTTP.TICKMS.
+procedure http.sweep;
+var i, s: int;
+begin
+  http.now := io.now;
+  http.nextsweep := http.now + HTTP.TICKMS * 1000000;
+  i := 0;
+  while i < http.nopen do
   begin
-    http.bigbase := -1;
-    http.bigowner := -1;
+    s := http.act[i];
+    if (http.sdl[s] <= http.now) or ((http.shs[s] > 0) and (http.shs[s] <= http.now)) then
+    begin
+      if http.sphase[s] <> HTTP.PLINGER then http.timedout := http.timedout + 1;
+      http.closeslot(s);                    // moves the last open slot into place i
+    end
+    else i := i + 1;
   end;
+  http.resume;
+end;
+
+// the listener index of fd, -1 when it is not a listening socket
+function http.listener(fd: int): int;
+var i: int;
+begin
+  for i := 0 to http.nlis - 1 do if http.lfds[i] = fd then return i;
+  if (http.nlis = 0) and (fd = http.lfd) then return 0;
+  return -1;
+end;
+
+// Bind the port (and any added with http.addport), fork workers - 1 more processes, and
+// create the epoll set.  Returns in every worker; each then runs its own loop with
+// http.poll.  http.serve is this followed by http.poll for ever.
+procedure http.listen(port: int; workers: int);
+var i, pid, fd: int;
+begin
+  http.nofile;
+  http.lports[0] := port;
+  http.ltls[0] := http.tlsmain;
+  http.lrole[0] := HTTP.LAPP;
+  if http.acme and (workers > 1) then io.fatal("http.https runs one worker: two would each order a certificate");
+  if http.redirport > 0 then
+  begin
+    http.addport(http.redirport);
+    http.lrole[http.nextra] := HTTP.LREDIR;
+  end;
+  http.nlis := http.nextra + 1;
   i := 1;
   while i < workers do
   begin
@@ -834,42 +2188,114 @@ begin
     if pid = 0 then break;
     i := i + 1;
   end;
-  http.lfd := net.listen(port, 1024, workers > 1);   // SO_REUSEPORT only when workers share the port
-  if http.lfd < 0 then io.fatal("cannot bind the port");
+  http.init;
+  for i := 0 to http.nlis - 1 do
+  begin
+    fd := net.listen(http.lports[i], MAXCONN, workers > 1);   // SO_REUSEPORT only when workers share the port
+    if fd < 0 then io.fatal("cannot bind the port");
+    http.lfds[i] := fd;
+  end;
+  http.lfd := http.lfds[0];
   http.ep := net.epoll;
   if http.ep < 0 then io.fatal("cannot create the epoll set");
-  // The listening socket is the one the whole loop depends on: without it in the set
-  // the server accepts nothing at all and would sit silently in epoll_wait forever.
-  // Same treatment as net.listen and net.epoll above.
-  if not net.watch(http.ep, EPOLL_ADD, http.lfd, EPOLLIN) then
-    io.fatal("cannot watch the listening socket");
-  while true do
+  // The listening sockets are what the whole loop depends on: without them in the set the
+  // server accepts nothing at all and would sit silently in epoll_wait forever.
+  for i := 0 to http.nlis - 1 do
+    if not net.watch(http.ep, EPOLL_ADD, http.lfds[i], EPOLLIN) then
+      io.fatal("cannot watch the listening socket");
+  // AUTOMATIC CERTIFICATES START ONCE THE LISTENERS ARE UP: the authority may fetch the
+  // challenge the moment it is accepted, and a certificate in the store is installed now,
+  // before the first connection.
+  if http.acme then
+    if not autocert.start then io.fatal("http.https: the certificate manager cannot start (see the line above)");
+end;
+
+// One round of the loop: wait up to `timeout` ms (-1: until something happens), serve what
+// is ready, close what is past its deadline.  The wait is cut short when a deadline check is
+// due, so it can return earlier than asked.  Returns the number of events handled.  For a
+// program with its own loop -- one that also drives lib/websocket.wz, say -- after
+// http.listen.
+function http.poll(timeout: int): int;
+var n, i, ev, fd, s, wait, due: int;
+    acc: array[0..HTTP.MAXLIS - 1] of bool;
+    accany: bool;
+begin
+  http.init;
+  http.now := io.now;
+  if http.now >= http.nextsweep then http.sweep;
+  wait := timeout;
+  if (http.nopen > 0) or http.lpaused then
   begin
-    n := net.wait(http.ep, addr(http.evs[0]), MAXEV, -1);
-    if n < 0 then
+    due := (http.nextsweep - http.now) div 1000000 + 1;
+    if (wait < 0) or (wait > due) then wait := due;
+  end;
+  // https mode: wake for the certificate manager's next step, and at least once a second --
+  // the loop is also what notices a quiet server's certificate getting old.
+  if http.acme then
+  begin
+    due := autocert.waitms;
+    if due > HTTP.TICKMS then due := HTTP.TICKMS;
+    if (wait < 0) or (wait > due) then wait := due;
+  end;
+  n := net.wait(http.ep, addr(http.evs[0]), MAXEV, wait);
+  if n < 0 then
+  begin
+    if n <> EINTR then io.fatal("epoll_wait failed");
+    n := 0;
+  end;
+  http.now := io.now;
+  accany := false;
+  for i := 0 to n - 1 do
+  begin
+    ev := io.get32(http.evs, i * 12);
+    fd := io.get32(http.evs, i * 12 + 4);
+    s := http.listener(fd);
+    if s >= 0 then
     begin
-      if n <> EINTR then io.fatal("epoll_wait failed");
-      n := 0;
-    end;
-    i := 0;
-    while i < n do
+      // Accepted after the other events, not now: a connection closed earlier in this
+      // batch frees its fd number, a new connection may be given it at once, and an event
+      // further down this batch -- meant for the old connection -- would then land on the
+      // new one.
+      acc[s] := true;
+      accany := true;
+    end
+    else
     begin
-      ev := io.get32(http.evs, i * 12);
-      fd := io.get32(http.evs, i * 12 + 4);
-      if fd = http.lfd then http.accept
-      else if (fd >= 0) and (fd < MAXCONN) then
+      s := http.slotfd(fd);
+      if s >= 0 then
       begin
-        if http.open[fd] then
+        if band(ev, bor(EPOLLERR, EPOLLHUP)) <> 0 then http.closeslot(s)
+        else
         begin
-          if band(ev, bor(EPOLLERR, EPOLLHUP)) <> 0 then http.drop(fd)
-          else
-          begin
-            if band(ev, EPOLLOUT) <> 0 then http.flush(fd);
-            if http.open[fd] and (band(ev, EPOLLIN) <> 0) then http.readable(fd);
-          end;
+          if band(ev, EPOLLOUT) <> 0 then http.drain(s);
+          if (http.sfd[s] = fd) and (band(ev, EPOLLIN) <> 0) then http.input(s);
         end;
       end;
-      i := i + 1;
     end;
   end;
+  if accany then
+    for i := 0 to HTTP.MAXLIS - 1 do
+      if acc[i] then
+      begin
+        if http.nlis = 0 then http.acceptfd(http.lfd, 0) else http.acceptfd(http.lfds[i], i);
+      end;
+  // One step of the certificate manager when one is due: at most one request to the
+  // authority, with a time limit; everything else here goes on between its steps.
+  if http.acme then
+  begin
+    autocert.tick;
+    http.now := io.now;
+  end;
+  if io.now >= http.nextsweep then http.sweep;
+  return n;
+end;
+
+// Run the event loop in `workers` independent processes.  Each opens its own listening
+// socket with SO_REUSEPORT, so the kernel spreads incoming connections across them: all
+// cores, no threads, no locks, nothing shared.  Never returns.
+procedure http.serve(port: int; workers: int);
+var n: int;
+begin
+  http.listen(port, workers);
+  while true do n := http.poll(-1);
 end;

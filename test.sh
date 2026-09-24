@@ -19,9 +19,34 @@ if cmp -s "$T/s1" "$T/s2" && cmp -s "$T/s2" "$T/s3"; then ok "fixpoint stage1 = 
 if cmp -s "$T/s3" ./bin/wantzel; then ok "the installed compiler is the fixpoint"; else bad "the installed compiler differs"; fi
 
 echo "the C bootstrap and the self-hosted compiler agree"
-for f in examples/*.wz tests/compiler/feat.wz tests/compiler/incl.wz tests/compiler/schema.wz src/wantzel.wz; do
-    ./bin/wantzel0 "$f" "$T/a" 2>/dev/null && ./bin/wantzel "$f" "$T/b" 2>/dev/null
-    if cmp -s "$T/a" "$T/b"; then ok "identical output for $f"; else bad "differing output for $f"; fi
+# A COMPILE THAT FAILS IS A FAILURE, NOT A PASS.  This check used to run
+#   wantzel0 f a 2>/dev/null && wantzel f b 2>/dev/null; cmp -s a b
+# which, when a compiler refused the source, wrote nothing and compared the files left over
+# from the PREVIOUS source -- so it reported "identical" for every example after the first
+# while the C bootstrap could not parse a single `for` loop.  Now both outputs are removed
+# before each compile, each compiler's exit status is checked, and a refusal is shown with
+# its message.
+#
+# Every example is compiled, and with it every library module it includes: that is how
+# lib/ gets here, because most modules declare callbacks (`app.request`) and cannot be
+# compiled on their own.  Both targets, since the two backends are counterparts as well;
+# the whole loop takes well under a second.
+WINDOWS_ONLY="examples/winmessage.wz"      # uses winapi(), which a Linux target refuses
+agree() {                   # agree <source> <target>
+    rm -f "$T/a" "$T/b" "$T/ea" "$T/eb"
+    if ! ./bin/wantzel0 "$1" "$T/a" --target="$2" >"$T/ea" 2>&1; then
+        bad "the C bootstrap cannot compile $1 ($2)"; sed 's/^/        /' "$T/ea"; return
+    fi
+    if ! ./bin/wantzel "$1" "$T/b" --target="$2" >"$T/eb" 2>&1; then
+        bad "the self-hosted compiler cannot compile $1 ($2)"; sed 's/^/        /' "$T/eb"; return
+    fi
+    if cmp -s "$T/a" "$T/b"; then ok "identical output for $1 ($2)"
+    else bad "differing output for $1 ($2)"; cmp "$T/a" "$T/b" 2>&1 | sed 's/^/        /'; fi
+}
+for f in examples/*.wz tests/compiler/feat.wz tests/compiler/incl.wz tests/compiler/schema.wz \
+         tests/compiler/for_const.wz src/wantzel.wz; do
+    case " $WINDOWS_ONLY " in *" $f "*) ;; *) agree "$f" linux ;; esac
+    agree "$f" windows
 done
 
 echo "language behaviour"

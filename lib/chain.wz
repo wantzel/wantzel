@@ -375,6 +375,25 @@ begin
   return true;
 end;
 
+// The issuer name of the certificate being placed, kept while the roots are parsed one by one.
+var
+  ch.iss:  array[0..1023] of char;
+  ch.issn: int;
+
+// Is the subject of the certificate x509 has just parsed (out of b) the name in ch.iss?
+function ch.issuedas(b: array of char): bool;
+var i: int;
+begin
+  if x509.subn <> ch.issn then return false;
+  i := 0;
+  while i < ch.issn do
+  begin
+    if b[x509.subat + i] <> ch.iss[i] then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
 function ch.verify(b: array of char; hostb: array of char; hostn: int; now: int): bool;
 var i, j, ok: int;
 begin
@@ -429,27 +448,45 @@ begin
   // whose key verifies it? The first one that succeeds ends the walk, because everything
   // below i was already verified by the loop above. That also handles the ordinary
   // three-certificate case, where i is simply the last.
+  //
+  // ONLY THE ROOTS WHOSE SUBJECT IS THE CERTIFICATE'S ISSUER, byte for byte -- and no
+  // exhaustive walk when none matches. That is how a path is built (a certificate names its
+  // issuer, RFC 5280), and it is what keeps the cost bounded: a system bundle holds well
+  // over a hundred roots, and trying every one of them with a full signature check cost
+  // seconds of CPU per handshake -- measured 28 s for one self-signed RSA certificate that
+  // no root had issued, all of it in the caller's thread. For a server that is a way to
+  // be stalled by anyone who connects. The name decides nothing on its own -- the signature
+  // is still checked -- it only picks which roots are worth checking. The price: a root
+  // whose subject is the same name in a different string encoding than the issuer field
+  // is not found. Authorities copy the bytes of their subject into what they issue, so
+  // that is not seen in practice.
   i := 0;
   while (i < ch.cnt) and (ok = 0) do
   begin
-    j := 0;
-    while (j < ch.rootcnt) and (ok = 0) do
+    if x509.parse(b, ch.at[i], ch.at[i] + ch.n[i]) and (x509.issn <= len(ch.iss)) then
     begin
-      if x509.parse(ch.roots, ch.rootat[j], ch.rootat[j] + ch.rootn[j]) then
+      ch.issn := x509.issn;
+      j := 0;
+      while j < ch.issn do begin ch.iss[j] := b[x509.issat + j]; j := j + 1; end;
+      j := 0;
+      while (j < ch.rootcnt) and (ok = 0) do
       begin
-        if x509.isca then
+        if x509.parse(ch.roots, ch.rootat[j], ch.rootat[j] + ch.rootn[j]) then
         begin
-          ch.takekeyfrom(ch.roots);
-          if ch.checksig(b, ch.at[i], ch.n[i]) then ok := 1;
+          if x509.isca and ch.issuedas(ch.roots) then
+          begin
+            ch.takekeyfrom(ch.roots);
+            if ch.checksig(b, ch.at[i], ch.n[i]) then ok := 1;
+          end;
         end;
+        j := j + 1;
       end;
-      j := j + 1;
     end;
     i := i + 1;
   end;
   if ok <> 0 then return true;
 
-  // FIRST: IS ANY CERTIFICATE IN THE CHAIN ITSELF A ROOT WE HOLD?
+  // OR: IS ANY CERTIFICATE IN THE CHAIN ITSELF A ROOT WE HOLD?
   //
   // A server may send the cross-signed root along with the rest -- cloudflare.com does:
   // four certificates, where the third IS a root in the store and the fourth only says who
@@ -472,26 +509,8 @@ begin
   end;
   if ok <> 0 then return true;
 
-  i := ch.cnt - 1;
-  j := 0;
-  ok := 0;
-  while (j < ch.rootcnt) and (ok = 0) do
-  begin
-    if x509.parse(ch.roots, ch.rootat[j], ch.rootat[j] + ch.rootn[j]) then
-    begin
-      if x509.isca then
-      begin
-        ch.takekeyfrom(ch.roots);
-        // checksig parses the chain certificate, which overwrites x509's fields -- that is
-        // why the key was copied out first.
-        if ch.checksig(b, ch.at[i], ch.n[i]) then ok := 1;
-      end;
-    end;
-    j := j + 1;
-  end;
-  if ok = 0 then begin ch.fail("no trusted root signs this chain"); return false; end;
-
-  return true;
+  ch.fail("no trusted root signs this chain");
+  return false;
 end;
 
 // ---- loading roots from a PEM bundle ------------------------------------------------------

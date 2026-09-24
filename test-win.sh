@@ -94,8 +94,12 @@ esac
 
 echo "wantzel0 and wantzel emit identical .exe (the C bootstrap and Wantzel agree)"
 for f in examples/hello.wz examples/cat.wz examples/primes.wz tests/compiler/feat.wz src/wantzel.wz; do
-    ./bin/wantzel0 "$f" "$T/a.exe" --target=windows 2>/dev/null && ./bin/wantzel "$f" "$T/b.exe" --target=windows 2>/dev/null
-    if cmp -s "$T/a.exe" "$T/b.exe"; then ok "identical .exe for $f"; else bad "differing .exe for $f"; fi
+    # Remove both outputs first: a compile that fails writes nothing, and cmp would then
+    # compare the files left over from the previous source and call them identical.
+    rm -f "$T/a.exe" "$T/b.exe"
+    if ! ./bin/wantzel0 "$f" "$T/a.exe" --target=windows >"$T/e0" 2>&1; then bad "the C bootstrap cannot compile $f"; sed 's/^/        /' "$T/e0"
+    elif ! ./bin/wantzel "$f" "$T/b.exe" --target=windows >"$T/e1" 2>&1; then bad "the self-hosted compiler cannot compile $f"; sed 's/^/        /' "$T/e1"
+    elif cmp -s "$T/a.exe" "$T/b.exe"; then ok "identical .exe for $f"; else bad "differing .exe for $f"; fi
 done
 
 echo "the .exe prints what the ELF prints, under Wine"

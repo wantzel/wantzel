@@ -112,7 +112,7 @@ for f in $list; do
   # wine processes later, the call is gone from it. A name in this list is
   # only as good as the file it names: check it after a rename.
   case "$f" in
-    tests/toolchain/win_syscalls.sh|tests/toolchain/win_exe_runs.sh|tests/toolchain/win_same_output.sh|tests/toolchain/win_getprocaddress.sh|tests/toolchain/win_winproc.sh|tests/toolchain/win_recv_reset.sh)
+    tests/toolchain/win_syscalls.sh|tests/toolchain/win_exe_runs.sh|tests/toolchain/win_same_output.sh|tests/toolchain/win_getprocaddress.sh|tests/toolchain/win_winproc.sh|tests/toolchain/win_recv_reset.sh|tests/toolchain/win_dns.sh|tests/toolchain/win_mcp_big.sh)
       [ $windows -eq 1 ] || { winskipped=$((winskipped+1)); continue; } ;;
   esac
   case "$f" in tests/bench/*) [ $bench -eq 1 ] || continue ;; esac

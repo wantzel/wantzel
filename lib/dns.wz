@@ -1,0 +1,1216 @@
+// lib/dns.wz -- hostnames to IPv4 addresses: a DNS stub resolver, over UDP to the
+// nameservers the system is configured with, and over TCP when an answer does not fit.
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+//   n := dns.resolve("example.com", addrs);        // blocking, bounded: count or DNS.*
+//   fd := dns.connect("example.com", 443);          // resolve, then net.connect
+//
+// AN ADDRESS IS ONE INT, a shl 24 + b shl 16 + c shl 8 + d, so 10.1.2.3 is 0x0A010203.
+// dns.ipstr writes one as text, dns.parseip reads one. A name that is already a dotted
+// IPv4 literal comes back as itself without a query, and "localhost" is 127.0.0.1
+// (RFC 6761) without one.
+//
+// WHERE THE NAMESERVERS COME FROM. /etc/resolv.conf, read on the first lookup: up to three
+// `nameserver` lines with an IPv4 address (IPv6 ones are skipped: lib/net.wz connects over
+// IPv4 only), plus `options timeout:n attempts:n`; `#` and `;` start comments. On Windows the
+// runtime answers an open of that path from GetNetworkParams, so the same code finds the
+// servers Windows is configured with. With no server at all, 127.0.0.1 is asked, as the C
+// library does. dns.noservers and dns.addserver replace the list (a test points them at a
+// server of its own); dns.loadconf reads another file.
+//
+// WHAT A LOOKUP DOES. The query goes to the first server; an attempt that is not answered
+// within the per-attempt timeout (2 s, or `options timeout`) moves on to the next server,
+// round after round (2, or `options attempts`), and the whole lookup ends after at most
+// 5 s however many servers there are. dns.settimeout changes both bounds.
+//
+// SPOOFING IS MADE HARD THE USUAL WAY: every attempt gets a fresh random query id AND a
+// fresh socket bound to a random source port, and a reply counts only when its id, its
+// question (name, type A, class IN) and its sender match. Anything else is ignored and the
+// attempt keeps waiting, so one forged datagram cannot end a lookup. The socket is
+// connected, so the kernel already drops datagrams from any other address.
+//
+// WHAT AN ANSWER MAY LOOK LIKE. Names may be compressed (pointers are followed only
+// backwards, so a loop cannot hang the parser). A CNAME chain in the answer is followed
+// from the name asked for to its addresses -- a service name is routinely served that way
+// -- and only records on that chain count: an unrelated A record in the same reply is
+// ignored. A chain that stops at a name the reply has no address for is asked for again,
+// under that name. A reply with the TC bit set (truncated) is asked again over TCP, to the
+// same server.
+//
+// FAILURES ARE DISTINCT, because they mean different things to the caller:
+//   DNS.NXDOMAIN   the name does not exist -- an authoritative no, not retried
+//   DNS.NODATA     the name exists but has no IPv4 address
+//   DNS.SERVFAIL   the server could not resolve it (the next server is tried first)
+//   DNS.REFUSED    the server refused or does not implement the query (idem)
+//   DNS.TIMEOUT    no server answered in time
+//   DNS.BADNAME    what was asked is not a hostname
+//   DNS.BADREPLY   the answer does not parse, or its CNAME chain loops
+//   DNS.NETWORK    no socket, the query could not be sent, or nothing listens there
+//   DNS.BUSY       every query slot is in use, or no such query
+//   DNS.NOCONNECT  (dns.connect only) resolved, but no address accepted the connection
+// dns.error(code) is a sentence for each.
+//
+// ANSWERS ARE CACHED for as long as their TTL says (the smallest on the chain, at most a
+// day), for 32 names. dns.flush empties the cache. Failures are not cached.
+//
+// FROM AN EPOLL LOOP, without blocking:
+//   q := dns.start("example.com");                 // a query number, or DNS.BUSY
+//   net.watch(ep, EPOLL_ADD, dns.fd, EPOLLIN);      // once: the resolver's own epoll set
+//   ... wait with a timeout no longer than dns.wait (ms; -1 when nothing is pending) ...
+//   n := dns.poll(q, addrs);                        // DNS.PENDING (0), a count, or DNS.*
+// dns.poll never blocks. Every outcome, even one known at once (a literal, a cache hit, a
+// bad name), is collected through it, and collecting frees the query; dns.cancel drops one
+// that is no longer wanted. The TCP fallback connects without blocking as well.
+
+include "io.wz";
+include "net.wz";
+include "rand.wz";
+
+const
+  DNS.MAXNS   = 3;          // nameservers kept, as the C library does
+  DNS.MAXADDR = 16;         // addresses kept per name
+  DNS.MAXQ    = 8;          // lookups in flight at once
+  DNS.MAXHOPS = 8;          // CNAME links followed, in one reply and across re-asks
+  DNS.NCACHE  = 32;         // names cached
+  DNS.MAXRR   = 64;         // answer records examined per reply
+
+  DNS.PENDING   = 0;
+  DNS.NXDOMAIN  = -1;
+  DNS.NODATA    = -2;
+  DNS.SERVFAIL  = -3;
+  DNS.REFUSED   = -4;
+  DNS.TIMEOUT   = -5;
+  DNS.BADNAME   = -6;
+  DNS.BADREPLY  = -7;
+  DNS.NETWORK   = -8;
+  DNS.BUSY      = -9;
+  DNS.NOCONNECT = -10;
+
+local const
+  DNS.SOCK_DGRAM  = 2;
+  DNS.EINPROGRESS = -115;
+  DNS.MAXTTL      = 86400;
+  // the state of a query slot
+  DNS.FREE       = 0;
+  DNS.UDP        = 1;       // a datagram is out, waiting for the reply
+  DNS.CONNECTING = 2;       // TCP: waiting for the connection, to send the query
+  DNS.READING    = 3;       // TCP: the query is sent, reading the reply
+  DNS.DONE       = 4;       // finished; res holds the outcome until dns.poll collects it
+
+type DnsQuery = record
+  state, fd, id, ns, tries, hops, res, ttl, lasterr, qn, repn, naddr: int;
+  trydl, dl: int;           // deadlines, monotonic ns: this attempt, the whole lookup
+  tcp: bool;
+  name: array[0..255] of char;          // the name being asked, lower case, no final dot
+  name_n: int;
+  key: array[0..255] of char;           // the name first asked for: the cache key
+  key_n: int;
+  q: array[0..299] of char;             // the query, after its two-byte TCP length
+  rep: array[0..65537] of char;         // the reply (after its TCP length, over TCP)
+  addrs: array[0..DNS.MAXADDR - 1] of int;
+end;
+
+var
+  // The configuration: read these, change them through the routines below.
+  dns.nns: int;                                   // nameservers in use
+  dns.nsip: array[0..DNS.MAXNS - 1] of int;
+  dns.nsport: array[0..DNS.MAXNS - 1] of int;
+  dns.tryms, dns.totalms, dns.attempts: int;      // per attempt, per lookup, rounds
+
+local var
+  dns.q: array[0..DNS.MAXQ - 1] of DnsQuery;
+  dns.loaded, dns.epon: bool;
+  dns.ep: int;
+  dns.ev: array[0..95] of char;                   // eight epoll events of 12 bytes
+  dns.sa: array[0..15] of char;
+  dns.conf: array[0..8191] of char;
+  dns.path: array[0..1023] of char;
+  dns.tmp, dns.tgt: array[0..255] of char;        // decoded names
+  dns.tn, dns.tgtn: int;
+  dns.out: array[0..DNS.MAXADDR - 1] of int;      // dns.connect's addresses
+  // the answer records of one reply: where each starts, and what it holds
+  dns.rrat, dns.rrtype, dns.rrcls, dns.rrttl, dns.rrdata, dns.rrlen: array[0..DNS.MAXRR - 1] of int;
+  // the cache
+  dns.ckey: array[0..DNS.NCACHE * 256 - 1] of char;
+  dns.ckeyn, dns.cexp, dns.cn: array[0..DNS.NCACHE - 1] of int;
+  dns.caddr: array[0..DNS.NCACHE * DNS.MAXADDR - 1] of int;
+
+// ---- addresses as text --------------------------------------------------------------------
+
+// The dotted-quad literal s (exactly four decimal parts of 0..255) as an address, or -1
+// when s is not one. Each part is decimal: "010" is ten, not the octal eight inet_aton reads.
+function dns.parseip(s: array of char): int;
+var i, k, v, nd, ip: int;
+begin
+  i := 0;
+  ip := 0;
+  k := 0;
+  while k < 4 do
+  begin
+    v := 0;
+    nd := 0;
+    while (i < len(s)) and (s[i] >= '0') and (s[i] <= '9') do
+    begin
+      v := v * 10 + (ord(s[i]) - ord('0'));
+      nd := nd + 1;
+      i := i + 1;
+      if nd > 3 then return 0 - 1;
+    end;
+    if (nd = 0) or (v > 255) then return 0 - 1;
+    ip := ip shl 8 + v;
+    if k < 3 then
+    begin
+      if (i >= len(s)) or (s[i] <> '.') then return 0 - 1;
+      i := i + 1;
+    end;
+    k := k + 1;
+  end;
+  if i <> len(s) then return 0 - 1;
+  return ip;
+end;
+
+// Append ip as a dotted quad; returns the new position (an appender, like io.push).
+function dns.ipstr(dst: array of char; at: int; ip: int): int;
+begin
+  at := io.pushnum(dst, at, band(ip shr 24, 255));
+  at := io.push(dst, at, ".");
+  at := io.pushnum(dst, at, band(ip shr 16, 255));
+  at := io.push(dst, at, ".");
+  at := io.pushnum(dst, at, band(ip shr 8, 255));
+  at := io.push(dst, at, ".");
+  return io.pushnum(dst, at, band(ip, 255));
+end;
+
+// A sentence for a DNS.* code, for a message to a person.
+function dns.error(code: int): str;
+begin
+  if code = DNS.NXDOMAIN then return "the name does not exist (NXDOMAIN)";
+  if code = DNS.NODATA then return "the name exists but has no IPv4 address";
+  if code = DNS.SERVFAIL then return "the nameserver could not resolve the name (SERVFAIL)";
+  if code = DNS.REFUSED then return "the nameserver refused the query";
+  if code = DNS.TIMEOUT then return "no nameserver answered in time";
+  if code = DNS.BADNAME then return "that is not a valid hostname";
+  if code = DNS.BADREPLY then return "the nameserver sent a reply that does not parse, or a CNAME chain that loops";
+  if code = DNS.NETWORK then return "the nameserver could not be reached";
+  if code = DNS.BUSY then return "too many lookups at once, or no such lookup";
+  if code = DNS.NOCONNECT then return "the name resolved, but no address accepted the connection";
+  if code = DNS.PENDING then return "the lookup is still running";
+  return "not a DNS error";
+end;
+
+// ---- configuration ------------------------------------------------------------------------
+
+// Forget the nameservers, and do not read /etc/resolv.conf any more.
+procedure dns.noservers;
+begin
+  dns.loaded := true;
+  dns.nns := 0;
+end;
+
+// Add a nameserver at a.b.c.d:port. False when the list (DNS.MAXNS) is full. The first
+// call before any lookup keeps /etc/resolv.conf from being read at all.
+function dns.addserver(a: int; b: int; c: int; d: int; port: int): bool;
+begin
+  dns.loaded := true;
+  if dns.nns >= DNS.MAXNS then return false;
+  dns.nsip[dns.nns] := band(a, 255) shl 24 + band(b, 255) shl 16 + band(c, 255) shl 8 + band(d, 255);
+  dns.nsport[dns.nns] := port;
+  dns.nns := dns.nns + 1;
+  return true;
+end;
+
+// The time one attempt may take, and the whole lookup, in milliseconds; 0 keeps the default
+// (2000 and 5000; `options timeout` sets the first).
+procedure dns.settimeout(tryms: int; totalms: int);
+begin
+  if tryms > 0 then dns.tryms := tryms;
+  if totalms > 0 then dns.totalms := totalms;
+end;
+
+// Is b[at..upto) exactly s?
+local function dns.word(b: array of char; at: int; upto: int; s: str): bool;
+var i: int;
+begin
+  if upto - at <> slen(s) then return false;
+  i := 0;
+  while i < slen(s) do
+  begin
+    if b[at + i] <> schar(s, i) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// The number after the colon of an option such as "timeout:3" in b[at..upto), or -1.
+local function dns.optnum(b: array of char; at: int; upto: int): int;
+var i, v: int;
+begin
+  i := at;
+  while (i < upto) and (b[i] <> ':') do i := i + 1;
+  if i + 1 >= upto then return 0 - 1;
+  i := i + 1;
+  v := 0;
+  while i < upto do
+  begin
+    if (b[i] < '0') or (b[i] > '9') then return 0 - 1;
+    v := v * 10 + (ord(b[i]) - ord('0'));
+    if v > 1000 then return 0 - 1;
+    i := i + 1;
+  end;
+  return v;
+end;
+
+// Read nameservers and options from a resolv.conf-style file, replacing the list. Returns
+// the number of IPv4 nameservers found, or a negative errno when the file cannot be read.
+function dns.loadconf(path: array of char): int;
+var fd, n, got, i, e, w0, w1, a0, a1, ip, v: int;
+    opts: bool;
+begin
+  dns.loaded := true;
+  if len(path) >= len(dns.path) then return 0 - 36;           // ENAMETOOLONG
+  i := 0;
+  while i < len(path) do
+  begin
+    dns.path[i] := path[i];
+    i := i + 1;
+  end;
+  dns.path[len(path)] := chr(0);
+  fd := sys3(SYS.open, addr(dns.path[0]), O_RDONLY, 0);
+  if fd < 0 then return fd;
+  n := 0;
+  while n < len(dns.conf) do
+  begin
+    got := sys3(SYS.read, fd, addr(dns.conf[n]), len(dns.conf) - n);
+    if got = EINTR then continue;
+    if got <= 0 then break;
+    n := n + got;
+  end;
+  net.close(fd);
+  dns.nns := 0;
+  i := 0;
+  while i < n do
+  begin
+    e := i;                                             // the end of this line
+    while (e < n) and (dns.conf[e] <> chr(10)) do e := e + 1;
+    // the first word
+    w0 := i;
+    while (w0 < e) and ((dns.conf[w0] = ' ') or (dns.conf[w0] = chr(9))) do w0 := w0 + 1;
+    w1 := w0;
+    while (w1 < e) and (dns.conf[w1] <> ' ') and (dns.conf[w1] <> chr(9)) and (dns.conf[w1] <> chr(13)) do w1 := w1 + 1;
+    opts := dns.word(dns.conf, w0, w1, "options");
+    if dns.word(dns.conf, w0, w1, "nameserver") or opts then
+    begin
+      a1 := w1;
+      while a1 < e do
+      begin
+        a0 := a1;
+        while (a0 < e) and ((dns.conf[a0] = ' ') or (dns.conf[a0] = chr(9)) or (dns.conf[a0] = chr(13))) do a0 := a0 + 1;
+        if (a0 >= e) or (dns.conf[a0] = '#') or (dns.conf[a0] = ';') then break;
+        a1 := a0;
+        while (a1 < e) and (dns.conf[a1] <> ' ') and (dns.conf[a1] <> chr(9)) and (dns.conf[a1] <> chr(13)) do a1 := a1 + 1;
+        if not opts then
+        begin
+          ip := dns.parseip(dns.conf[a0..a1 - 1]);
+          if (ip >= 0) and (dns.nns < DNS.MAXNS) then
+          begin
+            dns.nsip[dns.nns] := ip;
+            dns.nsport[dns.nns] := 53;
+            dns.nns := dns.nns + 1;
+          end;
+          break;                                        // one address per nameserver line
+        end;
+        v := dns.optnum(dns.conf, a0, a1);
+        if (a1 - a0 > 8) and dns.word(dns.conf, a0, a0 + 8, "timeout:") and (v >= 1) then
+        begin
+          if v > 30 then v := 30;
+          dns.tryms := v * 1000;
+        end;
+        if (a1 - a0 > 9) and dns.word(dns.conf, a0, a0 + 9, "attempts:") and (v >= 1) then
+        begin
+          if v > 5 then v := 5;
+          dns.attempts := v;
+        end;
+      end;
+    end;
+    i := e + 1;
+  end;
+  return dns.nns;
+end;
+
+// The configuration and the epoll set, made on first use. False when there is no epoll set.
+local function dns.setup: bool;
+var r: int;
+begin
+  if not dns.loaded then
+  begin
+    r := dns.loadconf("/etc/resolv.conf");
+    if r < 0 then dns.nns := 0;
+  end;
+  if dns.nns = 0 then
+  begin
+    // THE C LIBRARY'S FALLBACK: no configured server means the local one.
+    dns.nsip[0] := 0x7F000001;
+    dns.nsport[0] := 53;
+    dns.nns := 1;
+  end;
+  if dns.tryms <= 0 then dns.tryms := 2000;
+  if dns.totalms <= 0 then dns.totalms := 5000;
+  if dns.attempts <= 0 then dns.attempts := 2;
+  if not dns.epon then
+  begin
+    dns.ep := net.epoll;
+    if dns.ep < 0 then return false;
+    dns.epon := true;
+  end;
+  return true;
+end;
+
+// The resolver's epoll set, to watch for EPOLLIN in a loop of your own; negative when it
+// cannot be made. It stays the same for the life of the program.
+function dns.fd: int;
+begin
+  if not dns.setup then return 0 - 24;
+  return dns.ep;
+end;
+
+// ---- names ----------------------------------------------------------------------------------
+
+local function dns.lower(c: char): char;
+begin
+  if (c >= 'A') and (c <= 'Z') then return chr(ord(c) + 32);
+  return c;
+end;
+
+// Is a the same as b? Both are lower case already.
+local function dns.same(a: array of char; b: array of char): bool;
+var i: int;
+begin
+  if len(a) <> len(b) then return false;
+  i := 0;
+  while i < len(a) do
+  begin
+    if a[i] <> b[i] then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// Check the hostname s and keep it, in lower case and without a final dot, as the name
+// query k asks for and as its cache key. Labels of 1..63 letters, digits, '-' and '_', at
+// most 253 bytes in all. False when s is not a hostname.
+//
+// THE LAST LABEL MAY NOT BE ALL DIGITS. A top-level domain never is (RFC 3696), and what
+// looks like that is a broken address: "10.1.2", "256.0.0.1". dns.parseip has already
+// said those are not addresses, and asking a nameserver about them is worse than useless
+// -- some resolvers guess an address from three octets (10.1.2 came back as 10.1.0.2),
+// and a caller that then trusts it connects somewhere it never meant to go.
+local function dns.setname(k: int; s: array of char): bool;
+var n, i, lab, digits: int;
+    c: char;
+begin
+  n := len(s);
+  if (n > 0) and (s[n - 1] = '.') then n := n - 1;       // "example.com." is fully qualified
+  if (n < 1) or (n > 253) then return false;
+  lab := 0;
+  digits := 0;
+  i := 0;
+  while i < n do
+  begin
+    c := dns.lower(s[i]);
+    if c = '.' then
+    begin
+      if lab = 0 then return false;                     // an empty label
+      lab := 0;
+      digits := 0;
+    end
+    else
+    begin
+      if not (((c >= 'a') and (c <= 'z')) or ((c >= '0') and (c <= '9')) or (c = '-') or (c = '_')) then
+        return false;
+      if (c >= '0') and (c <= '9') then digits := digits + 1;
+      lab := lab + 1;
+      if lab > 63 then return false;
+    end;
+    dns.q[k].name[i] := c;
+    dns.q[k].key[i] := c;
+    i := i + 1;
+  end;
+  if lab = 0 then return false;
+  if digits = lab then return false;                    // the last label is all digits
+  dns.q[k].name_n := n;
+  dns.q[k].key_n := n;
+  return true;
+end;
+
+// Decode the (possibly compressed) name at p[at] into dns.tmp[0..dns.tn), in lower case
+// with dots between the labels. Returns the position just after the name where it STARTS
+// -- after its first pointer, not where the pointer led -- or -1 when it does not parse.
+//
+// A POINTER MAY ONLY GO BACKWARDS, to before everywhere this name has been read so far.
+// That alone guarantees the walk ends: every jump lands strictly lower than the last. A
+// pointer to itself or forwards, the two shapes of a loop, is refused. Real compression
+// always points at an earlier occurrence, so nothing valid is lost.
+local function dns.getname(p: array of char; at: int): int;
+var pos, lowest, after, l, t, i: int;
+begin
+  pos := at;
+  lowest := at;
+  after := 0 - 1;
+  dns.tn := 0;
+  while true do
+  begin
+    if pos >= len(p) then return 0 - 1;
+    l := ord(p[pos]);
+    if l = 0 then
+    begin
+      if after < 0 then after := pos + 1;
+      return after;
+    end;
+    if band(l, 0xC0) = 0xC0 then
+    begin
+      if pos + 1 >= len(p) then return 0 - 1;
+      t := band(l, 0x3F) shl 8 + ord(p[pos + 1]);
+      if t >= lowest then return 0 - 1;
+      if after < 0 then after := pos + 2;
+      lowest := t;
+      pos := t;
+    end
+    else
+    begin
+      if l > 63 then return 0 - 1;                      // 0x40 and 0x80: not in use
+      if pos + 1 + l > len(p) then return 0 - 1;
+      if dns.tn + l + 1 > 254 then return 0 - 1;
+      if dns.tn > 0 then
+      begin
+        dns.tmp[dns.tn] := '.';
+        dns.tn := dns.tn + 1;
+      end;
+      i := 0;
+      while i < l do
+      begin
+        dns.tmp[dns.tn] := dns.lower(p[pos + 1 + i]);
+        dns.tn := dns.tn + 1;
+        i := i + 1;
+      end;
+      pos := pos + 1 + l;
+    end;
+  end;
+  return 0 - 1;
+end;
+
+local function dns.be16(p: array of char; at: int): int;
+begin
+  return ord(p[at]) shl 8 + ord(p[at + 1]);
+end;
+
+local function dns.be32(p: array of char; at: int): int;
+begin
+  return dns.be16(p, at) shl 16 + dns.be16(p, at + 2);
+end;
+
+// The query for k's name, type A, class IN, recursion desired, under a fresh random id.
+// q[0..1] is its length for TCP; the message itself starts at q[2].
+local procedure dns.encode(k: int);
+var p, i, st, id: int;
+begin
+  id := rand.below(65536);
+  dns.q[k].id := id;
+  dns.q[k].q[2] := chr(id shr 8);
+  dns.q[k].q[3] := chr(band(id, 255));
+  dns.q[k].q[4] := chr(1);                              // RD
+  dns.q[k].q[5] := chr(0);
+  dns.q[k].q[6] := chr(0);
+  dns.q[k].q[7] := chr(1);                              // one question
+  i := 8;
+  while i < 14 do
+  begin
+    dns.q[k].q[i] := chr(0);
+    i := i + 1;
+  end;
+  p := 14;
+  st := 0;
+  while st < dns.q[k].name_n do
+  begin
+    i := st;
+    while (i < dns.q[k].name_n) and (dns.q[k].name[i] <> '.') do i := i + 1;
+    dns.q[k].q[p] := chr(i - st);
+    p := p + 1;
+    while st < i do
+    begin
+      dns.q[k].q[p] := dns.q[k].name[st];
+      p := p + 1;
+      st := st + 1;
+    end;
+    st := i + 1;
+  end;
+  dns.q[k].q[p] := chr(0);
+  dns.q[k].q[p + 1] := chr(0);
+  dns.q[k].q[p + 2] := chr(1);                          // type A
+  dns.q[k].q[p + 3] := chr(0);
+  dns.q[k].q[p + 4] := chr(1);                          // class IN
+  p := p + 5;
+  dns.q[k].qn := p - 2;
+  dns.q[k].q[0] := chr((p - 2) shr 8);
+  dns.q[k].q[1] := chr(band(p - 2, 255));
+end;
+
+// ---- the cache -----------------------------------------------------------------------------
+
+procedure dns.flush;
+var i: int;
+begin
+  i := 0;
+  while i < DNS.NCACHE do
+  begin
+    dns.cexp[i] := 0;
+    i := i + 1;
+  end;
+end;
+
+local function dns.cacheget(k: int): bool;
+var i, j, now: int;
+begin
+  now := io.now;
+  i := 0;
+  while i < DNS.NCACHE do
+  begin
+    if (dns.cexp[i] > now) and dns.same(dns.ckey[i * 256..i * 256 + dns.ckeyn[i] - 1], dns.q[k].key[0..dns.q[k].key_n - 1]) then
+    begin
+      j := 0;
+      while j < dns.cn[i] do
+      begin
+        dns.q[k].addrs[j] := dns.caddr[i * DNS.MAXADDR + j];
+        j := j + 1;
+      end;
+      dns.q[k].naddr := dns.cn[i];
+      return true;
+    end;
+    i := i + 1;
+  end;
+  return false;
+end;
+
+local procedure dns.cacheput(k: int);
+var i, j, pick, now: int;
+begin
+  if dns.q[k].ttl <= 0 then return;
+  now := io.now;
+  // the same name, else a free or expired slot, else the one that expires first
+  pick := 0 - 1;
+  i := 0;
+  while (i < DNS.NCACHE) and (pick < 0) do
+  begin
+    if (dns.cexp[i] > now) and dns.same(dns.ckey[i * 256..i * 256 + dns.ckeyn[i] - 1], dns.q[k].key[0..dns.q[k].key_n - 1]) then pick := i;
+    i := i + 1;
+  end;
+  i := 0;
+  while (i < DNS.NCACHE) and (pick < 0) do
+  begin
+    if dns.cexp[i] <= now then pick := i;
+    i := i + 1;
+  end;
+  if pick < 0 then
+  begin
+    pick := 0;
+    i := 1;
+    while i < DNS.NCACHE do
+    begin
+      if dns.cexp[i] < dns.cexp[pick] then pick := i;
+      i := i + 1;
+    end;
+  end;
+  j := 0;
+  while j < dns.q[k].key_n do
+  begin
+    dns.ckey[pick * 256 + j] := dns.q[k].key[j];
+    j := j + 1;
+  end;
+  dns.ckeyn[pick] := dns.q[k].key_n;
+  j := 0;
+  while j < dns.q[k].naddr do
+  begin
+    dns.caddr[pick * DNS.MAXADDR + j] := dns.q[k].addrs[j];
+    j := j + 1;
+  end;
+  dns.cn[pick] := dns.q[k].naddr;
+  dns.cexp[pick] := now + dns.q[k].ttl * 1000000000;
+end;
+
+// ---- sockets --------------------------------------------------------------------------------
+
+local procedure dns.fillsa(ip: int; port: int);
+var i: int;
+begin
+  i := 0;
+  while i < 16 do
+  begin
+    dns.sa[i] := chr(0);
+    i := i + 1;
+  end;
+  dns.sa[0] := chr(AF_INET);
+  dns.sa[2] := chr(band(port shr 8, 255));
+  dns.sa[3] := chr(band(port, 255));
+  dns.sa[4] := chr(band(ip shr 24, 255));
+  dns.sa[5] := chr(band(ip shr 16, 255));
+  dns.sa[6] := chr(band(ip shr 8, 255));
+  dns.sa[7] := chr(band(ip, 255));
+end;
+
+// A non-blocking UDP socket, bound to a random source port and connected to ip:port.
+local function dns.openudp(ip: int; port: int): int;
+var fd, r, i: int;
+begin
+  fd := sys3(SYS.socket, AF_INET, DNS.SOCK_DGRAM, 0);
+  if fd < 0 then return fd;
+  // A RANDOM SOURCE PORT, chosen here rather than left to the kernel, so that what a forger
+  // has to guess does not depend on how the system picks one. A port in use is simply
+  // another draw; after eight, connect below binds one the system chooses.
+  i := 0;
+  while i < 8 do
+  begin
+    dns.fillsa(0, 32768 + rand.below(32768));
+    if sys3(SYS.bind, fd, addr(dns.sa[0]), 16) = 0 then break;
+    i := i + 1;
+  end;
+  dns.fillsa(ip, port);
+  r := sys3(SYS.connect, fd, addr(dns.sa[0]), 16);
+  if r < 0 then
+  begin
+    net.close(fd);
+    return r;
+  end;
+  if not net.nonblock(fd) then
+  begin
+    net.close(fd);
+    return 0 - 9;
+  end;
+  return fd;
+end;
+
+// A non-blocking TCP socket with a connection to ip:port on its way.
+local function dns.opentcp(ip: int; port: int): int;
+var fd, r: int;
+begin
+  fd := net.socket;
+  if fd < 0 then return fd;
+  if not net.nonblock(fd) then
+  begin
+    net.close(fd);
+    return 0 - 9;
+  end;
+  dns.fillsa(ip, port);
+  r := sys3(SYS.connect, fd, addr(dns.sa[0]), 16);
+  if (r < 0) and (r <> DNS.EINPROGRESS) then
+  begin
+    net.close(fd);
+    return r;
+  end;
+  return fd;
+end;
+
+// ---- one lookup, as a state machine ----------------------------------------------------------
+
+// Close the socket of k's current attempt, if there is one.
+local procedure dns.drop(k: int);
+var gone: bool;
+begin
+  if dns.q[k].fd >= 0 then
+  begin
+    // EPOLL_DEL may say ENOENT: the fd is out of the set either way, which is what is wanted
+    gone := net.watch(dns.ep, EPOLL_DEL, dns.q[k].fd, 0);
+    net.close(dns.q[k].fd);
+    dns.q[k].fd := 0 - 1;
+  end;
+end;
+
+local procedure dns.finish(k: int; res: int);
+begin
+  dns.drop(k);
+  dns.q[k].res := res;
+  dns.q[k].state := DNS.DONE;
+  if res > 0 then dns.cacheput(k);
+end;
+
+local procedure dns.fail(k: int; err: int); forward;
+
+// Start an attempt of k: the query, under a fresh id, to server dns.q[k].ns, over UDP or
+// (after a truncated reply) over TCP.
+local procedure dns.attempt(k: int);
+var ip, port, fd, now: int;
+begin
+  dns.drop(k);
+  ip := dns.nsip[dns.q[k].ns];
+  port := dns.nsport[dns.q[k].ns];
+  dns.encode(k);
+  now := io.now;
+  dns.q[k].trydl := now + dns.tryms * 1000000;
+  if dns.q[k].trydl > dns.q[k].dl then dns.q[k].trydl := dns.q[k].dl;
+  dns.q[k].repn := 0;
+  if dns.q[k].tcp then
+  begin
+    fd := dns.opentcp(ip, port);
+    if fd < 0 then
+    begin
+      dns.fail(k, DNS.NETWORK);
+      return;
+    end;
+    dns.q[k].fd := fd;
+    dns.q[k].state := DNS.CONNECTING;
+    if not net.watch(dns.ep, EPOLL_ADD, fd, EPOLLOUT) then dns.fail(k, DNS.NETWORK);
+    return;
+  end;
+  fd := dns.openudp(ip, port);
+  if fd < 0 then
+  begin
+    dns.fail(k, DNS.NETWORK);
+    return;
+  end;
+  dns.q[k].fd := fd;
+  dns.q[k].state := DNS.UDP;
+  if net.send(fd, addr(dns.q[k].q[2]), dns.q[k].qn) <> dns.q[k].qn then
+  begin
+    dns.fail(k, DNS.NETWORK);
+    return;
+  end;
+  if not net.watch(dns.ep, EPOLL_ADD, fd, EPOLLIN) then dns.fail(k, DNS.NETWORK);
+end;
+
+// How much an error says about the server: an answer beats silence beats no connection.
+local function dns.rank(err: int): int;
+begin
+  if (err = DNS.SERVFAIL) or (err = DNS.REFUSED) or (err = DNS.BADREPLY) then return 3;
+  if err = DNS.TIMEOUT then return 2;
+  if err = DNS.NETWORK then return 1;
+  return 0;
+end;
+
+// This attempt of k failed with err: on to the next server, or give up when every round
+// has been tried or the lookup's time is up. The most telling failure is what is reported.
+local procedure dns.fail(k: int; err: int);
+begin
+  dns.drop(k);
+  if dns.rank(err) >= dns.rank(dns.q[k].lasterr) then dns.q[k].lasterr := err;
+  dns.q[k].tries := dns.q[k].tries + 1;
+  dns.q[k].tcp := false;
+  if (dns.q[k].tries >= dns.nns * dns.attempts) or (io.now >= dns.q[k].dl) then
+  begin
+    dns.finish(k, dns.q[k].lasterr);
+    return;
+  end;
+  dns.q[k].ns := dns.q[k].tries mod dns.nns;
+  dns.attempt(k);
+end;
+
+// Walk the answer section of reply p (an records from pos) for k's name, through any
+// CNAMEs. Returns the number of addresses (in dns.q[k].addrs), DNS.NODATA, DNS.BADREPLY,
+// or 0 when the chain ends at a name this reply holds no address for -- that name is then
+// in dns.tgt, to be asked for itself.
+local function dns.answers(k: int; p: array of char; pos: int; an: int): int;
+var i, n, t, rdl, ttl, hops, found, cname: int;
+begin
+  n := 0;
+  i := 0;
+  while i < an do
+  begin
+    t := dns.getname(p, pos);
+    if t < 0 then return DNS.BADREPLY;
+    if t + 10 > len(p) then return DNS.BADREPLY;
+    rdl := dns.be16(p, t + 8);
+    if t + 10 + rdl > len(p) then return DNS.BADREPLY;
+    if n < DNS.MAXRR then
+    begin
+      dns.rrat[n] := pos;
+      dns.rrtype[n] := dns.be16(p, t);
+      dns.rrcls[n] := dns.be16(p, t + 2);
+      ttl := dns.be32(p, t + 4);
+      if ttl >= 0x80000000 then ttl := 0;               // RFC 2181: the top bit set means 0
+      dns.rrttl[n] := ttl;
+      dns.rrdata[n] := t + 10;
+      dns.rrlen[n] := rdl;
+      n := n + 1;
+    end;
+    pos := t + 10 + rdl;
+    i := i + 1;
+  end;
+  // THE CHAIN, from the name asked for: its A records, or else its CNAME and around again.
+  i := 0;
+  while i < dns.q[k].name_n do
+  begin
+    dns.tgt[i] := dns.q[k].name[i];
+    i := i + 1;
+  end;
+  dns.tgtn := dns.q[k].name_n;
+  hops := 0;
+  while true do
+  begin
+    found := 0;
+    i := 0;
+    while i < n do
+    begin
+      if (dns.rrcls[i] = 1) and (dns.rrtype[i] = 1) and (dns.rrlen[i] = 4) and (found < DNS.MAXADDR) then
+      begin
+        t := dns.getname(p, dns.rrat[i]);
+        if dns.same(dns.tmp[0..dns.tn - 1], dns.tgt[0..dns.tgtn - 1]) then
+        begin
+          dns.q[k].addrs[found] := dns.be32(p, dns.rrdata[i]);
+          if dns.rrttl[i] < dns.q[k].ttl then dns.q[k].ttl := dns.rrttl[i];
+          found := found + 1;
+        end;
+      end;
+      i := i + 1;
+    end;
+    if found > 0 then
+    begin
+      dns.q[k].naddr := found;
+      return found;
+    end;
+    cname := 0 - 1;
+    i := 0;
+    while (i < n) and (cname < 0) do
+    begin
+      if (dns.rrcls[i] = 1) and (dns.rrtype[i] = 5) then
+      begin
+        t := dns.getname(p, dns.rrat[i]);
+        if dns.same(dns.tmp[0..dns.tn - 1], dns.tgt[0..dns.tgtn - 1]) then cname := i;
+      end;
+      i := i + 1;
+    end;
+    if cname < 0 then break;
+    hops := hops + 1;
+    if hops > DNS.MAXHOPS then return DNS.BADREPLY;     // a chain this long is a loop
+    t := dns.getname(p, dns.rrdata[cname]);
+    if (t < 0) or (dns.tn = 0) then return DNS.BADREPLY;
+    i := 0;
+    while i < dns.tn do
+    begin
+      dns.tgt[i] := dns.tmp[i];
+      i := i + 1;
+    end;
+    dns.tgtn := dns.tn;
+    if dns.rrttl[cname] < dns.q[k].ttl then dns.q[k].ttl := dns.rrttl[cname];
+  end;
+  if hops = 0 then return DNS.NODATA;
+  return 0;
+end;
+
+// A whole DNS message p has arrived for k. False when it is not the answer to k's question
+// -- a wrong id, not a response, another question -- and is to be ignored; true when k
+// moved on because of it.
+local function dns.take(k: int; p: array of char): bool;
+var pos, rc, r, i: int;
+begin
+  if len(p) < 12 then return false;
+  if dns.be16(p, 0) <> dns.q[k].id then return false;
+  if band(ord(p[2]), 0x80) = 0 then return false;       // a query, not a response
+  if dns.be16(p, 4) <> 1 then return false;
+  pos := dns.getname(p, 12);
+  if pos < 0 then return false;
+  if not dns.same(dns.tmp[0..dns.tn - 1], dns.q[k].name[0..dns.q[k].name_n - 1]) then return false;
+  if pos + 4 > len(p) then return false;
+  if (dns.be16(p, pos) <> 1) or (dns.be16(p, pos + 2) <> 1) then return false;
+  pos := pos + 4;
+  // IT IS THE ANSWER TO OUR QUESTION. Truncated first: the rest of it is then unreliable.
+  if (band(ord(p[2]), 2) <> 0) and (not dns.q[k].tcp) then
+  begin
+    dns.q[k].tcp := true;
+    dns.attempt(k);
+    return true;
+  end;
+  rc := band(ord(p[3]), 15);
+  if rc = 3 then
+  begin
+    dns.finish(k, DNS.NXDOMAIN);
+    return true;
+  end;
+  if rc = 2 then
+  begin
+    dns.fail(k, DNS.SERVFAIL);
+    return true;
+  end;
+  if rc <> 0 then
+  begin
+    dns.fail(k, DNS.REFUSED);
+    return true;
+  end;
+  r := dns.answers(k, p, pos, dns.be16(p, 6));
+  if r = DNS.BADREPLY then
+  begin
+    dns.fail(k, DNS.BADREPLY);
+    return true;
+  end;
+  if r <> 0 then
+  begin
+    dns.finish(k, r);
+    return true;
+  end;
+  // THE CHAIN STOPS SHORT: ask for its last name, with the time that is left.
+  dns.q[k].hops := dns.q[k].hops + 1;
+  if dns.q[k].hops > DNS.MAXHOPS then
+  begin
+    dns.finish(k, DNS.BADREPLY);
+    return true;
+  end;
+  i := 0;
+  while i < dns.tgtn do
+  begin
+    dns.q[k].name[i] := dns.tgt[i];
+    i := i + 1;
+  end;
+  dns.q[k].name_n := dns.tgtn;
+  dns.q[k].tries := 0;
+  dns.q[k].lasterr := 0;
+  dns.q[k].ns := 0;
+  dns.q[k].tcp := false;
+  dns.attempt(k);
+  return true;
+end;
+
+// Read what the UDP socket of k holds, until a reply is taken or nothing is left.
+local procedure dns.readudp(k: int);
+var r: int;
+begin
+  while dns.q[k].state = DNS.UDP do
+  begin
+    r := net.recv(dns.q[k].fd, addr(dns.q[k].rep[0]), 65536);
+    if r = EAGAIN then return;
+    if r = EINTR then continue;
+    if r < 0 then
+    begin
+      // on a connected UDP socket this is the ICMP answer that nothing listens there
+      dns.fail(k, DNS.NETWORK);
+      return;
+    end;
+    if r > 0 then
+      if dns.take(k, dns.q[k].rep[0..r - 1]) then return;
+  end;
+end;
+
+// The TCP socket of k is ready: send the query once connected, then collect the reply,
+// which arrives as a two-byte length and that many bytes.
+local procedure dns.tcpready(k: int);
+var r, want: int;
+begin
+  if dns.q[k].state = DNS.CONNECTING then
+  begin
+    r := net.send(dns.q[k].fd, addr(dns.q[k].q[0]), dns.q[k].qn + 2);
+    if r = EAGAIN then return;
+    if r <> dns.q[k].qn + 2 then
+    begin
+      dns.fail(k, DNS.NETWORK);
+      return;
+    end;
+    dns.q[k].state := DNS.READING;
+    if not net.watch(dns.ep, EPOLL_MOD, dns.q[k].fd, EPOLLIN) then dns.fail(k, DNS.NETWORK);
+    return;
+  end;
+  while dns.q[k].state = DNS.READING do
+  begin
+    r := net.recv(dns.q[k].fd, addr(dns.q[k].rep[dns.q[k].repn]), len(dns.q[k].rep) - dns.q[k].repn);
+    if r = EAGAIN then return;
+    if r = EINTR then continue;
+    if r <= 0 then
+    begin
+      dns.fail(k, DNS.NETWORK);                         // closed before the reply was whole
+      return;
+    end;
+    dns.q[k].repn := dns.q[k].repn + r;
+    if dns.q[k].repn >= 2 then
+    begin
+      want := dns.be16(dns.q[k].rep, 0);
+      if want < 12 then
+      begin
+        dns.fail(k, DNS.BADREPLY);
+        return;
+      end;
+      if dns.q[k].repn >= want + 2 then
+      begin
+        // over TCP nobody can inject a reply, so one that is not ours is a broken server
+        if not dns.take(k, dns.q[k].rep[2..want + 1]) then dns.fail(k, DNS.BADREPLY);
+        return;
+      end;
+    end;
+  end;
+end;
+
+local function dns.active(k: int): bool;
+begin
+  return (dns.q[k].state = DNS.UDP) or (dns.q[k].state = DNS.CONNECTING) or (dns.q[k].state = DNS.READING);
+end;
+
+// Move every lookup along: take what has arrived, waiting at most ms milliseconds for it,
+// then end every attempt whose time is up.
+local procedure dns.pump(ms: int);
+var n, i, k, fd, now: int;
+begin
+  if not dns.epon then return;
+  n := net.wait(dns.ep, addr(dns.ev[0]), 8, ms);
+  i := 0;
+  while i < n do
+  begin
+    fd := io.get32(dns.ev, i * 12 + 4);
+    k := 0;
+    while k < DNS.MAXQ do
+    begin
+      if dns.active(k) and (dns.q[k].fd = fd) then
+      begin
+        if dns.q[k].state = DNS.UDP then dns.readudp(k) else dns.tcpready(k);
+        break;
+      end;
+      k := k + 1;
+    end;
+    i := i + 1;
+  end;
+  now := io.now;
+  k := 0;
+  while k < DNS.MAXQ do
+  begin
+    if dns.active(k) and (now >= dns.q[k].trydl) then dns.fail(k, DNS.TIMEOUT);
+    k := k + 1;
+  end;
+end;
+
+// ---- the calls ------------------------------------------------------------------------------
+
+// Start looking up name. Returns a query number for dns.poll, or DNS.BUSY when DNS.MAXQ
+// lookups are already running. Never blocks.
+function dns.start(name: array of char): int;
+var k, ip: int;
+begin
+  k := 0;
+  while (k < DNS.MAXQ) and (dns.q[k].state <> DNS.FREE) do k := k + 1;
+  if k >= DNS.MAXQ then return DNS.BUSY;
+  dns.q[k].state := DNS.DONE;
+  dns.q[k].fd := 0 - 1;
+  dns.q[k].tries := 0;
+  dns.q[k].hops := 0;
+  dns.q[k].lasterr := 0;
+  dns.q[k].tcp := false;
+  dns.q[k].ttl := DNS.MAXTTL;
+  dns.q[k].naddr := 0;
+  ip := dns.parseip(name);
+  if ip >= 0 then
+  begin
+    dns.q[k].addrs[0] := ip;
+    dns.q[k].res := 1;
+    return k;
+  end;
+  if not dns.setname(k, name) then
+  begin
+    dns.q[k].res := DNS.BADNAME;
+    return k;
+  end;
+  if dns.same(dns.q[k].name[0..dns.q[k].name_n - 1], "localhost") then
+  begin
+    dns.q[k].addrs[0] := 0x7F000001;
+    dns.q[k].res := 1;
+    return k;
+  end;
+  if dns.cacheget(k) then
+  begin
+    dns.q[k].res := dns.q[k].naddr;
+    return k;
+  end;
+  if not dns.setup then
+  begin
+    dns.q[k].res := DNS.NETWORK;
+    return k;
+  end;
+  dns.q[k].dl := io.now + dns.totalms * 1000000;
+  dns.q[k].ns := 0;
+  dns.attempt(k);
+  return k;
+end;
+
+// The outcome of query q, without blocking: DNS.PENDING (0) while it runs; when it is
+// done, the number of addresses copied into out (at most len(out), which must be at least
+// one) or a negative DNS.* code -- and q is free again.
+function dns.poll(q: int; out: array of int): int;
+var r, i: int;
+begin
+  if (q < 0) or (q >= DNS.MAXQ) then return DNS.BUSY;
+  if dns.q[q].state = DNS.FREE then return DNS.BUSY;
+  if dns.q[q].state <> DNS.DONE then dns.pump(0);
+  if dns.q[q].state <> DNS.DONE then return DNS.PENDING;
+  r := dns.q[q].res;
+  if r > len(out) then r := len(out);
+  i := 0;
+  while i < r do
+  begin
+    out[i] := dns.q[q].addrs[i];
+    i := i + 1;
+  end;
+  if r = 0 then r := dns.q[q].res;                      // an empty out: still say how it ended
+  dns.q[q].state := DNS.FREE;
+  return r;
+end;
+
+// Drop query q; its outcome, if any, is lost.
+procedure dns.cancel(q: int);
+begin
+  if (q < 0) or (q >= DNS.MAXQ) then return;
+  if dns.q[q].state = DNS.FREE then return;
+  dns.drop(q);
+  dns.q[q].state := DNS.FREE;
+end;
+
+// Milliseconds until the next deadline of a running lookup, as a timeout for epoll_wait;
+// -1 when none is running.
+function dns.wait: int;
+var k, t, best, now: int;
+begin
+  best := 0 - 1;
+  now := io.now;
+  k := 0;
+  while k < DNS.MAXQ do
+  begin
+    if dns.active(k) then
+    begin
+      t := (dns.q[k].trydl - now + 999999) div 1000000;
+      if t < 0 then t := 0;
+      if (best < 0) or (t < best) then best := t;
+    end;
+    k := k + 1;
+  end;
+  return best;
+end;
+
+// Look name up and wait for the answer, at most the lookup's total time (5 s unless
+// dns.settimeout said otherwise). Returns the number of addresses written to out, or a
+// negative DNS.* code.
+function dns.resolve(name: array of char; out: array of int): int;
+var q, r, w: int;
+begin
+  q := dns.start(name);
+  if q < 0 then return q;
+  while true do
+  begin
+    r := dns.poll(q, out);
+    if r <> DNS.PENDING then return r;
+    w := dns.wait;
+    if (w < 0) or (w > 1000) then w := 1000;
+    dns.pump(w);
+  end;
+  return DNS.TIMEOUT;
+end;
+
+// Resolve name and connect to port on the first address that accepts, as net.connect does
+// (blocking). Returns the fd, or a negative DNS.* code -- DNS.NOCONNECT when the name
+// resolved but no address took the connection.
+function dns.connect(name: array of char; port: int): int;
+var n, i, fd, ip: int;
+begin
+  n := dns.resolve(name, dns.out);
+  if n < 0 then return n;
+  i := 0;
+  while i < n do
+  begin
+    ip := dns.out[i];
+    fd := net.connect(band(ip shr 24, 255), band(ip shr 16, 255), band(ip shr 8, 255), band(ip, 255), port);
+    if fd >= 0 then return fd;
+    i := i + 1;
+  end;
+  return DNS.NOCONNECT;
+end;

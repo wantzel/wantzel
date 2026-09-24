@@ -28,7 +28,7 @@
 /* limits                                                              */
 /* ------------------------------------------------------------------ */
 /* The release this compiler was built from; src/wantzel.wz has the same string. */
-#define VERSION "0.3.1"
+#define VERSION "0.3.2"
 #define SRCMAX  67108864
 #define CODEMAX 67108864
 #define DATMAX  33554432
@@ -3088,6 +3088,10 @@ long stmt(){
         cntfix[ncnt] = jfwd(0,0xE9); ncnt = ncnt + 1;
         return 0;
     }
+    if(tok == KW_FOR){
+        dofor();
+        return 0;
+    }
     if(tok == TK_ID && eqt("case")){ fail("'case' is no longer part of the language; write an if-chain: if x = a then ... else if x = b then ... else ..."); }
     if(tok == KW_ELSE){ fail("unexpected else (no ';' may precede it)"); }
     if(tok == TK_ID && eqt("repeat")){ fail("'repeat ... until' is no longer part of the language; write 'while true do begin ... if done then break; end'"); }
@@ -4567,6 +4571,7 @@ long genwin(){
     gen("  __WMAXFD = 1024;\n");
     gen("  __WMAXEP = 16;   // epoll sets at once; one more is EMFILE\n");
     gen("  __WEPBASE = 1000000;   // the fd of epoll set k is __WEPBASE + k\n");
+    gen("  __WRCFD = 2000001;   // the fd of the synthesised /etc/resolv.conf\n");
     gen("var\n");
     gen("  __wargv: array[0..63] of int;\n");
     gen("  __wargs: array[0..4095] of char;\n");
@@ -4588,6 +4593,10 @@ long genwin(){
     gen("  __wovl: array[0..31] of char;   // a zeroed OVERLAPPED for LockFileEx\n");
     gen("  __wexitc: array[0..7] of char;   // GetExitCodeProcess writes its DWORD here\n");
     gen("  __wpos: array[0..7] of char;   // SetFilePointerEx result\n");
+    gen("  __wrc: array[0..1023] of char;   // the synthesised /etc/resolv.conf\n");
+    gen("  __wrcn, __wrcat, __wrcopen: int;   // its length, the read position, 1 while open\n");
+    gen("  __wnp: array[0..16383] of char;   // FIXED_INFO, from GetNetworkParams\n");
+    gen("  __wnplen: array[0..7] of char;   // its size, in and out\n");
     gen("\n");
     gen("procedure __wp32(b: array of char; at: int; v: int);\n");
     gen("begin\n");
@@ -4636,6 +4645,107 @@ long genwin(){
     gen("  return other;\n");
     gen("end;\n");
     gen("\n");
+    gen("// /etc/resolv.conf, synthesised.  Windows keeps its DNS servers in the network\n");
+    gen("  // configuration, not in a file, so an open of exactly that path (read-only) is answered\n");
+    gen("  // from GetNetworkParams (iphlpapi.dll): one nameserver line per configured server.  A\n");
+    gen("  // program that reads the file to find its nameservers then runs unchanged.  The fd is\n");
+    gen("  // odd, so it can never be a HANDLE (those are multiples of 4); one open at a time.\n");
+    gen("function __wpatheq(p: int; s: str): bool;\n");
+    gen("var i: int;\n");
+    gen("begin\n");
+    gen("  i := 0;\n");
+    gen("  while i < slen(s) do\n");
+    gen("  begin\n");
+    gen("    if peek(p + i) <> ord(schar(s, i)) then return false;\n");
+    gen("    i := i + 1;\n");
+    gen("  end;\n");
+    gen("  return peek(p + i) = 0;\n");
+    gen("end;\n");
+    gen("\n");
+    gen("function __wpeek64(a: int): int;\n");
+    gen("var v, i: int;\n");
+    gen("begin\n");
+    gen("  v := 0;\n");
+    gen("  i := 7;\n");
+    gen("  while i >= 0 do\n");
+    gen("  begin\n");
+    gen("    v := bor(v shl 8, peek(a + i));\n");
+    gen("    i := i - 1;\n");
+    gen("  end;\n");
+    gen("  return v;\n");
+    gen("end;\n");
+    gen("\n");
+    gen("// Append a literal to the synthesised file.\n");
+    gen("procedure __wrctext(s: str);\n");
+    gen("var i: int;\n");
+    gen("begin\n");
+    gen("  i := 0;\n");
+    gen("  while (i < slen(s)) and (__wrcn < 1024) do\n");
+    gen("  begin\n");
+    gen("    __wrc[__wrcn] := schar(s, i);\n");
+    gen("    __wrcn := __wrcn + 1;\n");
+    gen("    i := i + 1;\n");
+    gen("  end;\n");
+    gen("end;\n");
+    gen("\n");
+    gen("// \"nameserver <the NUL-terminated text at ip>\" and a newline; nothing for an empty text\n");
+    gen("procedure __wrcline(ip: int);\n");
+    gen("var i: int;\n");
+    gen("begin\n");
+    gen("  if peek(ip) = 0 then return;\n");
+    gen("  if __wrcn + 32 > 1024 then return;\n");
+    gen("  __wrctext(\"nameserver \");\n");
+    gen("  i := 0;\n");
+    gen("  while (i < 16) and (peek(ip + i) <> 0) do\n");
+    gen("  begin\n");
+    gen("    __wrc[__wrcn] := chr(peek(ip + i));\n");
+    gen("    __wrcn := __wrcn + 1;\n");
+    gen("    i := i + 1;\n");
+    gen("  end;\n");
+    gen("  __wrc[__wrcn] := chr(10);\n");
+    gen("  __wrcn := __wrcn + 1;\n");
+    gen("end;\n");
+    gen("\n");
+    gen("// FIXED_INFO holds DnsServerList, an IP_ADDR_STRING, at offset 272: its Next pointer at\n");
+    gen("  // +0 and the address as text at +8.  A failed call leaves the file empty.\n");
+    gen("function __wresolvconf: int;\n");
+    gen("var r, p, k: int;\n");
+    gen("begin\n");
+    gen("  if __wrcopen <> 0 then return 0 - 24;   // EMFILE\n");
+    gen("  __wrcn := 0;\n");
+    gen("  __wrcat := 0;\n");
+    gen("  __wrctext(\"# the DNS servers Windows uses, from GetNetworkParams\\n\");\n");
+    gen("  __wp32(__wnplen, 0, 16384);\n");
+    gen("  r := winapi(\"iphlpapi.dll\", \"GetNetworkParams\", addr(__wnp[0]), addr(__wnplen[0]));\n");
+    gen("  if band(r, 0xFFFFFFFF) = 0 then\n");
+    gen("  begin\n");
+    gen("    __wrcline(addr(__wnp[280]));\n");
+    gen("    p := __wpeek64(addr(__wnp[272]));\n");
+    gen("    k := 0;\n");
+    gen("    while (p <> 0) and (k < 16) do\n");
+    gen("    begin\n");
+    gen("      __wrcline(p + 8);\n");
+    gen("      p := __wpeek64(p);\n");
+    gen("      k := k + 1;\n");
+    gen("    end;\n");
+    gen("  end;\n");
+    gen("  __wrcopen := 1;\n");
+    gen("  return __WRCFD;\n");
+    gen("end;\n");
+    gen("\n");
+    gen("function __wrcread(a: int; n: int): int;\n");
+    gen("var k: int;\n");
+    gen("begin\n");
+    gen("  k := 0;\n");
+    gen("  while (k < n) and (__wrcat < __wrcn) do\n");
+    gen("  begin\n");
+    gen("    poke(a + k, ord(__wrc[__wrcat]));\n");
+    gen("    k := k + 1;\n");
+    gen("    __wrcat := __wrcat + 1;\n");
+    gen("  end;\n");
+    gen("  return k;\n");
+    gen("end;\n");
+    gen("\n");
     gen("function __wwrite(fd: int; a: int; n: int): int;\n");
     gen("var ok, r: int;\n");
     gen("begin\n");
@@ -4654,6 +4764,7 @@ long genwin(){
     gen("function __wread(fd: int; a: int; n: int): int;\n");
     gen("var ok, r: int;\n");
     gen("begin\n");
+    gen("  if fd = __WRCFD then return __wrcread(a, n);\n");
     gen("  if __wissock(fd) then\n");
     gen("  begin\n");
     gen("    r := winapi(__W_RECV, __wsh[fd], a, n, 0);\n");
@@ -4669,6 +4780,7 @@ long genwin(){
     gen("function __wopen(path: int; flags: int): int;\n");
     gen("var access, disp, h: int;\n");
     gen("begin\n");
+    gen("  if (band(flags, 3) = 0) and __wpatheq(path, \"/etc/resolv.conf\") then return __wresolvconf;\n");
     gen("  access := 0x80000000;\n");
     gen("  if band(flags, 3) = 1 then access := 0x40000000;\n");
     gen("  if band(flags, 3) = 2 then access := 0xC0000000;\n");
@@ -4796,6 +4908,11 @@ long genwin(){
     gen("\n");
     gen("procedure __wclose(fd: int);\n");
     gen("begin\n");
+    gen("  if fd = __WRCFD then\n");
+    gen("  begin\n");
+    gen("    __wrcopen := 0;\n");
+    gen("    return;\n");
+    gen("  end;\n");
     gen("  if __wepset(fd) >= 0 then\n");
     gen("  begin\n");
     gen("    __wepfree(__wepset(fd));\n");
@@ -4842,11 +4959,14 @@ long genwin(){
     gen("  return 0 - 1;\n");
     gen("end;\n");
     gen("\n");
-    gen("function __wsock: int;\n");
+    gen("// socket(AF_INET, type, 0): SOCK_DGRAM (2, perhaps with SOCK_NONBLOCK or SOCK_CLOEXEC\n");
+    gen("  // or-ed in) is UDP, anything else TCP, as before.\n");
+    gen("function __wsock(kind: int): int;\n");
     gen("var h, fd: int;\n");
     gen("begin\n");
     gen("  __wneedwsa;\n");
-    gen("  h := winapi(__W_SOCKET, 2, 1, 6);\n");
+    gen("  if band(kind, 15) = 2 then h := winapi(__W_SOCKET, 2, 2, 17)\n");
+    gen("  else h := winapi(__W_SOCKET, 2, 1, 6);\n");
     gen("  if h = 0 - 1 then return 0 - 24;\n");
     gen("  fd := __wslot;\n");
     gen("  if fd < 0 then\n");
@@ -5295,7 +5415,12 @@ long genwin(){
     gen("begin\n");
     gen("  if not __wissock(fd) then return 0 - 9;\n");
     gen("  r := winapi(\"ws2_32.dll\", \"connect\", __wsh[fd], sa, sln);\n");
-    gen("  if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then return 0 - 111;   // ECONNREFUSED\n");
+    gen("  if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then\n");
+    gen("  begin\n");
+    gen("    // a non-blocking socket: the connection is on its way, as Linux reports it\n");
+    gen("    if band(winapi(\"ws2_32.dll\", \"WSAGetLastError\"), 0xFFFFFFFF) = 10035 then return 0 - 115;   // EINPROGRESS\n");
+    gen("    return 0 - 111;   // ECONNREFUSED\n");
+    gen("  end;\n");
     gen("  return 0;\n");
     gen("end;\n");
     gen("\n");
@@ -5357,7 +5482,7 @@ long genwin(){
     gen("    __wclose(a);\n");
     gen("    return 0;\n");
     gen("  end;\n");
-    gen("  if nr = 41 then return __wsock;   // socket\n");
+    gen("  if nr = 41 then return __wsock(b);   // socket\n");
     gen("  if nr = 49 then return __wbind(a, b, c);   // bind\n");
     gen("  if nr = 42 then return __wconnect(a, b, c);   // connect\n");
     gen("  if nr = 50 then return __wlisten(a, b);   // listen\n");

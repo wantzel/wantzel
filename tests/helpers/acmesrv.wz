@@ -20,6 +20,34 @@
 //     http://127.0.0.1:<port>/.well-known/acme-challenge/<token>
 // and compares what comes back. A fixture that just said "yes, validated" would let a client
 // that never serves the token pass, which is the single most important thing to get right.
+//
+// TWO MODES.
+//
+//   acmesrv <port> <challenge-port>
+//       The first one: validates DURING the challenge request and answers "valid" at once,
+//       issues a bare DER certificate signed by a key of its own. What examples/getcert.wz
+//       (tests/lib/getcert.sh) expects.
+//
+//   acmesrv <port> <challenge-port> <base-url> <ca.der> <ca-key-hex>
+//       Behaves like a real authority, for tests/lib/autocert.sh:
+//       - the URLs it hands out start with <base-url> (an https:// front, tests/helpers/tlsfront.wz)
+//       - validation is ASYNCHRONOUS: the challenge request is answered "processing" at once
+//         and a child process fetches the token afterwards, so the client must keep serving
+//         while it polls -- which is the whole point of the test
+//       - finalize answers "processing" and the order has to be polled until "valid"
+//       - the certificate is signed by the given CA (issuer name and key) and downloaded as a
+//         PEM chain: the certificate, then the CA
+//       - files in its working directory steer it, so a test can change its behaviour
+//         without restarting it:
+//             fail      every request gets a 500 serverInternal
+//             garbage   a 200 whose body is not JSON -- for every request, or, when the
+//                       file holds a path (/authz/1), only for that one
+//             wrongkey  the certificate is issued for a key of the authority's own, not the
+//                       one in the CSR -- which a client must notice before serving it
+//             age       a number: the certificate is issued as if that many days of its
+//                       90 have already passed (70 gives one that is due for renewal)
+//       - it prints ORDER <host>, VALIDATED / NOT VALIDATED and ISSUED on stdout, so a test
+//         can count what happened
 
 include "http.wz";
 include "json.wz";
@@ -27,6 +55,7 @@ include "net.wz";
 include "csr.wz";
 include "x509.wz";
 include "base64.wz";
+include "proc.wz";
 
 const
   ACMESRV.MAXTOK = 64;
@@ -53,6 +82,20 @@ var
   srv.thumb:  array[0..63] of char;   // the client's JWK thumbprint, taken from its JWS
   srv.thumbn: int;
 
+  // THE SECOND MODE (see the top of this file).
+  srv.async:   bool;
+  srv.base:    array[0..255] of char;  // what every URL starts with
+  srv.basen:   int;
+  srv.cader:   array[0..4095] of char; // the CA's certificate, DER
+  srv.cadern:  int;
+  srv.cad:     array[0..P.N-1] of int; // and its key
+  srv.polled:  int;                    // order polls since finalize: the first says processing
+  srv.chalstate: int;                  // 0 none, 1 fetching, 2 valid, 3 invalid
+  srv.pem:     array[0..16383] of char;
+  srv.pemn:    int;
+  srv.b64:     array[0..8191] of char;
+  srv.file:    array[0..255] of char;
+
 // ---- helpers ---------------------------------------------------------------------------
 
 function argnum(k: int): int;
@@ -69,6 +112,90 @@ begin
     c := argch(k, j);
   end;
   return v;
+end;
+
+var i, k: int;
+
+function hexval(c: char): int;
+begin
+  if (c >= '0') and (c <= '9') then return ord(c) - ord('0');
+  if (c >= 'a') and (c <= 'f') then return ord(c) - ord('a') + 10;
+  if (c >= 'A') and (c <= 'F') then return ord(c) - ord('A') + 10;
+  return 0;
+end;
+
+// Does a file of this name exist in the working directory? The control files of the second
+// mode are looked up on every request, so a test can create and remove them while it runs.
+function exists(name: str): bool;
+var n: int;
+begin
+  n := io.push(srv.file, 0, name);
+  srv.file[n] := chr(0);
+  return sys2(SYS.stat, addr(srv.file[0]), addr(srv.pem[0])) = 0;
+end;
+
+// Does the garbage control file apply to this request? Empty: to all of them.
+function garbagehere: bool;
+var fd, n, i: int;
+    b: array[0..127] of char;
+begin
+  n := io.push(srv.file, 0, "garbage");
+  srv.file[n] := chr(0);
+  fd := sys3(SYS.open, addr(srv.file[0]), O_RDONLY, 0);
+  if fd < 0 then return false;
+  n := sys3(SYS.read, fd, addr(b[0]), 127);
+  sys1(SYS.close, fd);
+  while (n > 0) and (ord(b[n - 1]) <= 32) do n := n - 1;
+  if n <= 0 then return true;
+  if n <> http.pathlen then return false;
+  i := 0;
+  while i < n do
+  begin
+    if http.inbuf[http.pathat + i] <> b[i] then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// A small number out of a control file, or 0.
+function filenum(name: str): int;
+var fd, n, i, v: int;
+    b: array[0..31] of char;
+begin
+  n := io.push(srv.file, 0, name);
+  srv.file[n] := chr(0);
+  fd := sys3(SYS.open, addr(srv.file[0]), O_RDONLY, 0);
+  if fd < 0 then return 0;
+  n := sys3(SYS.read, fd, addr(b[0]), 31);
+  sys1(SYS.close, fd);
+  v := 0;
+  i := 0;
+  while (i < n) and (b[i] >= '0') and (b[i] <= '9') do
+  begin
+    v := v * 10 + (ord(b[i]) - ord('0'));
+    i := i + 1;
+  end;
+  return v;
+end;
+
+// Write one word to a file, for the child that validated to tell the parent how it went.
+procedure putfile(name: str; what: str);
+var fd, n: int;
+begin
+  n := io.push(srv.file, 0, name);
+  srv.file[n] := chr(0);
+  fd := sys3(SYS.open, addr(srv.file[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
+  if fd < 0 then return;
+  n := sys3(SYS.write, fd, sadr(what), slen(what));
+  sys1(SYS.close, fd);
+end;
+
+procedure dropfile(name: str);
+var n: int;
+begin
+  n := io.push(srv.file, 0, name);
+  srv.file[n] := chr(0);
+  n := sys1(SYS.unlink, addr(srv.file[0]));
 end;
 
 // ---- reading the JWS the client sent ------------------------------------------------------
@@ -329,16 +456,21 @@ begin
   http.hdraddslice("Replay-Nonce", srv.tmp, 0, srv.tmpn);
 end;
 
+// A Location header: the base URL, then the path.
 procedure addlocation(s: str);
+var i: int;
 begin
-  srv.tmpn := io.push(srv.tmp, 0, s);
+  i := 0;
+  while i < srv.basen do begin srv.tmp[i] := srv.base[i]; i := i + 1; end;
+  srv.tmpn := io.push(srv.tmp, srv.basen, s);
   http.hdraddslice("Location", srv.tmp, 0, srv.tmpn);
 end;
 
-// The base URL of this server, so the directory can point at itself.
-procedure addbase(dst: array of char; at: int);
+// The base URL of this server, into the reply, so every URL points at itself -- or, in the
+// second mode, at the https front that the client talks to.
+procedure base;
 begin
-  srv.tmpn := at;
+  http.addb(srv.base, 0, srv.basen);
 end;
 
 // ---- fetching the challenge file ---------------------------------------------------------
@@ -474,26 +606,257 @@ begin
   return true;
 end;
 
+// ---- the second mode: a validation that happens later, in a child ----------------------
+//
+// A REAL AUTHORITY DOES NOT FETCH THE TOKEN WHILE THE CLIENT WAITS FOR ITS ANSWER. It says
+// "processing" and looks a moment later, from elsewhere; the client polls. So a client that
+// blocks on the challenge request, or stops serving port 80 while it polls, fails against
+// the real thing -- and this mode makes it fail here too.
+//
+// A CHILD DOES THE FETCH because this fixture is a single http.serve loop: fetching inline
+// would be the synchronous first mode again. The child reports through a file, which the
+// parent reads when the client polls; the parent reaps it on every request.
+//
+// THE FETCH HAS A DEADLINE OF ITS OWN, so a client that never answers leaves no child
+// behind for longer than ten seconds.
+procedure asyncfetch(expect: array of char; expectn: int);
+var fd, n, i, got, sent, deadline, bodyat: int;
+    req: array[0..511] of char;
+    rep: array[0..2047] of char;
+    ts: array[0..15] of char;
+begin
+  io.put64(ts, 0, 0);
+  io.put64(ts, 8, 50000000);                  // 50 ms: the "processing" reply goes out first
+  sys2(SYS.nanosleep, addr(ts[0]), 0);
+  io.put64(ts, 8, 10000000);
+  deadline := io.now + 10000000000;
+  fd := net.connect(127, 0, 0, 1, srv.chalport);
+  if fd < 0 then begin putfile("chal.result", "bad"); io.puts(STDOUT, "NOT VALIDATED (no connection)\n"); halt(0); end;
+  if not net.nonblock(fd) then begin putfile("chal.result", "bad"); halt(0); end;
+  n := io.push(req, 0, "GET /.well-known/acme-challenge/");
+  i := 0;
+  while i < srv.tokenn do begin req[n] := srv.token[i]; n := n + 1; i := i + 1; end;
+  n := io.push(req, n, " HTTP/1.0\r\nHost: ");
+  i := 0;
+  while i < srv.hostn do begin req[n] := srv.host[i]; n := n + 1; i := i + 1; end;
+  n := io.push(req, n, "\r\nConnection: close\r\n\r\n");
+  i := 0;
+  while (i < n) and (io.now < deadline) do
+  begin
+    sent := net.send(fd, addr(req[i]), n - i);
+    if sent > 0 then i := i + sent
+    else if sent = EAGAIN then sys2(SYS.nanosleep, addr(ts[0]), 0)
+    else i := n + 1;
+  end;
+  got := 0;
+  while (got < 2040) and (io.now < deadline) do
+  begin
+    n := net.recv(fd, addr(rep[got]), 2040 - got);
+    if n > 0 then got := got + n
+    else if n = EAGAIN then sys2(SYS.nanosleep, addr(ts[0]), 0)
+    else break;
+  end;
+  net.close(fd);
+  bodyat := 0;
+  i := 0;
+  while i + 3 < got do
+  begin
+    if (rep[i] = chr(13)) and (rep[i+1] = chr(10)) and (rep[i+2] = chr(13)) and (rep[i+3] = chr(10)) then
+    begin
+      bodyat := i + 4;
+      i := got;
+    end
+    else i := i + 1;
+  end;
+  n := got;
+  while (n > bodyat) and ((rep[n-1] = chr(10)) or (rep[n-1] = chr(13)) or (rep[n-1] = ' ')) do n := n - 1;
+  if (bodyat > 0) and (n - bodyat = expectn) then
+  begin
+    i := 0;
+    while (i < expectn) and (rep[bodyat + i] = expect[i]) do i := i + 1;
+    if i = expectn then
+    begin
+      putfile("chal.result", "ok");
+      io.puts(STDOUT, "VALIDATED\n");
+      halt(0);
+    end;
+  end;
+  putfile("chal.result", "bad");
+  io.puts(STDOUT, "NOT VALIDATED\n");
+  halt(0);
+end;
+
+// Where the child's fetch stands: 1 still fetching, 2 valid, 3 invalid.
+function chalstate: int;
+var fd, n: int;
+    b: array[0..7] of char;
+begin
+  if srv.chalstate <> 1 then return srv.chalstate;
+  n := io.push(srv.file, 0, "chal.result");
+  srv.file[n] := chr(0);
+  fd := sys3(SYS.open, addr(srv.file[0]), O_RDONLY, 0);
+  if fd < 0 then return 1;
+  n := sys3(SYS.read, fd, addr(b[0]), 8);
+  sys1(SYS.close, fd);
+  if (n >= 2) and (b[0] = 'o') and (b[1] = 'k') then
+  begin
+    srv.chalstate := 2;
+    srv.validated := true;
+  end
+  else if n >= 3 then srv.chalstate := 3;
+  return srv.chalstate;
+end;
+
+// A certificate for the requested name, signed by the CA that was handed in -- its name as
+// issuer, its key as signer -- dated as the "age" control file says.
+function issueca(qx: array of int; qy: array of int): bool;
+var at, outer, tbs, mark, extblk, extseq, ext, m2, tbsat, tbsn, nb, age, i: int;
+begin
+  if not x509.parse(srv.cader, 0, srv.cadern) then return false;
+  age := filenum("age");
+  nb := io.realtime div 1000000000 - age * 86400 - 60;
+  at := 0;
+  at := der.open(srv.cert, at);
+  outer := der.mark;
+  tbsat := at;
+  at := der.open(srv.cert, at);
+  tbs := der.mark;
+  srv.cert[at] := chr(0xA0);
+  srv.cert[at + 1] := chr(3);
+  at := at + 2;
+  at := der.putint(srv.cert, at, 2);
+  at := der.putint(srv.cert, at, 1000 + rand.below(1000000));   // serial
+  at := csr.algid(srv.cert, at);
+  // THE ISSUER IS THE CA'S SUBJECT, copied as its DER: a chain is linked by these bytes.
+  i := 0;
+  while i < x509.subn do begin srv.cert[at + i] := srv.cader[x509.subat + i]; i := i + 1; end;
+  at := at + x509.subn;
+  at := der.open(srv.cert, at);
+  mark := der.mark;
+  at := csr.puttime(srv.cert, at, nb);
+  if at < 0 then return false;
+  at := csr.puttime(srv.cert, at, nb + 90 * 86400);
+  if at < 0 then return false;
+  at := der.close(srv.cert, mark, at);
+  at := csr.name(srv.cert, at, srv.host, srv.hostn);
+  at := csr.spki(srv.cert, at, qx, qy);
+  at := der.opentag(srv.cert, at, 0xA3);
+  extblk := der.mark;
+  at := der.open(srv.cert, at);
+  extseq := der.mark;
+  at := der.open(srv.cert, at);
+  ext := der.mark;
+  csr.oid(5, srv.tmp);
+  at := der.putoid(srv.cert, at, srv.tmp, csr.n);
+  m2 := csr.san(srv.tmp, 0, srv.host, srv.hostn);
+  at := der.put(srv.cert, at, DER.OCTSTR, srv.tmp, 0, m2);
+  at := der.close(srv.cert, ext, at);
+  at := der.close(srv.cert, extseq, at);
+  at := der.close(srv.cert, extblk, at);
+  at := der.close(srv.cert, tbs, at);
+  tbsn := at - tbsat;
+  csr.digest(srv.cert, tbsat, tbsn);
+  p256.frombytes(csr.tmp2, csr.hash, 0);
+  if not p256.sign(srv.cad, csr.tmp2) then return false;
+  at := csr.algid(srv.cert, at);
+  m2 := csr.dersig(srv.tmp, 0, p256.sigr, p256.sigs);
+  at := der.putbits(srv.cert, at, srv.tmp, 0, m2);
+  at := der.close(srv.cert, outer, at);
+  srv.certn := at;
+  return true;
+end;
+
+// One PEM block of b[0..n) onto srv.pem.
+procedure pemadd(b: array of char; n: int);
+var m, i: int;
+begin
+  srv.pemn := io.push(srv.pem, srv.pemn, "-----BEGIN CERTIFICATE-----\n");
+  m := base64.encode(srv.b64, 0, b[0..n - 1]);
+  i := 0;
+  while i < m do
+  begin
+    srv.pem[srv.pemn] := srv.b64[i];
+    srv.pemn := srv.pemn + 1;
+    i := i + 1;
+    if (i mod 64 = 0) or (i = m) then begin srv.pem[srv.pemn] := chr(10); srv.pemn := srv.pemn + 1; end;
+  end;
+  srv.pemn := io.push(srv.pem, srv.pemn, "-----END CERTIFICATE-----\n");
+end;
+
+// The order object as it stands.
+procedure orderreply(st: str);
+begin
+  http.add("{\"status\":\"");
+  http.add(st);
+  http.add("\",\"identifiers\":[{\"type\":\"dns\",\"value\":\"");
+  http.addb(srv.host, 0, srv.hostn);
+  http.add("\"}],\"authorizations\":[\"");
+  base;
+  http.add("/authz/1\"],\"finalize\":\"");
+  base;
+  http.add("/finalize/1\"");
+  if srv.finalized and (srv.polled > 0) then
+  begin
+    http.add(",\"certificate\":\"");
+    base;
+    http.add("/cert/1\"");
+  end;
+  http.add("}");
+end;
+
+// Read a file whole into dst; its length, or -1.
+function readall(path: array of char; dst: array of char): int;
+var fd, n, got: int;
+begin
+  fd := sys3(SYS.open, addr(path[0]), O_RDONLY, 0);
+  if fd < 0 then return 0 - 1;
+  got := 0;
+  while got < len(dst) do
+  begin
+    n := sys3(SYS.read, fd, addr(dst[got]), len(dst) - got);
+    if n <= 0 then break;
+    got := got + n;
+  end;
+  sys1(SYS.close, fd);
+  return got;
+end;
+
 // ---- the endpoints ----------------------------------------------------------------------------
 
 procedure app.request;
-var i, n, at, keyat: int;
+var i, n, at, keyat, pid: int;
     payat, payn: int;
     qx, qy: array[0..P.N-1] of int;
     pt: array[0..127] of char;
     ptn: int;
 begin
+  // Reap whatever validation child has finished, so none is left as a zombie.
+  while proc.reap > 0 do i := 0;
   addnonce;
+
+  // ---- the control files of the second mode ----
+  if srv.async and exists("fail") then
+  begin
+    http.add("{\"type\":\"urn:ietf:params:acme:error:serverInternal\",\"detail\":\"the authority is down for maintenance\"}");
+    http.finish(500, "application/problem+json");
+    return;
+  end;
+  if srv.async and garbagehere then
+  begin
+    http.add("<html>this is not an ACME reply</html>");
+    http.finish(200, "application/json");
+    return;
+  end;
 
   // ---- GET /directory ----
   if pathis("/directory") then
   begin
-    http.add("{\"newNonce\":\"http://127.0.0.1:");
-    http.addn(srv.port);
-    http.add("/new-nonce\",\"newAccount\":\"http://127.0.0.1:");
-    http.addn(srv.port);
-    http.add("/new-acct\",\"newOrder\":\"http://127.0.0.1:");
-    http.addn(srv.port);
+    http.add("{\"newNonce\":\"");
+    base;
+    http.add("/new-nonce\",\"newAccount\":\"");
+    base;
+    http.add("/new-acct\",\"newOrder\":\"");
+    base;
     http.add("/new-order\"}");
     http.finish(200, "application/json");
     return;
@@ -530,7 +893,7 @@ begin
       http.finish(400, "application/json");
       return;
     end;
-    addlocation("http://127.0.0.1:0/acct/1");
+    addlocation("/acct/1");
     http.add("{\"status\":\"valid\"}");
     http.finish(201, "application/json");
     return;
@@ -560,14 +923,13 @@ begin
     end;
     srv.validated := false;
     srv.finalized := false;
-    addlocation("http://127.0.0.1:0/order/1");
-    http.add("{\"status\":\"pending\",\"identifiers\":[{\"type\":\"dns\",\"value\":\"");
-    http.addb(srv.host, 0, srv.hostn);
-    http.add("\"}],\"authorizations\":[\"http://127.0.0.1:");
-    http.addn(srv.port);
-    http.add("/authz/1\"],\"finalize\":\"http://127.0.0.1:");
-    http.addn(srv.port);
-    http.add("/finalize/1\"}");
+    srv.polled := 0;
+    srv.chalstate := 0;
+    io.puts(STDOUT, "ORDER ");
+    io.out(STDOUT, addr(srv.host[0]), srv.hostn);
+    io.puts(STDOUT, "\n");
+    addlocation("/order/1");
+    orderreply("pending");
     http.finish(201, "application/json");
     return;
   end;
@@ -579,15 +941,28 @@ begin
   // authority that failure is a timeout with nothing saying why.
   if pathis("/authz/1") then
   begin
-    http.add("{\"status\":\"pending\",\"identifier\":{\"type\":\"dns\",\"value\":\"");
+    // In the second mode the authorization is what the child found, once it has finished.
+    http.add("{\"status\":\"");
+    if not srv.async then http.add("pending")
+    else
+    begin
+      i := chalstate;
+      if i = 2 then http.add("valid")
+      else if i = 3 then http.add("invalid")
+      else http.add("pending");
+    end;
+    http.add("\",\"identifier\":{\"type\":\"dns\",\"value\":\"");
     http.addb(srv.host, 0, srv.hostn);
-    http.add("\"},\"challenges\":[{\"type\":\"dns-01\",\"url\":\"http://127.0.0.1:");
-    http.addn(srv.port);
-    http.add("/chal/dns\",\"token\":\"unused\"},{\"type\":\"http-01\",\"url\":\"http://127.0.0.1:");
-    http.addn(srv.port);
+    http.add("\"},\"challenges\":[{\"type\":\"dns-01\",\"url\":\"");
+    base;
+    http.add("/chal/dns\",\"token\":\"unused\"},{\"type\":\"http-01\",\"url\":\"");
+    base;
     http.add("/chal/http\",\"token\":\"");
     http.addb(srv.token, 0, srv.tokenn);
-    http.add("\"}]}");
+    http.add("\"");
+    if srv.async and (srv.chalstate = 3) then
+      http.add(",\"status\":\"invalid\",\"error\":{\"type\":\"urn:ietf:params:acme:error:unauthorized\",\"detail\": \"the key authorization did not match\"}");
+    http.add("}]}");
     http.finish(200, "application/json");
     return;
   end;
@@ -596,6 +971,22 @@ begin
   if pathis("/chal/http") then
   begin
     ptn := acmesrv.keyauth(pt, 127);
+    if srv.async then
+    begin
+      // "processing" now; the child looks in a moment.
+      if (ptn > 0) and (srv.chalstate = 0) then
+      begin
+        dropfile("chal.result");
+        srv.chalstate := 1;
+        pid := proc.fork;
+        if pid = 0 then asyncfetch(pt, ptn);
+      end;
+      http.add("{\"type\":\"http-01\",\"status\":\"processing\",\"token\":\"");
+      http.addb(srv.token, 0, srv.tokenn);
+      http.add("\"}");
+      http.finish(200, "application/json");
+      return;
+    end;
     if (ptn > 0) and fetchchallenge(pt, ptn) then
     begin
       srv.validated := true;
@@ -627,6 +1018,26 @@ begin
       http.finish(400, "application/json");
       return;
     end;
+    if srv.async then
+    begin
+      if exists("wrongkey") then
+      begin
+        p256.copy(qx, ca.qx);
+        p256.copy(qy, ca.qy);
+      end;
+      if not issueca(qx, qy) then
+      begin
+        http.add("{\"type\":\"urn:ietf:params:acme:error:serverInternal\"}");
+        http.finish(500, "application/json");
+        return;
+      end;
+      srv.finalized := true;
+      srv.polled := 0;
+      io.puts(STDOUT, "ISSUED\n");
+      orderreply("processing");
+      http.finish(200, "application/json");
+      return;
+    end;
     if not issue(qx, qy) then
     begin
       http.add("{\"type\":\"urn:ietf:params:acme:error:serverInternal\"}");
@@ -634,9 +1045,23 @@ begin
       return;
     end;
     srv.finalized := true;
-    http.add("{\"status\":\"valid\",\"certificate\":\"http://127.0.0.1:");
-    http.addn(srv.port);
+    http.add("{\"status\":\"valid\",\"certificate\":\"");
+    base;
     http.add("/cert/1\"}");
+    http.finish(200, "application/json");
+    return;
+  end;
+
+  // ---- POST /order/1: polling the order (second mode) ----
+  if pathis("/order/1") then
+  begin
+    if srv.finalized then
+    begin
+      srv.polled := srv.polled + 1;
+      orderreply("valid");
+    end
+    else if srv.validated then orderreply("ready")
+    else orderreply("pending");
     http.finish(200, "application/json");
     return;
   end;
@@ -649,6 +1074,16 @@ begin
       http.finish(404, "application/json");
       return;
     end;
+    if srv.async then
+    begin
+      // The chain as a real authority sends it: the certificate, then its issuer.
+      srv.pemn := 0;
+      pemadd(srv.cert, srv.certn);
+      pemadd(srv.cader, srv.cadern);
+      http.addb(srv.pem, 0, srv.pemn);
+      http.finish(200, "application/pem-certificate-chain");
+      return;
+    end;
     http.addb(srv.cert, 0, srv.certn);
     http.finish(200, "application/pkix-cert");
     return;
@@ -657,6 +1092,9 @@ begin
   http.add("{\"type\":\"urn:ietf:params:acme:error:malformed\"}");
   http.finish(404, "application/json");
 end;
+
+var
+  argbuf: array[0..1023] of char;
 
 begin
   p256.setup;
@@ -669,8 +1107,31 @@ begin
   srv.chalport := argnum(2);
   if (srv.port = 0) or (srv.chalport = 0) then
   begin
-    io.puts(STDERR, "usage: acmesrv <port> <challenge-port>\n");
+    io.puts(STDERR, "usage: acmesrv <port> <challenge-port> [<base-url> <ca.der> <ca-key-hex>]\n");
     halt(1);
+  end;
+  if argc() > 5 then
+  begin
+    srv.async := true;
+    srv.basen := io.argstr(3, srv.base);
+    i := io.argstr(4, argbuf);
+    argbuf[i] := chr(0);
+    srv.cadern := readall(argbuf, srv.cader);
+    if srv.cadern <= 0 then begin io.puts(STDERR, "acmesrv: cannot read the CA certificate\n"); halt(1); end;
+    i := io.argstr(5, argbuf);
+    if i <> 64 then begin io.puts(STDERR, "acmesrv: the CA key must be 64 hex digits\n"); halt(1); end;
+    k := 0;
+    while k < 32 do
+    begin
+      srv.tmp[k] := chr(hexval(argbuf[2 * k]) * 16 + hexval(argbuf[2 * k + 1]));
+      k := k + 1;
+    end;
+    p256.frombytes(srv.cad, srv.tmp, 0);
+  end
+  else
+  begin
+    srv.basen := io.push(srv.base, 0, "http://127.0.0.1:");
+    srv.basen := io.pushnum(srv.base, srv.basen, srv.port);
   end;
   io.puts(STDOUT, "LISTENING\n");
   // ONE WORKER, AND THAT IS NOT A PERFORMANCE CHOICE. http.serve forks a process per worker

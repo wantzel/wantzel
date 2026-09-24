@@ -40,7 +40,11 @@ trap cleanup EXIT
   || { echo "  FAIL  examples/getcert.wz does not compile"; exit 1; }
 ok "a certificate authority ($(stat -c %s "$tmp/acmesrv") bytes) and a client ($(stat -c %s "$tmp/getcert") bytes) build"
 
-( cd "$tmp" && ./acmesrv "$caport" "$chport" > ca.log 2>&1 & )
+# THE PID IS KEPT, so cleanup can stop the authority. Started as `( ... & )` it was a
+# grandchild nobody knew the number of: every run left one behind, listening, and a later
+# run landing on the same port would have talked to it.
+( cd "$tmp" && exec ./acmesrv "$caport" "$chport" > ca.log 2>&1 ) &
+started="$started $!"
 i=0
 while [ $i -lt 60 ]; do
   ss -tln 2>/dev/null | grep -q ":$caport " && break

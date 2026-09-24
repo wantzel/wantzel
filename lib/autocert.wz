@@ -1,0 +1,2010 @@
+// lib/autocert.wz -- a server that gets its own certificate and keeps it, from inside its
+// own event loop: ACME (RFC 8555) with the HTTP-01 challenge, against Let's Encrypt or any
+// authority that speaks the protocol.
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// WHAT IT JOINS. lib/acme.wz builds and reads the protocol messages, lib/jws.wz signs them,
+// lib/csr.wz makes the request, lib/certstore.wz keeps files, lib/x509.wz and lib/chain.wz
+// read and check certificates, lib/tls.wz talks HTTPS. Each works; none of them decides WHEN
+// to do what. This file is that decision: a state machine that a server's loop steps.
+//
+// THE CONTRACT WITH THE LOOP, in three calls:
+//
+//   autocert.tick             from the loop's timer. Does nothing until something is due;
+//                             then at most ONE outbound HTTPS request, bounded by a timeout.
+//   autocert.answer(path, b)  from the HTTP layer, for GET /.well-known/acme-challenge/<t>:
+//                             the key authorization from memory, or -1 when it is not ours.
+//   autocert.waitms           how long the loop may sleep before the next tick is due.
+//
+// And one thing it does by itself: when a certificate is ready it hands it to the TLS
+// server with tls.setcert. Nothing has to be restarted.
+//
+// WHY ONE REQUEST PER TICK. The authority fetches the challenge from us WHILE the order is
+// pending. A client that does the whole order in one blocking call is not listening at that
+// moment, which is why examples/getcert.wz needs a fork. Stepping instead means the loop
+// runs between the requests -- and the loop is what answers the authority's fetch.
+//
+// THE LIFECYCLE:
+//
+//   start     load the account key and the certificate from the store. A certificate that
+//             parses, matches its key, is for this host and is in date is installed at
+//             once -- and NOT re-ordered while it has more than 30 days left. That is what
+//             makes a restart free: Let's Encrypt counts orders, and a service that orders
+//             on every start locks itself out.
+//   check     daily (and exactly at the renewal moment): renew when fewer than 30 days are
+//             left -- or a third of the lifetime, for a certificate shorter than 90 days.
+//   order     directory, nonce, account (key created on first use and kept), new order,
+//             authorization, challenge, poll, finalize with a NEW key and CSR, poll,
+//             download. Then VERIFY: right host, our key, in date, every link signed by the
+//             next. Then save atomically, then install.
+//   failure   keep serving the old certificate; try again after 1 h, then 6 h, then every
+//             24 h (or later, when the authority says so with Retry-After). The next attempt
+//             is written to the store, so a crash-looping service does not hammer the
+//             authority either.
+//
+// TRUST. Every request to the authority is HTTPS, and the authority's certificate must chain
+// to a root in the trust store (lib/chain.wz) -- a connection that does not verify is
+// refused, never used. When the caller has put no roots in the store, autocert.start calls
+// ch.addsystem: the machine's bundle, or the two built-in Let's Encrypt roots.
+//
+// THE STORE, one directory, 0700, files 0600, every write atomic (lib/certstore.wz):
+//   account.key       the account key, PEM "EC PRIVATE KEY" (openssl reads it)
+//   <host>.pem        the certificate key and the chain, in ONE file, so a crash between
+//                     two writes can never pair a new key with an old certificate
+//   <host>.retry      when the next attempt is allowed, after a failure
+// A missing or read-only store is not fatal: it works, without a cache, and says so.
+//
+// WHAT IS NOT HERE: DNS-01 (only needed for wildcards, and it needs a DNS provider's API),
+// several names in one certificate, revocation, account key rollover.
+
+include "io.wz";
+include "net.wz";
+include "chain.wz";
+include "tls.wz";
+include "acme.wz";
+include "certstore.wz";
+include "dns.wz";
+
+const
+  AUTOCERT.PRODUCTION = "https://acme-v02.api.letsencrypt.org/directory";
+  AUTOCERT.STAGING    = "https://acme-staging-v02.api.letsencrypt.org/directory";
+  AUTOCERT.PREFIX     = "/.well-known/acme-challenge/";
+
+  AUTOCERT.DAY    = 86400;
+  AUTOCERT.MAXREP = 65536;      // one reply from the authority; a chain is about 5 kB
+  AUTOCERT.MAXCERTS = 8;
+  AUTOCERT.MAXPINS = 8;
+
+  // Where an order is. IDLE means no order is running: the next tick is a check.
+  ACS.IDLE      = 0;
+  ACS.DIR       = 1;
+  ACS.NONCE     = 2;
+  ACS.ACCOUNT   = 3;
+  ACS.ORDER     = 4;
+  ACS.AUTHZ     = 5;
+  ACS.CHALLENGE = 6;
+  ACS.POLLAUTHZ = 7;
+  ACS.FINALIZE  = 8;
+  ACS.POLLORDER = 9;
+  ACS.DOWNLOAD  = 10;
+
+var
+  // ---- configuration: set before autocert.start ----
+  autocert.host:  array[0..255] of char;
+  autocert.hostn: int;
+  autocert.email: array[0..255] of char;
+  autocert.emailn: int;
+  autocert.dir:   array[0..511] of char;     // the directory URL; empty means Let's Encrypt
+  autocert.dirn:  int;
+  autocert.usestaging: bool;                 // with no explicit directory: staging, not production
+  autocert.storep: array[0..1023] of char;   // the store; empty means certs/ beside the binary
+  autocert.storepn: int;
+  autocert.checkms:   int;                   // how often to look at the certificate (1 day)
+  autocert.renewsec:  int;                   // renew when fewer seconds than this are left (30 days)
+  autocert.retryms:   int;                   // the first retry after a failure (1 hour)
+  autocert.timeoutms: int;                   // one request to the authority (10 s)
+  autocert.ordertimeoutms: int;              // one whole order, polling included (10 min)
+  autocert.quiet: bool;                      // no log lines on stderr (autocert.msg still has them)
+  autocert.configured: bool;
+
+  // ---- what a caller may read ----
+  autocert.started:  bool;
+  autocert.havecert: bool;                   // a certificate is installed
+  autocert.notafter: int;                    // its expiry, seconds since the epoch
+  autocert.state:    int;                    // one of ACS.*
+  autocert.orders:   int;                    // orders placed since start
+  autocert.installs: int;                    // certificates installed since start
+  autocert.fails:    int;                    // failed attempts in a row
+  autocert.wakeat:   int;                    // monotonic ms of the next tick that does something
+  autocert.caching:  bool;                   // the store can be written
+  autocert.msg:  array[0..1023] of char;     // the last log line, without the newline
+  autocert.msgn: int;
+  autocert.leaf:  array[0..8191] of char;    // the installed certificate, DER
+  autocert.leafn: int;
+  autocert.key.d, autocert.key.qx, autocert.key.qy: array[0..P.N-1] of int;  // its key
+
+  // ---- the order in progress ----
+  autocert.acct.d, autocert.acct.qx, autocert.acct.qy: array[0..P.N-1] of int;
+  autocert.haveacct: bool;
+  autocert.new.d, autocert.new.qx, autocert.new.qy: array[0..P.N-1] of int;
+  autocert.orderurl:  array[0..ACME.MAXURL] of char;
+  autocert.orderurln: int;
+  autocert.token:   array[0..127] of char;   // the challenge we answer; empty = none
+  autocert.tokenn:  int;
+  autocert.keyauth: array[0..255] of char;
+  autocert.keyauthn: int;
+  autocert.orderstart: int;                  // monotonic ms
+  autocert.polls:   int;
+  autocert.pollms:  int;
+  autocert.badnonces: int;
+  autocert.why:     str;                     // why the current order failed
+  autocert.detail:  array[0..511] of char;   // and what the other side said, when it said anything
+  autocert.detailn: int;
+
+  // ---- one HTTPS request ----
+  autocert.uhost:  array[0..255] of char;
+  autocert.uhostn: int;
+  autocert.uport:  int;
+  autocert.upath:  array[0..1023] of char;
+  autocert.upathn: int;
+  autocert.ip:     array[0..3] of int;
+  autocert.req:    array[0..12287] of char;
+  autocert.rep:    array[0..AUTOCERT.MAXREP-1] of char;
+  autocert.repn:   int;
+  autocert.hdrend: int;                      // where the headers end (the body starts)
+  autocert.status: int;                      // the HTTP status
+  autocert.bod:    array[0..AUTOCERT.MAXREP-1] of char;   // the body, de-chunked
+  autocert.bodn:   int;
+  autocert.retryafter: int;                  // seconds, 0 when the reply carried none
+  autocert.loc:    array[0..ACME.MAXURL] of char;
+  autocert.locn:   int;
+  autocert.ep:     int;                      // an epoll set of our own, to wait with a limit
+  autocert.ev:     array[0..11] of char;
+  autocert.tv:     array[0..15] of char;
+  autocert.sa:     array[0..15] of char;
+  autocert.stat:   array[0..31] of char;     // the "status" member of the last reply
+  autocert.statn:  int;
+
+  // ---- names with a fixed address, ahead of DNS (autocert.pin) ----
+  autocert.pinname: array[0..AUTOCERT.MAXPINS * 256 - 1] of char;
+  autocert.pinlen:  array[0..AUTOCERT.MAXPINS-1] of int;
+  autocert.pinip:   array[0..AUTOCERT.MAXPINS * 4 - 1] of int;
+  autocert.pins:    int;
+  autocert.addrs:   array[0..DNS.MAXADDR-1] of int;   // what DNS answered
+
+  // ---- certificates being read or checked ----
+  autocert.chain:  array[0..16383] of char;  // DER, one certificate after another
+  autocert.cat:    array[0..AUTOCERT.MAXCERTS-1] of int;
+  autocert.cn:     array[0..AUTOCERT.MAXCERTS-1] of int;
+  autocert.ncerts: int;
+  autocert.b64:    array[0..16383] of char;  // base64 with the line breaks taken out
+  autocert.der:    array[0..255] of char;    // one key, DER
+  autocert.pemnext: int;
+  autocert.file:   array[0..16383] of char;  // a store file being built or read
+  autocert.filen:  int;
+  autocert.name:   array[0..299] of char;    // a store file name
+  autocert.namen:  int;
+  autocert.kd, autocert.kx, autocert.ky: array[0..P.N-1] of int;   // a key just read
+  autocert.pt: array[0..63] of char;
+
+// ---- logging: one line per step --------------------------------------------------------------
+//
+// ONE LINE, AND IT SAYS WHAT HAPPENED AND WHAT HAPPENS NEXT. An operator reading a journal at
+// three in the morning needs "renewal failed: the authority said X; the old certificate stays;
+// next attempt in 1 h" -- not a state number. Every line also stays in autocert.msg, so a
+// program that logs its own way can pick it up.
+
+procedure autocert.logs(s: str);
+begin
+  if autocert.msgn + slen(s) < len(autocert.msg) then
+    autocert.msgn := io.push(autocert.msg, autocert.msgn, s);
+end;
+
+procedure autocert.logb(b: array of char; n: int);
+var i: int;
+begin
+  i := 0;
+  while (i < n) and (autocert.msgn < len(autocert.msg) - 1) do
+  begin
+    // Bytes from the other side end up in a log line: nothing below a space survives, so a
+    // reply cannot forge a second line.
+    if ord(b[i]) < 32 then autocert.msg[autocert.msgn] := ' '
+    else autocert.msg[autocert.msgn] := b[i];
+    autocert.msgn := autocert.msgn + 1;
+    i := i + 1;
+  end;
+end;
+
+procedure autocert.logn(v: int);
+begin
+  if autocert.msgn + 24 < len(autocert.msg) then
+    autocert.msgn := io.pushnum(autocert.msg, autocert.msgn, v);
+end;
+
+procedure autocert.logbegin;
+begin
+  autocert.msgn := io.push(autocert.msg, 0, "autocert: ");
+  if autocert.hostn > 0 then
+  begin
+    autocert.logb(autocert.host, autocert.hostn);
+    autocert.logs(": ");
+  end;
+end;
+
+procedure autocert.logend;
+begin
+  if autocert.quiet then return;
+  autocert.msg[autocert.msgn] := chr(10);
+  io.out(STDERR, addr(autocert.msg[0]), autocert.msgn + 1);
+end;
+
+procedure autocert.say(s: str);
+begin
+  autocert.logbegin;
+  autocert.logs(s);
+  autocert.logend;
+end;
+
+// A duration the way a person reads it.
+procedure autocert.logdur(ms: int);
+begin
+  if ms < 1000 then begin autocert.logn(ms); autocert.logs(" ms"); end
+  else if ms < 120000 then begin autocert.logn(ms div 1000); autocert.logs(" s"); end
+  else if ms < 7200000 then begin autocert.logn(ms div 60000); autocert.logs(" min"); end
+  else begin autocert.logn(ms div 3600000); autocert.logs(" h"); end;
+end;
+
+// A moment as YYYY-MM-DD, for "valid until".
+procedure autocert.logdate(t: int);
+var days, y, m, d, mdays: int;
+begin
+  days := t div AUTOCERT.DAY;
+  y := 1970;
+  while days >= 365 do
+  begin
+    if x509.leap(y) then
+    begin
+      if days < 366 then break;
+      days := days - 366;
+    end
+    else days := days - 365;
+    y := y + 1;
+  end;
+  m := 1;
+  while m <= 12 do
+  begin
+    mdays := x509.mdays(y, m);
+    if days < mdays then break;
+    days := days - mdays;
+    m := m + 1;
+  end;
+  d := days + 1;
+  autocert.logn(y);
+  autocert.logs("-");
+  if m < 10 then autocert.logs("0");
+  autocert.logn(m);
+  autocert.logs("-");
+  if d < 10 then autocert.logs("0");
+  autocert.logn(d);
+end;
+
+// ---- time -----------------------------------------------------------------------------------
+//
+// TWO CLOCKS, ON PURPOSE. Scheduling uses the monotonic clock, so setting the system clock
+// cannot make a retry fire early or never. Certificate dates use the wall clock, because
+// that is what a certificate's dates are measured against.
+
+function autocert.nowms: int;
+begin
+  return io.now div 1000000;
+end;
+
+function autocert.nowsec: int;
+begin
+  return io.realtime div 1000000000;
+end;
+
+// ---- configuration ----------------------------------------------------------------------------
+
+procedure autocert.defaults;
+begin
+  if autocert.configured then return;
+  autocert.checkms := AUTOCERT.DAY * 1000;
+  autocert.renewsec := 30 * AUTOCERT.DAY;
+  autocert.retryms := 3600 * 1000;
+  autocert.timeoutms := 10000;
+  autocert.ordertimeoutms := 600 * 1000;
+  autocert.configured := true;
+end;
+
+procedure autocert.copyin(dst: array of char; src: array of char; n: array of int);
+var i: int;
+begin
+  i := 0;
+  while (i < len(src)) and (i < len(dst)) do begin dst[i] := src[i]; i := i + 1; end;
+  n[0] := i;
+end;
+
+// The name the certificate is for. One name per certificate.
+procedure autocert.sethost(h: array of char);
+var n: array[0..0] of int;
+begin
+  autocert.defaults;
+  autocert.copyin(autocert.host, h, n);
+  autocert.hostn := n[0];
+end;
+
+// A contact address for the account; the authority mails about expiry and policy changes.
+procedure autocert.setemail(e: array of char);
+var n: array[0..0] of int;
+begin
+  autocert.defaults;
+  autocert.copyin(autocert.email, e, n);
+  autocert.emailn := n[0];
+end;
+
+// An explicit directory URL -- a private authority, or a test fixture. Overrides staging.
+procedure autocert.setdirectory(u: array of char);
+var n: array[0..0] of int;
+begin
+  autocert.defaults;
+  autocert.copyin(autocert.dir, u, n);
+  autocert.dirn := n[0];
+end;
+
+// Where the store lives. Not called: certs/ beside the binary.
+procedure autocert.setstore(p: array of char);
+var n: array[0..0] of int;
+begin
+  autocert.defaults;
+  autocert.copyin(autocert.storep, p, n);
+  autocert.storepn := n[0];
+end;
+
+// The timing, in one call, for a caller that needs other values than the defaults (a test
+// shrinks them to seconds). Zero or less keeps a value as it is.
+procedure autocert.settiming(checkms: int; renewsec: int; retryms: int; timeoutms: int);
+begin
+  autocert.defaults;
+  if checkms > 0 then autocert.checkms := checkms;
+  if renewsec > 0 then autocert.renewsec := renewsec;
+  if retryms > 0 then autocert.retryms := retryms;
+  if timeoutms > 0 then autocert.timeoutms := timeoutms;
+end;
+
+// A fixed address for a name, the way /etc/hosts gives one. See autocert.resolve.
+function autocert.pin(name: array of char; a: int; b: int; c: int; d: int): bool;
+var i: int;
+begin
+  if (autocert.pins >= AUTOCERT.MAXPINS) or (len(name) > 255) or (len(name) = 0) then return false;
+  i := 0;
+  while i < len(name) do
+  begin
+    autocert.pinname[autocert.pins * 256 + i] := name[i];
+    i := i + 1;
+  end;
+  autocert.pinlen[autocert.pins] := len(name);
+  autocert.pinip[autocert.pins * 4] := a;
+  autocert.pinip[autocert.pins * 4 + 1] := b;
+  autocert.pinip[autocert.pins * 4 + 2] := c;
+  autocert.pinip[autocert.pins * 4 + 3] := d;
+  autocert.pins := autocert.pins + 1;
+  return true;
+end;
+
+// ---- small byte helpers ------------------------------------------------------------------------
+
+function autocert.lower(c: char): int;
+var v: int;
+begin
+  v := ord(c);
+  if (v >= 65) and (v <= 90) then return v + 32;
+  return v;
+end;
+
+// Does b[at..n) start with s, ignoring case?
+function autocert.starts(b: array of char; at: int; n: int; s: str): bool;
+var i: int;
+begin
+  if at + slen(s) > n then return false;
+  i := 0;
+  while i < slen(s) do
+  begin
+    if autocert.lower(b[at + i]) <> autocert.lower(schar(s, i)) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// Is the last status read exactly s?
+function autocert.statis(s: str): bool;
+var i: int;
+begin
+  if autocert.statn <> slen(s) then return false;
+  i := 0;
+  while i < autocert.statn do
+  begin
+    if autocert.stat[i] <> schar(s, i) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// ---- URLs ------------------------------------------------------------------------------------
+//
+// https://host[:port]/path, and nothing else. The authority hands us URLs for every later
+// step, so this parser sees text from the other side: anything it does not expect is
+// refused, not guessed at. No user@, no IPv6 brackets, no plain http -- the last one on
+// purpose, because a directory over plain HTTP can be rewritten by anyone on the path.
+function autocert.parseurl(u: array of char; n: int): bool;
+var i, port, digits: int;
+    c: char;
+begin
+  autocert.uhostn := 0;
+  autocert.upathn := 0;
+  autocert.uport := 443;
+  if not autocert.starts(u, 0, n, "https://") then return false;
+  i := 8;
+  while i < n do
+  begin
+    c := u[i];
+    if (c = ':') or (c = '/') then break;
+    if not (((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z'))
+            or ((c >= '0') and (c <= '9')) or (c = '.') or (c = '-')) then return false;
+    if autocert.uhostn >= len(autocert.uhost) then return false;
+    autocert.uhost[autocert.uhostn] := c;
+    autocert.uhostn := autocert.uhostn + 1;
+    i := i + 1;
+  end;
+  if autocert.uhostn = 0 then return false;
+  if (i < n) and (u[i] = ':') then
+  begin
+    i := i + 1;
+    port := 0;
+    digits := 0;
+    while (i < n) and (u[i] >= '0') and (u[i] <= '9') do
+    begin
+      port := port * 10 + (ord(u[i]) - ord('0'));
+      digits := digits + 1;
+      if port > 65535 then return false;
+      i := i + 1;
+    end;
+    if (digits = 0) or (port = 0) then return false;
+    autocert.uport := port;
+  end;
+  if i >= n then
+  begin
+    autocert.upath[0] := '/';
+    autocert.upathn := 1;
+    return true;
+  end;
+  if u[i] <> '/' then return false;
+  while i < n do
+  begin
+    // A path goes into a request line: a control character or a space would end it early
+    // and put the rest somewhere else.
+    if ord(u[i]) <= 32 then return false;
+    if autocert.upathn >= len(autocert.upath) then return false;
+    autocert.upath[autocert.upathn] := u[i];
+    autocert.upathn := autocert.upathn + 1;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// ---- from a name to an address ------------------------------------------------------------------
+//
+// THE ONLY PLACE A HOSTNAME BECOMES AN ADDRESS. Everything that connects goes through here, so
+// adding a resolver is one call in one place.
+//
+// In order: a literal a.b.c.d; a name pinned with autocert.pin; localhost; and then DNS.
+function autocert.dotted(h: array of char; n: int): bool;
+var i, k, v, digits: int;
+begin
+  i := 0;
+  k := 0;
+  while k < 4 do
+  begin
+    v := 0;
+    digits := 0;
+    while (i < n) and (h[i] >= '0') and (h[i] <= '9') and (digits < 4) do
+    begin
+      v := v * 10 + (ord(h[i]) - ord('0'));
+      digits := digits + 1;
+      i := i + 1;
+    end;
+    if (digits = 0) or (v > 255) then return false;
+    autocert.ip[k] := v;
+    k := k + 1;
+    if k < 4 then
+    begin
+      if (i >= n) or (h[i] <> '.') then return false;
+      i := i + 1;
+    end;
+  end;
+  return i = n;
+end;
+
+function autocert.resolve(h: array of char; n: int): bool;
+var p, i, got: int;
+    same: bool;
+begin
+  if autocert.dotted(h, n) then return true;
+  p := 0;
+  while p < autocert.pins do
+  begin
+    if autocert.pinlen[p] = n then
+    begin
+      same := true;
+      i := 0;
+      while (i < n) and same do
+      begin
+        if autocert.lower(autocert.pinname[p * 256 + i]) <> autocert.lower(h[i]) then same := false;
+        i := i + 1;
+      end;
+      if same then
+      begin
+        autocert.ip[0] := autocert.pinip[p * 4];
+        autocert.ip[1] := autocert.pinip[p * 4 + 1];
+        autocert.ip[2] := autocert.pinip[p * 4 + 2];
+        autocert.ip[3] := autocert.pinip[p * 4 + 3];
+        return true;
+      end;
+    end;
+    p := p + 1;
+  end;
+  if autocert.starts(h, 0, n, "localhost") and (n = 9) then
+  begin
+    autocert.ip[0] := 127; autocert.ip[1] := 0; autocert.ip[2] := 0; autocert.ip[3] := 1;
+    return true;
+  end;
+  // ---- DNS, AND ONLY HERE ---------------------------------------------------------------
+  // The system's nameservers (lib/dns.wz), bounded in time; the first address is used.
+  got := dns.resolve(h[0..n - 1], autocert.addrs);
+  if got <= 0 then
+  begin
+    autocert.why := "cannot resolve the authority's name";
+    autocert.detailn := io.push(autocert.detail, 0, dns.error(got));
+    return false;
+  end;
+  autocert.ip[0] := band(autocert.addrs[0] shr 24, 255);
+  autocert.ip[1] := band(autocert.addrs[0] shr 16, 255);
+  autocert.ip[2] := band(autocert.addrs[0] shr 8, 255);
+  autocert.ip[3] := band(autocert.addrs[0], 255);
+  return true;
+end;
+
+// ---- one HTTPS request ------------------------------------------------------------------------
+//
+// EVERY STEP HAS A LIMIT. SO_SNDTIMEO bounds the blocking connect() (Linux honours it there).
+// After that lib/tls.wz takes over the socket: it switches it to non-blocking mode and ends
+// every call within tls.deadline, set here to autocert.timeoutms. The wait for the reply --
+// where an authority takes its time -- is done here as well, with epoll and the same limit
+// for the whole reply, before each read.
+procedure autocert.settimeout(fd: int; opt: int; ms: int);
+var r: int;
+begin
+  io.put64(autocert.tv, 0, ms div 1000);
+  io.put64(autocert.tv, 8, (ms mod 1000) * 1000);
+  // SO_RCVTIMEO is 20 and SO_SNDTIMEO 21 on Linux. The result is not checked: a platform
+  // without them (the Windows runtime ignores both) still works, just without this bound,
+  // and the epoll wait below still applies.
+  r := sys5(SYS.setsockopt, fd, SOL_SOCKET, opt, addr(autocert.tv[0]), 16);
+end;
+
+function autocert.dial: int;
+var fd, r, i: int;
+begin
+  fd := sys3(SYS.socket, AF_INET, SOCK_STREAM, 0);
+  if fd < 0 then return fd;
+  autocert.settimeout(fd, 21, autocert.timeoutms);
+  i := 0;
+  while i < 16 do begin autocert.sa[i] := chr(0); i := i + 1; end;
+  autocert.sa[0] := chr(AF_INET);
+  autocert.sa[2] := chr(band(autocert.uport shr 8, 255));
+  autocert.sa[3] := chr(band(autocert.uport, 255));
+  i := 0;
+  while i < 4 do begin autocert.sa[4 + i] := chr(band(autocert.ip[i], 255)); i := i + 1; end;
+  r := sys3(SYS.connect, fd, addr(autocert.sa[0]), 16);
+  if r < 0 then
+  begin
+    net.close(fd);
+    return r;
+  end;
+  return fd;
+end;
+
+// Wait until fd has something to read, or the deadline passes.
+function autocert.readable(fd: int; deadline: int): bool;
+var left, n: int;
+begin
+  left := deadline - autocert.nowms;
+  if left <= 0 then return false;
+  if not net.watch(autocert.ep, EPOLL_ADD, fd, EPOLLIN) then return true;   // cannot wait: just read
+  n := net.wait(autocert.ep, addr(autocert.ev[0]), 1, left);
+  if net.watch(autocert.ep, EPOLL_DEL, fd, EPOLLIN) then n := n;
+  return n > 0;
+end;
+
+// A header of the reply, case-insensitively, into dst. Returns its length, or -1.
+function autocert.header(name: str; dst: array of char): int;
+var i, k, n: int;
+begin
+  i := 0;
+  while i < autocert.hdrend do
+  begin
+    if ((i = 0) or (autocert.rep[i - 1] = chr(10)))
+       and autocert.starts(autocert.rep, i, autocert.hdrend, name)
+       and (i + slen(name) < autocert.hdrend) and (autocert.rep[i + slen(name)] = ':') then
+    begin
+      k := i + slen(name) + 1;
+      while (k < autocert.hdrend) and ((autocert.rep[k] = ' ') or (autocert.rep[k] = chr(9))) do k := k + 1;
+      n := 0;
+      while (k < autocert.hdrend) and (autocert.rep[k] <> chr(13)) and (autocert.rep[k] <> chr(10)) do
+      begin
+        if n >= len(dst) then return 0 - 1;
+        dst[n] := autocert.rep[k];
+        n := n + 1;
+        k := k + 1;
+      end;
+      return n;
+    end;
+    i := i + 1;
+  end;
+  return 0 - 1;
+end;
+
+function autocert.number(b: array of char; n: int): int;
+var i, v: int;
+begin
+  if n <= 0 then return 0 - 1;
+  v := 0;
+  i := 0;
+  while i < n do
+  begin
+    if (b[i] < '0') or (b[i] > '9') then return 0 - 1;
+    v := v * 10 + (ord(b[i]) - ord('0'));
+    if v > 1000000000 then return 0 - 1;
+    i := i + 1;
+  end;
+  return v;
+end;
+
+// Where the headers end, or -1 while they have not all arrived.
+function autocert.findend(n: int): int;
+var i: int;
+begin
+  i := 0;
+  while i + 3 < n do
+  begin
+    if (autocert.rep[i] = chr(13)) and (autocert.rep[i + 1] = chr(10))
+       and (autocert.rep[i + 2] = chr(13)) and (autocert.rep[i + 3] = chr(10)) then return i + 4;
+    i := i + 1;
+  end;
+  return 0 - 1;
+end;
+
+var
+  autocert.clen:    int;      // Content-Length, -1 when absent
+  autocert.chunked: bool;
+  autocert.hv:      array[0..63] of char;
+
+// Has the whole reply arrived? Only asked once the headers are in.
+function autocert.complete(n: int): bool;
+var i: int;
+begin
+  if autocert.clen >= 0 then return n >= autocert.hdrend + autocert.clen;
+  if autocert.chunked then
+  begin
+    // The last chunk is "0" CRLF, then (no trailers here) CRLF.
+    i := autocert.hdrend;
+    while i + 4 < n do
+    begin
+      if ((i = autocert.hdrend) or ((autocert.rep[i - 2] = chr(13)) and (autocert.rep[i - 1] = chr(10))))
+         and (autocert.rep[i] = '0') and (autocert.rep[i + 1] = chr(13)) and (autocert.rep[i + 2] = chr(10))
+         and (autocert.rep[i + 3] = chr(13)) and (autocert.rep[i + 4] = chr(10)) then return true;
+      i := i + 1;
+    end;
+    return false;
+  end;
+  // Neither: the body ends where the connection does. A reply that has no body at all says so
+  // with its status.
+  return (autocert.status = 204) or (autocert.status = 304);
+end;
+
+// Read the headers we use, once they are all there.
+procedure autocert.readhead;
+var n: int;
+begin
+  autocert.status := 0;
+  if (autocert.hdrend > 12) and autocert.starts(autocert.rep, 0, autocert.hdrend, "HTTP/1.") then
+    autocert.status := (ord(autocert.rep[9]) - ord('0')) * 100 + (ord(autocert.rep[10]) - ord('0')) * 10
+                       + (ord(autocert.rep[11]) - ord('0'));
+  autocert.clen := 0 - 1;
+  n := autocert.header("content-length", autocert.hv);
+  if n > 0 then autocert.clen := autocert.number(autocert.hv, n);
+  autocert.chunked := false;
+  n := autocert.header("transfer-encoding", autocert.hv);
+  if (n >= 7) and autocert.starts(autocert.hv, n - 7, n, "chunked") then
+  begin
+    autocert.chunked := true;
+    autocert.clen := 0 - 1;
+  end;
+end;
+
+// The body out of the reply, into autocert.bod, undoing chunked encoding. False when the
+// chunks do not add up -- a truncated or garbled body is refused, not half-used.
+function autocert.takebody: bool;
+var i, size, v, k: int;
+    c: char;
+begin
+  autocert.bodn := 0;
+  if not autocert.chunked then
+  begin
+    size := autocert.repn - autocert.hdrend;
+    if (autocert.clen >= 0) and (autocert.clen < size) then size := autocert.clen;
+    k := 0;
+    while k < size do begin autocert.bod[k] := autocert.rep[autocert.hdrend + k]; k := k + 1; end;
+    autocert.bodn := size;
+    return true;
+  end;
+  i := autocert.hdrend;
+  while true do
+  begin
+    size := 0;
+    k := 0;
+    while i < autocert.repn do
+    begin
+      c := autocert.rep[i];
+      v := 0 - 1;
+      if (c >= '0') and (c <= '9') then v := ord(c) - ord('0')
+      else if (c >= 'a') and (c <= 'f') then v := ord(c) - ord('a') + 10
+      else if (c >= 'A') and (c <= 'F') then v := ord(c) - ord('A') + 10;
+      if v < 0 then break;
+      size := size * 16 + v;
+      k := k + 1;
+      if k > 7 then return false;
+      i := i + 1;
+    end;
+    if k = 0 then return false;
+    // skip a chunk extension, then the CRLF
+    while (i < autocert.repn) and (autocert.rep[i] <> chr(10)) do i := i + 1;
+    i := i + 1;
+    if size = 0 then return true;
+    if (i + size > autocert.repn) or (autocert.bodn + size > len(autocert.bod)) then return false;
+    k := 0;
+    while k < size do
+    begin
+      autocert.bod[autocert.bodn] := autocert.rep[i + k];
+      autocert.bodn := autocert.bodn + 1;
+      k := k + 1;
+    end;
+    i := i + size + 2;          // the data, then its CRLF
+    if i > autocert.repn then return false;
+  end;
+  return false;
+end;
+
+// One request: GET when post is false, otherwise POST body as application/jose+json. The URL
+// is absolute (https://...). True when a complete reply came back, whatever its status;
+// false, with autocert.why set, when the transport failed -- in which case nothing in the
+// reply may be used.
+function autocert.fetch(url: array of char; urln: int; post: bool; body: array of char; bodyn: int): bool;
+var fd, n, i, deadline, r: int;
+begin
+  autocert.repn := 0;
+  autocert.hdrend := 0 - 1;
+  autocert.status := 0;
+  autocert.bodn := 0;
+  autocert.locn := 0;
+  autocert.retryafter := 0;
+  if not autocert.parseurl(url, urln) then
+  begin
+    autocert.why := "the authority gave a URL this client does not accept (https only)";
+    return false;
+  end;
+  if not autocert.resolve(autocert.uhost, autocert.uhostn) then return false;
+  deadline := autocert.nowms + autocert.timeoutms;
+
+  fd := autocert.dial;
+  if fd < 0 then
+  begin
+    autocert.why := "cannot connect to the authority";
+    return false;
+  end;
+
+  // THE HANDSHAKE, WITH THE DATE AND THE NAME CHECKED AND THE CHAIN VERIFIED.
+  tls.now := autocert.nowsec;
+  tls.deadline := autocert.timeoutms;
+  if not tls.connectb(fd, autocert.uhost, autocert.uhostn) then
+  begin
+    net.close(fd);
+    autocert.why := "the TLS handshake with the authority failed";
+    autocert.detailn := io.push(autocert.detail, 0, tls.errmsg);
+    return false;
+  end;
+  // NOT VERIFIED MEANS NOT USED. An encrypted connection to someone who cannot show a
+  // certificate we trust is a connection to whoever is in the way, and they would be the
+  // one choosing our certificate.
+  if not tls.verified then
+  begin
+    tls.close;
+    net.close(fd);
+    autocert.why := "the authority's certificate is not trusted";
+    if slen(tls.chainerr) > 0 then autocert.detailn := io.push(autocert.detail, 0, tls.chainerr)
+    else autocert.detailn := io.push(autocert.detail, 0, "the server did not prove it holds its key");
+    return false;
+  end;
+
+  if post then n := io.push(autocert.req, 0, "POST ") else n := io.push(autocert.req, 0, "GET ");
+  i := 0;
+  while i < autocert.upathn do begin autocert.req[n] := autocert.upath[i]; n := n + 1; i := i + 1; end;
+  n := io.push(autocert.req, n, " HTTP/1.1\r\nHost: ");
+  i := 0;
+  while i < autocert.uhostn do begin autocert.req[n] := autocert.uhost[i]; n := n + 1; i := i + 1; end;
+  if autocert.uport <> 443 then
+  begin
+    n := io.push(autocert.req, n, ":");
+    n := io.pushnum(autocert.req, n, autocert.uport);
+  end;
+  n := io.push(autocert.req, n, "\r\nUser-Agent: wantzel-autocert\r\nAccept: */*\r\nConnection: close\r\n");
+  if post then
+  begin
+    if n + bodyn + 100 > len(autocert.req) then
+    begin
+      tls.close;
+      net.close(fd);
+      autocert.why := "the request does not fit";
+      return false;
+    end;
+    n := io.push(autocert.req, n, "Content-Type: application/jose+json\r\nContent-Length: ");
+    n := io.pushnum(autocert.req, n, bodyn);
+    n := io.push(autocert.req, n, "\r\n\r\n");
+    i := 0;
+    while i < bodyn do begin autocert.req[n] := body[i]; n := n + 1; i := i + 1; end;
+  end
+  else n := io.push(autocert.req, n, "\r\n");
+  if not tls.write(autocert.req, n) then
+  begin
+    net.close(fd);
+    autocert.why := "the request could not be sent";
+    return false;
+  end;
+
+  // THE REPLY, with the deadline checked before every read that would wait.
+  while true do
+  begin
+    if autocert.repn >= AUTOCERT.MAXREP then
+    begin
+      tls.close;
+      net.close(fd);
+      autocert.why := "the authority's reply is too large";
+      return false;
+    end;
+    if (tls.plainat >= tls.plainn) and (not autocert.readable(fd, deadline)) then
+    begin
+      tls.close;
+      net.close(fd);
+      autocert.why := "the authority did not answer in time";
+      return false;
+    end;
+    r := tls.read(autocert.rep[autocert.repn..AUTOCERT.MAXREP - 1], AUTOCERT.MAXREP - autocert.repn);
+    if r <= 0 then break;
+    autocert.repn := autocert.repn + r;
+    if autocert.hdrend < 0 then
+    begin
+      autocert.hdrend := autocert.findend(autocert.repn);
+      if autocert.hdrend >= 0 then autocert.readhead;
+    end;
+    if (autocert.hdrend >= 0) and autocert.complete(autocert.repn) then break;
+  end;
+  tls.close;
+  net.close(fd);
+
+  if autocert.hdrend < 0 then
+  begin
+    autocert.why := "the authority's reply ended before its headers did";
+    return false;
+  end;
+  if (autocert.clen >= 0) and (autocert.repn < autocert.hdrend + autocert.clen) then
+  begin
+    autocert.why := "the authority's reply is shorter than it said";
+    return false;
+  end;
+  if not autocert.takebody then
+  begin
+    autocert.why := "the authority's reply has a broken chunked body";
+    return false;
+  end;
+
+  // Every reply may carry the next nonce; keep it whenever there is one.
+  if acme.readnonce(autocert.rep, autocert.hdrend) then n := n;
+  autocert.locn := autocert.header("location", autocert.loc);
+  if autocert.locn < 0 then autocert.locn := 0;
+  n := autocert.header("retry-after", autocert.hv);
+  if n > 0 then autocert.retryafter := autocert.number(autocert.hv, n);
+  if autocert.retryafter < 0 then autocert.retryafter := 0;
+  return true;
+end;
+
+// ---- reading what the authority said ---------------------------------------------------------
+
+// The "status" member of the body, into autocert.stat.
+function autocert.readstat: bool;
+begin
+  acme.err := "";
+  autocert.statn := acme.get(autocert.bod, autocert.bodn, "status", autocert.stat, len(autocert.stat) - 1);
+  if autocert.statn < 0 then begin autocert.statn := 0; return false; end;
+  return true;
+end;
+
+// An error document (RFC 7807): its type and detail, into autocert.detail.
+procedure autocert.readproblem;
+var n, i, k: int;
+begin
+  acme.err := "";
+  autocert.detailn := 0;
+  n := acme.get(autocert.bod, autocert.bodn, "type", autocert.detail, 200);
+  if n > 0 then
+  begin
+    autocert.detailn := n;
+    autocert.detailn := io.push(autocert.detail, autocert.detailn, ": ");
+  end;
+  acme.err := "";
+  n := acme.get(autocert.bod, autocert.bodn, "detail", autocert.detail[autocert.detailn..len(autocert.detail) - 1], 250);
+  if n > 0 then autocert.detailn := autocert.detailn + n
+  else if autocert.detailn >= 2 then autocert.detailn := autocert.detailn - 2;
+  if autocert.detailn = 0 then autocert.detailn := io.push(autocert.detail, 0, "(no explanation in the reply)");
+  // The text is a JSON string body: \" and \\ become what they stand for, so the log line
+  // reads as the authority wrote it.
+  k := 0;
+  i := 0;
+  while i < autocert.detailn do
+  begin
+    if (autocert.detail[i] = '\\') and (i + 1 < autocert.detailn) then i := i + 1;
+    autocert.detail[k] := autocert.detail[i];
+    k := k + 1;
+    i := i + 1;
+  end;
+  autocert.detailn := k;
+end;
+
+// Is the error of the last reply this type (the part after "urn:ietf:params:acme:error:")?
+function autocert.problemis(t: str): bool;
+var n, i, k: int;
+begin
+  acme.err := "";
+  n := acme.get(autocert.bod, autocert.bodn, "type", autocert.hv, len(autocert.hv) - 1);
+  if n < slen(t) then return false;
+  k := n - slen(t);
+  i := 0;
+  while i < slen(t) do
+  begin
+    if autocert.hv[k + i] <> schar(t, i) then return false;
+    i := i + 1;
+  end;
+  return (k = 0) or (autocert.hv[k - 1] = ':');
+end;
+
+// ---- PEM ------------------------------------------------------------------------------------------
+//
+// One block "-----BEGIN <label>-----" ... "-----END <label>-----", decoded into
+// dst[at..]. Returns the decoded length, or -1 when there is no such block from `from` on or
+// it does not decode. autocert.pemnext is where the search can go on; autocert.pemerr is true
+// when a block was there but broken, which is not the same as no block.
+var autocert.pemerr: bool;
+
+function autocert.pemblock(b: array of char; from: int; n: int; lbl: str; dst: array of char; at: int): int;
+var i, k, bodyat, m: int;
+    found: bool;
+begin
+  autocert.pemnext := n;
+  autocert.pemerr := false;
+  i := from;
+  found := false;
+  while (i < n) and (not found) do
+  begin
+    if autocert.starts(b, i, n, "-----BEGIN ") and autocert.starts(b, i + 11, n, lbl)
+       and autocert.starts(b, i + 11 + slen(lbl), n, "-----") then found := true
+    else i := i + 1;
+  end;
+  if not found then return 0 - 1;
+  autocert.pemerr := true;
+  bodyat := i + 16 + slen(lbl);
+  k := bodyat;
+  while (k < n) and (not autocert.starts(b, k, n, "-----END ")) do k := k + 1;
+  if k >= n then return 0 - 1;
+  // Line breaks are not part of the data; base64.decode refuses them, so they come out first.
+  m := 0;
+  i := bodyat;
+  while i < k do
+  begin
+    if ord(b[i]) > 32 then
+    begin
+      if m >= len(autocert.b64) then return 0 - 1;
+      autocert.b64[m] := b[i];
+      m := m + 1;
+    end;
+    i := i + 1;
+  end;
+  autocert.pemnext := k + 9;
+  if m = 0 then return 0 - 1;
+  m := base64.decode(autocert.b64[0..m - 1], dst[at..len(dst) - 1]);
+  if m > 0 then autocert.pemerr := false;
+  return m;
+end;
+
+// Write src[0..n) as a PEM block at dst[at..], 64 characters to a line. Returns the new
+// position, or -1 when it does not fit (or at is already -1, so calls can be chained).
+function autocert.pemput(dst: array of char; at: int; lbl: str; src: array of char; n: int): int;
+var m, i: int;
+begin
+  if at < 0 then return 0 - 1;
+  if at + (n + 2) div 3 * 4 + (n + 47) div 48 + 2 * slen(lbl) + 40 > len(dst) then return 0 - 1;
+  at := io.push(dst, at, "-----BEGIN ");
+  at := io.push(dst, at, lbl);
+  at := io.push(dst, at, "-----\n");
+  m := base64.encode(autocert.b64, 0, src[0..n - 1]);
+  i := 0;
+  while i < m do
+  begin
+    dst[at] := autocert.b64[i];
+    at := at + 1;
+    i := i + 1;
+    if (i mod 64 = 0) or (i = m) then begin dst[at] := chr(10); at := at + 1; end;
+  end;
+  at := io.push(dst, at, "-----END ");
+  at := io.push(dst, at, lbl);
+  at := io.push(dst, at, "-----\n");
+  return at;
+end;
+
+// ---- keys on disk ---------------------------------------------------------------------------------
+//
+// SEC 1 "EC PRIVATE KEY", which openssl reads and writes: version 1, the 32-byte scalar,
+// the curve, and the public point. For P-256 the encoding has one shape and one length, so
+// it is written and checked as that shape rather than parsed generically.
+const AUTOCERT.KEYLEN = 121;
+
+procedure autocert.keyder(d: array of int; qx: array of int; qy: array of int);
+var i: int;
+begin
+  i := io.push(autocert.der, 0, "\x30\x77\x02\x01\x01\x04\x20");
+  p256.tobytes(autocert.der, 7, d);
+  i := io.push(autocert.der, 39, "\xa0\x0a\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07\xa1\x44\x03\x42\x00\x04");
+  p256.tobytes(autocert.der, 57, qx);
+  p256.tobytes(autocert.der, 89, qy);
+end;
+
+function autocert.same(a: array of char; at: int; s: str): bool;
+var i: int;
+begin
+  i := 0;
+  while i < slen(s) do
+  begin
+    if a[at + i] <> schar(s, i) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+// Read a key block from b[0..n) into autocert.kd/kx/ky. False when it is not there, is not
+// this shape, or its public half does not belong to its private half -- a key file that is
+// damaged in the scalar would otherwise sign with a key nobody has a certificate for.
+//
+// Two shapes, both P-256 with the public point: SEC 1 "EC PRIVATE KEY" (what this file
+// writes, and `openssl ecparam -genkey`), and PKCS #8 "PRIVATE KEY" (`openssl genpkey`,
+// `openssl req -newkey ec`), which wraps the same key without the curve inside it.
+function autocert.readkey(b: array of char; n: int): bool;
+var m, dat, xat: int;
+begin
+  m := autocert.pemblock(b, 0, n, "EC PRIVATE KEY", autocert.der, 0);
+  if m >= 0 then
+  begin
+    if m <> AUTOCERT.KEYLEN then return false;
+    if not autocert.same(autocert.der, 0, "\x30\x77\x02\x01\x01\x04\x20") then return false;
+    if not autocert.same(autocert.der, 39, "\xa0\x0a\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07\xa1\x44\x03\x42\x00\x04") then return false;
+    dat := 7;
+    xat := 57;
+  end
+  else
+  begin
+    m := autocert.pemblock(b, 0, n, "PRIVATE KEY", autocert.der, 0);
+    if m <> 138 then return false;
+    if not autocert.same(autocert.der, 0, "\x30\x81\x87\x02\x01\x00\x30\x13\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07\x04\x6d\x30\x6b\x02\x01\x01\x04\x20") then return false;
+    if not autocert.same(autocert.der, 68, "\xa1\x44\x03\x42\x00\x04") then return false;
+    dat := 36;
+    xat := 74;
+  end;
+  p256.setup;
+  p256.frombytes(autocert.kd, autocert.der, dat);
+  if not p256.inrange(autocert.kd) then return false;
+  p256.frombytes(autocert.kx, autocert.der, xat);
+  p256.frombytes(autocert.ky, autocert.der, xat + 32);
+  p256.mulpoint(p256.gx, p256.gy, autocert.kd);
+  if p256.iszero(p256.az) then return false;
+  p256.affine;
+  return (p256.cmp(p256.t0, autocert.kx) = 0) and (p256.cmp(p256.t1, autocert.ky) = 0);
+end;
+
+// ---- the store -----------------------------------------------------------------------------------
+
+procedure autocert.setname(suffix: str);
+var i: int;
+begin
+  i := 0;
+  while i < autocert.hostn do begin autocert.name[i] := autocert.host[i]; i := i + 1; end;
+  autocert.namen := io.push(autocert.name, autocert.hostn, suffix);
+end;
+
+// Write autocert.file to a store file. A failure is logged and otherwise harmless: the
+// certificate is still in memory and still served.
+function autocert.save(name: array of char; n: int; what: str): bool;
+begin
+  if not autocert.caching then return false;
+  if cs.write(name, n, autocert.file, autocert.filen) then return true;
+  autocert.caching := false;
+  autocert.logbegin;
+  autocert.logs("cannot save the ");
+  autocert.logs(what);
+  autocert.logs(" (");
+  autocert.logs(cs.err);
+  autocert.logs("): working without a cache, and a restart will order again");
+  autocert.logend;
+  return false;
+end;
+
+// The time of the next allowed attempt and the failures so far, as "<unix seconds> <count>".
+procedure autocert.saveretry(at: int);
+begin
+  autocert.filen := io.pushnum(autocert.file, 0, at);
+  autocert.filen := io.push(autocert.file, autocert.filen, " ");
+  autocert.filen := io.pushnum(autocert.file, autocert.filen, autocert.fails);
+  autocert.filen := io.push(autocert.file, autocert.filen, "\n");
+  autocert.setname(".retry");
+  if autocert.save(autocert.name, autocert.namen, "retry state") then at := at;
+end;
+
+// ---- checking a certificate chain ----------------------------------------------------------------
+
+// Every CERTIFICATE block of b[0..n) into autocert.chain. Returns how many, or -1 when one does
+// not decode or there are too many.
+function autocert.readchain(b: array of char; n: int): int;
+var from, at, m: int;
+begin
+  autocert.ncerts := 0;
+  from := 0;
+  at := 0;
+  while true do
+  begin
+    m := autocert.pemblock(b, from, n, "CERTIFICATE", autocert.chain, at);
+    if m < 0 then
+    begin
+      // no further block is the normal end; a block that is there but broken is not
+      if autocert.pemerr then return 0 - 1;
+      return autocert.ncerts;
+    end;
+    if autocert.ncerts >= AUTOCERT.MAXCERTS then return 0 - 1;
+    autocert.cat[autocert.ncerts] := at;
+    autocert.cn[autocert.ncerts] := m;
+    autocert.ncerts := autocert.ncerts + 1;
+    at := at + m;
+    from := autocert.pemnext;
+  end;
+  return 0 - 1;
+end;
+
+// THE CHECKS A CERTIFICATE MUST PASS BEFORE IT IS SERVED -- whether it just came from the
+// authority or was read from disk:
+//   1. the leaf parses, and it is for autocert.host
+//   2. its key is (qx, qy): the private half is ours. A certificate for another key is
+//      useless in a way that only shows at the first handshake
+//   3. it is in date: not before its notBefore (five minutes of clock skew allowed), not
+//      after its notAfter
+//   4. every certificate in the chain is signed by the next, and each signer is a CA
+// Whether the top of the chain reaches a root this machine trusts is REPORTED, not required:
+// a staging or private authority issues under a root that is rightly not in the system
+// bundle, and the certificate is still the one that was asked for.
+var
+  autocert.verr: str;
+  autocert.rooted: bool;
+  autocert.cnotafter: int;      // the checked certificate's expiry
+
+function autocert.check(qx: array of int; qy: array of int; now: int): bool;
+var i: int;
+begin
+  autocert.verr := "";
+  autocert.rooted := false;
+  if autocert.ncerts <= 0 then begin autocert.verr := "no certificate"; return false; end;
+  if not x509.parse(autocert.chain, autocert.cat[0], autocert.cat[0] + autocert.cn[0]) then
+    begin autocert.verr := "the certificate does not parse"; return false; end;
+  if not x509.matchesb(autocert.chain, autocert.host, autocert.hostn) then
+    begin autocert.verr := "the certificate is not for this host"; return false; end;
+  if (x509.keyalg <> 2) or (x509.keyn <> 65) or (autocert.chain[x509.keyat] <> chr(4)) then
+    begin autocert.verr := "the certificate does not carry a P-256 key"; return false; end;
+  p256.tobytes(autocert.pt, 0, qx);
+  p256.tobytes(autocert.pt, 32, qy);
+  i := 0;
+  while i < 64 do
+  begin
+    if autocert.chain[x509.keyat + 1 + i] <> autocert.pt[i] then
+      begin autocert.verr := "the certificate is for a different key"; return false; end;
+    i := i + 1;
+  end;
+  if now + 300 < x509.notbefore then begin autocert.verr := "the certificate is not valid yet"; return false; end;
+  if now >= x509.notafter then begin autocert.verr := "the certificate has expired"; return false; end;
+  autocert.cnotafter := x509.notafter;
+
+  // the links
+  i := 0;
+  while i + 1 < autocert.ncerts do
+  begin
+    if not x509.parse(autocert.chain, autocert.cat[i + 1], autocert.cat[i + 1] + autocert.cn[i + 1]) then
+      begin autocert.verr := "a certificate in the chain does not parse"; return false; end;
+    if not x509.isca then begin autocert.verr := "the chain has a signer that is not a CA"; return false; end;
+    ch.reset;
+    ch.takekeyfrom(autocert.chain);
+    if not ch.checksig(autocert.chain, autocert.cat[i], autocert.cn[i]) then
+      begin autocert.verr := "a certificate in the chain is not signed by the next"; return false; end;
+    i := i + 1;
+  end;
+
+  // and the root, for the log
+  ch.reset;
+  i := 0;
+  while i < autocert.ncerts do
+  begin
+    if ch.setcert(i, autocert.cat[i], autocert.cn[i]) then i := i + 1 else i := autocert.ncerts;
+  end;
+  autocert.rooted := ch.verify(autocert.chain, autocert.host, autocert.hostn, now);
+  // ch.verify re-parsed other certificates; leave the leaf's fields for the caller.
+  if x509.parse(autocert.chain, autocert.cat[0], autocert.cat[0] + autocert.cn[0]) then i := i;
+  return true;
+end;
+
+// Serve the chain in autocert.chain (leaf first) with key (d, qx, qy), from now on.
+function autocert.install(d: array of int; qx: array of int; qy: array of int): bool;
+var i, total: int;
+begin
+  if autocert.cn[0] > len(autocert.leaf) then return false;
+  i := 0;
+  while i < autocert.cn[0] do begin autocert.leaf[i] := autocert.chain[autocert.cat[0] + i]; i := i + 1; end;
+  autocert.leafn := autocert.cn[0];
+  // THE HAND-OVER. tls.setcert copies the certificate and the key into the TLS server's own
+  // state, so the next handshake uses them; nothing else has to restart.
+  //
+  // THE WHOLE CHAIN, NOT THE LEAF. A browser has the root, never the intermediate that
+  // signed the leaf: a server that sends only its own certificate is refused by every
+  // client that does not happen to have the intermediate cached. readchain put the
+  // certificates back to back from autocert.cat[0] on, leaf first, which is the form
+  // tls.setcert takes.
+  total := autocert.cat[autocert.ncerts - 1] + autocert.cn[autocert.ncerts - 1] - autocert.cat[0];
+  if not tls.setcert(autocert.chain[autocert.cat[0]..autocert.cat[0] + total - 1], total, d) then return false;
+  p256.copy(autocert.key.d, d);
+  p256.copy(autocert.key.qx, qx);
+  p256.copy(autocert.key.qy, qy);
+  autocert.notafter := autocert.cnotafter;
+  autocert.havecert := true;
+  autocert.installs := autocert.installs + 1;
+  return true;
+end;
+
+// ---- start: what is on disk ------------------------------------------------------------------------
+
+procedure autocert.loadaccount;
+var n: int;
+begin
+  autocert.haveacct := false;
+  if not cs.ready then return;
+  n := cs.read("account.key", 11);
+  if n < 0 then return;                       // a first run: made when the first order needs it
+  if autocert.readkey(cs.buf, n) then
+  begin
+    p256.copy(autocert.acct.d, autocert.kd);
+    p256.copy(autocert.acct.qx, autocert.kx);
+    p256.copy(autocert.acct.qy, autocert.ky);
+    autocert.haveacct := true;
+    return;
+  end;
+  autocert.say("the stored account key is unreadable; a new account will be made");
+end;
+
+procedure autocert.loadcert;
+var n, now: int;
+begin
+  if not cs.ready then return;
+  autocert.setname(".pem");
+  n := cs.read(autocert.name, autocert.namen);
+  if n < 0 then
+  begin
+    autocert.say("no certificate in the store yet");
+    return;
+  end;
+  // THE FILE IS COPIED OUT FIRST: cs.buf is the store's one read buffer.
+  autocert.filen := 0;
+  while autocert.filen < n do begin autocert.file[autocert.filen] := cs.buf[autocert.filen]; autocert.filen := autocert.filen + 1; end;
+  now := autocert.nowsec;
+  if not autocert.readkey(autocert.file, autocert.filen) then
+  begin
+    autocert.say("the stored certificate key is unreadable; ordering a new certificate");
+    return;
+  end;
+  if autocert.readchain(autocert.file, autocert.filen) <= 0 then
+  begin
+    autocert.say("the stored certificate chain is unreadable; ordering a new certificate");
+    return;
+  end;
+  if not autocert.check(autocert.kx, autocert.ky, now) then
+  begin
+    autocert.logbegin;
+    autocert.logs("the stored certificate is not usable (");
+    autocert.logs(autocert.verr);
+    autocert.logs("); ordering a new one");
+    autocert.logend;
+    return;
+  end;
+  if not autocert.install(autocert.kd, autocert.kx, autocert.ky) then
+  begin
+    autocert.say("the stored certificate could not be installed; ordering a new one");
+    return;
+  end;
+  autocert.logbegin;
+  autocert.logs("certificate loaded from the store, valid until ");
+  autocert.logdate(autocert.notafter);
+  autocert.logs(" (");
+  autocert.logn((autocert.notafter - now) div AUTOCERT.DAY);
+  autocert.logs(" days left)");
+  autocert.logend;
+end;
+
+// The persisted retry time: a crash-looping service must not order on every start.
+procedure autocert.loadretry;
+var n, i, at, cnt, now: int;
+begin
+  if not cs.ready then return;
+  autocert.setname(".retry");
+  n := cs.read(autocert.name, autocert.namen);
+  if n <= 0 then return;
+  at := 0;
+  i := 0;
+  while (i < n) and (cs.buf[i] >= '0') and (cs.buf[i] <= '9') do
+  begin
+    at := at * 10 + (ord(cs.buf[i]) - ord('0'));
+    i := i + 1;
+  end;
+  i := i + 1;
+  cnt := 0;
+  while (i < n) and (cs.buf[i] >= '0') and (cs.buf[i] <= '9') do
+  begin
+    cnt := cnt * 10 + (ord(cs.buf[i]) - ord('0'));
+    i := i + 1;
+  end;
+  now := autocert.nowsec;
+  if cnt > 0 then autocert.fails := cnt;
+  if at > now then
+  begin
+    // NEVER LONGER THAN A DAY: a clock that was wrong when the file was written must not
+    // lock the service out for longer than the longest ordinary backoff.
+    if at - now > AUTOCERT.DAY then at := now + AUTOCERT.DAY;
+    autocert.wakeat := autocert.nowms + (at - now) * 1000;
+  end;
+end;
+
+// ---- start ----------------------------------------------------------------------------------------
+//
+// True when the module can run: a host, a directory URL it accepts, and a trust store. It does
+// no network work; the first tick does.
+function autocert.start: bool;
+var ok: bool;
+    n: int;
+begin
+  autocert.defaults;
+  autocert.state := ACS.IDLE;
+  if autocert.hostn <= 0 then begin autocert.say("no hostname set (autocert.sethost)"); return false; end;
+  if autocert.dirn = 0 then
+  begin
+    if autocert.usestaging then autocert.dirn := io.push(autocert.dir, 0, AUTOCERT.STAGING)
+    else autocert.dirn := io.push(autocert.dir, 0, AUTOCERT.PRODUCTION);
+  end;
+  if not autocert.parseurl(autocert.dir, autocert.dirn) then
+  begin
+    autocert.say("the directory URL is not an https:// URL");
+    return false;
+  end;
+  // THE TRUST STORE. A caller that put roots in keeps exactly those; one that did not gets the
+  // machine's bundle, or the built-in Let's Encrypt roots where there is none.
+  if ch.rootcnt = 0 then n := ch.addsystem;
+  if ch.rootcnt = 0 then begin autocert.say("no trusted roots; cannot talk to an authority"); return false; end;
+  p256.setup;
+  autocert.ep := net.epoll;
+  if autocert.ep < 0 then begin autocert.say("cannot make an epoll set"); return false; end;
+
+  if autocert.storepn > 0 then ok := cs.opendir(autocert.storep, autocert.storepn)
+  else ok := cs.open;
+  autocert.caching := ok;
+  if not ok then
+  begin
+    autocert.logbegin;
+    autocert.logs("no certificate store (");
+    autocert.logs(cs.err);
+    autocert.logs("): working without a cache, and a restart will order again");
+    autocert.logend;
+  end;
+  autocert.wakeat := autocert.nowms;
+  autocert.loadaccount;
+  autocert.loadcert;
+  autocert.loadretry;
+  // IS THE STORE WRITABLE? Found out now, by writing back what was just read, rather than at
+  // the end of the first order -- an operator should learn it at start.
+  if autocert.caching then
+  begin
+    if autocert.wakeat > autocert.nowms then
+      autocert.saveretry(autocert.nowsec + (autocert.wakeat - autocert.nowms) div 1000)
+    else autocert.saveretry(0);
+  end;
+  if autocert.wakeat > autocert.nowms then
+  begin
+    autocert.logbegin;
+    autocert.logs("an earlier attempt failed; the next one is in ");
+    autocert.logdur(autocert.wakeat - autocert.nowms);
+    autocert.logend;
+  end;
+  autocert.started := true;
+  return true;
+end;
+
+// ---- the order, step by step ------------------------------------------------------------------------
+
+procedure autocert.moveto(st: int; delayms: int);
+begin
+  autocert.state := st;
+  autocert.wakeat := autocert.nowms + delayms;
+end;
+
+// The order failed. Keep what is served, forget the order, and try again later.
+//
+// BACKOFF: 1 h, 6 h, then 24 h between attempts (autocert.retryms times 1, 6, 24). Let's
+// Encrypt allows five failed validations per name per hour; the first retry alone respects
+// that. A Retry-After from the authority wins when it asks for longer, up to a week.
+procedure autocert.failorder;
+var delay, now: int;
+begin
+  autocert.fails := autocert.fails + 1;
+  if autocert.fails = 1 then delay := autocert.retryms
+  else if autocert.fails = 2 then delay := autocert.retryms * 6
+  else delay := autocert.retryms * 24;
+  if autocert.retryafter * 1000 > delay then delay := autocert.retryafter * 1000;
+  if delay > 7 * AUTOCERT.DAY * 1000 then delay := 7 * AUTOCERT.DAY * 1000;
+  autocert.logbegin;
+  autocert.logs("order failed: ");
+  autocert.logs(autocert.why);
+  if autocert.detailn > 0 then
+  begin
+    autocert.logs(" (");
+    autocert.logb(autocert.detail, autocert.detailn);
+    autocert.logs(")");
+  end;
+  if autocert.havecert then autocert.logs("; the current certificate stays in use")
+  else autocert.logs("; there is no certificate yet");
+  autocert.logs("; next attempt in ");
+  autocert.logdur(delay);
+  autocert.logend;
+  autocert.tokenn := 0;
+  autocert.keyauthn := 0;
+  autocert.detailn := 0;
+  autocert.moveto(ACS.IDLE, delay);
+  now := autocert.nowsec;
+  autocert.saveretry(now + delay div 1000);
+end;
+
+// The same, for a reply whose status we did not expect.
+procedure autocert.failreply(what: str);
+begin
+  autocert.why := what;
+  autocert.readproblem;
+  autocert.failorder;
+end;
+
+// Sign acme.body for url and POST it. usekid false is the account-creation shape.
+function autocert.post(url: array of char; urln: int; usekid: bool): bool;
+begin
+  jws.setkey(autocert.acct.d, autocert.acct.qx, autocert.acct.qy);
+  jws.setnonce(acme.nonce, acme.noncen);
+  jws.setkid(acme.kid, acme.kidn);
+  if not jws.signb(url, urln, acme.body, acme.bodyn, usekid) then
+  begin
+    autocert.why := "cannot sign the request";
+    return false;
+  end;
+  return autocert.fetch(url, urln, true, jws.buf, jws.n);
+end;
+
+// A POST-as-GET: an empty payload, which is how ACME reads a resource with a signature.
+function autocert.postget(url: array of char; urln: int): bool;
+begin
+  acme.bodyn := 0;
+  return autocert.post(url, urln, true);
+end;
+
+// BADNONCE IS NOT A FAILURE. The authority refuses a request whose nonce it has already seen
+// or has forgotten, and hands out a fresh one in the same reply -- so the step is simply
+// repeated. Three in a row is a real problem.
+function autocert.retrynonce: bool;
+begin
+  if (autocert.status = 400) and autocert.problemis("badNonce") and (autocert.badnonces < 3) then
+  begin
+    autocert.badnonces := autocert.badnonces + 1;
+    autocert.wakeat := autocert.nowms;
+    return true;
+  end;
+  return false;
+end;
+
+// The next poll: 1 s, 2 s, 4 s, 8 s, 8 s ... or what Retry-After says, within a minute.
+function autocert.nextpoll: int;
+var d: int;
+begin
+  autocert.polls := autocert.polls + 1;
+  d := autocert.pollms;
+  if autocert.pollms < 8000 then autocert.pollms := autocert.pollms * 2;
+  if autocert.retryafter > 0 then
+  begin
+    d := autocert.retryafter * 1000;
+    if d > 60000 then d := 60000;
+  end;
+  return d;
+end;
+
+procedure autocert.stepdir;
+begin
+  if not autocert.fetch(autocert.dir, autocert.dirn, false, acme.body, 0) then begin autocert.failorder; return; end;
+  if autocert.status <> 200 then begin autocert.failreply("the directory could not be read"); return; end;
+  acme.err := "";
+  if not acme.readdir(autocert.bod, autocert.bodn) then
+  begin
+    autocert.why := "the directory does not list newNonce, newAccount and newOrder";
+    autocert.failorder;
+    return;
+  end;
+  autocert.moveto(ACS.NONCE, 0);
+end;
+
+procedure autocert.stepnonce;
+begin
+  acme.noncen := 0;
+  if not autocert.fetch(acme.newnonce, acme.newnoncen, false, acme.body, 0) then begin autocert.failorder; return; end;
+  if (autocert.status <> 200) and (autocert.status <> 204) then begin autocert.failreply("no nonce could be had"); return; end;
+  if acme.noncen <= 0 then
+  begin
+    autocert.why := "the authority sent no nonce";
+    autocert.failorder;
+    return;
+  end;
+  autocert.say("authority reached (directory and nonce)");
+  autocert.moveto(ACS.ACCOUNT, 0);
+end;
+
+procedure autocert.stepaccount;
+begin
+  // THE ACCOUNT KEY IS MADE ONCE AND KEPT. The same key finds the same account again, so a
+  // new-account request on every order is not a new account each time -- the authority
+  // answers 200 with the existing one.
+  if not autocert.haveacct then
+  begin
+    if not p256.genkey(autocert.acct.d, autocert.acct.qx, autocert.acct.qy) then
+    begin
+      autocert.why := "cannot make an account key";
+      autocert.failorder;
+      return;
+    end;
+    autocert.haveacct := true;
+    autocert.keyder(autocert.acct.d, autocert.acct.qx, autocert.acct.qy);
+    autocert.filen := autocert.pemput(autocert.file, 0, "EC PRIVATE KEY", autocert.der, AUTOCERT.KEYLEN);
+    if autocert.save("account.key", 11, "account key") then autocert.say("account key created and saved")
+    else autocert.say("account key created (not saved)");
+  end;
+  acme.acctbody(autocert.email, autocert.emailn);
+  if not autocert.post(acme.newacct, acme.newacctn, false) then begin autocert.failorder; return; end;
+  if autocert.retrynonce then return;
+  if (autocert.status <> 200) and (autocert.status <> 201) then begin autocert.failreply("the account was refused"); return; end;
+  if autocert.locn <= 0 then
+  begin
+    autocert.why := "the authority returned no account URL";
+    autocert.failorder;
+    return;
+  end;
+  acme.kidn := 0;
+  while acme.kidn < autocert.locn do begin acme.kid[acme.kidn] := autocert.loc[acme.kidn]; acme.kidn := acme.kidn + 1; end;
+  if autocert.status = 201 then autocert.say("account registered") else autocert.say("account found");
+  autocert.moveto(ACS.ORDER, 0);
+end;
+
+// An order or a finalized order: go where its status says.
+procedure autocert.follow;
+begin
+  if not autocert.readstat then
+  begin
+    autocert.why := "the order has no status";
+    autocert.failorder;
+    return;
+  end;
+  acme.err := "";
+  if not acme.readorder(autocert.bod, autocert.bodn) then
+  begin
+    autocert.why := "the order does not parse";
+    autocert.failorder;
+    return;
+  end;
+  if autocert.statis("valid") then
+  begin
+    if acme.certurln <= 0 then begin autocert.why := "the order is valid but names no certificate"; autocert.failorder; return; end;
+    autocert.moveto(ACS.DOWNLOAD, 0);
+    return;
+  end;
+  if autocert.statis("processing") then
+  begin
+    autocert.moveto(ACS.POLLORDER, autocert.nextpoll);
+    return;
+  end;
+  if autocert.statis("ready") then
+  begin
+    if acme.finalizen <= 0 then begin autocert.why := "the order names no finalize URL"; autocert.failorder; return; end;
+    autocert.moveto(ACS.FINALIZE, 0);
+    return;
+  end;
+  if autocert.statis("pending") then
+  begin
+    if acme.authzn <= 0 then begin autocert.why := "the order names no authorization"; autocert.failorder; return; end;
+    autocert.moveto(ACS.AUTHZ, 0);
+    return;
+  end;
+  autocert.why := "the authority marked the order invalid";
+  autocert.readproblem;
+  autocert.failorder;
+end;
+
+procedure autocert.steporder;
+begin
+  acme.orderbody(autocert.host, autocert.hostn);
+  if not autocert.post(acme.neworder, acme.newordern, true) then begin autocert.failorder; return; end;
+  if autocert.retrynonce then return;
+  if autocert.status <> 201 then begin autocert.failreply("the order was refused"); return; end;
+  if autocert.locn <= 0 then
+  begin
+    autocert.why := "the authority returned no order URL";
+    autocert.failorder;
+    return;
+  end;
+  autocert.orderurln := 0;
+  while autocert.orderurln < autocert.locn do
+  begin
+    autocert.orderurl[autocert.orderurln] := autocert.loc[autocert.orderurln];
+    autocert.orderurln := autocert.orderurln + 1;
+  end;
+  autocert.orders := autocert.orders + 1;
+  autocert.say("order placed");
+  autocert.follow;
+end;
+
+procedure autocert.stepauthz;
+begin
+  if not autocert.postget(acme.authz, acme.authzn) then begin autocert.failorder; return; end;
+  if autocert.retrynonce then return;
+  if autocert.status <> 200 then begin autocert.failreply("the authorization could not be read"); return; end;
+  if not autocert.readstat then begin autocert.why := "the authorization has no status"; autocert.failorder; return; end;
+  // ALREADY VALID: the authority remembers a recent proof for this account and name, so
+  // there is nothing to answer.
+  if autocert.statis("valid") then
+  begin
+    autocert.say("authorization already valid");
+    autocert.moveto(ACS.FINALIZE, 0);
+    return;
+  end;
+  if not autocert.statis("pending") then
+  begin
+    autocert.why := "the authorization is not pending";
+    autocert.readproblem;
+    autocert.failorder;
+    return;
+  end;
+  acme.err := "";
+  if not acme.readauthz(autocert.bod, autocert.bodn) then
+  begin
+    autocert.why := "no usable http-01 challenge";
+    autocert.detailn := io.push(autocert.detail, 0, acme.err);
+    autocert.failorder;
+    return;
+  end;
+  // THE TOKEN IS COPIED BEFORE IT IS PUBLISHED, and only a token of the characters RFC 8555
+  // allows (base64url) is: it becomes part of a path we answer, and a token with a slash or a
+  // dot in it would make that path mean something else.
+  autocert.tokenn := 0;
+  while autocert.tokenn < acme.tokenn do
+  begin
+    if not (((acme.token[autocert.tokenn] >= 'a') and (acme.token[autocert.tokenn] <= 'z'))
+            or ((acme.token[autocert.tokenn] >= 'A') and (acme.token[autocert.tokenn] <= 'Z'))
+            or ((acme.token[autocert.tokenn] >= '0') and (acme.token[autocert.tokenn] <= '9'))
+            or (acme.token[autocert.tokenn] = '-') or (acme.token[autocert.tokenn] = '_')) then
+    begin
+      autocert.tokenn := 0;
+      autocert.why := "the challenge token has characters a token may not have";
+      autocert.failorder;
+      return;
+    end;
+    autocert.token[autocert.tokenn] := acme.token[autocert.tokenn];
+    autocert.tokenn := autocert.tokenn + 1;
+  end;
+  autocert.keyauthn := jws.keyauthb(autocert.keyauth, 0, autocert.token, autocert.tokenn,
+                                    autocert.acct.qx, autocert.acct.qy);
+  autocert.say("challenge ready; asking the authority to look");
+  autocert.moveto(ACS.CHALLENGE, 0);
+end;
+
+procedure autocert.stepchallenge;
+begin
+  acme.bodyn := io.push(acme.body, 0, "{}");
+  if not autocert.post(acme.chal, acme.chaln, true) then begin autocert.failorder; return; end;
+  if autocert.retrynonce then return;
+  if autocert.status <> 200 then begin autocert.failreply("the challenge was refused"); return; end;
+  autocert.pollms := 1000;
+  autocert.moveto(ACS.POLLAUTHZ, autocert.nextpoll);
+end;
+
+// The text of the first "detail" member between from and upto, into autocert.detail. The
+// authority may put spaces around the colon, and Let's Encrypt does.
+procedure autocert.finddetail(from: int; upto: int);
+var i, k: int;
+begin
+  i := from;
+  while i + 8 <= upto do
+  begin
+    if autocert.same(autocert.bod, i, "\"detail\"") then
+    begin
+      k := json.ws(autocert.bod, i + 8, upto);
+      if (k < upto) and (autocert.bod[k] = ':') then
+      begin
+        k := json.ws(autocert.bod, k + 1, upto);
+        if (k < upto) and (autocert.bod[k] = '"') then
+        begin
+          k := k + 1;
+          autocert.detailn := 0;
+          while (k < upto) and (autocert.bod[k] <> '"') and (autocert.detailn < 400) do
+          begin
+            autocert.detail[autocert.detailn] := autocert.bod[k];
+            autocert.detailn := autocert.detailn + 1;
+            k := k + 1;
+          end;
+          return;
+        end;
+      end;
+    end;
+    i := i + 1;
+  end;
+end;
+
+procedure autocert.steppollauthz;
+begin
+  if not autocert.postget(acme.authz, acme.authzn) then begin autocert.failorder; return; end;
+  if autocert.retrynonce then return;
+  if autocert.status <> 200 then begin autocert.failreply("the authorization could not be read"); return; end;
+  if not autocert.readstat then begin autocert.why := "the authorization has no status"; autocert.failorder; return; end;
+  if autocert.statis("valid") then
+  begin
+    autocert.say("the authority validated the challenge");
+    autocert.moveto(ACS.FINALIZE, 0);
+    return;
+  end;
+  if autocert.statis("pending") then
+  begin
+    autocert.moveto(ACS.POLLAUTHZ, autocert.nextpoll);
+    return;
+  end;
+  // invalid, deactivated, expired, revoked: the reason sits inside the challenge's "error".
+  autocert.why := "the authority did not accept the challenge";
+  autocert.detailn := 0;
+  acme.err := "";
+  // the first "detail" inside the challenges is the one that matters
+  if acme.find(autocert.bod, autocert.bodn, "challenges") then autocert.finddetail(acme.vat, acme.vend);
+  autocert.failorder;
+end;
+
+procedure autocert.stepfinalize;
+begin
+  // A NEW KEY FOR EVERY CERTIFICATE. Reusing the previous certificate's key would keep a key
+  // alive past the certificate that vouched for it; a renewal is the moment to rotate.
+  if not p256.genkey(autocert.new.d, autocert.new.qx, autocert.new.qy) then
+  begin
+    autocert.why := "cannot make a certificate key";
+    autocert.failorder;
+    return;
+  end;
+  if not acme.csrbody(autocert.new.d, autocert.new.qx, autocert.new.qy, autocert.host, autocert.hostn) then
+  begin
+    autocert.why := "cannot build the certificate request";
+    autocert.failorder;
+    return;
+  end;
+  if not autocert.post(acme.finalize, acme.finalizen, true) then begin autocert.failorder; return; end;
+  if autocert.retrynonce then return;
+  if autocert.status <> 200 then begin autocert.failreply("finalize was refused"); return; end;
+  autocert.say("certificate requested, for a new key");
+  autocert.pollms := 1000;
+  autocert.follow;
+end;
+
+procedure autocert.steppollorder;
+begin
+  if not autocert.postget(autocert.orderurl, autocert.orderurln) then begin autocert.failorder; return; end;
+  if autocert.retrynonce then return;
+  if autocert.status <> 200 then begin autocert.failreply("the order could not be read"); return; end;
+  autocert.follow;
+end;
+
+procedure autocert.stepdownload;
+var now, i: int;
+begin
+  if not autocert.postget(acme.certurl, acme.certurln) then begin autocert.failorder; return; end;
+  if autocert.retrynonce then return;
+  if autocert.status <> 200 then begin autocert.failreply("the certificate could not be downloaded"); return; end;
+  now := autocert.nowsec;
+  if autocert.readchain(autocert.bod, autocert.bodn) <= 0 then
+  begin
+    autocert.why := "the download is not a PEM certificate chain";
+    autocert.failorder;
+    return;
+  end;
+  if not autocert.check(autocert.new.qx, autocert.new.qy, now) then
+  begin
+    autocert.why := "the issued certificate failed its checks";
+    autocert.detailn := io.push(autocert.detail, 0, autocert.verr);
+    autocert.failorder;
+    return;
+  end;
+  // SAVED BEFORE IT IS SERVED: a certificate that is in use but not on disk is ordered again
+  // after the next restart. Key and chain go into one file, written in one rename.
+  autocert.keyder(autocert.new.d, autocert.new.qx, autocert.new.qy);
+  autocert.filen := autocert.pemput(autocert.file, 0, "EC PRIVATE KEY", autocert.der, AUTOCERT.KEYLEN);
+  i := 0;
+  while i < autocert.ncerts do
+  begin
+    autocert.filen := autocert.pemput(autocert.file, autocert.filen, "CERTIFICATE",
+                                      autocert.chain[autocert.cat[i]..autocert.cat[i] + autocert.cn[i] - 1],
+                                      autocert.cn[i]);
+    i := i + 1;
+  end;
+  autocert.setname(".pem");
+  if autocert.filen < 0 then autocert.say("the certificate is too large for the store; it is served but not saved")
+  else if autocert.save(autocert.name, autocert.namen, "certificate") then i := 0;
+  if not autocert.install(autocert.new.d, autocert.new.qx, autocert.new.qy) then
+  begin
+    autocert.why := "the TLS server would not take the certificate";
+    autocert.failorder;
+    return;
+  end;
+  now := autocert.nowsec;
+  autocert.logbegin;
+  autocert.logs("certificate installed, valid until ");
+  autocert.logdate(autocert.notafter);
+  autocert.logs(" (");
+  autocert.logn((autocert.notafter - now) div AUTOCERT.DAY);
+  autocert.logs(" days)");
+  if not autocert.rooted then autocert.logs("; its chain does not reach a root this machine trusts (normal for a staging or private authority)");
+  autocert.logend;
+  autocert.fails := 0;
+  autocert.tokenn := 0;
+  autocert.keyauthn := 0;
+  autocert.saveretry(0);
+  autocert.moveto(ACS.IDLE, autocert.checkms);
+end;
+
+// ---- the check: is an order due? ------------------------------------------------------------------
+//
+// RENEW WHEN FEWER THAN 30 DAYS ARE LEFT -- or fewer than a third of the certificate's
+// lifetime, when that is shorter: a certificate that lives six days would otherwise be renewed
+// on every check.
+procedure autocert.checkdue;
+var now, left, before, life, nextms: int;
+begin
+  now := autocert.nowsec;
+  if autocert.havecert then
+  begin
+    left := autocert.notafter - now;
+    before := autocert.renewsec;
+    // the lifetime of the installed leaf
+    life := 0;
+    if x509.parse(autocert.leaf, 0, autocert.leafn) then life := x509.notafter - x509.notbefore;
+    if (life > 0) and (life div 3 < before) then before := life div 3;
+    if left > before then
+    begin
+      // Next look: in a day, or exactly when it becomes due, whichever is first.
+      nextms := autocert.checkms;
+      if (left - before) * 1000 < nextms then nextms := (left - before) * 1000 + 1000;
+      autocert.moveto(ACS.IDLE, nextms);
+      return;
+    end;
+    autocert.logbegin;
+    autocert.logs("renewing: ");
+    autocert.logn(left div AUTOCERT.DAY);
+    autocert.logs(" days left");
+    autocert.logend;
+  end
+  else autocert.say("ordering a certificate");
+  autocert.orderstart := autocert.nowms;
+  autocert.polls := 0;
+  autocert.pollms := 1000;
+  autocert.badnonces := 0;
+  autocert.detailn := 0;
+  autocert.retryafter := 0;
+  autocert.state := ACS.DIR;
+end;
+
+// ---- the loop's side -------------------------------------------------------------------------------
+
+// Call from the loop's timer, as often as it likes: it does nothing until something is due,
+// and then at most one request.
+procedure autocert.tick;
+var st: int;
+begin
+  if not autocert.started then return;
+  if autocert.nowms < autocert.wakeat then return;
+  if autocert.state = ACS.IDLE then
+  begin
+    autocert.checkdue;
+    if autocert.state = ACS.IDLE then return;
+  end
+  else if autocert.nowms - autocert.orderstart > autocert.ordertimeoutms then
+  begin
+    autocert.why := "the order took too long";
+    autocert.failorder;
+    return;
+  end;
+  st := autocert.state;
+  if st = ACS.DIR then autocert.stepdir
+  else if st = ACS.NONCE then autocert.stepnonce
+  else if st = ACS.ACCOUNT then autocert.stepaccount
+  else if st = ACS.ORDER then autocert.steporder
+  else if st = ACS.AUTHZ then autocert.stepauthz
+  else if st = ACS.CHALLENGE then autocert.stepchallenge
+  else if st = ACS.POLLAUTHZ then autocert.steppollauthz
+  else if st = ACS.FINALIZE then autocert.stepfinalize
+  else if st = ACS.POLLORDER then autocert.steppollorder
+  else if st = ACS.DOWNLOAD then autocert.stepdownload;
+end;
+
+// How long the loop may wait before calling autocert.tick again, in ms (never negative).
+function autocert.waitms: int;
+var w: int;
+begin
+  if not autocert.started then return 60000;
+  w := autocert.wakeat - autocert.nowms;
+  if w < 0 then w := 0;
+  return w;
+end;
+
+// The answer to GET <path>, when path is /.well-known/acme-challenge/<token> for the order
+// in progress: the key authorization, written to dst, and its length. -1 otherwise -- the
+// caller answers 404.
+//
+// ONLY THE EXACT TOKEN. A prefix match would answer for any longer path that starts with it,
+// and an answer outside an order would publish a key authorization nobody asked for.
+function autocert.answer(path: array of char; dst: array of char): int;
+var i, at: int;
+begin
+  if (autocert.tokenn <= 0) or (autocert.keyauthn <= 0) then return 0 - 1;
+  at := slen(AUTOCERT.PREFIX);
+  if len(path) <> at + autocert.tokenn then return 0 - 1;
+  if not autocert.same(path, 0, AUTOCERT.PREFIX) then return 0 - 1;
+  i := 0;
+  while i < autocert.tokenn do
+  begin
+    if path[at + i] <> autocert.token[i] then return 0 - 1;
+    i := i + 1;
+  end;
+  if len(dst) < autocert.keyauthn then return 0 - 1;
+  i := 0;
+  while i < autocert.keyauthn do begin dst[i] := autocert.keyauth[i]; i := i + 1; end;
+  return autocert.keyauthn;
+end;
