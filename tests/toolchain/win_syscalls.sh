@@ -1,5 +1,5 @@
 # The system calls behave the same in a Windows executable (under Wine) as in the ELF:
-# storage, and epoll sets.
+# storage, epoll sets, and the process and network calls a server needs at startup.
 . "$ROOT/tests/helpers.sh"
 [ -x "${WINE:-/usr/lib/wine/wine64}" ] || command -v wine64 >/dev/null 2>&1 || command -v wine >/dev/null 2>&1 || { echo "wine is missing"; exit 1; }
 compile_win "$ROOT/tests/compiler/syscalls_storage.wz" "$T/sc.exe"
@@ -59,3 +59,52 @@ assert_eq "epoll sets in the ELF" "$(sed '$d' "$T/eps.lin")" "$want"
 assert_eq "epoll sets in the .exe (the ELF is the reference)" "$(sed '$d' "$T/eps.win")" "$want"
 # the runtime has a fixed number of sets, and one more is EMFILE rather than a crash
 assert_eq "one epoll set too many in the .exe" "$(tail -n 1 "$T/eps.win")" "the set that did not fit: -24"
+
+# ---- process and network calls: getpid, kill, connect, nanosleep --------------------
+# A number the runtime does not know stops the program with "an unsupported system call
+# was made on Windows". getpid, kill and connect were missing, so a server that writes its
+# pid to a lock file at startup could not start on Windows at all -- it compiled, and
+# stopped on its first line. And nanosleep slept 1 ms whatever it was asked.
+
+# ---- one process: pid, alive, connect, sleep -- the ELF is the reference ----------
+compile "$ROOT/tests/helpers/procnet.wz" "$T/pn"
+compile_win "$ROOT/tests/helpers/procnet.wz" "$T/pn.exe"
+port=$(( 21000 + $$ % 20000 ))
+want='own pid: positive
+alive(own pid): yes
+alive(999999): no
+kill(999999, 15): -3
+connect to a listening port: ok
+accept: ok
+connect to a closed port: -111
+nanosleep 300 ms: slept at least 290 ms'
+assert_eq "process and network calls in the ELF" "$("$T/pn" "$port")" "$want"
+got=$(cd "$T" && run_win "$T/pn.exe" "$((port + 2))" 2>&1 | tr -d '\r')
+assert_eq "process and network calls in the .exe (the ELF is the reference)" "$got" "$want"
+
+# ---- two processes: one stops the other --------------------------------------------
+# stopkill <sleeper...> -- <stopper...>: start the sleeper, read its pid, let the stopper
+# end it, and print what both said.
+compile "$ROOT/tests/helpers/sleeper.wz" "$T/sl"
+compile "$ROOT/tests/helpers/stopper.wz" "$T/st"
+compile_win "$ROOT/tests/helpers/sleeper.wz" "$T/sl.exe"
+compile_win "$ROOT/tests/helpers/stopper.wz" "$T/st.exe"
+stopkill() {
+  _out=$1; _slp=$2; _stp=$3
+  : > "$_out.sleeper"
+  $_slp > "$_out.sleeper" 2>&1 &
+  _bg=$!
+  _n=0
+  until [ -s "$_out.sleeper" ]; do _n=$((_n + 1)); [ $_n -lt 200 ] || break; sleep 0.1; done
+  _pid=$(head -1 "$_out.sleeper" | tr -d '\r')
+  $_stp "$_pid" 2>&1 | tr -d '\r' > "$_out"
+  wait $_bg 2>/dev/null
+  tail -n +2 "$_out.sleeper" | tr -d '\r' >> "$_out"
+}
+want='before: alive
+kill: 0
+after: gone'
+stopkill "$T/sk.lin" "$T/sl" "$T/st"
+assert_eq "kill between two processes in the ELF" "$(cat "$T/sk.lin")" "$want"
+stopkill "$T/sk.win" "run_win $T/sl.exe" "run_win $T/st.exe"
+assert_eq "kill between two processes in the .exe (the sleeper never wakes)" "$(cat "$T/sk.win")" "$want"

@@ -48,7 +48,7 @@ const
   // tests/toolchain/release_assets.sh checks it against the git tag: a binary that
   // cannot say which version it is cannot be matched to a published checksum.
   // bootstrap/boot.c carries the same string.
-  VERSION = "0.3.0";
+  VERSION = "0.3.1";
   SRCMAX  = 67108864;
   CODEMAX = 67108864;
   DATMAX  = 33554432;
@@ -6479,6 +6479,7 @@ begin
   gen("  __wfind: array[0..319] of char;   // WIN32_FIND_DATAA\n");
   gen("  __wpath: array[0..1039] of char;   // path + backslash-star\n");
   gen("  __wovl: array[0..31] of char;   // a zeroed OVERLAPPED for LockFileEx\n");
+  gen("  __wexitc: array[0..7] of char;   // GetExitCodeProcess writes its DWORD here\n");
   gen("  __wpos: array[0..7] of char;   // SetFilePointerEx result\n");
   gen("\n");
   gen("procedure __wp32(b: array of char; at: int; v: int);\n");
@@ -7180,6 +7181,58 @@ begin
   gen("end;\n");
   gen("\n");
   gen("\n");
+  gen("// connect: Winsock's sockaddr_in is Linux's byte for byte (see __wbind), and the\n");
+  gen("  // socket from __wsock is blocking, so a failure is a refusal, not EINPROGRESS.\n");
+  gen("function __wconnect(fd: int; sa: int; sln: int): int;\n");
+  gen("var r: int;\n");
+  gen("begin\n");
+  gen("  if not __wissock(fd) then return 0 - 9;\n");
+  gen("  r := winapi(\"ws2_32.dll\", \"connect\", __wsh[fd], sa, sln);\n");
+  gen("  if band(r, 0xFFFFFFFF) = 0xFFFFFFFF then return 0 - 111;   // ECONNREFUSED\n");
+  gen("  return 0;\n");
+  gen("end;\n");
+  gen("\n");
+  gen("// kill: signal 0 asks only whether the process exists (OpenProcess plus\n");
+  gen("  // GetExitCodeProcess = STILL_ACTIVE); any other signal ends it with TerminateProcess,\n");
+  gen("  // exit code 128 + sig as a shell would report it.  ESRCH when there is no such process.\n");
+  gen("function __wkill(pid: int; sig: int): int;\n");
+  gen("var h, r: int;\n");
+  gen("begin\n");
+  gen("  if sig = 0 then\n");
+  gen("  begin\n");
+  gen("    h := winapi(\"kernel32.dll\", \"OpenProcess\", 0x1000, 0, pid);   // QUERY_LIMITED_INFORMATION\n");
+  gen("    if h = 0 then return 0 - 3;\n");
+  gen("    r := winapi(\"kernel32.dll\", \"GetExitCodeProcess\", h, addr(__wexitc[0]));\n");
+  gen("    __wdummy := winapi(__K_CLOSEHANDLE, h);\n");
+  gen("    if band(r, 0xFFFFFFFF) = 0 then return 0 - 3;\n");
+  gen("    if __wg32(__wexitc, 0) = 259 then return 0;   // STILL_ACTIVE\n");
+  gen("    return 0 - 3;\n");
+  gen("  end;\n");
+  gen("  h := winapi(\"kernel32.dll\", \"OpenProcess\", 1, 0, pid);   // PROCESS_TERMINATE\n");
+  gen("  if h = 0 then return 0 - 3;\n");
+  gen("  r := winapi(\"kernel32.dll\", \"TerminateProcess\", h, 128 + sig);\n");
+  gen("  __wdummy := winapi(__K_CLOSEHANDLE, h);\n");
+  gen("  if band(r, 0xFFFFFFFF) = 0 then return 0 - 1;   // EPERM\n");
+  gen("  return 0;\n");
+  gen("end;\n");
+  gen("\n");
+  gen("// nanosleep: the timespec at ts (tv_sec, then tv_nsec, each 64-bit little-endian),\n");
+  gen("  // rounded UP to whole milliseconds because Sleep counts in ms.  The low four bytes of\n");
+  gen("  // each field are read: 2^31 seconds is more than any caller asks for.\n");
+  gen("function __wsleep(ts: int): int;\n");
+  gen("var s, ns, i: int;\n");
+  gen("begin\n");
+  gen("  s := 0; ns := 0; i := 3;\n");
+  gen("  while i >= 0 do\n");
+  gen("  begin\n");
+  gen("    s := bor(s shl 8, peek(ts + i));\n");
+  gen("    ns := bor(ns shl 8, peek(ts + 8 + i));\n");
+  gen("    i := i - 1;\n");
+  gen("  end;\n");
+  gen("  __wdummy := winapi(__K_SLEEP, s * 1000 + (ns + 999999) div 1000000);\n");
+  gen("  return 0;\n");
+  gen("end;\n");
+  gen("\n");
   gen("function __wsys(nr: int; a: int; b: int; c: int; d: int; e: int; f: int): int;\n");
   gen("var t: int;\n");
   gen("begin\n");
@@ -7199,6 +7252,7 @@ begin
   gen("  end;\n");
   gen("  if nr = 41 then return __wsock;   // socket\n");
   gen("  if nr = 49 then return __wbind(a, b, c);   // bind\n");
+  gen("  if nr = 42 then return __wconnect(a, b, c);   // connect\n");
   gen("  if nr = 50 then return __wlisten(a, b);   // listen\n");
   gen("  if nr = 43 then return __waccept(a);   // accept\n");
   gen("  if nr = 288 then return __waccept(a);   // accept4\n");
@@ -7267,11 +7321,7 @@ begin
   gen("    if band(t, 0xFF) = 0 then return 0 - 1;\n");
   gen("    return b;\n");
   gen("  end;\n");
-  gen("  if nr = 35 then   // nanosleep\n");
-  gen("  begin\n");
-  gen("    __wdummy := winapi(__K_SLEEP, 1);\n");
-  gen("    return 0;\n");
-  gen("  end;\n");
+  gen("  if nr = 35 then return __wsleep(a);   // nanosleep\n");
   gen("  if nr = 90 then return 0;   // chmod: no-op\n");
   // readlink: -1, NOT a trap. Windows has no /proc/self/exe, and setlibdir asks for it
   // first to find lib/ without trusting argv[0]. Returning the error is what makes it
@@ -7281,6 +7331,8 @@ begin
   gen("  if nr = 89 then return 0 - 1;   // readlink: no /proc, caller falls back\n");
   gen("  if nr = 57 then return 0;   // fork: no worker processes, run single-process\n");
   gen("  if nr = 61 then return 0;   // wait4: nothing to wait for\n");
+  gen("  if nr = 39 then return band(winapi(\"kernel32.dll\", \"GetCurrentProcessId\"), 0xFFFFFFFF);   // getpid\n");
+  gen("  if nr = 62 then return __wkill(a, b);   // kill\n");
   gen("  if (nr = 60) or (nr = 231) then winapi(__K_EXITPROCESS, band(a, 0xFFFFFFFF));\n");
   gen("  __wputs(\"runtime error: an unsupported system call was made on Windows\\n\");\n");
   gen("  winapi(__K_EXITPROCESS, 70);\n");

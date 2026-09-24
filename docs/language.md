@@ -808,16 +808,19 @@ unchanged.
 **The language is identical on both platforms.** Everything above holds for a `.exe`;
 what differs is underneath: Linux gets the `SYSCALL` instruction, Windows a runtime shim
 translating to the Win32 equivalent. Reads and writes, files, directory listing and
-`stat`, sockets, `epoll` (emulated over `WSAPoll`), time, `mmap`/`msync`, `fsync`,
-`rename`, `flock`, `getrandom` and the command line are all translated. The compiler
+`stat`, sockets (including an outgoing `connect`), `epoll` (emulated over `WSAPoll`), time,
+`nanosleep`, `mmap`/`msync`, `fsync`, `rename`, `flock`, `getrandom`, `getpid`, `kill` and
+the command line are all translated. The compiler
 compiles itself into a working `wantzel.exe`, which compiles Wantzel source and
 reproduces itself byte-identically: self-hosting on Windows.
 
-Three differences remain, all properties of the Windows runtime rather than of the language:
+Four differences remain, all properties of the Windows runtime rather than of the language:
 
 - **No `fork`.** Windows lacks it, so `fork` returns `0` and the caller becomes the only
   worker — a multi-worker HTTP server runs single-process there: it works, but does not
   use every core the way it does on Linux.
+- **No `execve`.** Replacing the running program has no Win32 counterpart; `proc.exec`
+  stops with "an unsupported system call was made on Windows".
 - **At most 16 `epoll` sets at once.** They behave as on Linux — independent, and one
   can be watched inside another — but a seventeenth `epoll_create1` returns `EMFILE`,
   where Linux is limited only by the number of open files.

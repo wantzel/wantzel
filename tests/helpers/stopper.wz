@@ -1,0 +1,22 @@
+// stopper <pid> -- is that process alive, stop it with signal 15, is it alive now.
+include "io.wz";
+include "proc.wz";
+
+var
+  pid, r, i: int;
+  ts: array[0..15] of char;
+
+begin
+  pid := io.argn(1);
+  if proc.alive(pid) then io.puts(STDOUT, "before: alive\n") else io.puts(STDOUT, "before: gone\n");
+  io.puts(STDOUT, "kill: "); io.putn(STDOUT, proc.kill(pid, 15)); io.puts(STDOUT, "\n");
+  // a process does not vanish the instant it is told to; give it up to two seconds
+  ts[8] := chr(0); ts[9] := chr(0xE1); ts[10] := chr(0xF5); ts[11] := chr(0x05);   // 100 ms
+  i := 0;
+  while (i < 20) and proc.alive(pid) do
+  begin
+    r := sys2(SYS.nanosleep, addr(ts[0]), 0);
+    i := i + 1;
+  end;
+  if proc.alive(pid) then io.puts(STDOUT, "after: alive\n") else io.puts(STDOUT, "after: gone\n");
+end.

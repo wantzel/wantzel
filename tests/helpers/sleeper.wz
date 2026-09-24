@@ -1,0 +1,15 @@
+// sleeper -- prints its own pid, then sleeps 30 seconds and says it woke up. A test
+// that stops it from another process expects never to see the second line.
+include "io.wz";
+include "proc.wz";
+
+var
+  ts: array[0..15] of char;
+  r: int;
+
+begin
+  io.putn(STDOUT, proc.self); io.puts(STDOUT, "\n");
+  ts[0] := chr(30);
+  r := sys2(SYS.nanosleep, addr(ts[0]), 0);
+  io.puts(STDOUT, "woke up\n");
+end.

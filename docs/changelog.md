@@ -18,6 +18,18 @@ first on every upgrade.
 
 Newest first. Dates are the day the change landed.
 
+## 0.3.1 — 24 September 2026
+
+**A patch release for Windows.** A Windows executable now starts a server that writes its
+process id and checks another process, connects out over TCP, and sleeps as long as it is
+asked. Nothing that compiles today changes meaning.
+
+**Compiler**
+
+- A Windows executable now translates `getpid`, `kill` and `connect`: `proc.self`,
+  `proc.alive`, `proc.kill` and `net.connect` work there instead of stopping the program.
+- `nanosleep` on Windows sleeps the time asked for; it slept 1 ms whatever it was given.
+
 ## 0.3.0 — 24 September 2026
 
 **The standard library now lives on disk, beside the compiler.** It used to be embedded in
