@@ -1,5 +1,5 @@
 // type/record: declaration, fields, assignment, records in locals and globals, whole-record copy.
-include "io.wz";
+import io;
 type
   Point = record
     x, y: int;

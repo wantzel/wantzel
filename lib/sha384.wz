@@ -1,7 +1,7 @@
 // lib/sha384.wz -- SHA-384 (FIPS 180-4).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // WHY THIS EXISTS: public certificate chains sign with ecdsa-with-SHA384. Measured
@@ -23,7 +23,7 @@
 //     mistake that gives correct digests for short ASCII messages and wrong ones as soon
 //     as a word goes above 2^63.
 
-include "io.wz";
+import io;
 
 var
   sha384.k:     array[0..79] of int;    // round constants, filled by sha384.setup

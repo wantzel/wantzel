@@ -12,8 +12,8 @@
 // out as the structuredContent of an MCP or REST reply, so truncation would hand the
 // peer an unparseable envelope instead of one failed call.  The appenders still
 // truncate; the writer tests for it and turns it into -1.
-include "io.wz";
-include "json.wz";
+import io;
+import json;
 
 type Unit = schema
   key: text[16];

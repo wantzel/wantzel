@@ -1,6 +1,6 @@
 // spec §3: precedence, div/mod truncate toward zero, bits, shifts, comparisons on
 // int/char/real, short-circuit and/or, no implicit conversions.
-include "io.wz";
+import io;
 var
   calls: int;
 procedure show(s: str; v: int);

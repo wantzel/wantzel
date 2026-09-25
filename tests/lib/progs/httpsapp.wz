@@ -14,9 +14,9 @@
 //   GET  /big?n=N     N bytes, 'a'..'z' over and over (the pattern repeats every 26)
 //   GET  /stats       the counters a leak or a deadline shows up in
 //   GET  /reload      install cert2/key2 with http.httpsfiles, while serving
-include "io.wz";
-include "http.wz";
-include "sha256.wz";
+import io;
+import http;
+import sha256;
 
 var
   pat: array[0..65519] of char;          // 2520 times 'a'..'z': a whole number of patterns

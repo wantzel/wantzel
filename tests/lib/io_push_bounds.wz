@@ -20,7 +20,7 @@
 // The contract pinned here: the position that comes back never exceeds len(b), and it
 // stays usable, so a chain of pushes on a full buffer keeps returning len(b) instead of
 // running off the end.
-include "json.wz";
+import json;
 var small: array[0..7] of char;      // deliberately too small
     big:    array[0..63] of char;
     tiny:   array[0..3] of char;

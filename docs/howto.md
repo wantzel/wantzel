@@ -14,6 +14,25 @@ There is no toolkit underneath any of this — the binary is kilobytes and nothi
 and the price is that somebody has to know what the platform demands. That knowledge is
 below, so it only has to be paid once.
 
+## Installing the compiler
+
+One file, downloaded; nothing to build and nothing else to install:
+
+```sh
+curl -fsSLO https://github.com/wantzel/wantzel/releases/latest/download/wantzel-linux-x86_64
+curl -fsSLO https://github.com/wantzel/wantzel/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS                  # wantzel-linux-x86_64: OK
+mv wantzel-linux-x86_64 wantzel && chmod +x wantzel
+./wantzel --version
+```
+
+The file is the compiler and the whole standard library: `import io;` works with nothing
+beside it, `./wantzel --lib` lists the modules and `./wantzel --lib io` prints one. A
+specific release instead of the newest is `.../releases/download/v<version>/wantzel-linux-x86_64`.
+Several versions side by side are several files — `wantzel --version` says which one you
+have, and its library cannot come from anywhere else. Building it yourself from a clone is
+in the README (*Build from source*).
+
 ## Background work with fork
 
 `fork` needs no compiler change: `sys1`/`sys2`/etc. are builtins that translate straight to
@@ -97,8 +116,8 @@ not using TLS is often the right answer there. Otherwise, self-sign in-process w
 `lib/csr.wz`:
 
 ```pascal
-include "csr.wz";
-include "tls.wz";
+import csr;
+import tls;
 
 p256.setup;
 hn := io.push(host, 0, "localhost");
@@ -128,7 +147,7 @@ program does it itself: no certbot, no cron, no reverse proxy, no second process
 `lib/http.wz` needs one call more than a plain one:
 
 ```pascal
-include "http.wz";
+import http;
 
 procedure app.request;
 begin
@@ -151,7 +170,7 @@ sudo ./hello        # ports 80 and 443; or grant the binary cap_net_bind_service
 Try it against **staging** first (the `true`) — its certificates are not trusted by browsers,
 but its rate limits are generous; change it to `false` for a real certificate. The
 authority's address is found through DNS (`lib/dns.wz`, with the machine's nameservers).
-`examples/autocert.wz` is the same server with command-line options for every setting.
+`examples/autocertd.wz` is the same server with command-line options for every setting.
 
 What the program does, in one loop:
 

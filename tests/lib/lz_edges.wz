@@ -1,0 +1,91 @@
+// lz.pack and lz.unpack at their edges: empty input, one byte, one byte repeated, text
+// with no repetition, a repeat further back than the 65535-byte window, a destination
+// one byte too small, and damaged input -- cut short, an offset reaching before the
+// start, a length running past the end. Damaged input must give -1, never a runtime error.
+import io;
+import lz;
+
+var
+  a, p, b: array[0..199999] of char;
+  small: array[0..0] of char;
+  i, n, k, m: int;
+  x: int;
+
+// roundtrip(label, n) -- a[0..n) packed into p, unpacked into b, compared
+procedure roundtrip(label: str; n: int);
+var j: int;
+    same: bool;
+begin
+  k := lz.pack(a, n, p);
+  m := lz.unpack(p, k, b);
+  same := m = n;
+  j := 0;
+  while same and (j < n) do begin if a[j] <> b[j] then same := false; j := j + 1; end;
+  io.puts(STDOUT, label); io.puts(STDOUT, ": ");
+  io.putn(STDOUT, n); io.puts(STDOUT, " -> "); io.putn(STDOUT, k);
+  if same then io.puts(STDOUT, ", back byte for byte") else io.puts(STDOUT, ", DIFFERENT");
+  if k > lz.bound(n) then io.puts(STDOUT, ", ABOVE lz.bound");
+  io.puts(STDOUT, "\n");
+end;
+
+procedure report(label: str; v: int);
+begin
+  io.puts(STDOUT, label); io.puts(STDOUT, ": "); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+
+begin
+  roundtrip("empty", 0);
+
+  a[0] := 'x';
+  roundtrip("one byte", 1);
+
+  for i := 0 to 99999 do a[i] := 'a';
+  roundtrip("one byte repeated", 100000);
+
+  // no four bytes ever repeat: a counter written in base 256, two digits wide
+  for i := 0 to 59999 do begin a[i + i] := chr(i div 256); a[i + i + 1] := chr(i mod 256); end;
+  n := 120000;
+  // every 4-byte window of a 2-byte counter is new, so this is literals only
+  roundtrip("no repetition", n);
+
+  // the same 1000 bytes at 0 and at 70000: further apart than the window, so the second
+  // copy cannot refer back to the first
+  x := 12345;
+  for i := 0 to 69999 do
+  begin
+    x := (x * 1103515245 + 12345) mod 2147483648;
+    a[i] := chr(x div 65536 mod 256);
+  end;
+  for i := 0 to 999 do a[70000 + i] := a[i];
+  roundtrip("repeat beyond the window", 71000);
+
+  // a destination too small: -1 from both
+  for i := 0 to 999 do a[i] := chr(i mod 7 + 65);
+  report("pack into one byte", lz.pack(a, 1000, small));
+  k := lz.pack(a, 1000, p);
+  report("unpack into one byte", lz.unpack(p, k, small));
+  report("unpack into 999 bytes", lz.unpack(p, k, view(addr(b[0]), 999)));
+  report("unpack into 1000 bytes", lz.unpack(p, k, view(addr(b[0]), 1000)));
+
+  // damaged input
+  report("nothing at all", lz.unpack(p, 0, b));
+  report("cut short by one byte", lz.unpack(p, k - 1, b));
+  report("cut short after the first token", lz.unpack(p, 1, b));
+  report("n beyond the source array", lz.unpack(p, len(p) + 1, b));
+  // token: 1 literal, match 4; the literal; offset 2 -- before the start
+  p[0] := chr(16); p[1] := 'z'; p[2] := chr(2); p[3] := chr(0); p[4] := chr(0);
+  report("offset before the start", lz.unpack(p, 5, b));
+  // token: 15 literals and more to come, then 255, 255 ... with only 3 bytes of text
+  p[0] := chr(240); p[1] := chr(255); p[2] := chr(255); p[3] := 'a'; p[4] := 'b';
+  report("literals past the end", lz.unpack(p, 5, b));
+  // token: match length 15 + more; the length bytes never end
+  p[0] := chr(31); p[1] := 'z'; p[2] := chr(1); p[3] := chr(0); p[4] := chr(255);
+  report("match length never ends", lz.unpack(p, 5, b));
+  // a valid match that is longer than the destination
+  p[0] := chr(31); p[1] := 'z'; p[2] := chr(1); p[3] := chr(0); p[4] := chr(200); p[5] := chr(0);
+  report("match past the destination", lz.unpack(p, 6, view(addr(b[0]), 100)));
+  report("the same, with room", lz.unpack(p, 6, b));
+  // zero offset
+  p[0] := chr(16); p[1] := 'z'; p[2] := chr(0); p[3] := chr(0); p[4] := chr(0);
+  report("offset zero", lz.unpack(p, 5, b));
+end.

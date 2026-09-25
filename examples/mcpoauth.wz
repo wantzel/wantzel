@@ -7,8 +7,8 @@
 // One person can log in: the user/secret pair given on the command line.
 
 
-include "oauth.wz";
-include "mcphttp.wz";
+import oauth;
+import mcphttp;
 
 type AddArgs = schema
   a: int "first term";
@@ -32,7 +32,7 @@ tools
   greet(GreetArgs): GreetResult "Greet someone." readonly;
 end;
 
-include "tools.wz";
+import tools;
 
 var
   demo.user: array[0..127] of char;

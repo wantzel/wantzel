@@ -1,17 +1,14 @@
-# A name that no library declares must get the plain "undeclared identifier".
+# A name that no library module declares must get the plain "undeclared identifier".
 #
-# The hint helps only when the name really is in a library. On an
-# ordinary typo it would be noise, and worse, a wrong hint sends the reader to include a
-# file that will not help.
+# The hint helps only when the name really is in a module. On an ordinary typo it would be
+# noise, and worse, a wrong hint sends the reader to import a module that will not help.
 #
 # This is a .sh test and not a .err one because .err matches a SUBSTRING: a test asserting
 # "undeclared identifier" would pass with a hint appended too. What is checked here is an
 # ABSENCE.
 #
-# It also checks that both compilers say the same thing. They reach the answer by
-# different means -- the self-hosted one searches the library it carries, bootstrap/boot.c
-# has no embedded copy and tests whether lib/<prefix>.wz exists on disk -- so this is
-# exactly the kind of counterpart pair that drifts unnoticed.
+# Only the self-hosted compiler is asked. The library is part of it; bootstrap/boot.c has
+# none, and needs none to build the compiler.
 . "$ROOT/tests/helpers.sh"
 
 cat > "$T/typo.wz" <<'WZ'
@@ -44,14 +41,14 @@ done
 # message sent the reader to a file that does not have what they need.
 #
 # BOTH SPELLINGS, and they used to fail the same way for different reasons:
-#   already/  io.wz is included three lines up   -> "add: include "io.wz";" is absurd advice
-#   notyet/   io.wz is not included              -> naming the library is still wrong
+#   already/  io is imported three lines up   -> "add: import io;" is absurd advice
+#   notyet/   io is not imported              -> naming the module is still wrong
 #
-# MEASURED 18-09-2026: an agent reads "add: include "io.wz";", adds the include it already
-# has, recompiles, gets the identical error, and has nowhere left to go. The message took
+# MEASURED 18-09-2026: an agent reads "add: ..." for the line it already has, adds it
+# again, recompiles, gets the identical error, and has nowhere left to go. The message took
 # away the one fact it needed -- that the name does not exist.
 cat > "$T/already.wz" <<'WZ'
-include "io.wz";
+import io;
 begin
   io.putc(1, chr(65));
 end.
@@ -63,19 +60,17 @@ end.
 WZ
 
 for f in already notyet; do
-  for cc in "$WANTZEL" "$WANTZEL0"; do
-    "$cc" "$T/$f.wz" "$T/out.bin" >"$T/cerr" 2>&1 && {
-      echo "$f.wz compiled, but io.putc does not exist"; exit 1; }
-    assert_contains "$f is reported" "$(cat "$T/cerr")" "undeclared identifier: io.putc"
-    # THE ABSENCE IS THE POINT, and it is why this lives in a .sh: an .err file matches a
-    # SUBSTRING, so "undeclared identifier: io.putc" passes just as happily with the wrong
-    # sentence appended to it.
-    if grep -q "is declared in" "$T/cerr"; then
-      echo "$f: a library hint appeared for a name that library does not declare:"
-      sed 's/^/  /' "$T/cerr"
-      exit 1
-    fi
-  done
+  "$WANTZEL" "$T/$f.wz" "$T/out.bin" >"$T/cerr" 2>&1 && {
+    echo "$f.wz compiled, but io.putc does not exist"; exit 1; }
+  assert_contains "$f is reported" "$(cat "$T/cerr")" "undeclared identifier: io.putc"
+  # THE ABSENCE IS THE POINT, and it is why this lives in a .sh: an .err file matches a
+  # SUBSTRING, so "undeclared identifier: io.putc" passes just as happily with the wrong
+  # sentence appended to it.
+  if grep -q "is declared in" "$T/cerr"; then
+    echo "$f: a library hint appeared for a name that module does not declare:"
+    sed 's/^/  /' "$T/cerr"
+    exit 1
+  fi
 done
 
 # ---- ONE TYPO AWAY: NAME THE NEIGHBOUR. FURTHER AWAY: SAY NOTHING ----------------------
@@ -89,7 +84,7 @@ done
 # and `a` for `say`, which is worse than silence: a wrong suggestion is the very failure
 # this message was fixed for. So: distance one, within the module the prefix names.
 cat > "$T/near.wz" <<'WZ'
-include "io.wz";
+import io;
 begin
   io.putc(1, chr(65));
 end.
@@ -99,44 +94,41 @@ WZ
 # about the threshold. io.putint is two edits from io.putn, inside the module the prefix
 # names, so it reaches exactly the comparison this guards.
 cat > "$T/far.wz" <<'WZ'
-include "io.wz";
+import io;
 begin
   io.putint(1, 3);
 end.
 WZ
 
-for cc in "$WANTZEL" "$WANTZEL0"; do
-  "$cc" "$T/near.wz" "$T/out.bin" >"$T/cerr" 2>&1
-  assert_contains "one typo away gets the neighbour" "$(cat "$T/cerr")" \
-    "undeclared identifier: io.putc -- did you mean io.puts?"
-  "$cc" "$T/far.wz" "$T/out.bin" >"$T/cerr" 2>&1
-  # AN ABSENCE AGAIN: an invented name must get no suggestion at all.
-  if grep -q "did you mean" "$T/cerr"; then
-    echo "a suggestion appeared for an invented name, which is worse than none:"
-    sed 's/^/  /' "$T/cerr"
-    exit 1
-  fi
-done
+"$WANTZEL" "$T/near.wz" "$T/out.bin" >"$T/cerr" 2>&1
+assert_contains "one typo away gets the neighbour" "$(cat "$T/cerr")" \
+  "undeclared identifier: io.putc -- did you mean io.puts?"
+"$WANTZEL" "$T/far.wz" "$T/out.bin" >"$T/cerr" 2>&1
+# AN ABSENCE AGAIN: an invented name must get no suggestion at all.
+if grep -q "did you mean" "$T/cerr"; then
+  echo "a suggestion appeared for an invented name, which is worse than none:"
+  sed 's/^/  /' "$T/cerr"
+  exit 1
+fi
 
-# and the hint itself, from BOTH compilers, which must agree word for word
+# and the hint itself, with the line to add
 cat > "$T/forgot.wz" <<'WZ'
 begin
   io.puts(STDOUT, "hi\n");
 end.
 WZ
-"$WANTZEL"  "$T/forgot.wz" "$T/out.bin" >"$T/a" 2>&1
-"$WANTZEL0" "$T/forgot.wz" "$T/out.bin" >"$T/b" 2>&1
-assert_contains "the self-hosted compiler names the library" "$(cat "$T/a")" 'io.puts is declared in io.wz'
-assert_contains "the C bootstrap names the library"          "$(cat "$T/b")" 'io.puts is declared in io.wz'
+"$WANTZEL" "$T/forgot.wz" "$T/out.bin" >"$T/a" 2>&1
+assert_contains "the compiler names the module and the import" "$(cat "$T/a")" \
+  'io.puts is declared in the library module io; add: import io;'
 
 # the remedy it proposes has to work
 cat > "$T/fixed.wz" <<'WZ'
-include "io.wz";
+import io;
 begin
   io.puts(STDOUT, "hi\n");
 end.
 WZ
 compile "$T/fixed.wz" "$T/fixed"
-assert_eq "the suggested include makes it compile and run" "$("$T/fixed")" "hi"
+assert_eq "the suggested import makes it compile and run" "$("$T/fixed")" "hi"
 
 echo "the hint names the library, both compilers agree, and a name that is not there gets no hint"

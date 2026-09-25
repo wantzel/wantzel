@@ -19,8 +19,8 @@
 //
 // WHAT IT PRINTS. The value, without quotes for a string, and a newline. A missing field is
 // exit 1 and nothing on stdout, so `v=$(jsonget x) || echo absent` works.
-include "io.wz";
-include "json.wz";
+import io;
+import json;
 
 const
   MAXIN = 1048576;                      // a megabyte of reply is more than any test sends

@@ -37,8 +37,8 @@ trap cleanup EXIT
 cases="0 3 111 112 113 127 128 129 1000"
 
 {
-echo 'include "io.wz";'
-echo 'include "sha384.wz";'
+echo 'import io;'
+echo 'import sha384;'
 echo 'var b: array[0..2047] of char; d: array[0..47] of char; i, j, n: int;'
 echo 'begin'
 for n in $cases; do

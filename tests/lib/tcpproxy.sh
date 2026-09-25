@@ -68,8 +68,8 @@ ok "it builds, $size bytes"
 # The smallest thing that answers: one line of HTTP per connection. Written in Wantzel too,
 # because nothing here may need another language.
 cat > "$tmp/srv.wz" <<'WZ'
-include "io.wz";
-include "net.wz";
+import io;
+import net;
 var lfd, fd, n, port, k, j, r, body: int;
     buf: array[0..1023] of char;
     big: array[0..1023] of char;

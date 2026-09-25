@@ -12,7 +12,7 @@
 // cannot be declared.)
 
 
-include "mcphttp.wz";
+import mcphttp;
 
 // ---- tool argument and result shapes --------------------------------
 
@@ -50,7 +50,7 @@ tools
   wordcount(CountArgs): CountResult "Count characters, words, and optionally how often a word occurs." readonly idempotent;
 end;
 
-include "tools.wz";
+import tools;
 
 function tool.add(a: array of AddArgs; r: array of AddResult): int;
 begin

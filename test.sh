@@ -22,10 +22,12 @@ echo "bootstrap"
 "$T/s1" src/wantzel.wz "$T/s2" && "$T/s2" src/wantzel.wz "$T/s3"
 if [ -x "$T/s1" ]; then ok "the C bootstrap builds a working stage1"; else bad "stage1 does not build or does not run"; fi
 if cmp -s "$T/s2" "$T/s3"; then ok "fixpoint stage2 = stage3"; else bad "fixpoint"; fi
-if cmp -s "$T/s3" ./bin/wantzel; then ok "the installed compiler is the fixpoint"; else bad "the installed compiler differs"; fi
+# bin/wantzel is the fixpoint WITH the library appended after it (build.sh step 6), so
+# the comparison covers the length of the fixpoint and no further.
+if cmp -s -n "$(wc -c < "$T/s3")" "$T/s3" ./bin/wantzel; then ok "the installed compiler is the fixpoint"; else bad "the installed compiler differs"; fi
 
 echo "the C bootstrap refuses what it does not implement"
-# bootstrap/boot.c does not implement schema, tools or --debug:
+# bootstrap/boot.c does not implement schema, tools, import or --debug:
 # it must refuse those loudly, with a message that says so, not miscompile them.
 refuses() {                 # refuses <name> <source> <needle>
     rm -f "$T/a" "$T/ea"
@@ -38,6 +40,11 @@ printf 'type S = schema field: int; end;\nbegin end.\n' > "$T/c.wz"
 refuses "schema is refused" "$T/c.wz" "does not implement 'schema'"
 printf 'tools t handler(In): Out "d"; end;\nbegin end.\n' > "$T/c.wz"
 refuses "tools is refused" "$T/c.wz" "does not implement 'tools'"
+# import: the library is part of bin/wantzel, not of the bootstrap, and the compiler's own
+# source imports nothing. Without the refusal wantzel0 would read `import` as a name and
+# fail somewhere else with a message that says nothing.
+printf 'import io;\nbegin end.\n' > "$T/c.wz"
+refuses "import is refused" "$T/c.wz" "does not implement 'import'"
 # --debug is refused as an argument wantzel0 does not accept at all -- it takes
 # only <source.wz> <executable>, so a third argument is refused before it is even looked at.
 printf 'begin end.\n' > "$T/c.wz"

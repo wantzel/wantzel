@@ -63,9 +63,9 @@ directory holds two programs.
 
 **Names that belong to one file share a prefix: `tree.paint`, `doc.save`, `run.go`.**
 
-The language has no namespaces and `include` is textual — everything lands in one flat
-scope. The prefix *is* the namespace: it says where a name comes from, keeps two modules
-from colliding, and makes a name greppable to exactly one file. Already universal in `lib/`
+The language has no namespaces, and `import` and `include` are textual — everything lands
+in one flat scope. The prefix *is* the namespace: it says where a name comes from, keeps two
+modules from colliding, and makes a name greppable to exactly one file. Already universal in `lib/`
 (`json.parse`, `io.puts`, `http.get`) and in every application of size.
 
 The prefix matches the file: `tree.wz` defines `tree.*`. Where a file is one obvious noun,
@@ -194,7 +194,7 @@ the levels are mixed. A routine that mentions a syscall number is at the bottom 
 almost nothing else should be.
 
 **Where the vocabulary goes:** a file of its own, named after what it's about. `fs.wz` is
-about files; `fs.map`, `fs.open`, `fs.stat` are the words it contributes. The caller includes
+about files; `fs.map`, `fs.open`, `fs.stat` are the words it contributes. The caller imports
 it and never reaches past it to a syscall. Same technique as §1, from the other side: that
 section says where files go, this one says why the result reads better.
 

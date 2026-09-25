@@ -1,0 +1,50 @@
+// lib/proc.wz: forking, reaping, and unpacking the exit status correctly.
+//
+// The killed child below sleeps on a REAL timespec, and the parent waits until the
+// child exists before signalling it.  Both of those were missing and the test passed
+// by luck: sys4(SYS.nanosleep, 0, 0, 0, 0) passes a null pointer, which the kernel
+// refuses with -EFAULT in about ten microseconds instead of sleeping.  The child
+// therefore ran straight to halt(0), and whether the SIGKILL arrived first was a race
+// the parent normally won and lost under load -- status 0 instead of 9, and then
+// "ok = yes (WRONG)", which is the test reporting the opposite of what it guards.
+// A test that depends on winning a microsecond race is a bug, not noise.
+import io;
+import proc;
+const CHILD.SLEEP.S = 30;           // long enough that only the kill ends it
+var pid, st: int;
+    ts: array[0..1] of int;         // a timespec: seconds, then nanoseconds
+procedure show(s: str; v: int); begin io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n"); end;
+begin
+  // a child that exits cleanly with code 7
+  pid := proc.fork;
+  if pid = 0 then halt(7);
+  st := proc.wait(pid);
+  show("reaped, status = ", proc.status[0]);
+  show("  exitcode = ", proc.exitcode(proc.status[0]));
+  if proc.exited(proc.status[0]) then io.puts(STDOUT, "  exited = yes\n") else io.puts(STDOUT, "  exited = no\n");
+  show("  signal = ", proc.signal(proc.status[0]));
+  // proc.ok is false: the child exited cleanly but with code 7, and that is not success
+  if proc.ok(proc.status[0]) then io.puts(STDOUT, "  ok = yes\n") else io.puts(STDOUT, "  ok = no (code 7)\n");
+
+  // a child killed by a signal: the exit code is then 0, and without checking the
+  // signal it would look like success
+  ts[0] := CHILD.SLEEP.S; ts[1] := 0;
+  pid := proc.fork;
+  if pid = 0 then
+  begin
+    // A real timespec, so the child is still sleeping when the signal arrives.  If it
+    // ever does wake up, exit non-zero: reaching this halt at all means the kill was
+    // lost, and that must show up as a failure rather than as a status of 0.
+    st := sys4(SYS.nanosleep, addr(ts[0]), 0, 0, 0);
+    halt(9);
+  end;
+  // Do not signal a child that may not have been scheduled yet: wait until it exists.
+  while not proc.alive(pid) do st := 0;
+  st := proc.kill(pid, 9);
+  st := proc.wait(pid);
+  show("killed child, status = ", proc.status[0]);
+  show("  exit code says = ", proc.exitcode(proc.status[0]));
+  show("  signal says    = ", proc.signal(proc.status[0]));
+  if proc.ok(proc.status[0]) then io.puts(STDOUT, "  ok = yes (WRONG)\n") else io.puts(STDOUT, "  ok = no (correct)\n");
+  show("children still alive = ", proc.nchildren);
+end.

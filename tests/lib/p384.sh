@@ -58,8 +58,8 @@ pad() { printf '%096s' "$1" | tr ' ' '0'; }
 sr=$(pad "$sr"); ss=$(pad "$ss")
 
 cat > "$tmp/t.wz" <<WZ
-include "io.wz";
-include "p384.wz";
+import io;
+import p384;
 var e, r, s, qx, qy, bad1: array[0..Q.N-1] of int;
     a, b, slow, fast: array[0..Q.N-1] of int;
     rb: array[0..47] of char;

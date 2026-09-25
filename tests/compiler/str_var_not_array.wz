@@ -8,7 +8,7 @@
 //
 // tests/compiler/str_var_remedy.wz is the other half: the remedy this message suggests
 // has to compile, or the message is worse than nothing.
-include "kv.wz";
+import kv;
 var b: array[0..63] of char;
     n: int;
 procedure look(key: str);

@@ -1,6 +1,6 @@
 // schema v2: real fields, arrays of int/real/bool/text[N], text[N] copies, null, optional, write, jsonschema.
-include "io.wz";
-include "json.wz";
+import io;
+import json;
 
 type Sample = schema
   name:   text[16] "a short name";

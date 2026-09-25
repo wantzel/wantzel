@@ -112,7 +112,7 @@ echo "over each limit: one JSON-RPC error naming it, and the server answers the 
 # be 64 MB -- mcp.in and mcp.buf of 4 MB, tool.out and tool.vbuf of 1 MB.  A 64 MB static
 # buffer would add 64 MB here; the ceiling leaves room for code, not for that.
 cat > "$T/min.wz" <<'WZ'
-include "json.wz";
+import json;
 type AddArgs = schema
   a: int;
   b: int;
@@ -123,7 +123,7 @@ end;
 tools
   add(AddArgs): AddResult "Add two whole numbers.";
 end;
-include "toolsmcp.wz";
+import toolsmcp;
 function tool.add(a: array of AddArgs; r: array of AddResult): int;
 begin
   r[0].sum := a[0].a + a[0].b;

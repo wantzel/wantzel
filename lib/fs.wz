@@ -1,12 +1,12 @@
 // lib/fs.wz -- directories, file metadata and reading, on raw syscalls.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // Read-only: nothing here creates, writes or deletes.
 
-include "io.wz";
+import io;
 
 const
   DT_DIR  = 4;

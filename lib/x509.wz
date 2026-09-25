@@ -1,7 +1,7 @@
 // lib/x509.wz -- reading an X.509 certificate (RFC 5280), on top of lib/der.wz.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // WHAT A TLS CLIENT ACTUALLY NEEDS from a certificate, and it is far less than a
@@ -19,8 +19,8 @@
 // socket. Every length is checked in lib/der.wz and every routine here reports failure
 // rather than returning a half-filled structure.
 
-include "io.wz";
-include "der.wz";
+import io;
+import der;
 
 const
   // 128, NOT 16. Measured 22-09-2026: google.com's certificate carries about seventy

@@ -1,6 +1,6 @@
 // spec §1-2: comments, case-insensitive identifiers and keywords, dotted names,
 // int/hex/char/string literals and escapes, constants of every kind.
-include "io.wz";
+import io;
 // a brace comment
 // over two lines
 CONST

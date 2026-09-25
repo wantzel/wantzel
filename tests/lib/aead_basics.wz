@@ -1,0 +1,104 @@
+// lib/aead.wz against the AEAD test vector in RFC 8439 section 2.8.2.
+//
+// THIS IS THE ONE THAT MATTERS FOR TLS: ChaCha20 and Poly1305 are each correct on their own
+// (their own tests say so), and this checks that they are COMBINED the way the specification
+// says -- the Poly1305 key from counter zero, the payload from counter one, each part padded
+// to sixteen bytes, and the two lengths at the end.
+//
+// Getting the combination wrong gives a cipher that encrypts and decrypts perfectly between
+// two copies of itself, and cannot talk to anything else. That failure is invisible until
+// the first real server refuses the record.
+import io;
+import aead;
+
+var
+  key:   array[0..31] of char;
+  nonce: array[0..11] of char;
+  aad:   array[0..15] of char;
+  buf:   array[0..255] of char;
+  tag:   array[0..15] of char;
+  i, n, failures: int;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ") else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+function nib(c: char): int;
+begin
+  if (c >= '0') and (c <= '9') then return ord(c) - ord('0');
+  return ord(c) - ord('a') + 10;
+end;
+
+procedure hexin(b: array of char; s: str);
+var i: int;
+begin
+  i := 0;
+  while i * 2 < slen(s) do
+  begin
+    b[i] := chr(nib(schar(s, i * 2)) * 16 + nib(schar(s, i * 2 + 1)));
+    i := i + 1;
+  end;
+end;
+
+function hexeq(b: array of char; at: int; s: str): bool;
+var i: int;
+begin
+  i := 0;
+  while i * 2 < slen(s) do
+  begin
+    if ord(b[at + i]) <> nib(schar(s, i * 2)) * 16 + nib(schar(s, i * 2 + 1)) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+begin
+  failures := 0;
+
+  // ---- RFC 8439 section 2.8.2 --------------------------------------------------------------
+  hexin(key, "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
+  hexin(nonce, "070000004041424344454647");
+  hexin(aad, "50515253c0c1c2c3c4c5c6c7");
+
+  n := io.push(buf, 0, "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.");
+  expect(n = 114, "the RFC's plaintext is 114 bytes");
+
+  ae.setkey(key);
+  ae.setnonce(nonce);
+  ae.seal(aad, 12, buf, 0, n, tag);
+
+  expect(hexeq(buf, 0, "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6"),
+         "the first 32 bytes of the RFC ciphertext");
+  expect(hexeq(buf, 96, "3ff4def08e4b7a9de576d26586cec64b6116"),
+         "and the last 18 bytes of it");
+  expect(hexeq(tag, 0, "1ae10b594f09e26a7e902ecbd0600691"), "and the tag is the RFC's");
+
+  // ---- AND IT OPENS AGAIN ------------------------------------------------------------------
+  ae.setnonce(nonce);
+  expect(ae.open(aad, 12, buf, 0, n, tag), "the same message opens");
+  expect(hexeq(buf, 0, "4c616469657320616e642047656e746c656d656e"), "and the plaintext is back");
+
+  // ---- A CHANGED BYTE MUST BE REFUSED ------------------------------------------------------
+  //
+  // THE CHECK THE WHOLE THING EXISTS FOR. An AEAD that decrypts a tampered message is not an
+  // AEAD; it is a cipher with a decorative tag.
+  ae.setnonce(nonce);
+  ae.seal(aad, 12, buf, 0, n, tag);
+  buf[50] := chr(bxor(ord(buf[50]), 1));
+  ae.setnonce(nonce);
+  expect(not ae.open(aad, 12, buf, 0, n, tag), "one flipped bit is refused");
+
+  // ---- AND SO MUST CHANGED ASSOCIATED DATA -------------------------------------------------
+  //
+  // The AAD is the TLS record header: it travels in the clear and must still be covered. A
+  // tag over the payload alone would let an attacker rewrite it.
+  buf[50] := chr(bxor(ord(buf[50]), 1));
+  aad[0] := chr(bxor(ord(aad[0]), 1));
+  ae.setnonce(nonce);
+  expect(not ae.open(aad, 12, buf, 0, n, tag), "changed associated data is refused");
+
+  if failures > 0 then halt(1);
+end.

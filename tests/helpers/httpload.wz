@@ -36,7 +36,7 @@
 //                                     connection ended in a clean EOF (reset=0) or a reset
 //                                     (reset=1) -- the point of this mode: a reset
 //                                     before the status line is read is exactly the bug.
-include "net.wz";
+import net;
 
 const
   MAXC   = 8192;              // connections this client can hold at once

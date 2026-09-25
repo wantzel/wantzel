@@ -1,0 +1,240 @@
+// lib/rand.wz: the source every key in this library comes from.
+//
+// WHY THIS DESERVES A TEST OF ITS OWN, despite being fifty lines. Every private key, every
+// TLS nonce, every ECDSA k comes through here. A generator that quietly returns the same
+// bytes twice, or fills only part of a buffer, breaks everything downstream in a way that
+// looks like it works: the key is still 32 bytes, the handshake still completes, and the
+// security is gone. Nothing else in the suite would notice.
+//
+// WHAT CAN AND CANNOT BE ESTABLISHED HERE. Randomness cannot be proven by looking at output
+// -- any specific sequence is as likely as any other, and a test that demanded "looks
+// random" would be a test of luck. What CAN be checked is the failure modes that are not
+// subtle at all:
+//
+//   1. the WHOLE buffer is filled, including its last byte
+//   2. two calls differ, and a hundred calls give a hundred different values
+//   3. every byte position varies across calls (a generator filling only the first eight
+//      bytes passes check 2 and is catastrophic)
+//   4. every bit position within a byte gets used
+//   5. rand.below stays in range, and covers its range
+//
+// THE LAST-BYTE CHECK EXISTS FOR A REASON: a loop written `while got < len(b) - 1` leaves
+// one byte untouched, which for a 32-byte key means it is always zero. That is a real bug
+// shape and it is invisible to anything that just looks at the first few bytes.
+import io;
+import rand;
+
+var
+  a, b: array[0..31] of char;
+  seen: array[0..255] of int;        // how often each byte value appeared, over many draws
+  varies: array[0..31] of bool;      // did position i ever differ from the first draw?
+  bitseen: array[0..7] of int;       // how often each bit position was set
+  first: array[0..31] of char;
+  small: array[0..0] of char;
+  big: array[0..255] of char;
+  i, j, k, n, same, zero, lo, hi, distinct: int;
+  failures: int;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ")
+  else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+begin
+  failures := 0;
+
+  // ---- 1. THE WHOLE BUFFER IS FILLED ------------------------------------------------------
+  //
+  // Prefilled with a marker, then overwritten. Any position still holding the marker after
+  // several draws was not written -- and the LAST position is the one that a
+  // `while got < len(b) - 1` bug leaves behind.
+  i := 0;
+  while i < 32 do begin a[i] := chr(0xAA); i := i + 1; end;
+  rand.bytes(a);
+  // A single draw can legitimately produce 0xAA in a position, so this is repeated: the
+  // chance of the same position being 0xAA in all ten draws by luck is 256^-10.
+  i := 0;
+  while i < 32 do begin varies[i] := false; i := i + 1; end;
+  k := 0;
+  while k < 10 do
+  begin
+    rand.bytes(a);
+    i := 0;
+    while i < 32 do
+    begin
+      if a[i] <> chr(0xAA) then varies[i] := true;
+      i := i + 1;
+    end;
+    k := k + 1;
+  end;
+  same := 0;
+  i := 0;
+  while i < 32 do
+  begin
+    if not varies[i] then same := same + 1;
+    i := i + 1;
+  end;
+  expect(same = 0, "every byte of the buffer is written, including the last");
+
+  // A one-byte buffer, and a 256-byte one: the small case catches an off-by-one in the loop
+  // bound, the large one catches a generator that only ever fills one kernel-sized chunk.
+  small[0] := chr(0xAA);
+  zero := 0;
+  k := 0;
+  while k < 20 do
+  begin
+    rand.bytes(small);
+    if small[0] <> chr(0xAA) then zero := zero + 1;
+    k := k + 1;
+  end;
+  expect(zero > 0, "a one-byte buffer is filled");
+
+  i := 0;
+  while i < 256 do begin big[i] := chr(0); i := i + 1; end;
+  rand.bytes(big);
+  zero := 0;
+  i := 0;
+  while i < 256 do
+  begin
+    if big[i] = chr(0) then zero := zero + 1;
+    i := i + 1;
+  end;
+  // About one byte in 256 is legitimately zero, so 256 bytes should hold roughly one. More
+  // than twenty means a large part of the buffer was never touched.
+  expect(zero < 20, "a 256-byte buffer is filled, not just its first chunk");
+
+  // ---- 2. TWO DRAWS DIFFER ------------------------------------------------------------------
+  rand.bytes(a);
+  rand.bytes(b);
+  same := 0;
+  i := 0;
+  while i < 32 do
+  begin
+    if a[i] = b[i] then same := same + 1;
+    i := i + 1;
+  end;
+  // Two independent 32-byte draws share about one byte by chance; 32 identical means the
+  // same bytes came back twice, which for a key generator is the worst possible failure.
+  expect(same < 16, "two draws are not the same bytes");
+
+  // ---- 3. EVERY POSITION VARIES -------------------------------------------------------------
+  //
+  // THE CHECK THAT CATCHES A PARTIAL FILL. A generator that randomises the first eight bytes
+  // and leaves the rest constant passes every check above: the buffer is "written", and two
+  // draws "differ". Here each position must differ from the first draw at least once over a
+  // hundred draws.
+  rand.bytes(first);
+  i := 0;
+  while i < 32 do begin varies[i] := false; i := i + 1; end;
+  k := 0;
+  while k < 100 do
+  begin
+    rand.bytes(a);
+    i := 0;
+    while i < 32 do
+    begin
+      if a[i] <> first[i] then varies[i] := true;
+      i := i + 1;
+    end;
+    k := k + 1;
+  end;
+  same := 0;
+  i := 0;
+  while i < 32 do
+  begin
+    if not varies[i] then same := same + 1;
+    i := i + 1;
+  end;
+  expect(same = 0, "every byte POSITION varies, not just the first few");
+
+  // ---- 4. EVERY BIT POSITION IS USED ---------------------------------------------------------
+  //
+  // A generator producing only ASCII, or only even numbers, would pass everything above. Over
+  // 3200 bytes each of the eight bits should be set close to half the time.
+  i := 0;
+  while i < 8 do begin bitseen[i] := 0; i := i + 1; end;
+  i := 0;
+  while i < 256 do begin seen[i] := 0; i := i + 1; end;
+  k := 0;
+  while k < 100 do
+  begin
+    rand.bytes(a);
+    i := 0;
+    while i < 32 do
+    begin
+      seen[ord(a[i])] := seen[ord(a[i])] + 1;
+      j := 0;
+      while j < 8 do
+      begin
+        if band(ord(a[i]) shr j, 1) = 1 then bitseen[j] := bitseen[j] + 1;
+        j := j + 1;
+      end;
+      i := i + 1;
+    end;
+    k := k + 1;
+  end;
+  // 3200 bytes, so each bit should be set about 1600 times. A bit stuck at 0 or 1 shows up
+  // immediately; the band is wide because this must not be flaky.
+  same := 0;
+  i := 0;
+  while i < 8 do
+  begin
+    if (bitseen[i] < 1200) or (bitseen[i] > 2000) then same := same + 1;
+    i := i + 1;
+  end;
+  expect(same = 0, "all eight bit positions are used, none stuck");
+
+  // AND THE VALUES SPREAD ACROSS THE WHOLE BYTE RANGE. With 3200 draws over 256 values, seeing
+  // fewer than 200 distinct values would mean the output is confined to a subset.
+  distinct := 0;
+  i := 0;
+  while i < 256 do
+  begin
+    if seen[i] > 0 then distinct := distinct + 1;
+    i := i + 1;
+  end;
+  expect(distinct > 200, "the output covers the whole byte range");
+
+  // ---- 5. rand.below STAYS IN RANGE AND COVERS IT ---------------------------------------------
+  //
+  // Out of range is a crash waiting to happen at a call site that indexes an array with it.
+  // And a rand.below that always returns 0 is in range, so coverage is checked too.
+  lo := 0;
+  hi := 0;
+  i := 0;
+  while i < 256 do begin seen[i] := 0; i := i + 1; end;
+  k := 0;
+  while k < 2000 do
+  begin
+    n := rand.below(10);
+    if n < 0 then lo := lo + 1;
+    if n >= 10 then hi := hi + 1;
+    seen[n] := seen[n] + 1;
+    k := k + 1;
+  end;
+  expect((lo = 0) and (hi = 0), "rand.below(10) stays within 0..9");
+  distinct := 0;
+  i := 0;
+  while i < 10 do
+  begin
+    if seen[i] > 0 then distinct := distinct + 1;
+    i := i + 1;
+  end;
+  expect(distinct = 10, "and reaches every value in its range");
+
+  // rand.below(1) must be 0 every time -- the degenerate case, where a modulo-bias
+  // correction written carelessly can loop forever or divide by zero.
+  same := 0;
+  k := 0;
+  while k < 100 do
+  begin
+    if rand.below(1) <> 0 then same := same + 1;
+    k := k + 1;
+  end;
+  expect(same = 0, "rand.below(1) is always 0");
+
+  if failures > 0 then halt(1);
+end.

@@ -11,7 +11,7 @@
 //
 // AND A ROUTINE MAY REUSE THE NAME TOO: local_two_libs_a declares a file-level `i` while
 // a routine below could declare its own -- see rt_local_bounds for that direction.
-include "io.wz";
+import io;
 include "progs/local_two_libs_a.wz";
 include "progs/local_two_libs_b.wz";
 

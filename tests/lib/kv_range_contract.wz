@@ -8,7 +8,7 @@
 // a plausible false. Only one violation can be shown per run (the process halts on the
 // first), so this exercises kv.same's "aend past the end of a" branch; the others in
 // kv.bytes and kv.same follow the same guard, one line for each of the four parameters.
-include "kv.wz";
+import kv;
 var
   a: array[0..3] of char;
   b: array[0..3] of char;

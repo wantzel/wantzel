@@ -1,0 +1,3 @@
+// A module name that is nothing like one: the message says how to list them.
+import nosuchmodule;
+begin end.

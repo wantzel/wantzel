@@ -1,0 +1,164 @@
+// lib/acme.wz: reading and building the ACME messages, with no network.
+//
+// WHY THIS RUNS WITHOUT A CERTIFICATE AUTHORITY. Let's Encrypt cannot validate `localhost`
+// -- there is nothing about it to prove ownership of -- so the network half needs either a
+// public domain or a local ACME server. What does NOT need either is the message handling,
+// and that is most of the protocol and all of the places it goes subtly wrong.
+//
+// THE FIXTURES ARE REAL SHAPES. Directory, order and authorization bodies as
+// Let's Encrypt sends them, including the parts that break a careless parser: several
+// challenge types in one array, fields in an order nobody promised, and a header whose name
+// is capitalised differently than expected.
+import io;
+import acme;
+
+var
+  buf:  array[0..4095] of char;
+  out:  array[0..255] of char;
+  host: array[0..63] of char;
+  email: array[0..63] of char;
+  d, qx, qy: array[0..P.N-1] of int;
+  n, i, failures: int;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ")
+  else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+// Fill buf from a literal and return its length.
+function load(s: str): int;
+var k: int;
+begin
+  k := 0;
+  while k < slen(s) do begin buf[k] := schar(s, k); k := k + 1; end;
+  return k;
+end;
+
+function textis(b: array of char; n: int; s: str): bool;
+var k: int;
+begin
+  if n <> slen(s) then return false;
+  k := 0;
+  while k < n do
+  begin
+    if b[k] <> schar(s, k) then return false;
+    k := k + 1;
+  end;
+  return true;
+end;
+
+begin
+  failures := 0;
+  p256.setup;
+
+  // ---- the directory -------------------------------------------------------------------
+  //
+  // The real one carries a "meta" object and several more URLs; only three matter, and a
+  // reader that assumes a field order would break on the next deployment.
+  n := load("{\"keyChange\":\"https://ca/kc\",\"meta\":{\"website\":\"https://ca\",\"termsOfService\":\"https://ca/tos\"},\"newAccount\":\"https://ca/acct\",\"newNonce\":\"https://ca/nonce\",\"newOrder\":\"https://ca/order\",\"revokeCert\":\"https://ca/rev\"}");
+  expect(acme.readdir(buf, n), "the directory parses");
+  expect(textis(acme.newacct, acme.newacctn, "https://ca/acct"), "newAccount comes out");
+  expect(textis(acme.newnonce, acme.newnoncen, "https://ca/nonce"), "newNonce comes out");
+  expect(textis(acme.neworder, acme.newordern, "https://ca/order"), "newOrder comes out");
+
+  // A NESTED OBJECT MUST NOT CONFUSE IT. "meta" above contains a "website" member; a parser
+  // that scanned for a key anywhere in the text rather than at the top level would find
+  // fields inside it.
+  n := load("{\"meta\":{\"newOrder\":\"https://WRONG/\"},\"newAccount\":\"https://ca/a\",\"newNonce\":\"https://ca/n\",\"newOrder\":\"https://ca/o\"}");
+  expect(acme.readdir(buf, n), "a directory with a nested object parses");
+  expect(textis(acme.neworder, acme.newordern, "https://ca/o"),
+         "and a key nested inside another object is NOT picked up");
+
+  // A directory missing a required URL must be refused, not half-read.
+  n := load("{\"newAccount\":\"https://ca/a\"}");
+  expect(not acme.readdir(buf, n), "a directory missing newOrder is refused");
+
+  // ---- the nonce header ------------------------------------------------------------------
+  //
+  // HEADER NAMES ARE CASE-INSENSITIVE and servers differ, so this is checked in two
+  // spellings. A client matching only one works against one server and mysteriously fails
+  // against another.
+  n := load("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nReplay-Nonce: abc123XYZ\r\n\r\n{}");
+  expect(acme.readnonce(buf, n), "the Replay-Nonce header is found");
+  expect(textis(acme.nonce, acme.noncen, "abc123XYZ"), "and its value is exact");
+
+  n := load("HTTP/1.1 200 OK\r\nREPLAY-NONCE: SHOUTED\r\n\r\n");
+  expect(acme.readnonce(buf, n), "in any capitalisation");
+  expect(textis(acme.nonce, acme.noncen, "SHOUTED"), "and still exact");
+
+  // A HEADER NAME MUST START A LINE. "X-Replay-Nonce" contains the name as a substring, and
+  // a search that ignored line starts would read the wrong value.
+  n := load("HTTP/1.1 200 OK\r\nX-Replay-Nonce: DECOY\r\n\r\n");
+  expect(not acme.readnonce(buf, n), "a header whose name merely CONTAINS it is not matched");
+
+  // ---- an order --------------------------------------------------------------------------
+  n := load("{\"status\":\"pending\",\"expires\":\"2026-10-01T00:00:00Z\",\"identifiers\":[{\"type\":\"dns\",\"value\":\"example.com\"}],\"authorizations\":[\"https://ca/authz/77\"],\"finalize\":\"https://ca/finalize/9\"}");
+  expect(acme.readorder(buf, n), "an order parses");
+  expect(textis(acme.finalize, acme.finalizen, "https://ca/finalize/9"), "finalize comes out");
+  expect(textis(acme.authz, acme.authzn, "https://ca/authz/77"), "and the first authorization");
+
+  // Once the order is valid it carries the certificate URL as well.
+  n := load("{\"status\":\"valid\",\"authorizations\":[\"https://ca/authz/1\"],\"finalize\":\"https://ca/f\",\"certificate\":\"https://ca/cert/42\"}");
+  expect(acme.readorder(buf, n), "a valid order parses");
+  expect(textis(acme.certurl, acme.certurln, "https://ca/cert/42"), "and yields the certificate URL");
+
+  // ---- an authorization, with SEVERAL challenge types -------------------------------------
+  //
+  // THE CHECK THIS FILE EXISTS FOR. A server offers http-01, dns-01 and tls-alpn-01 in one
+  // array, and http-01 is NOT first. Taking the first one means answering a dns-01 challenge
+  // by serving a file -- which never validates, and fails as a timeout rather than as an
+  // error that says why.
+  n := load("{\"status\":\"pending\",\"identifier\":{\"type\":\"dns\",\"value\":\"example.com\"},\"challenges\":[{\"type\":\"dns-01\",\"url\":\"https://ca/chal/dns\",\"token\":\"DNSTOKEN\"},{\"type\":\"http-01\",\"url\":\"https://ca/chal/http\",\"token\":\"HTTPTOKEN\"},{\"type\":\"tls-alpn-01\",\"url\":\"https://ca/chal/alpn\",\"token\":\"ALPNTOKEN\"}]}");
+  expect(acme.readauthz(buf, n), "an authorization with three challenge types parses");
+  expect(textis(acme.chal, acme.chaln, "https://ca/chal/http"),
+         "and the http-01 challenge is chosen, not the first one");
+  expect(textis(acme.token, acme.tokenn, "HTTPTOKEN"), "with its own token");
+
+  // And when http-01 is absent it must say so rather than pick something else.
+  n := load("{\"challenges\":[{\"type\":\"dns-01\",\"url\":\"https://ca/d\",\"token\":\"T\"}]}");
+  expect(not acme.readauthz(buf, n), "an authorization without http-01 is refused");
+
+  // ---- the payloads we send ----------------------------------------------------------------
+  i := 0;
+  while i < slen("floris@wantzel.com") do
+  begin email[i] := schar("floris@wantzel.com", i); i := i + 1; end;
+  acme.acctbody(email, i);
+  expect(textis(acme.body, acme.bodyn,
+    "{\"termsOfServiceAgreed\":true,\"contact\":[\"mailto:floris@wantzel.com\"]}"),
+    "the account payload is exactly what the protocol expects");
+
+  // THE TERMS MUST BE AGREED. Without that field the account is refused, and the error from
+  // the server says only "malformed".
+  acme.acctbody(email, 0);
+  expect(textis(acme.body, acme.bodyn, "{\"termsOfServiceAgreed\":true}"),
+         "and without an address it still agrees to the terms");
+
+  i := 0;
+  while i < slen("example.com") do
+  begin host[i] := schar("example.com", i); i := i + 1; end;
+  acme.orderbody(host, i);
+  expect(textis(acme.body, acme.bodyn,
+    "{\"identifiers\":[{\"type\":\"dns\",\"value\":\"example.com\"}]}"),
+    "the order payload names the identifier as a dns type");
+
+  // ---- the CSR payload ----------------------------------------------------------------------
+  //
+  // BASE64URL WITHOUT PADDING, like every other field in ACME. A '=' makes it a different
+  // string and the server rejects it as malformed.
+  if not p256.genkey(d, qx, qy) then expect(false, "a key is generated");
+  expect(acme.csrbody(d, qx, qy, host, 11), "the CSR payload is built");
+  n := 0;
+  i := 0;
+  while i < acme.bodyn do
+  begin
+    if acme.body[i] = '=' then n := n + 1;
+    i := i + 1;
+  end;
+  expect(n = 0, "and carries no base64 padding");
+  expect(acme.bodyn > 300, "and is a plausible size for a real request");
+
+  if failures > 0 then halt(1);
+end.

@@ -5,8 +5,8 @@
 // empty, so a caller had no way to show why a directory, order or authorization was
 // refused -- a malformed reply from the certificate authority looked exactly like one that
 // simply omitted an optional field.
-include "io.wz";
-include "acme.wz";
+import io;
+import acme;
 
 var
   buf: array[0..255] of char;

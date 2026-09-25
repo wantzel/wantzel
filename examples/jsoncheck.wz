@@ -1,0 +1,105 @@
+// jsoncheck.wz -- check a JSON document against a JSON Schema.
+//
+//   jsoncheck schema.json document.json
+//
+// Exit code 0 when it is valid, 1 when it is not, 2 when something could not be read. A
+// failure names the PLACE: /servers/0/command, not merely "invalid". That distinction is the
+// difference between a message you can act on and one you have to investigate, which is what
+// the rest of this toolchain is built around.
+//
+// A LIGHT FORM of JSON Schema 2020-12 (lib/jsonschema.wz says exactly which keywords). Keywords
+// it cannot check are IGNORED, which the specification requires -- so a document it accepts
+// may still be rejected by a complete validator, never the other way round. When that
+// happens it says so rather than implying a clean bill.
+
+import io;
+import fs;
+import jsonschema;
+
+var
+  sc:   array[0..65535] of char;
+  scn:  int;
+  doc:  array[0..65535] of char;
+  docn: int;
+  path: array[0..1023] of char;
+
+function loadfile(k: int; dst: array of char; max: int): int;
+var base, n, i: int;
+    j: int;
+    c: char;
+begin
+  j := 0;
+  c := argch(k, j);
+  while (c <> chr(0)) and (j < len(path) - 1) do
+  begin
+    path[j] := c;
+    j := j + 1;
+    c := argch(k, j);
+  end;
+  path[j] := chr(0);
+  base := fs.map(addr(path[0]));
+  if base < 0 then return 0 - 1;
+  n := fs.size;
+  if n > max then begin fs.unmap(base, n); return 0 - 2; end;
+  i := 0;
+  while i < n do begin dst[i] := chr(peek(base + i)); i := i + 1; end;
+  fs.unmap(base, n);
+  return n;
+end;
+
+begin
+  if argc() < 3 then
+  begin
+    io.puts(STDERR, "usage: jsoncheck <schema.json> <document.json>\n");
+    io.puts(STDERR, "\n");
+    io.puts(STDERR, "Exits 0 valid, 1 fails the schema, 2 read error, 3 not JSON at all.\n");
+    halt(2);
+  end;
+
+  scn := loadfile(1, sc, 65535);
+  if scn = 0 - 1 then begin io.puts(STDERR, "jsoncheck: cannot read the schema\n"); halt(2); end;
+  if scn = 0 - 2 then begin io.puts(STDERR, "jsoncheck: the schema is too large\n"); halt(2); end;
+
+  docn := loadfile(2, doc, 65535);
+  if docn = 0 - 1 then begin io.puts(STDERR, "jsoncheck: cannot read the document\n"); halt(2); end;
+  if docn = 0 - 2 then begin io.puts(STDERR, "jsoncheck: the document is too large\n"); halt(2); end;
+
+  if sch.valid(sc, scn, doc, docn) then
+  begin
+    io.puts(STDOUT, "valid");
+    // PARTIAL IS REPORTED EVEN ON SUCCESS, because that is exactly when it matters: the
+    // caller is about to trust the answer.
+    if sch.partial then
+    begin
+      io.puts(STDOUT, " (but this schema uses ");
+      io.puts(STDOUT, sch.skipped);
+      io.puts(STDOUT, ", which this validator does not check)");
+    end;
+    io.puts(STDOUT, "\n");
+    halt(0);
+  end;
+
+  // ---- THREE OUTCOMES, NOT TWO ----------------------------------------------------------
+  //
+  // "this is not JSON" and "this does not match the schema" send you to different places --
+  // the first to the syntax, the second to the schema. Reporting them the same way is how
+  // someone spends ten minutes reading a schema over a missing comma.
+  //
+  // AND IT GETS ITS OWN EXIT CODE, 3, because a script wants to tell them apart too: a
+  // malformed file is a different problem from one that simply does not fit.
+  if sch.notjson then
+  begin
+    io.puts(STDERR, "not JSON: ");
+    io.puts(STDERR, sch.err);
+    io.puts(STDERR, "\n");
+    halt(3);
+  end;
+
+  io.puts(STDERR, "invalid: ");
+  io.puts(STDERR, sch.err);
+  io.puts(STDERR, " at ");
+  if sch.pathn = 0 then io.puts(STDERR, "the document root")
+  else io.out(STDERR, addr(sch.path[0]), sch.pathn);
+  io.puts(STDERR, "\n");
+  halt(1);
+end.

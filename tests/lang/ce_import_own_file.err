@@ -1,0 +1,1 @@
+ce_import_own_file.wz:2: import takes a module name, without quotes or .wz; a file of your own is included: include "helper.wz";

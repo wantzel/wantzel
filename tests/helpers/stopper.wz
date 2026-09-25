@@ -1,6 +1,6 @@
 // stopper <pid> -- is that process alive, stop it with signal 15, is it alive now.
-include "io.wz";
-include "proc.wz";
+import io;
+import proc;
 
 var
   pid, r, i: int;

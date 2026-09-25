@@ -4,8 +4,8 @@
 //
 //   mcpbig [maxin maxout toolmax [port]]     0 keeps a default; with a port it serves
 //                                            MCP over HTTP at /mcp instead of stdio
-include "json.wz";
-include "sha256.wz";
+import json;
+import sha256;
 
 type DigestArgs = schema
   payload: text[50331648] "the bytes to measure";
@@ -41,8 +41,8 @@ tools
   probe(ProbeArgs): ProbeResult "The mappings the MCP library holds, the process's VmSize, and the resident pages of the tool result mapping." readonly;
 end;
 
-include "tools.wz";
-include "mcphttp.wz";
+import tools;
+import mcphttp;
 
 const
   PATTERN = "0123456789abcd\"\\";

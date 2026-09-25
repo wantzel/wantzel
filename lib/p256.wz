@@ -1,7 +1,7 @@
 // lib/p256.wz -- the NIST P-256 curve and ECDSA verification (FIPS 186-4, SEC 2).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // WHY THIS CURVE AND NOT X25519, which is already here: because certificates use it.
@@ -42,8 +42,8 @@
 // operation in this file, not just signing, and is left as a follow-up rather than folded into
 // this rewrite.
 
-include "io.wz";
-include "rand.wz";
+import io;
+import rand;
 
 const
   P.N = 8;                  // 8 limbs of 32 bits = 256 bits

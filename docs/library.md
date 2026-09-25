@@ -6,61 +6,82 @@
 
 ---
 
-`include "io.wz";` finds `lib/` without a path: the compiler looks there, beside its own
-executable, before it looks beside your source (see [flags.md](flags.md)). These are
-ordinary `.wz` files on disk — read them, step into them, change them under a ticket.
+The library is part of the compiler: `import io;` reads the module `io` from the compiler
+you run, never from disk, so a program and a compiler file always build the same executable.
+Its source is `lib/` in this repository; `wantzel --lib io` prints the copy inside your
+compiler, byte for byte the same. Read it, step into it, and change it in `lib/` followed by
+`./build.sh`.
+
+## Import and include
+
+```pascal
+import io;                  // a module: a bare name, no quotes, no .wz, no path
+import json;
+include "model.wz";         // a file of your own, next to this file
+include "store/orders.wz";  // a file of your own, in a directory next to this file
+```
+
+`import` reads a module from the library inside the compiler; `include` reads a file, relative
+to the directory of the file that names it. A module never comes from disk and a file never
+from the library, so a `lib/` directory or a file of your own that happens to share a module's
+name changes nothing about an `import`. Both are textual and read once; a module imported by
+another module is there for the rest of the program too. The complete rules and every error
+message are in [language.md §1b](language.md#1b-imports-and-includes); the mistakes people make
+with them, and an example of files including each other, in
+[writing-wantzel.md](writing-wantzel.md#imports-and-includes).
 
 ## All modules
 
 | module | for |
 |---|---|
-| `acme.wz` | getting a certificate from a certificate authority (RFC 8555) |
-| `aead.wz` | ChaCha20-Poly1305 as one operation (RFC 8439 §2.8) |
-| `autocert.wz` | a certificate a server gets and renews by itself, from inside its own event loop (ACME, HTTP-01); `http.https` uses it |
-| `base64.wz` | base64 encoding and decoding (RFC 4648) |
-| `certstore.wz` | keeping keys and certificates on disk, beside the binary |
-| `chacha20.wz` | the ChaCha20 stream cipher (RFC 8439) |
-| `chain.wz` | does a certificate chain up to something trusted? |
-| `csr.wz` | a certificate signing request, and a self-signed certificate (RFC 2986, 5280) |
-| `der.wz` | reading DER, and the parts of X.509 a TLS client needs (X.690, RFC 5280) |
-| `dns.wz` | hostnames to IPv4 and IPv6 addresses: a DNS stub resolver over UDP, and TCP when truncated |
-| `fs.wz` | directories, file metadata and reading, on raw syscalls |
-| `hash.wz` | open-addressing hash tables on caller-supplied arrays |
-| `hkdf.wz` | HKDF (RFC 5869) and the TLS 1.3 key schedule (RFC 8446 §7.1) |
-| `hmac.wz` | HMAC-SHA256 (RFC 2104 / RFC 4231) |
-| `http.wz` | a non-blocking HTTP/1.1 server on epoll, plain and HTTPS, with automatic certificates |
-| `io.wz` | output, numbers and little-endian byte packing |
-| `json.wz` | JSON scanning primitives |
-| `jsonschema.wz` | validating JSON against a JSON Schema (2020-12), the useful subset |
-| `jws.wz` | JSON Web Signature with ES256, and the JWK thumbprint (RFC 7515, 7638) |
-| `kv.wz` | helpers for a small JSON object kept as compact text |
-| `log.wz` | one JSON line per event on stderr, for journald or a file |
-| `math.wz` | real arithmetic beyond the operators: `exp`, `log`, `pow`, trigonometry, text |
-| `mcp.wz` | Model Context Protocol over JSON-RPC 2.0 |
-| `mcphttp.wz` | MCP over HTTP: the endpoint routine for `app.request` |
-| `net.wz` | sockets and epoll, straight on top of the system calls; IPv4 and IPv6 (IPv6 on Linux only for now) |
-| `oauth.wz` | an OAuth 2.1 authorization server for MCP clients |
-| `openapi.wz` | an OpenAPI 3.1 document and a Swagger UI page, generated from a `tools` block |
-| `p256.wz` | the NIST P-256 curve and ECDSA verification (FIPS 186-4, SEC 2) |
-| `p384.wz` | ECDSA over NIST P-384 (secp384r1), verification only |
-| `poly1305.wz` | the Poly1305 one-time authenticator (RFC 8439) |
-| `proc.wz` | processes: forking, reaping, and knowing how it ended |
-| `protobuf.wz` | reader for the protobuf wire format |
-| `rand.wz` | random bytes and numbers from the kernel |
-| `router.wz` | a few helpers on top of `http.wz` for routing by path |
-| `rsa.wz` | RSA-2048 signature verification, for certificate chains that are not ECDSA |
-| `sha1.wz` | SHA-1 (RFC 3174) -- not a security primitive; kept only for protocols that name it (`websocket.wz`'s handshake) |
-| `sha256.wz` | SHA-256 (FIPS 180-4) |
-| `sha384.wz` | SHA-384 (FIPS 180-4) |
-| `store.wz` | durable tables of fixed-size records: an append-only log |
-| `time.wz` | calendar time without a time zone |
-| `tls.wz` | TLS 1.3: a blocking client, and a server that runs inside an event loop |
-| `tools.wz` | MCP and REST glue for a declared `tools` block |
-| `toolsmcp.wz` | the MCP half of the glue for a declared `tools` block |
-| `uuid.wz` | UUID version 4 (RFC 9562) |
-| `websocket.wz` | a WebSocket server (RFC 6455) that takes over a connection from `http.wz`, on the same port |
-| `x25519.wz` | X25519 key agreement on Curve25519 (RFC 7748) |
-| `x509.wz` | reading an X.509 certificate (RFC 5280), on top of `der.wz` |
+| `acme` | getting a certificate from a certificate authority (RFC 8555) |
+| `aead` | ChaCha20-Poly1305 as one operation (RFC 8439 §2.8) |
+| `autocert` | a certificate a server gets and renews by itself, from inside its own event loop (ACME, HTTP-01); `http.https` uses it |
+| `base64` | base64 encoding and decoding (RFC 4648) |
+| `certstore` | keeping keys and certificates on disk, beside the binary |
+| `chacha20` | the ChaCha20 stream cipher (RFC 8439) |
+| `chain` | does a certificate chain up to something trusted? |
+| `csr` | a certificate signing request, and a self-signed certificate (RFC 2986, 5280) |
+| `der` | reading DER, and the parts of X.509 a TLS client needs (X.690, RFC 5280) |
+| `dns` | hostnames to IPv4 and IPv6 addresses: a DNS stub resolver over UDP, and TCP when truncated |
+| `fs` | directories, file metadata and reading, on raw syscalls |
+| `hash` | open-addressing hash tables on caller-supplied arrays |
+| `hkdf` | HKDF (RFC 5869) and the TLS 1.3 key schedule (RFC 8446 §7.1) |
+| `hmac` | HMAC-SHA256 (RFC 2104 / RFC 4231) |
+| `http` | a non-blocking HTTP/1.1 server on epoll, plain and HTTPS, with automatic certificates |
+| `io` | output, numbers and little-endian byte packing |
+| `json` | JSON scanning primitives |
+| `jsonschema` | validating JSON against a JSON Schema (2020-12), the useful subset |
+| `jws` | JSON Web Signature with ES256, and the JWK thumbprint (RFC 7515, 7638) |
+| `kv` | helpers for a small JSON object kept as compact text |
+| `log` | one JSON line per event on stderr, for journald or a file |
+| `lz` | LZ compression, packing and unpacking: the format the compiler stores this library in |
+| `math` | real arithmetic beyond the operators: `exp`, `log`, `pow`, trigonometry, text |
+| `mcp` | Model Context Protocol over JSON-RPC 2.0 |
+| `mcphttp` | MCP over HTTP: the endpoint routine for `app.request` |
+| `net` | sockets and epoll, straight on top of the system calls; IPv4 and IPv6 (IPv6 on Linux only for now) |
+| `oauth` | an OAuth 2.1 authorization server for MCP clients |
+| `openapi` | an OpenAPI 3.1 document and a Swagger UI page, generated from a `tools` block |
+| `p256` | the NIST P-256 curve and ECDSA verification (FIPS 186-4, SEC 2) |
+| `p384` | ECDSA over NIST P-384 (secp384r1), verification only |
+| `poly1305` | the Poly1305 one-time authenticator (RFC 8439) |
+| `proc` | processes: forking, reaping, and knowing how it ended |
+| `protobuf` | reader for the protobuf wire format |
+| `rand` | random bytes and numbers from the kernel |
+| `router` | a few helpers on top of `http.wz` for routing by path |
+| `rsa` | RSA-2048 signature verification, for certificate chains that are not ECDSA |
+| `sha1` | SHA-1 (RFC 3174) -- not a security primitive; kept only for protocols that name it (`websocket.wz`'s handshake) |
+| `sha256` | SHA-256 (FIPS 180-4) |
+| `sha384` | SHA-384 (FIPS 180-4) |
+| `store` | durable tables of fixed-size records: an append-only log |
+| `time` | calendar time without a time zone |
+| `tls` | TLS 1.3: a blocking client, and a server that runs inside an event loop |
+| `tools` | MCP and REST glue for a declared `tools` block |
+| `toolsmcp` | the MCP half of the glue for a declared `tools` block |
+| `uuid` | UUID version 4 (RFC 9562) |
+| `websocket` | a WebSocket server (RFC 6455) that takes over a connection from `http.wz`, on the same port |
+| `x25519` | X25519 key agreement on Curve25519 (RFC 7748) |
+| `x509` | reading an X.509 certificate (RFC 5280), on top of `der.wz` |
 
 `tools.wz`/`toolsmcp.wz` are the transport for a declared `tools ... end;` block — see
 [language.md §7b](language.md#7b-tools--a-tool-table-as-a-declaration). Together
@@ -75,7 +96,7 @@ already records several sharper pitfalls (`store.*`, `kv.*`, `oauth.*`, `sha256.
 
 ## `io` — output, numbers, byte access
 
-`include "io.wz";`
+`import io;`
 
 The lowest layer: no buffering, no allocation, every call a syscall or a few instructions
 over a buffer you already own.
@@ -107,7 +128,7 @@ returning a stale or zero time that looks real.
 Limits: no formatted output beyond decimal integers, no line-oriented reading.
 
 ```pascal
-include "io.wz";
+import io;
 
 var
   buf: array[0..63] of char;
@@ -123,7 +144,7 @@ end.
 
 ## `fs` — directories, file metadata, byte search
 
-`include "fs.wz";` (pulls in `io.wz`)
+`import fs;` (pulls in `io`)
 
 Read-only: nothing here creates, writes, renames or deletes. `fs.open` is a convenience for
 the read-only case; writing goes through `sys3(SYS.open, ...)` directly.
@@ -161,7 +182,7 @@ caller that always goes through `fs.opendir`/`fs.close` never needs `fs.forget` 
 already does this for you.
 
 ```pascal
-include "fs.wz";
+import fs;
 
 var
   path: array[0..15] of char;
@@ -182,7 +203,7 @@ end.
 
 ## `time` — calendar time without a time zone
 
-`include "time.wz";` (pulls in `io.wz`)
+`import time;` (pulls in `io`)
 
 A moment is an `int`: seconds since `1970-01-01T00:00:00Z`. Proleptic Gregorian calendar,
 UTC only, no DST, no leap seconds. Day arithmetic is exact for years 1..9999 and beyond.
@@ -209,7 +230,7 @@ Limits: no time zones beyond UTC, no duration/interval type, no calendar arithme
 moment ↔ date. `time.nowsec` shares `io.realtime`'s fatal-on-clock-failure behavior.
 
 ```pascal
-include "time.wz";
+import time;
 
 var
   s: array[0..15] of char;
@@ -226,7 +247,7 @@ end.
 
 ## `math` — real arithmetic beyond the operators
 
-`include "math.wz";` (pulls in `json.wz`, and through it `io.wz`)
+`import math;` (pulls in `json`, and through it `io`)
 
 Plain Wantzel over `real`: range reduction plus a series, no C math library. A few ULP of accuracy over the ranges the routines target, not
 IEEE-754-exact at every corner. Constants: `MATH.PI`, `MATH.E`, `MATH.LN2`, `MATH.HALFPI`,
@@ -257,7 +278,7 @@ Three routines are internal only — `math.reduce`, `math.sinr`, `math.cosr` —
 `math.cos` instead; the three give a silently wrong answer outside the first quadrant.
 
 ```pascal
-include "math.wz";
+import math;
 
 var
   buf: array[0..31] of char;
@@ -272,7 +293,7 @@ end.
 
 ## `json` — JSON scanning and writing primitives
 
-`include "json.wz";` (pulls in `io.wz`)
+`import json;` (pulls in `io`)
 
 No tree: a value stays in the input buffer, described by `(offset, length)`. The generated
 `schema` parsers are built on this; reach for it directly only for open-ended input (a proxy,
@@ -312,7 +333,7 @@ Limits: no tree, no path lookup, no in-place mutation. Field lookup by key is
 `kv.find`/`kv.first`/`kv.next` in `lib/kv.wz`; a whole typed object is a `schema` declaration.
 
 ```pascal
-include "json.wz";
+import json;
 
 var
   buf: array[0..127] of char;
@@ -331,8 +352,8 @@ end.
 
 ## `http` — a non-blocking HTTP/1.1 server on epoll
 
-`include "http.wz";` (pulls in `net.wz`, `json.wz` and `autocert.wz`, which brings the TLS
-stack and `dns.wz`)
+`import http;` (pulls in `net`, `json` and `autocert`, which brings the TLS stack and
+`dns`)
 
 One process, one event loop, no threads, no allocation per request. The application defines
 `procedure app.request`, called once per complete request, reading the request through the
@@ -434,10 +455,9 @@ with whatever else the program drives in between (`ws.poll`, a timer). The fd-ba
 of older loops — `http.accept`, `http.readable(fd)`, `http.flush(fd)`, `http.drop(fd)`,
 `http.open[fd]` — still work, but only `http.poll` enforces the deadlines.
 
-**Any include that brings in `http.wz`** — `tools.wz`, `mcphttp.wz`, `router.wz`,
-`openapi.wz` — makes `app.request` mandatory, even if `http.serve` is never called; an empty
-body suffices. A stdio-only MCP server includes `toolsmcp.wz` instead and needs no HTTP at
-all.
+**Any import that brings in `http`** — `tools`, `mcphttp`, `router`, `openapi` — makes
+`app.request` mandatory, even if `http.serve` is never called; an empty body suffices. A
+stdio-only MCP server imports `toolsmcp` instead and needs no HTTP at all.
 
 **HTTPS.** One call before `http.serve` makes its port speak TLS 1.3 (`tls.wz`); nothing in
 `app.request` changes:
@@ -493,7 +513,7 @@ Limits: no routing table beyond `router.wz`, no middleware, no chunked transfer 
 (every reply carries `Content-Length`), no HTTP/2.
 
 ```pascal
-include "http.wz";
+import http;
 
 procedure app.request;
 begin
@@ -512,9 +532,9 @@ end.
 
 ## `mcp` — an MCP server, and how large its messages may be
 
-`include "toolsmcp.wz";` for a server over stdio (pulls in `mcp.wz` and `json.wz`);
-`include "tools.wz";` and `include "mcphttp.wz";` to serve the same tools over HTTP. The
-tools themselves are a declared `tools ... end;` block — see
+`import toolsmcp;` for a server over stdio (pulls in `mcp` and `json`);
+`import tools;` and `import mcphttp;` to serve the same tools over HTTP. The tools
+themselves are a declared `tools ... end;` block — see
 [language.md §7b](language.md#7b-tools--a-tool-table-as-a-declaration). `mcp.stdio` reads
 one JSON-RPC message per line; `mcp.http`, called from `app.request`, answers one per POST.
 
@@ -562,7 +582,7 @@ use `text[N]` fields and arrays instead.
 
 ## `autocert` — a certificate that a server gets and keeps by itself
 
-`include "autocert.wz";` (pulls in `tls.wz`, `chain.wz`, `acme.wz`, `certstore.wz`, `dns.wz`)
+`import autocert;` (pulls in `tls`, `chain`, `acme`, `certstore`, `dns`)
 
 **A server on `http.wz` does not call any of this itself: `http.https` does** (see *HTTPS*
 in the `http` section). The routines below are for a program with a loop of its own.
@@ -624,12 +644,12 @@ openssl reads. A missing or read-only store works — without a cache — and sa
 
 Limits: HTTP-01 only (no wildcards), one name per certificate, no revocation. A step blocks
 the loop for the length of one HTTPS request: the name lookup (at most 12 s), the connect and
-every TLS call are each bounded by the request timeout (10 s). `examples/autocert.wz` is a
+every TLS call are each bounded by the request timeout (10 s). `examples/autocertd.wz` is a
 complete server on `http.https`.
 
 ## `websocket` — a WebSocket server on the same port as `http`
 
-`include "websocket.wz";` (pulls in `net.wz`, `base64.wz`, `http.wz` and `sha1.wz`)
+`import websocket;` (pulls in `net`, `base64`, `http` and `sha1`)
 
 RFC 6455, on the SAME listening socket `http.wz` already has. This module never opens a
 socket of its own; it takes over a connection that `app.request` hands it.
@@ -667,10 +687,10 @@ that: `ws.closefd(fd, 1009)`), `WS.OUTMAX` 64 KB per outgoing frame; `ws.take` r
 256 connections are already open, whatever the fd. `http.serve` cannot also call `ws.poll`,
 so a program wanting both protocols runs its own loop — `http.listen` once, then `http.poll`
 and `ws.poll(0)` on every wake — instead of calling `http.serve`. A program that never
-includes `websocket.wz` is unaffected.
+imports `websocket` is unaffected.
 
 ```pascal
-include "websocket.wz";
+import websocket;
 
 procedure app.wsframe(fd: int);
 var base: int;
@@ -703,7 +723,7 @@ end;
 
 ## `dns` — hostnames to IPv4 and IPv6 addresses
 
-`include "dns.wz";` (pulls in `net.wz` and `rand.wz`)
+`import dns;` (pulls in `net` and `rand`)
 
 A stub resolver: it asks the nameservers the system is configured with, over UDP, and again
 over TCP when an answer comes back truncated. `dns.resolve`/`dns.start`/`dns.poll` are A
@@ -763,7 +783,7 @@ Limits: no `search` domains and no `/etc/hosts` beyond `localhost`, so give a fu
 `dns.connect`'s IPv6 support goes through `net.connect6`.
 
 ```pascal
-include "dns.wz";
+import dns;
 
 var
   addrs: array[0..DNS.MAXADDR - 1] of int;
@@ -804,7 +824,7 @@ end;
 
 ## `tls` — TLS 1.3, a blocking client and an event-loop server
 
-`include "tls.wz";` (pulls in the crypto modules it needs)
+`import tls;` (pulls in the crypto modules it needs)
 
 TLS 1.3 only, one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`), one group (X25519). The
 server signs with one P-256 key. No TLS 1.2, no resumption, no client certificates, no
@@ -876,3 +896,22 @@ second (ECDSA signing is most of it) and about 30 MB/s of encrypted data.
 `examples/serve.wz` is the complete server: HTTP and HTTPS on one loop, the ACME challenge,
 and a certificate picked up from disk while running. `examples/localhttps.wz` is the
 smallest one, on `tls.accept`.
+
+## `lz` — packing and unpacking
+
+`import lz;` (pulls in nothing)
+
+The simplest LZ block format: runs of literal bytes and back-references into what was
+written already, no entropy coding. Source text packs to about half its size; unpacking runs
+at a few hundred MB/s. It is the format the compiler stores this library in, so it is
+exercised on every `import`.
+
+| routine | what it does |
+|---|---|
+| `lz.pack(src, n, dst): int` | `src[0..n)` packed into `dst`; the packed length, or `-1` when `dst` is too small |
+| `lz.unpack(src, n, dst): int` | `src[0..n)` unpacked into `dst`; the original length, or `-1` when `dst` is too small or `src` is not a whole, valid stream |
+| `lz.bound(n): int` | the largest result `lz.pack` can give for `n` bytes — size `dst` by it and packing never fails |
+
+`lz.unpack` checks every count and offset before it uses it: damaged or hostile input gives
+`-1`, never a read or write outside a buffer and never a runtime error. The same input always
+packs to the same bytes. The format itself is described at the top of `lib/lz.wz`.

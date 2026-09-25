@@ -12,7 +12,7 @@
 // and the one that just does not, so the knowledge of what the limit IS stays there.
 
 
-include "io.wz";
+import io;
 
 const
   // Room for the largest generated source. The data-segment case alone needs more

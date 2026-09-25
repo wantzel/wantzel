@@ -1,0 +1,170 @@
+// lib/lz.wz -- LZ compression: the simplest block format, packing and unpacking.
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that imports it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+//   k := lz.pack(text, n, packed);      // packed length, or -1 when packed is too small
+//   m := lz.unpack(packed, k, out);     // original length, or -1: too small, or damaged
+//   lz.bound(n)                         // the most lz.pack can need for n bytes
+//
+// THE FORMAT is the shape of LZ4 without its frame: runs of literal bytes, each followed by
+// a back-reference into what has been written already. No entropy coding. A sequence is
+//
+//   token      high 4 bits: number of literals; low 4 bits: match length - 4
+//   [more]     when a count in the token is 15: further bytes of 255 ..., then the rest
+//   literals   copied as they are
+//   offset     2 bytes, little-endian: 1..65535 bytes back from the current end
+//   [more]     the match length continued, as above
+//
+// and the last sequence has literals only. Text packs to roughly half its size; unpacking
+// runs at a few hundred MB/s. This is the one implementation of the format: the compiler
+// stores its standard library in it (docs/design.md), and its own unpacker is a copy of
+// lz.unpack that a test keeps identical to the one here.
+//
+// NOTHING IS TRUSTED ON THE WAY IN. lz.unpack checks every count and offset against both
+// buffers before it touches them, so damaged or hostile input gives -1 -- never a read or a
+// write outside a buffer, and never a runtime error.
+//
+// This module imports nothing, so a program without the rest of the library -- such as the
+// tool that packs the library into the compiler -- can include it as a file, by path.
+
+var
+  lz.ht: array[0..65535] of int;       // where each 4-byte hash was last seen, for lz.pack
+
+// lz.bound(n) -- the largest result lz.pack can give for n bytes: everything a literal,
+// plus the length bytes. A dst of this size never makes lz.pack fail.
+function lz.bound(n: int): int;
+begin
+  return n + n div 255 + 16;
+end;
+
+// lz.more(dst, o, v) -- a count continued past 15: bytes of 255, then the rest; the new o.
+// The caller has checked that it fits.
+function lz.more(dst: array of char; o: int; v: int): int;
+begin
+  while v >= 255 do
+  begin
+    dst[o] := chr(255);
+    o := o + 1;
+    v := v - 255;
+  end;
+  dst[o] := chr(v);
+  return o + 1;
+end;
+
+// lz.pack(src, n, dst) -- src[0..n) packed into dst; the packed length, or -1 when dst is
+// too small (or n is not within src). Greedy, with one hash table over 4-byte prefixes:
+// the same input always gives the same output.
+function lz.pack(src: array of char; n: int; dst: array of char): int;
+var i, j, h, m, lit, ml, o, a, t, need: int;
+begin
+  if (n < 0) or (n > len(src)) then return 0 - 1;
+  h := 0;
+  while h <= 65535 do begin lz.ht[h] := 0 - 1; h := h + 1; end;
+  i := 0; a := 0; o := 0;
+  while i + 4 <= n do
+  begin
+    h := band((ord(src[i]) + ord(src[i + 1]) * 256 + ord(src[i + 2]) * 65536
+               + ord(src[i + 3]) * 16777216) * 2654435761 shr 16, 65535);
+    j := lz.ht[h];
+    lz.ht[h] := i;
+    m := 0;
+    if (j >= 0) and (i - j <= 65535) then
+      while (i + m < n) and (src[j + m] = src[i + m]) do m := m + 1;
+    if m < 4 then i := i + 1
+    else
+    begin
+      // one sequence: the literals since a, then "copy m bytes from i - j back"
+      lit := i - a;
+      ml := m - 4;
+      need := 3 + lit;
+      if lit >= 15 then need := need + (lit - 15) div 255 + 1;
+      if ml >= 15 then need := need + (ml - 15) div 255 + 1;
+      if o + need > len(dst) then return 0 - 1;
+      if lit < 15 then t := lit * 16 else t := 240;
+      if ml < 15 then t := t + ml else t := t + 15;
+      dst[o] := chr(t);
+      o := o + 1;
+      if lit >= 15 then o := lz.more(dst, o, lit - 15);
+      while a < i do begin dst[o] := src[a]; o := o + 1; a := a + 1; end;
+      dst[o] := chr(band(i - j, 255));
+      dst[o + 1] := chr((i - j) shr 8);
+      o := o + 2;
+      if ml >= 15 then o := lz.more(dst, o, ml - 15);
+      i := i + m;
+      a := i;
+    end;
+  end;
+  // the last sequence: what is left, as literals, and no match after it
+  lit := n - a;
+  need := 1 + lit;
+  if lit >= 15 then need := need + (lit - 15) div 255 + 1;
+  if o + need > len(dst) then return 0 - 1;
+  if lit < 15 then dst[o] := chr(lit * 16) else dst[o] := chr(240);
+  o := o + 1;
+  if lit >= 15 then o := lz.more(dst, o, lit - 15);
+  while a < n do begin dst[o] := src[a]; o := o + 1; a := a + 1; end;
+  return o;
+end;
+
+// lz.unpack(src, n, dst) -- src[0..n), as lz.pack made it, unpacked into dst; the unpacked
+// length, or -1 when dst is too small or src is not a whole, valid stream.
+function lz.unpack(src: array of char; n: int; dst: array of char): int;
+var p, o, t, lit, ml, b, d: int;
+begin
+  if (n < 1) or (n > len(src)) then return 0 - 1;
+  p := 0;
+  o := 0;
+  while p < n do
+  begin
+    t := ord(src[p]);
+    p := p + 1;
+    lit := t shr 4;
+    if lit = 15 then
+    begin
+      b := 255;
+      while b = 255 do
+      begin
+        if p >= n then return 0 - 1;
+        b := ord(src[p]);
+        p := p + 1;
+        lit := lit + b;
+      end;
+    end;
+    if (lit > n - p) or (lit > len(dst) - o) then return 0 - 1;
+    while lit > 0 do
+    begin
+      dst[o] := src[p];
+      o := o + 1;
+      p := p + 1;
+      lit := lit - 1;
+    end;
+    if p = n then return o;
+    if p + 2 > n then return 0 - 1;
+    d := ord(src[p]) + ord(src[p + 1]) * 256;
+    p := p + 2;
+    if (d = 0) or (d > o) then return 0 - 1;
+    ml := band(t, 15);
+    if ml = 15 then
+    begin
+      b := 255;
+      while b = 255 do
+      begin
+        if p >= n then return 0 - 1;
+        b := ord(src[p]);
+        p := p + 1;
+        ml := ml + b;
+      end;
+    end;
+    ml := ml + 4;
+    if ml > len(dst) - o then return 0 - 1;
+    while ml > 0 do
+    begin
+      dst[o] := dst[o - d];
+      o := o + 1;
+      ml := ml - 1;
+    end;
+  end;
+  return 0 - 1;
+end;

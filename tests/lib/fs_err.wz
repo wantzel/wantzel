@@ -3,8 +3,8 @@
 // from a real failure (a component of the path is not a directory) or "the directory is
 // exhausted" from a getdents error. fs.err/fs.errno now carry that difference: empty for
 // the common case, filled for a real failure.
-include "io.wz";
-include "fs.wz";
+import io;
+import fs;
 
 var
   pad: array[0..511] of char;

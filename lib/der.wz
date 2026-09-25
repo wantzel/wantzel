@@ -1,7 +1,7 @@
 // lib/der.wz -- reading DER, and the parts of X.509 a TLS client needs (X.690, RFC 5280).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // DER IS TAG-LENGTH-VALUE, ALL THE WAY DOWN. One byte of tag, a length that is either one
@@ -20,7 +20,7 @@
 // obvious attack there is, and it must be a refusal rather than a read past the end.
 // Every routine here returns a negative number rather than trusting a length.
 
-include "io.wz";
+import io;
 
 const
   // Universal tags, X.690 §8.

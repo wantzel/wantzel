@@ -1,5 +1,5 @@
 // spec §6: ord/chr, len/addr, slen/schar/sadr, scan, argc/argch, sys calls.
-include "io.wz";
+import io;
 var
   a: array[5..9] of int;
   b: array[0..15] of char;

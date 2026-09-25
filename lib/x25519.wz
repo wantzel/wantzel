@@ -1,7 +1,7 @@
 // lib/x25519.wz -- X25519 key agreement on Curve25519 (RFC 7748).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // ONE PUBLIC ROUTINE: x.scalarmult(out, scalar, point). Both inputs are 32 bytes, the
@@ -26,12 +26,12 @@
 // for every bit and swaps with a MASK rather than an `if`. Nothing in this file may branch
 // on scalar or key material.
 //
-// THE TEST VECTORS ARE RFC 7748's OWN, in tests/lib/x25519.wz: §5.2 for scalarmult and
+// THE TEST VECTORS ARE RFC 7748's OWN, in tests/lib/x25519_basics.wz: §5.2 for scalarmult and
 // §6.1 for the full Diffie-Hellman with Alice and Bob. Cryptography that is almost right
 // is indistinguishable from cryptography that is right until someone attacks it, so this
 // file is worth nothing without them.
 
-include "io.wz";
+import io;
 
 const
   X.LIMBS = 10;

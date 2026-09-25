@@ -28,7 +28,7 @@
 /* limits                                                              */
 /* ------------------------------------------------------------------ */
 /* The release this compiler was built from; src/wantzel.wz has the same string. */
-#define VERSION "0.4.0"
+#define VERSION "0.5.0"
 #define SRCMAX  67108864
 #define CODEMAX 67108864
 #define DATMAX  33554432
@@ -112,6 +112,7 @@
 #define KW_DOWNTO    140
 #define KW_LOCAL     141
 #define KW_TOOLS     142
+#define KW_IMPORT    143
 
 /* symbol kinds */
 #define SK_VAR   0
@@ -199,18 +200,10 @@ long filenam[1024], filelen[1024], nfiles, curfile;
 long incpos[16], incend[16], incline[16], incfile[16], incdepth;
 long srclen; long srcend;
 char pathbuf[1024];
-/* Where the compiler looks for its library, plus the identity of every file read in
-   (st_dev + st_ino from stat(2)).  Counterpart of src/wantzel.wz. */
-char libdir[1024]; long libdirlen;
+/* The identity of every file read in (st_dev + st_ino from stat(2)), below. */
 /* the name of the type being declared, before it is known whether it is a record or a
    schema -- see decltypes. Counterpart of tnamebuf in src/wantzel.wz. */
 char tnamebuf[64];
-/* the compiler's own path, read from /proc/self/exe -- see setlibdir */
-char selfbuf[1024];
-/* the lib/ path tried for a bare include name: the fallback overwrites pathbuf with the
-   relative name, so it is kept here for the error message.  Counterpart of
-   src/wantzel.wz:triedlib. */
-char triedlib[1024]; long triedlibn;
 char stbuf[144];
 long fdev[1024]; long fino[1024];
 
@@ -349,7 +342,7 @@ long failkeyword(char *what, long jsonkey){
 
 /* iskw -- is the current token a keyword?  Every "name expected" site asks this first. */
 long iskw(void){
-    return tok >= KW_CONST && tok <= KW_TOOLS;
+    return tok >= KW_CONST && tok <= KW_IMPORT;
 }
 
 /* kwnamed -- is the current keyword standing where a NAME belongs, judged by the character
@@ -426,6 +419,7 @@ long keyword(){
         if(eqt("if")){ return KW_IF; }
         if(eqt("int")){ return KW_INT; }
         if(eqt("include")){ return KW_INCLUDE; }
+        if(eqt("import")){ return KW_IMPORT; }
     }
     if(c == 108){
         if(eqt("local")){ return KW_LOCAL; }
@@ -819,45 +813,7 @@ long makepath(long doff){
     return 0;
 }
 
-/* The directory the compiler itself is in plus "lib/": the search path for includes.
 
-   THE ANCHOR IS /proc/self/exe AND NOT argv[0], counterpart of src/wantzel.wz.  argv[0]
-   is whatever the caller said: started through PATH it is the bare word "wantzel" with no
-   '/' in it, cut stays 0, and the search path collapses to a relative "lib/" that depends
-   on the working directory.  readlink answers where the process really came from; argv[0]
-   remains the fallback when it cannot (no /proc).  Counterpart of src/wantzel.wz. */
-long setlibdir(char *a0){
-    long i; long cut; long n;
-    libdirlen = 0; i = 0; cut = 0;
-    n = readlink("/proc/self/exe", selfbuf, 1023);
-    if(n > 0){
-        i = 0; while(i < n){ if(selfbuf[i] == 47){ cut = i + 1; } i = i + 1; }
-        i = 0; while(i < cut){ libdir[i] = selfbuf[i]; i = i + 1; }
-    } else {
-        while(a0[i] != 0 && i < 900){ if(a0[i] == 47){ cut = i + 1; } i = i + 1; }
-        i = 0; while(i < cut){ libdir[i] = a0[i]; i = i + 1; }
-    }
-    libdirlen = cut;
-    /* If the compiler sits in .../bin/, its library belongs in .../lib/ beside it
-       (prefix/bin next to prefix/lib).  Counterpart of src/wantzel.wz. */
-    if(libdirlen >= 4 && libdir[libdirlen-4] == 'b' && libdir[libdirlen-3] == 'i'
-       && libdir[libdirlen-2] == 'n' && libdir[libdirlen-1] == 47){ libdirlen = libdirlen - 4; }
-    libdir[libdirlen] = 'l'; libdir[libdirlen+1] = 'i';
-    libdir[libdirlen+2] = 'b'; libdir[libdirlen+3] = 47;
-    libdirlen = libdirlen + 4;
-    return 0;
-}
-
-/* "undeclared identifier", with the library that declares it when there is one.
- *
- * WHY THIS EXISTS.  Forgetting the include is the first mistake a newcomer makes, and
- * "undeclared identifier" on io.puts says nothing about where io.puts lives -- while the
- * compiler can simply look.
- *
- * The counterpart in src/wantzel.wz searches the library it CARRIES; this one has no
- * embedded copy and reads lib/ from disk, so it tests whether libdir holds a file named
- * after the part before the first dot. Same message, same effect, by the means each has.
- */
 /* Not in any library: still say WHICH name. The bare message meant reading the whole
    routine to find the one identifier that was wrong. */
 long laterinclude(void);
@@ -881,55 +837,7 @@ void failname(void){
     _exit(1);
 }
 
-/* isnamech(c) -- part of a name? Letters, digits, '_' and the dot that qualifies it. */
-long isnamech(char c){
-    if(c >= 'a' && c <= 'z'){ return 1; }
-    if(c >= 'A' && c <= 'Z'){ return 1; }
-    if(c >= '0' && c <= '9'){ return 1; }
-    return c == '_' || c == '.';
-}
 
-/* onetypo(a, an, at, bn) -- do `a` and src[at..at+bn] differ by at most ONE insertion,
-   deletion or substitution?
-
-   DISTANCE ONE, AND DELIBERATELY NOT MORE. Measured against the 144 real errors in the
-   error log: every name a writer actually invented -- print, writeln, say, js.obj -- has
-   its nearest real neighbour 3 to 5 edits away, and suggesting "Init" for "print" is
-   worse than saying nothing. */
-long onetypo(char *a, long an, long at, long bn){
-    long i; long j; long diff;
-    if(an == bn){
-        diff = 0;
-        i = 0;
-        while(i < an){
-            if(a[i] != src[at + i]){ diff = diff + 1; }
-            if(diff > 1){ return 0; }
-            i = i + 1;
-        }
-        return diff == 1;
-    }
-    if(an == bn + 1){
-        i = 0;
-        while(i < bn && a[i] == src[at + i]){ i = i + 1; }
-        j = i;
-        while(j < bn){
-            if(a[j + 1] != src[at + j]){ return 0; }
-            j = j + 1;
-        }
-        return 1;
-    }
-    if(bn == an + 1){
-        i = 0;
-        while(i < an && a[i] == src[at + i]){ i = i + 1; }
-        j = i;
-        while(j < an){
-            if(a[j] != src[at + j + 1]){ return 0; }
-            j = j + 1;
-        }
-        return 1;
-    }
-    return 0;
-}
 
 /* kwhere(at, upto, w) -- does the word w start exactly at `at`? */
 long kwhere(long at, long upto, char *w){
@@ -961,193 +869,20 @@ long laterinclude(void){
     return -1;
 }
 
-/* namehere(at, upto, want, wantn) -- is exactly `want` at `at`, and nothing more?
 
-   THE END MATTERS: without it io.put would match io.putn, and the compiler would keep
-   quiet about a name that really is missing. */
-long namehere(long at, long upto, char *want, long wantn){
-    long i; char c;
-    if(at + wantn > upto){ return 0; }
-    i = 0;
-    while(i < wantn){
-        if(src[at + i] != want[i]){ return 0; }
-        i = i + 1;
-    }
-    c = src[at + wantn];
-    if(c >= 'a' && c <= 'z'){ return 0; }
-    if(c >= 'A' && c <= 'Z'){ return 0; }
-    if(c >= '0' && c <= '9'){ return 0; }
-    return c != '_' && c != '.';
-}
 
-/* libdeclares(at, n, want, wantn) -- is `want` declared in the library text at
-   src[at..at+n]?
 
-   A DECLARATION POSITION, NOT ANY OCCURRENCE. The name has to follow `procedure`,
-   `function`, `const`, `var` or `type` -- otherwise io.puts would "declare" itself in
-   every file that CALLS it, and the answer would be yes everywhere.
 
-   THIS IS NOT THE SEARCH THAT WAS REMOVED. That one scanned EVERY library to work out
-   which file declares a name, and needed a preference rule because store.table also
-   occurs in oauth.wz. This reads ONE file whose name the convention already gave us. */
-long libdeclares(long at, long n, char *want, long wantn){
-    long i; long j; long k; long e;
-    e = at + n;
-    i = at;
-    while(i < e){
-        while(i < e && (src[i] == ' ' || src[i] == 9)){ i = i + 1; }
-        j = i;
-        while(j < e && src[j] != 10){ j = j + 1; }
-        k = i;
-        if(kwhere(k, j, "procedure ")){ k = k + 10; }
-        else if(kwhere(k, j, "function ")){ k = k + 9; }
-        else if(kwhere(k, j, "const ")){ k = k + 6; }
-        else if(kwhere(k, j, "var ")){ k = k + 4; }
-        else if(kwhere(k, j, "type ")){ k = k + 5; }
-        else { k = -1; }
-        if(k >= 0){
-            while(k < j && (src[k] == ' ' || src[k] == 9)){ k = k + 1; }
-            if(namehere(k, j, want, wantn)){ return 1; }
-        }
-        i = j + 1;
-    }
-    return 0;
-}
-
-/* nearname(at, n, want, wantn) -- the declared name in this library that is ONE typo
-   away, or 0 if there is none. Fills nearbuf.
-
-   ONLY WITHIN THIS MODULE, which is what the compiler knows at this point anyway: the
-   name before the dot picked the file. That filter is doing real work -- it is the reason
-   `print` and `writeln` get no suggestion at all rather than a wrong one. */
-long nearname(long at, long n, char *want, long wantn){
-    long i; long j; long k; long e; long nl;
-    e = at + n;
-    i = at;
-    while(i < e){
-        while(i < e && (src[i] == ' ' || src[i] == 9)){ i = i + 1; }
-        j = i;
-        while(j < e && src[j] != 10){ j = j + 1; }
-        k = i;
-        if(kwhere(k, j, "procedure ")){ k = k + 10; }
-        else if(kwhere(k, j, "function ")){ k = k + 9; }
-        else if(kwhere(k, j, "const ")){ k = k + 6; }
-        else if(kwhere(k, j, "var ")){ k = k + 4; }
-        else if(kwhere(k, j, "type ")){ k = k + 5; }
-        else { k = -1; }
-        if(k >= 0){
-            while(k < j && (src[k] == ' ' || src[k] == 9)){ k = k + 1; }
-            nl = 0;
-            while(k + nl < j && isnamech(src[k + nl])){ nl = nl + 1; }
-            if(nl > 0 && onetypo(want, wantn, k, nl)){
-                if(nl >= TBMAX){ return 0; }
-                nearbufn = 0;
-                while(nearbufn < nl){ nearbuf[nearbufn] = src[k + nearbufn]; nearbufn = nearbufn + 1; }
-                return nearbufn;
-            }
-        }
-        i = j + 1;
-    }
-    return 0;
-}
-
-/* failnear(n) -- "undeclared identifier: X -- did you mean Y?"
-
-   THE NAME FIRST, THE SUGGESTION AFTER A DASH. The fact the reader needs is that X does
-   not exist; the nearest name is help, not the finding. */
-void failnear(long n){
-    wrs(2,"wantzel: "); wrname(2); wrs(2,":"); wrnum(2,line);
-    wrs(2,": undeclared identifier: ");
-    { long j; j = 0; while(obuf[j] != 0){ j = j + 1; } wrbuf(2,(long)(size_t)&obuf[0],j); }
-    wrs(2," -- did you mean ");
-    wrbuf(2,(long)(size_t)&nearbuf[0],n);
-    wrs(2,"?\n");
-    _exit(1);
-}
-
+/* failundeclared -- "undeclared identifier: X". This compiler carries no library, so it
+   has nothing to look a name up in: the hint that names the module to import is the
+   self-hosted compiler's. It only has to build src/wantzel.wz, which imports nothing. */
 long failundeclared(void){
-    long i; long n; long fd; long mark; long n2; long olen; long erin; long near;
-    n = 0;
-    while(tbuf[n] != 0 && tbuf[n] != '.'){ n = n + 1; }
-    if(tbuf[n] != '.' || n == 0){ failname(); }
-    /* pathbuf := <libdir><prefix>.wz */
-    i = 0; while(i < libdirlen){ pathbuf[i] = libdir[i]; i = i + 1; }
-    if(i + n + 4 >= 1022){ failname(); }
-    { long j; j = 0; while(j < n){ pathbuf[i+j] = tbuf[j]; j = j + 1; } }
-    i = i + n;
-    pathbuf[i] = '.'; pathbuf[i+1] = 'w'; pathbuf[i+2] = 'z'; pathbuf[i+3] = 0;
-    fd = (long)open(pathbuf, 0, 0);
-    if(fd < 0){ failname(); }
-    close((int)fd);
-    /* THE FILE EXISTS -- BUT IS IT ALREADY INCLUDED? Then this name is NOT in it, and the
-       suggestion would be wrong twice over: wrong about where the name lives, and wrong
-       about what to do, because the include is already there.
-
-       MEASURED 18-09-2026: io.putc does not exist, io.wz was included three
-       lines above, and the compiler answered "io.putc is declared in io.wz; add: include
-       "io.wz";". An agent adds the include it already has, recompiles, gets the identical
-       error, and loops.
-
-       pathbuf holds the library path right now, which is what samefile compares against. */
-    /* THE FILE EXISTS -- BUT IS THE NAME IN IT? That is the question the old code never
-       asked, and it is the whole bug. Asking about the name answers both halves at once,
-       whether or not the file is already included.
-
-       The text is read and then dropped: srclen goes back to where it was. */
-    olen = 0;
-    while(obuf[olen] != 0){ olen = olen + 1; }
-    mark = srclen;
-    n2 = readfile();
-    if(n2 > 0){
-        erin = libdeclares(mark, n2, obuf, olen);
-        if(!erin){
-            near = nearname(mark, n2, obuf, olen);
-            srclen = mark;
-            if(near > 0){ failnear(near); }
-            failname();
-        }
-        srclen = mark;
-    } else { srclen = mark; }
-    wrs(2,"wantzel: "); wrname(2); wrs(2,":"); wrnum(2,line);
-    wrs(2,": undeclared identifier: ");
-    { long j; j = 0; while(obuf[j] != 0){ j = j + 1; } wrbuf(2,(long)(size_t)&obuf[0],j); }
-    wrs(2," is declared in ");
-    wrbuf(2,(long)(size_t)&tbuf[0],n); wrs(2,".wz; add: include \"");
-    wrbuf(2,(long)(size_t)&tbuf[0],n); wrs(2,".wz\";\n");
-    _exit(1);
+    failname();
     return 0;
 }
 
-/* does the name from the include contain a '/'? then it is a path, not a library name */
-long haspath(long doff){
-    long i;
-    i = 0;
-    while(dat[doff+i] != 0){ if(dat[doff+i] == 47){ return 1; } i = i + 1; }
-    return 0;
-}
 
-/* pathbuf := <search path>/<name from the include> */
-long makelibpath(long doff){
-    long i; long n;
-    n = 0;
-    while(n < libdirlen){ pathbuf[n] = libdir[n]; n = n + 1; }
-    i = 0;
-    while(dat[doff+i] != 0){
-        if(n >= 1022){ fail("include path too long"); }
-        pathbuf[n] = dat[doff+i]; n = n + 1; i = i + 1;
-    }
-    pathbuf[n] = 0;
-    return 0;
-}
 
-/* does pathbuf exist? */
-long fileexists(){
-    long fd;
-    fd = opn((long)&pathbuf[0],0,0);
-    if(fd < 0){ return 0; }
-    cls(fd);
-    return 1;
-}
 
 /* pathbuf opschonen: "a/./b" -> "a/b", "a/x/../b" -> "a/b" */
 long normpath(){
@@ -1180,21 +915,9 @@ long doinclude(){
     doff = tval;
     next();
     if(tok != 59){ fail("missing ; after include"); }
-    /* A BARE NAME is a library name, a name with a '/' is a path.
-       Counterpart of src/wantzel.wz. */
-    triedlibn = 0;
-    if(haspath(doff)){ makepath(doff); }
-    else {
-        makelibpath(doff);
-        /* keep the library path before makepath writes the relative name over it */
-        if(!fileexists()){
-            while(pathbuf[triedlibn] != 0 && triedlibn < 1023){
-                triedlib[triedlibn] = pathbuf[triedlibn]; triedlibn = triedlibn + 1;
-            }
-            triedlib[triedlibn] = 0;
-            makepath(doff);
-        }
-    }
+    /* ALWAYS A FILE, relative to the includer or absolute. This compiler carries no
+       library: src/wantzel.wz imports nothing, and `import` is refused below. */
+    makepath(doff);
     normpath();
     datlen = datmark;                 /* the path is not program data */
     i = 0;
@@ -1210,19 +933,14 @@ long doinclude(){
     incdepth = incdepth + 1;
     start = srclen;
     n = readfile();
-    /* NAMING THE PATH IT TRIED, not just "cannot open": a bare library name is resolved
-       against <compiler dir>/lib/ first, so the path attempted is not what is written on
-       the line. The counterpart in src/wantzel.wz is failinclude. */
+    /* NAMING THE PATH IT TRIED, not just "cannot open": it is relative to the includer,
+       so it is not what is written on the line. */
     if(n < 0){
         long q;
         wrs(2,"wantzel: "); wrname(2); wrs(2,":"); wrnum(2,line);
         wrs(2,": cannot open the included file: ");
         q = 0; while(pathbuf[q] != 0){ q = q + 1; }
         wrbuf(2,(long)(size_t)&pathbuf[0],q);
-        if(triedlibn > 0){
-            wrs(2,"\n  looked in the library first: ");
-            wrbuf(2,(long)(size_t)&triedlib[0],triedlibn);
-        }
         wrs(2,"\n");
         _exit(1);
     }
@@ -1693,8 +1411,7 @@ long trapheading(char *msg){
    supposed to be reproducible, and it was not -- a build server naming its sources
    absolutely cannot produce the artifact a developer verified. And the second is worse:
    the build machine's directory layout, including a user's home directory, ends up inside
-   every executable anyone ships. The embedded LIBRARY files leaked it either way, because
-   they are named <libdir>/<name> and libdir is found from /proc/self/exe.
+   every executable anyone ships.
 
    THE RULE IS THE LAST TWO SEGMENTS OF THE DIRECTORY, AT MOST. A diagnostic has to say
    which file and which line; what it does not have to say is where the tree was checked
@@ -3502,6 +3219,7 @@ long parseprogram(){
             fail("the 'program' header is no longer part of the language; delete that line");
         }
         if(tok == KW_INCLUDE){ doinclude(); }
+        else if(tok == KW_IMPORT){ fail("this bootstrap compiler does not implement 'import': it carries no library; build bin/wantzel first (./build.sh) and use it instead"); }
         else if(tok == KW_SCHEMA){ fail("a schema is declared as 'type X = schema ... end;'"); }
         else if(tok == KW_TOOLS){ decltools(); }
         /* `local` before a declaration limits it to this file.  declloc
@@ -3678,27 +3396,9 @@ int main(int argc,char **argv){
        the same string in its VERSION constant. */
     if(argc == 2 && (argeqs(argv[1],"--version") || argeqs(argv[1],"-v"))){
         wrs(1,"wantzel " VERSION "\n");
-        /* AND WHERE THE LIBRARY IS, the counterpart of the same block in src/wantzel.wz.
-           Since the standard library moved to disk, a compiler copied WITHOUT its lib/
-           beside it fails on `include "io.wz"` -- and the honest answer to "is my install
-           right?" is the path itself, plus whether anything is there. */
-        setlibdir(argv[0]);
-        wrs(1,"library ");
-        if(libdirlen > 0){
-            long fd; long n = libdirlen;
-            wrbuf(1,(long)&libdir[0],libdirlen);
-            /* io.wz is the probe: every program that includes anything includes it, so
-               its absence is what the user hits first.  The probe is undone again --
-               libdir is the real search path. */
-            if(n + 6 < (long)sizeof(libdir)){
-                libdir[n]='i'; libdir[n+1]='o'; libdir[n+2]='.';
-                libdir[n+3]='w'; libdir[n+4]='z'; libdir[n+5]=0;
-                fd = opn((long)&libdir[0],0,0);
-                libdir[n] = 0;
-                if(fd < 0) wrs(1,"   NOT FOUND -- copy lib/ next to the compiler");
-                else cls(fd);
-            }
-        } else wrs(1,"(unknown -- the compiler could not find its own path)");
+        /* The library is part of bin/wantzel, appended by build.sh after the fixed point;
+           this compiler has none, and needs none to build src/wantzel.wz. */
+        wrs(1,"library none (the bootstrap compiler carries no library)");
         wrs(1,"\n");
         return 0;
     }
@@ -3718,7 +3418,6 @@ int main(int argc,char **argv){
         wrs(2,"no --debug. Use bin/wantzel (the self-hosted compiler) for that.\n");
         return 1;
     }
-    setlibdir(argv[0]);
     i = 0; while(argv[1][i] != 0){ pathbuf[i] = argv[1][i]; i = i + 1; }
     pathbuf[i] = 0;
     i = 0; while(argv[2][i] != 0){ outname[i] = argv[2][i]; i = i + 1; }

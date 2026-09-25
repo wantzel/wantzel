@@ -25,6 +25,9 @@ compiler translate that correctly? Everything lives in `tests/`; the runner is `
 
 ## Running
 
+The suite runs in a clone, after `./build.sh` (see the README's *Build from source*); the
+downloaded compiler is enough to write programs, not to run this suite.
+
 ```bash
 ./wztest                          # lang + compiler + lib + limits, ~1 s
 ./wztest tests/lang               # one directory
@@ -47,7 +50,7 @@ only when `--bench` was typed, and nothing under `tests/toolchain/` calls it.
 ## The bootstrap fixed point
 
 `bootstrap/boot.c` is a small C compiler for exactly what `src/wantzel.wz` needs to compile
-itself: no `schema`, no `tools`, no `--debug`. `src/wantzel.wz` is the real compiler,
+itself: no `schema`, no `tools`, no `import`, no `--debug`. `src/wantzel.wz` is the real compiler,
 self-hosted, and it implements the whole language.
 
 The chain is `boot.c` → `wantzel.stage1` → `stage2` → `stage3`. **stage2 and stage3 must be
@@ -64,7 +67,37 @@ Anything the compiler's source does not use (schema, tools, `real` arithmetic be
 it already has, `--debug`) can change freely in the self-hosted compiler without touching
 `boot.c` at all. What `boot.c` must still do is *refuse* anything it does not implement,
 loudly and with a clear message, rather than miscompile it — `test.sh` checks that for
-`schema`, `tools` and `--debug`.
+`schema`, `tools`, `import` and `--debug`.
+
+## The library inside the compiler
+
+`bin/wantzel` is the fixed point with the standard library appended after it (see
+[design.md](design.md#one-file-the-standard-library-travels-in-the-compiler)). `./build.sh`
+does it in order: the fixed point is checked on the compiler alone; stage3 builds
+`bootstrap/libpack.wz`, which packs `lib/*.wz` with `lib/lz.wz`; the result is appended;
+every module is read back through the new compiler (`wantzel --lib <module>`) and compared
+with its file; only then is it installed. The whole build takes well under a second.
+
+Because the library is inside the compiler, **a change in `lib/` reaches a test only
+through a rebuild.** `./wztest` rebuilds by itself when a file in `lib/` is newer than
+`bin/wantzel`, so a test of a module always runs against the module as it is on disk,
+packed exactly as a user gets it. The checks that keep this honest, all with `--toolchain`:
+
+| test | what it holds |
+|---|---|
+| `library_current.sh` | the sha256 in the compiler is the sha256 of `lib/` now |
+| `lib_export.sh` | `wantzel --lib` lists exactly the modules of `lib/`, and each comes back byte for byte |
+| `lz_copy_is_identical.sh` | the compiler's unpacker is `lz.unpack` from `lib/lz.wz`, letter for letter |
+| `trailer_damaged.sh` | a damaged trailer is refused with a message, never read past a buffer |
+| `standalone_binary.sh` | the compiler copied alone into an empty directory compiles, and gives the same bytes |
+| `lib_dir_is_ignored.sh` | a `lib/` directory or a local `io.wz` changes nothing; an include is always a file |
+| `output_runs_identical.sh` | a fixed set of programs runs (or still compiles) exactly as the 0.4.0 reference did; a `--debug` build and a refused program stay byte-identical |
+
+**To test a changed module without touching `lib/`**, copy it next to the test program and
+include the copy as a file (`include "./tls.wz";` where the program had `import tls;`): a
+file is always a file, and the modules the copy imports still come from the compiler.
+`tests/lib/tls.sh` and `tests/lib/websocket.sh` sabotage their module this way to prove
+their checks can fail.
 
 ## Watching the speed
 

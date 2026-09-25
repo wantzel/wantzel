@@ -3,7 +3,7 @@
 // leak Dutch and a working name from before this compiler stood on its own;
 // nothing pinned that, which is why it survived.  This test prints the text itself, so a change to the
 // wording is visible in the diff instead of silent.
-include "oauth.wz";
+import oauth;
 var
   i: int;
 // oauth.wz forward-declares these two: the library does not know how an

@@ -1,6 +1,6 @@
 // slices: a[lo..hi] (inclusive, like a declaration) passed as an array view;
 // on globals, locals, array parameters and arrays of records; empty slices; bounds.
-include "io.wz";
+import io;
 type
   Item = record
     k: int;

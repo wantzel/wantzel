@@ -1,7 +1,7 @@
 // lib/p384.wz -- ECDSA over NIST P-384 (secp384r1), verification only.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // WHY THIS EXISTS. Measured 22-09-2026: the intermediates and roots of github.com,
@@ -27,8 +27,8 @@
 // secret to leak. Timing only matters where a private scalar is involved, which is signing,
 // and this file does not sign.
 
-include "io.wz";
-include "rand.wz";
+import io;
+import rand;
 
 const
   Q.N = 12;                 // 12 limbs of 32 bits = 384 bits

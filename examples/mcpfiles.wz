@@ -12,8 +12,8 @@
 // and this program only writes the handlers (tool.<name>).
 
 
-include "mcphttp.wz";
-include "fs.wz";
+import mcphttp;
+import fs;
 
 const
   MAXPATH  = 4096;
@@ -65,7 +65,7 @@ tools
   search(SearchArgs): SearchResult "Search every text file under a directory for a literal string, and return matching lines with their file and line number." readonly;
 end;
 
-include "tools.wz";
+import tools;
 
 var
   app.root:    array[0..MAXPATH - 1] of char;

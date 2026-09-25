@@ -75,9 +75,9 @@ ss -tln 2>/dev/null | grep -q ":$port " \
 
 # ---- the client ----------------------------------------------------------------------------
 cat > "$tmp/cli.wz" <<WZ
-include "io.wz";
-include "net.wz";
-include "tls.wz";
+import io;
+import net;
+import tls;
 var fd, n, i, rfd, rn: int;
     buf: array[0..8191] of char;
     req: array[0..255] of char;
@@ -282,23 +282,28 @@ else bad "only $n of 5 handshakes succeeded" "fresh random exposes an assumption
 # nothing, because there is no tag on it yet -- the first version of this check did exactly
 # that and passed while proving nothing. The byte has to land inside a record that carries a
 # tag.
-# THE SABOTAGED BUILD NEEDS ITS OWN COMPILER BESIDE ITS OWN lib/, because the compiler
-# resolves the standard library relative to its OWN location -- `wantzel --version` prints
-# the path it will use. Copying only the sources and pointing at them does not work, and a
-# first version of this check did exactly that: it silently built the GOOD client and then
-# reported that a tampered record had been accepted.
-mkdir -p "$tmp/pg/lib" "$tmp/pg/bin"
-cp "$here"/lib/*.wz "$tmp/pg/lib/"
-cp "$here/bin/wantzel" "$tmp/pg/bin/"
+# THE SABOTAGED MODULE IS INCLUDED AS A FILE. The compiler reads its library from its own
+# file and from nowhere else, so a modified copy of lib/tls.wz beside a copied compiler
+# changes nothing -- a first version of this check built the GOOD client exactly that way
+# and then reported that a tampered record had been accepted. A copy included by path is a
+# file, and a file is what the compiler reads: the client below includes "./tls.wz" where
+# the real one imports tls. Every module that copy imports still comes from the compiler,
+# so exactly one module is sabotaged and nothing around it.
+mkdir -p "$tmp/pg"
 awk '/tls\.mknonce\(tls\.siv, tls\.sseq\);/ && !done {
        print "  tls.plain[0] := chr(bxor(ord(tls.plain[0]), 1));"; done=1 }
-     { print }' "$here/lib/tls.wz" > "$tmp/pg/lib/tls.wz"
+     { print }' "$here/lib/tls.wz" > "$tmp/pg/tls.wz"
+sed 's|^import tls;$|include "./tls.wz";|' "$tmp/cli.wz" > "$tmp/pg/cli.wz"
 
-# THE SABOTAGE MUST ACTUALLY BE IN THE FILE. An awk pattern that matches nothing leaves a
-# perfect copy, and then this whole check passes while testing the unmodified client.
-if ! grep -q "bxor(ord(tls.plain\[0\]), 1)" "$tmp/pg/lib/tls.wz"; then
+# THE SABOTAGE MUST ACTUALLY BE IN THE FILE, AND THE FILE IN THE CLIENT. An awk pattern that
+# matches nothing leaves a perfect copy, and a sed that matches nothing leaves the client
+# importing the real module; either way this whole check passes while testing the
+# unmodified client.
+if ! grep -q "bxor(ord(tls.plain\[0\]), 1)" "$tmp/pg/tls.wz"; then
   bad "the sabotage did not apply" "tls.mknonce(tls.siv, ...) not found in lib/tls.wz"
-elif "$tmp/pg/bin/wantzel" "$tmp/cli.wz" "$tmp/cli_sab" >/dev/null 2>&1; then
+elif ! grep -q '^include "./tls.wz";$' "$tmp/pg/cli.wz"; then
+  bad "the sabotaged client does not include the sabotaged file" "check the sed on cli.wz"
+elif "$here/bin/wantzel" "$tmp/pg/cli.wz" "$tmp/cli_sab" >/dev/null 2>&1; then
   sab=$("$tmp/cli_sab" "$port" localhost 2>&1 || true)
   case "$sab" in
     *HANDSHAKE-OK*) bad "a tampered record was ACCEPTED" \
@@ -307,7 +312,7 @@ elif "$tmp/pg/bin/wantzel" "$tmp/cli.wz" "$tmp/cli_sab" >/dev/null 2>&1; then
     *) bad "a tampered record failed for the wrong reason" "got: $(echo "$sab" | head -2)" ;;
   esac
 else
-  bad "the sabotaged client does not build" "$("$tmp/pg/bin/wantzel" "$tmp/cli.wz" "$tmp/cli_sab" 2>&1 | head -2)"
+  bad "the sabotaged client does not build" "$("$here/bin/wantzel" "$tmp/pg/cli.wz" "$tmp/cli_sab" 2>&1 | head -2)"
 fi
 
 # ---- 5. AND THE OTHER DIRECTION: OUR SERVER, OPENSSL'S CLIENT --------------------------------
@@ -325,10 +330,10 @@ D=$(openssl ec -in "$tmp/k.pem" -text -noout 2>/dev/null \
 openssl x509 -in "$tmp/c.pem" -outform DER -out "$tmp/c.der" 2>/dev/null
 
 cat > "$tmp/srv.wz" <<WZ
-include "io.wz";
-include "net.wz";
-include "fs.wz";
-include "tls.wz";
+import io;
+import net;
+import fs;
+import tls;
 var lfd, fd, base, n, i: int;
     cert: array[0..8191] of char;
     d: array[0..P.N-1] of int;

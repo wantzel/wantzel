@@ -6,7 +6,7 @@
 //
 // WHAT IS CHECKED, and the edges are the point: a round trip is not enough on its own,
 // because two mirrored bugs cancel out. So the exact bytes are checked as well.
-include "io.wz";
+import io;
 
 var
   b: array[0..15] of char;

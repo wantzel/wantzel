@@ -9,7 +9,7 @@
 // It surfaced through lib/mcp.wz, where mcp.name and mcp.version are str globals the
 // application is meant to set. A minimal MCP server that did not set them compiled fine
 // and died on its FIRST request.
-include "json.wz";
+import json;
 var
   s: str;
   t2: str;

@@ -1,7 +1,7 @@
 // lib/tls.wz -- TLS 1.3: a blocking client, and a server that runs inside an event loop.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // WHAT IT SPEAKS, and the narrowness is deliberate rather than provisional. TLS 1.3 only,
@@ -71,17 +71,17 @@
 // to zero on every key change. Get it wrong and the first record still decrypts -- because
 // sequence 0 XOR anything is the IV itself -- and the second one does not.
 
-include "io.wz";
-include "net.wz";
-include "rand.wz";
-include "sha256.wz";
-include "hkdf.wz";
-include "x25519.wz";
-include "aead.wz";
-include "x509.wz";
-include "chain.wz";
-include "p256.wz";
-include "p384.wz";
+import io;
+import net;
+import rand;
+import sha256;
+import hkdf;
+import x25519;
+import aead;
+import x509;
+import chain;
+import p256;
+import p384;
 
 const
   // HOW MANY CERTIFICATES A CHAIN MAY HAVE. Real chains are two or three; eight is generous

@@ -1,7 +1,7 @@
 // lib/acme.wz -- getting a certificate from a certificate authority (RFC 8555).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // THE WHOLE PROTOCOL IS SIX REQUESTS, and each is a JWS signed with the account key:
@@ -29,11 +29,11 @@
 // wildcard and needs the operator's DNS provider, which is a dependency this stack avoids;
 // it can be added as an explicit choice later.
 
-include "io.wz";
-include "json.wz";
-include "base64.wz";
-include "jws.wz";
-include "csr.wz";
+import io;
+import json;
+import base64;
+import jws;
+import csr;
 
 const
   ACME.MAXURL = 255;

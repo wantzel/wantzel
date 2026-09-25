@@ -35,6 +35,15 @@ export WANTZEL WANTZEL0 ROOT
 
 [ -x "$WANTZEL" ] || { echo "wztest: $WANTZEL is missing; run ./build.sh" >&2; exit 2; }
 
+# THE LIBRARY IS PART OF THE COMPILER: build.sh packs lib/ into bin/wantzel, so a change in
+# lib/ reaches a test only through a rebuild. Without this, a test of lib/io.wz run after
+# editing it would test the io.wz that was packed before -- and pass. The build takes a
+# fraction of a second; tests/toolchain/library_current.sh checks the result by content.
+if [ -n "$(find lib -name '*.wz' -newer "$WANTZEL" 2>/dev/null | head -1)" ]; then
+  echo "wztest: lib/ changed after bin/wantzel was built; rebuilding"
+  ./build.sh >/dev/null || { echo "wztest: ./build.sh failed" >&2; exit 2; }
+fi
+
 verbose=0; update=0; listonly=0; timing=0; toolchain=0; bench=0; filter=""; targets=""
 while [ $# -gt 0 ]; do
   case "$1" in

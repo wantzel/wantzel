@@ -1,0 +1,4 @@
+// include is always a file. There is no io.wz next to this one, and io is a library
+// module: the message says it is imported.
+include "io.wz";
+begin end.

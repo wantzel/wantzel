@@ -7,9 +7,9 @@
 // silent data loss on every change to a record layout, so the test asserts the REFUSAL
 // and the detail beside it, not just that something went wrong.
 //
-// The working directory carries the process id, like tests/lib/store.wz, so two runs
+// The working directory carries the process id, like tests/lib/store_basics.wz, so two runs
 // never share a file.
-include "store.wz";
+import store;
 var
   tab, i, n, row: int;
   dir: array[0..31] of char;

@@ -22,13 +22,13 @@ cleanup() { rc=$?; rm -rf "$tmp" || true; exit $rc; }
 trap cleanup EXIT
 
 cat > "$tmp/t.wz" <<'WZ'
-include "io.wz";
-include "rand.wz";
-include "der.wz";
-include "x509.wz";
-include "tls.wz";
-include "p256.wz";
-include "p384.wz";
+import io;
+import rand;
+import der;
+import x509;
+import tls;
+import p256;
+import p384;
 
 var failures: int;
 

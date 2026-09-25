@@ -1,0 +1,3 @@
+// A path into a lib directory that does not exist here: the library is imported.
+include "lib/io.wz";
+begin end.

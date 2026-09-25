@@ -1,7 +1,7 @@
 // lib/hmac.wz -- HMAC-SHA256 (RFC 2104 / RFC 4231).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // hmac.sha256(key, msg, digest) writes the 32-byte MAC into digest[0..31].
@@ -9,7 +9,7 @@
 // Uses the global sha256 state, so it must not be interleaved with another
 // sha256.update sequence.
 
-include "sha256.wz";
+import sha256;
 
 var
   hmac.kb:    array[0..63] of char;   // the (padded) key block, xored with ipad/opad

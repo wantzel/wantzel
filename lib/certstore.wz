@@ -1,7 +1,7 @@
 // lib/certstore.wz -- keeping keys and certificates on disk, beside the binary.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // WHY THIS EXISTS AT ALL, when the rest of the stack is happy to hold everything in memory:
@@ -25,8 +25,8 @@
 // without the benefit -- which is the right behaviour for something whose whole job is to
 // avoid unnecessary work.
 
-include "io.wz";
-include "fs.wz";
+import io;
+import fs;
 
 const
   // readlink(2) is syscall 89 on x86-64. Defined here rather than added to lib/io.wz:

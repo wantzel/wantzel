@@ -1,14 +1,14 @@
 // lib/json.wz -- JSON scanning primitives.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // Nothing here builds a tree.  Values stay where they are, in the input
 // buffer, and are described by (offset, length) pairs.  The parsers that the
 // compiler generates from a `schema` declaration are built on these.
 
-include "io.wz";
+import io;
 
 var
   json.ival: int;          // last number scanned

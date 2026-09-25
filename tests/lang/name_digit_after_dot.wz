@@ -8,7 +8,7 @@
 // The point of allowing it rather than rewriting the name is that the constant is then
 // literally the JSON value: no translation rule for a writer to remember.  A real
 // literal must keep reading as a number, and that is the other half of this test.
-include "io.wz";
+import io;
 const
   TArgs.f.1 = 7;
   TArgs.f.2 = 8;

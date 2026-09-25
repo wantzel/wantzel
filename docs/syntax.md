@@ -1,6 +1,6 @@
 # Syntax
 
-**The whole of it: forty keywords, one way to say each thing.**
+**The whole of it: forty-one keywords, one way to say each thing.**
 
 [README](../README.md) · [Language](language.md) · [Syntax](syntax.md) · [Library](library.md) · [Writing Wantzel](writing-wantzel.md) · [How-to](howto.md) · [Design](design.md) · [Changelog](changelog.md)
 
@@ -11,14 +11,15 @@ This page is form only: how to write Wantzel. What it *means* is
 [`writing-wantzel.md`](writing-wantzel.md); for project-level agreements (entry points,
 name prefixes) see the Conventions section of [`howto.md`](howto.md).
 
-## The forty keywords
+## The forty-one keywords
 
 ```
 and       array     begin     bool      break     char      const     continue
 div       do        downto    else      end       false     for       forward
-function  if        include   int       local     mod       not       of
-or        procedure real      record    return    schema    shl       shr
-str       then      to        tools     true      type      var       while
+function  if        import    include   int       local     mod       not
+of        or        procedure real      record    return    schema    shl
+shr       str       then      to        tools     true      type      var
+while
 ```
 
 Case does not distinguish names: `Foo`, `foo` and `FOO` are one name, and so are
@@ -31,7 +32,8 @@ inside its file; nothing outside can see it. Public is still the default.
 ## A program
 
 ```pascal
-include "io.wz";           // other files, before anything else
+import io;                 // a module of the standard library: a name, no quotes
+                           // (a file of your own is `include "shapes.wz";`: in quotes)
 
 const
   MAX = 100;
@@ -63,8 +65,10 @@ begin                      // the main block, last
 end.                       // a full stop, not a semicolon
 ```
 
-Fixed order: includes, then declarations, then the main block. No header line — a file
-starts with its first declaration. A routine must be declared before use, or `forward`.
+Fixed order: imports and includes, then declarations, then the main block. No header line
+— a file starts with its first declaration. `import` names a module of the library inside
+the compiler; `include` names a file, relative to the file it stands in — the rules are in
+[language.md](language.md#imports-and-includes). A routine must be declared before use, or `forward`.
 
 ## Types
 

@@ -187,8 +187,8 @@ esac
 # A tiny HTTP server in Wantzel rather than borrowing one: the test then does not depend on
 # what happens to be installed.
 cat > "$tmp/h.wz" <<WZ
-include "io.wz";
-include "net.wz";
+import io;
+import net;
 var lfd, fd, n, i: int;
     buf: array[0..1023] of char;
     ts: array[0..15] of char;

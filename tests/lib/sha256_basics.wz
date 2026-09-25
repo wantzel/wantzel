@@ -1,0 +1,64 @@
+// SHA-256 and HMAC-SHA256 against the NIST/RFC test vectors; streaming
+// (byte by byte and in blocks of 4096) must give the same as one-shot.
+import hmac;
+
+var
+  digest: array[0..31] of char;
+  hexbuf: array[0..63] of char;
+  million: array[0..999999] of char;
+  key20: array[0..19] of char;
+  key131: array[0..130] of char;
+  i, at: int;
+
+procedure show(label: str);
+var n: int;
+begin
+  io.puts(STDOUT, label);
+  n := sha256.hex(digest, hexbuf, 0);
+  io.out(STDOUT, addr(hexbuf[0]), n);
+  io.puts(STDOUT, "\n");
+end;
+
+begin
+  sha256.hash("", digest);
+  show("sha256(\"\") = ");
+
+  sha256.hash("abc", digest);
+  show("sha256(\"abc\") = ");
+
+  sha256.hash("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", digest);
+  show("sha256(two-block) = ");
+
+  for i := 0 to len(million) - 1 do million[i] := 'a';
+  sha256.hash(million, digest);
+  show("sha256(a x 1000000) one-shot = ");
+
+  sha256.init;
+  at := 0;
+  while at + 4096 <= len(million) do
+  begin
+    sha256.update(million[at..at + 4095]);
+    at := at + 4096;
+  end;
+  if at < len(million) then sha256.update(million[at..len(million) - 1]);   // rest: 576 bytes
+  sha256.final(digest);
+  show("sha256(a x 1000000) chunked = ");
+
+  sha256.init;
+  sha256.update("a");
+  sha256.update("b");
+  sha256.update("c");
+  sha256.final(digest);
+  show("sha256(\"abc\") byte-by-byte = ");
+
+  hmac.sha256("key", "The quick brown fox jumps over the lazy dog", digest);
+  show("hmac(key, fox) = ");
+
+  for i := 0 to len(key20) - 1 do key20[i] := chr(0x0b);
+  hmac.sha256(key20, "Hi There", digest);
+  show("hmac(rfc4231 #1) = ");
+
+  for i := 0 to len(key131) - 1 do key131[i] := chr(0xaa);
+  hmac.sha256(key131, "Test Using Larger Than Block-Size Key - Hash Key First", digest);
+  show("hmac(rfc4231 #6) = ");
+end.

@@ -21,7 +21,7 @@
 //   !async          every name after it is started at once with dns.start and collected
 //                   with dns.poll, from an epoll loop of this program's own that watches
 //                   dns.fd and waits no longer than dns.wait; printed in the same form
-include "dns.wz";
+import dns;
 
 var
   ports, word: array[0..255] of char;

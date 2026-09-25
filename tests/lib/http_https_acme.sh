@@ -6,7 +6,7 @@
 # with one difference that matters here: the authority issues from an INTERMEDIATE, and a
 # client is given only the ROOT. That is how a browser meets a Let's Encrypt certificate,
 # and it only verifies when the server sends the intermediate along with its own
-# certificate. The server under test is examples/autocert.wz, which is http.https plus
+# certificate. The server under test is examples/autocertd.wz, which is http.https plus
 # option parsing.
 #
 # WHAT IS ESTABLISHED:
@@ -68,8 +68,8 @@ hexkey() { openssl ec -in "$1" -text -noout 2>/dev/null | sed -n '/priv:/,/pub:/
   || { echo "  FAIL  the ACME fixture does not compile"; exit 1; }
 "$here/bin/wantzel" "$here/tests/helpers/tlsfront.wz" tlsfront >/dev/null 2>&1 \
   || { echo "  FAIL  the TLS front does not compile"; exit 1; }
-"$here/bin/wantzel" "$here/examples/autocert.wz" server 2>cerr \
-  || { echo "  FAIL  examples/autocert.wz does not compile"; cat cerr; exit 1; }
+"$here/bin/wantzel" "$here/examples/autocertd.wz" server 2>cerr \
+  || { echo "  FAIL  examples/autocertd.wz does not compile"; cat cerr; exit 1; }
 
 intkey=$(hexkey int.key); frontkey=$(hexkey front.key)
 touch ca/fail                     # the authority starts out failing: no certificate yet

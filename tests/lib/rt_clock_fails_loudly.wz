@@ -30,7 +30,7 @@
 // The clock ids the library actually asks for (CLOCK_MONOTONIC, CLOCK_REALTIME) are
 // always available on Linux, so the guard cannot be provoked through io.now itself; the
 // failing id is the only way to exercise the path at all.
-include "io.wz";
+import io;
 
 var
   ts: array[0..15] of char;

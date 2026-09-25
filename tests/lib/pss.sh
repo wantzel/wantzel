@@ -54,9 +54,9 @@ D256=$(openssl dgst -sha256 -binary "$tmp/msg.txt" | xxd -p -c32 | hexesc)
 D384=$(openssl dgst -sha384 -binary "$tmp/msg.txt" | xxd -p -c48 | hexesc)
 
 cat > "$tmp/t.wz" <<WZ
-include "io.wz";
-include "sha384.wz";
-include "rsa.wz";
+import io;
+import sha384;
+import rsa;
 var nb, s2, s3: array[0..299] of char;
     d2, d3: array[0..63] of char;
     eb: array[0..7] of char;

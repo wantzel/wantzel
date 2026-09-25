@@ -14,7 +14,7 @@ port=$(free_port)
 ulimit -Sn 4096 2>/dev/null
 
 cat > "$T/own.wz" <<'EOF'
-include "http.wz";
+import http;
 
 var
   big: array[0..299999] of char;

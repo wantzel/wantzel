@@ -1,7 +1,7 @@
 // lib/jws.wz -- JSON Web Signature with ES256, and the JWK thumbprint (RFC 7515, 7638).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // THIS EXISTS FOR ACME. Every request to a certificate authority is a JWS: a header, a
@@ -22,10 +22,10 @@
 // flat. Handing it DER produces a signature every verifier rejects, and the error message
 // says nothing useful.
 
-include "io.wz";
-include "base64.wz";
-include "sha256.wz";
-include "p256.wz";
+import io;
+import base64;
+import sha256;
+import p256;
 
 var
   jws.buf:   array[0..8191] of char;   // the assembled JWS

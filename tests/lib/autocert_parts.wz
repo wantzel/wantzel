@@ -5,7 +5,7 @@
 // pieces one at a time, where a wrong answer names the piece. Every input that should be
 // REFUSED is here beside one that should be accepted, because a parser that accepts
 // everything passes every positive case.
-include "autocert.wz";
+import autocert;
 
 var
   failures: int;

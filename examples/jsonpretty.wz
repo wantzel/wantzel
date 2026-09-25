@@ -10,9 +10,9 @@
 // It FORMATS and does not repair: a document with a trailing comma, a missing
 // brace or a stray word is refused with a message on standard error and exit
 // status 1, because a formatter that guesses has edited your file.
-include "io.wz";
-include "fs.wz";
-include "json.wz";
+import io;
+import fs;
+import json;
 
 const
   MAXIN = 262144;

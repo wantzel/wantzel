@@ -1,7 +1,7 @@
 // lib/log.wz -- one JSON line per event on stderr, for journald or a file.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 //   log.info("started");                      {"t":...,"level":"info","msg":"started"}
@@ -9,8 +9,8 @@
 //   log.error("cannot bind");
 // The request line of lib/http.wz is the same shape (http.logging := true).
 
-include "io.wz";
-include "json.wz";
+import io;
+import json;
 
 var
   log.buf: array[0..4095] of char;

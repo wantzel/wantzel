@@ -1,7 +1,7 @@
 // lib/http.wz -- a non-blocking HTTP/1.1 server on epoll.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // One process, one event loop, no threads and no allocation per request.  The application
@@ -59,9 +59,9 @@
 // chunks, deadlines, the big-body region -- is the same code for both.  Each connection
 // records the listener it came from (http.slis), and http.addport opens more than one.
 
-include "net.wz";
-include "json.wz";
-include "autocert.wz";
+import net;
+import json;
+import autocert;
 
 const
   MAXCONN = 4096;           // connections open at once, per worker (http.maxconn lowers it)

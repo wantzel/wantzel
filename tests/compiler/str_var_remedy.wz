@@ -2,7 +2,7 @@
 // given: copy the str into a buffer with io.push and pass the slice. An error message
 // that proposes something has to be checked like any other instruction -- otherwise it
 // sends the reader somewhere that does not work.
-include "kv.wz";
+import kv;
 var b: array[0..63] of char;
     kbuf: array[0..63] of char;
     n: int;

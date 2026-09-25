@@ -1,7 +1,7 @@
 // lib/csr.wz -- a certificate signing request, and a self-signed certificate (RFC 2986, 5280).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // TWO THINGS THAT SHARE ALMOST EVERYTHING:
@@ -20,10 +20,10 @@
 // a slice rather than re-encoded. Re-encoding to sign is how two different requests end up
 // treated as the same one.
 
-include "io.wz";
-include "der.wz";
-include "sha256.wz";
-include "p256.wz";
+import io;
+import der;
+import sha256;
+import p256;
 
 var
   csr.buf:  array[0..4095] of char;

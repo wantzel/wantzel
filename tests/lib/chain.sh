@@ -80,8 +80,8 @@ NOTCA=$(hexesc notca.der); SUB=$(hexesc sub.der)
 nnotca=$(stat -c%s notca.der); nsub=$(stat -c%s sub.der)
 
 cat > "$tmp/t.wz" <<WZ
-include "io.wz";
-include "chain.wz";
+import io;
+import chain;
 var cb, fb, nb: array[0..8191] of char;
     rb: array[0..4095] of char;
     hb: array[0..63] of char;

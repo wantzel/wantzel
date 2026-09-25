@@ -36,19 +36,23 @@ On Windows, run it under WSL2.
 
 ## Quick start
 
-```bash
-git clone https://github.com/wantzel/wantzel
-cd wantzel && ./build.sh                            # build the compiler, once
-./bin/wantzel examples/hello.wz hello && ./hello    # compile and run
+```sh
+curl -fsSLO https://github.com/wantzel/wantzel/releases/latest/download/wantzel-linux-x86_64
+curl -fsSLO https://github.com/wantzel/wantzel/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS                  # wantzel-linux-x86_64: OK
+mv wantzel-linux-x86_64 wantzel && chmod +x wantzel
+./wantzel --version
 ```
 
-That is the whole installation. If you download a release, take the archive rather than
-the bare binary: `include` is resolved from the `lib/` directory beside the compiler.
+That one file is the compiler **and** the complete standard library: nothing to install,
+no `lib/` directory, no archive, nothing to build. `./wantzel --lib` lists the modules
+inside it, and `./wantzel --lib io` prints the source of one. To call it as `wantzel` from
+anywhere, move it to a directory on your `PATH`, for example `~/.local/bin/`.
 
 ## A first program
 
 ```pascal
-include "io.wz";
+import io;
 
 begin
   io.puts(STDOUT, "hello, world\n");
@@ -56,15 +60,16 @@ end.
 ```
 
 ```console
-$ wantzel hello.wz hello && ./hello
+$ ./wantzel hello.wz hello && ./hello
 hello, world
 ```
 
-The result is a static executable of about 9 kB. When something is wrong, the compiler
-says where and what, in one line:
+`import io;` takes a module from the library in the compiler; `include "mine.wz";` reads a
+file of your own, next to the file that names it. The result is a static executable of
+about 2 kB. When something is wrong, the compiler says where and what, in one line:
 
 ```console
-$ wantzel oops.wz oops
+$ ./wantzel oops.wz oops
 wantzel: oops.wz:6: type error in assignment: expected int, found str
 ```
 
@@ -76,12 +81,12 @@ wantzel: oops.wz:6: type error in assignment: expected int, found str
 | **No dependencies** | One static binary, and every program it produces is one too. Nothing to install per agent, nothing to tear down. |
 | **Small at run time** | No runtime, no garbage collector, no virtual machine. |
 | **Strict and verbose** | What it refuses, nobody has to review. What it accepts, it accepts in silence. Otherwise: the file, the line and the reason. |
-| **HTTPS with nothing linked** | TLS 1.3 written in the language itself: X25519, ChaCha20-Poly1305, ECDSA P-256/P-384, RSA, chain verification and a trust store. [`examples/autocert.wz`](examples/autocert.wz) serves HTTP and HTTPS and gets and renews its own Let's Encrypt certificate from one event loop. |
+| **HTTPS with nothing linked** | TLS 1.3 written in the language itself: X25519, ChaCha20-Poly1305, ECDSA P-256/P-384, RSA, chain verification and a trust store. [`examples/autocertd.wz`](examples/autocertd.wz) serves HTTP and HTTPS and gets and renews its own Let's Encrypt certificate from one event loop. |
 
 ## What is in the box
 
-The standard library in [`lib/`](lib/) covers what a networked tool needs, with no C
-underneath: files and processes, JSON and JSON Schema, an HTTP server, WebSocket on the same
+The standard library — its source in [`lib/`](lib/), and all of it inside the compiler file —
+covers what a networked tool needs, with no C underneath: files and processes, JSON and JSON Schema, an HTTP server, WebSocket on the same
 port, an MCP server over stdio or HTTP, OAuth, TLS 1.3, ACME, and a persistent store.
 
 A tool is one declared line; the compiler generates its JSON Schema, argument parsing,
@@ -95,6 +100,45 @@ end;
 
 [`examples/`](examples/) holds single-file programs you can read in one sitting, among them
 an MCP server, an HTTP server, an HTTPS client and server, and a file server over MCP.
+
+## Build from source
+
+You need `git`, a C compiler that answers to `cc` (gcc or clang), and a POSIX shell with the
+usual coreutils — `sha256sum` among them. The C compiler is used once, for
+`bootstrap/boot.c`; nothing else is linked or installed.
+
+```sh
+git clone https://github.com/wantzel/wantzel
+cd wantzel && ./build.sh
+./bin/wantzel examples/hello.wz hello && ./hello
+```
+
+What `./build.sh` does, in well under a second:
+
+1. `cc` builds `bootstrap/boot.c` — a small C compiler for just the part of the language the
+   compiler's own source uses — into `bin/wantzel0`.
+2. `wantzel0` compiles `src/wantzel.wz` into stage 1; stage 1 compiles it into stage 2;
+   stage 2 compiles it once more into stage 3.
+3. Stage 2 and stage 3 must be byte-identical: the fixed point, the compiler reproducing
+   itself exactly. If they differ, the build stops.
+4. The standard library in `lib/` is packed and appended to stage 3, every module is read
+   back and compared with its file, and the result becomes `bin/wantzel`.
+
+To check it yourself — the fixed point, the bootstrap and the whole suite:
+
+```sh
+./wztest --toolchain
+```
+
+A release is reproducible: the tag of a release builds, on any machine, to exactly the
+published file.
+
+```sh
+tag=$(git describe --tags --abbrev=0)                  # the newest release
+git checkout -q "$tag" && ./build.sh
+curl -fsSLO "https://github.com/wantzel/wantzel/releases/download/$tag/SHA256SUMS"
+cp bin/wantzel wantzel-linux-x86_64 && sha256sum -c SHA256SUMS
+```
 
 ## Documentation
 
@@ -117,7 +161,8 @@ an MCP server, an HTTP server, an HTTPS client and server, and a file server ove
 |---|---|
 | `src/` | the compiler, in Wantzel |
 | `bootstrap/boot.c` | a small C compiler, used once to build the first binary -- just enough of the language to compile `src/` itself, for Linux |
-| `lib/` | the standard library |
+| `bootstrap/libpack.wz` | packs `lib/` into the trailer `build.sh` appends to the compiler |
+| `lib/` | the standard library, as source; `build.sh` packs it into the compiler |
 | `examples/` | single-file programs |
 | `tests/` | the suite: `./wztest` runs it |
 

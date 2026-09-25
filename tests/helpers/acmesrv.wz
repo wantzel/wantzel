@@ -49,13 +49,13 @@
 //       - it prints ORDER <host>, VALIDATED / NOT VALIDATED and ISSUED on stdout, so a test
 //         can count what happened
 
-include "http.wz";
-include "json.wz";
-include "net.wz";
-include "csr.wz";
-include "x509.wz";
-include "base64.wz";
-include "proc.wz";
+import http;
+import json;
+import net;
+import csr;
+import x509;
+import base64;
+import proc;
 
 const
   ACMESRV.MAXTOK = 64;

@@ -16,7 +16,7 @@
 // Build and run:  wantzel examples/structures.wz /tmp/structures && /tmp/structures
 
 
-include "io.wz";
+import io;
 
 const
   MAXN  = 64;

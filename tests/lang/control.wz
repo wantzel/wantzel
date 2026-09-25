@@ -1,5 +1,5 @@
 // spec §5: if/else chains, while, repeat, nested break/continue, blocks, halt.
-include "io.wz";
+import io;
 var
   i, j, s: int;
 procedure show(s: str; v: int);

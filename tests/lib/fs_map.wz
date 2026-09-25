@@ -11,8 +11,8 @@
 // maps passes WITH the leak, since ulimit -n is 1048576 here. Instead this counts: a
 // descriptor is the lowest free number, so after fifty maps the next open still has to
 // come back low. Measured: 3 without the leak, 53 with it.
-include "io.wz";
-include "fs.wz";
+import io;
+import fs;
 
 var
   pad: array[0..511] of char;

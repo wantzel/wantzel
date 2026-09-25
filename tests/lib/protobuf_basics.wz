@@ -1,0 +1,124 @@
+// lib/protobuf.wz: reading the protobuf wire format.
+//
+// WHY THIS TEST EXISTS. 226 lines of public standard library with no test: a change to the
+// compiler could break it and nothing here would notice, because nothing in this repository
+// includes it.
+//
+// THE EXPECTED VALUES COME FROM THE SPECIFICATION, not from running the implementation and
+// writing down what it said. Varint 300 is 0xAC 0x02 because 300 = 0b100101100, split into
+// seven-bit groups little-endian with the continuation bit set on all but the last. A test
+// that records current behaviour cannot tell a bug from a feature.
+import io;
+import protobuf;
+
+var
+  b: array[0..255] of char;
+  n, at, failures: int;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ") else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+procedure expectn(got: int; want: int; what: str);
+begin
+  if got = want then io.puts(STDOUT, "ok   ")
+  else
+  begin
+    io.puts(STDOUT, "FAIL "); failures := failures + 1;
+  end;
+  io.puts(STDOUT, what);
+  if got <> want then
+  begin
+    io.puts(STDOUT, " -- wanted "); io.putn(STDOUT, want);
+    io.puts(STDOUT, ", got "); io.putn(STDOUT, got);
+  end;
+  io.puts(STDOUT, "\n");
+end;
+
+procedure bytes3(a: int; c: int; d: int);
+begin
+  b[0] := chr(a); b[1] := chr(c); b[2] := chr(d);
+end;
+
+begin
+  failures := 0;
+  pb.err := false;
+
+  // ---- 1. VARINT -----------------------------------------------------------------------
+  // 300 = 0xAC 0x02 (spec example). One byte for 1, and the position moves by the right
+  // number of bytes -- a decoder that reads the value but returns the wrong position
+  // desynchronises every field after it.
+  b[0] := chr(172); b[1] := chr(2);
+  at := pb.varint(b, 0, 2);
+  expectn(pb.ival, 300, "varint 0xAC 0x02 is 300");
+  expectn(at, 2, "and it consumed two bytes");
+
+  b[0] := chr(1);
+  at := pb.varint(b, 0, 1);
+  expectn(pb.ival, 1, "a one-byte varint");
+  expectn(at, 1, "consumes one byte");
+
+  b[0] := chr(0);
+  at := pb.varint(b, 0, 1);
+  expectn(pb.ival, 0, "and zero encodes as a single zero byte");
+
+  // ---- 2. A TRUNCATED VARINT IS REFUSED --------------------------------------------------
+  //
+  // THE CONTINUATION BIT SAYS "more follows" and the buffer ends. Returning a value here
+  // would be inventing data from a message that was cut off in transit.
+  pb.err := false;
+  b[0] := chr(172);
+  expectn(pb.varint(b, 0, 1), 0 - 1, "a varint that runs off the end is refused");
+  expect(pb.err, "and pb.err says so");
+
+  // ---- 3. A TAG CARRIES A FIELD NUMBER AND A WIRE TYPE -----------------------------------
+  // 0x08 = field 1, wire type 0 (VARINT). 0x12 = field 2, wire type 2 (LEN).
+  pb.err := false;
+  bytes3(8, 150, 1);                     // field 1, varint 150
+  at := pb.next(b, 0, 3);
+  expectn(pb.fn, 1, "tag 0x08 is field 1");
+  expectn(pb.wt, 0, "with wire type VARINT");
+  expectn(pb.ival, 150, "and the value follows");
+
+  // A LEN field: tag 0x12, length 2, then two bytes.
+  pb.err := false;
+  b[0] := chr(18); b[1] := chr(2); b[2] := chr(65); b[3] := chr(66);
+  at := pb.next(b, 0, 4);
+  expectn(pb.fn, 2, "tag 0x12 is field 2");
+  expectn(pb.wt, 2, "with wire type LEN");
+  expectn(pb.vat, 2, "the payload starts after the length");
+  expectn(pb.vend, 4, "and ends where the field ends");
+  expectn(at, 4, "and the field consumed everything");
+
+  // ---- 4. A LENGTH THAT POINTS PAST THE BUFFER -------------------------------------------
+  //
+  // THIS IS THE ONE THAT MATTERS FOR SAFETY. A malformed message can claim a payload longer
+  // than what arrived; a reader that believes it reads past the end of the buffer.
+  pb.err := false;
+  b[0] := chr(18); b[1] := chr(99); b[2] := chr(65);
+  expectn(pb.next(b, 0, 3), 0 - 1, "a length past the end of the buffer is refused");
+  expect(pb.err, "and that is flagged too");
+
+  // ---- 5. ZIGZAG -------------------------------------------------------------------------
+  // The spec's own table: 0->0, 1->-1, 2->1, 3->-2.
+  expectn(pb.zigzag(0), 0, "zigzag 0 is 0");
+  expectn(pb.zigzag(1), 0 - 1, "zigzag 1 is -1");
+  expectn(pb.zigzag(2), 1, "zigzag 2 is 1");
+  expectn(pb.zigzag(3), 0 - 2, "zigzag 3 is -2");
+  expectn(pb.zigzag(4294967294), 2147483647, "and the largest positive 32-bit value");
+  expectn(pb.zigzag(4294967295), 0 - 2147483648, "and the smallest negative one");
+
+  // ---- 6. A 32-BIT SIGNED VALUE WITH RUBBISH ABOVE BIT 31 --------------------------------
+  //
+  // The comment in the library says a 32-bit-only writer may leave rubbish in the high
+  // half, and that pb.i32 clamps. That claim is worth a check: without the mask, -1 written
+  // by such a writer reads as a huge positive number.
+  expectn(pb.i32(0xFFFFFFFF), 0 - 1, "0xFFFFFFFF reads as -1");
+  expectn(pb.i32(0x7FFFFFFF), 2147483647, "and 0x7FFFFFFF stays positive");
+  expectn(pb.i32(5), 5, "a small value is untouched");
+
+  if failures > 0 then halt(1);
+end.

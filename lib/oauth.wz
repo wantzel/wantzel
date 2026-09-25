@@ -1,7 +1,7 @@
 // lib/oauth.wz -- an OAuth 2.1 authorization server for MCP clients, in one
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 // process with the resource server it protects.
 //
@@ -28,14 +28,14 @@
 // ten minutes; access tokens after OAUTH.ACCESS_TTL seconds; refresh tokens
 // are rotated on every use.
 
-include "router.wz";
-include "store.wz";
-include "hash.wz";
-include "sha256.wz";
-include "base64.wz";
-include "rand.wz";
-include "json.wz";
-include "time.wz";
+import router;
+import store;
+import hash;
+import sha256;
+import base64;
+import rand;
+import json;
+import time;
 
 const
   OAUTH.MAXCLIENTS = 256;
@@ -259,6 +259,24 @@ begin
   return hash.get(oauth.cidx.keys, oauth.cidx.rows, 32, id);
 end;
 
+// May b[from..upto) go into a response header or an HTML attribute as it is?  A
+// redirect_uri and a state do both: they are written into the Location header of the
+// redirect and into the sign-in form.  After percent-decoding, a CR LF would add headers
+// of the sender's choosing, and a quote or an angle bracket would add markup.  Only
+// printable ASCII without those passes; a real redirect uri or state never needs them.
+function oauth.urlsafe(b: array of char; from: int; upto: int): bool;
+var i: int;
+    c: char;
+begin
+  for i := from to upto - 1 do
+  begin
+    c := b[i];
+    if (ord(c) <= 32) or (ord(c) >= 127) then return false;
+    if (c = '"') or (c = '<') or (c = '>') or (c = '\\') or (c = '`') then return false;
+  end;
+  return true;
+end;
+
 // does the client allow this redirect uri?
 function oauth.uriallowed(b: array of char; from: int; upto: int): bool;
 var i, k, n: int;
@@ -357,9 +375,15 @@ begin
   begin
     k := oauth.reg.redirect_uris_len[i];
     if k < 8 then begin router.error(400, "invalid_redirect_uri"); return; end;
-    if not ((oauth.reg.redirect_uris[i * 256] = 'h') and (oauth.reg.redirect_uris[i * 256 + 1] = 't')) then
+    if not (json.eq(oauth.reg.redirect_uris, i * 256, i * 256 + 7, "http://")
+            or json.eq(oauth.reg.redirect_uris, i * 256, i * 256 + 8, "https://")) then
     begin
-      router.error(400, "invalid_redirect_uri: must be http(s)");
+      router.error(400, "invalid_redirect_uri: must be http:// or https://");
+      return;
+    end;
+    if not oauth.urlsafe(oauth.reg.redirect_uris, i * 256, i * 256 + k) then
+    begin
+      router.error(400, "invalid_redirect_uri: control characters, spaces, quotes and angle brackets are not allowed");
       return;
     end;
   end;
@@ -456,6 +480,7 @@ begin
   if (not ok) or (http.pvlen = 0) or (http.pvlen > OAUTH.URILEN) then begin router.error(400, "invalid_request: redirect_uri"); return false; end;
   oauth.ok := oauth.take(oauth.q.uri);
   oauth.q.urin := http.pvlen;
+  if not oauth.urlsafe(oauth.q.uri, 0, oauth.q.urin) then begin router.error(400, "invalid_request: redirect_uri"); return false; end;
   if not oauth.uriallowed(oauth.q.uri, 0, oauth.q.urin) then begin router.error(400, "invalid_request: redirect_uri is not registered"); return false; end;
   oauth.q.staten := 0;
   if fromform then ok := http.form("state") else ok := http.param("state");
@@ -464,6 +489,9 @@ begin
     if http.pvlen > 255 then begin router.error(400, "invalid_request: state too long"); return false; end;
     oauth.ok := oauth.take(oauth.q.state);
     oauth.q.staten := http.pvlen;
+    // and no '&': it is appended to the redirect as &state=..., where one would add a parameter
+    if (not oauth.urlsafe(oauth.q.state, 0, oauth.q.staten)) or (scan(oauth.q.state, 0, oauth.q.staten, '&') < oauth.q.staten) then
+    begin router.error(400, "invalid_request: state"); return false; end;
   end;
   if fromform then ok := http.form("code_challenge") else ok := http.param("code_challenge");
   if (not ok) or (http.pvlen < 43) or (http.pvlen > 64) then begin router.error(400, "invalid_request: code_challenge (PKCE S256) is required"); return false; end;
@@ -478,24 +506,39 @@ begin
   return true;
 end;
 
+// b[0..n) as text in an HTML page: the client chose it (client_name at registration), so
+// it is escaped, never written as markup.
+procedure oauth.addtext(b: array of char; n: int);
+var i: int;
+    c: char;
+begin
+  for i := 0 to n - 1 do
+  begin
+    c := b[i];
+    if c = '&' then http.add("&amp;")
+    else if c = '<' then http.add("&lt;")
+    else if c = '>' then http.add("&gt;")
+    else if c = '"' then http.add("&quot;")
+    else if c = chr(39) then http.add("&#39;")
+    else http.addb(b, i, 1);
+  end;
+end;
+
 procedure oauth.hidden(name: str; v: array of char; n: int);
 begin
   http.add("<input type=\"hidden\" name=\""); http.add(name); http.add("\" value=\"");
-  http.addb(v, 0, n);                       // values are our own or already validated; quotes are not allowed in them
+  http.addb(v, 0, n);                       // our own values, or checked by oauth.urlsafe: no quotes, no angle brackets
   http.add("\">\n");
 end;
 
 // GET /authorize: validate, then show the login form (the form posts back to /authorize)
 procedure oauth.authorize;
-var i: int;
 begin
   if not oauth.readrequest(false) then return;
-  for i := 0 to oauth.q.staten - 1 do
-    if (oauth.q.state[i] = '"') or (oauth.q.state[i] = '<') or (oauth.q.state[i] = '&') then begin router.error(400, "invalid_request: state"); return; end;
   http.add("<!doctype html><html><head><meta charset=\"utf-8\"><title>Sign in</title>");
   http.add("<style>body{font-family:sans-serif;max-width:24em;margin:4em auto}input{width:100%;margin:.3em 0 1em;padding:.5em}button{padding:.6em 1.2em}</style></head><body>");
   http.add("<h1>Sign in</h1><p>");
-  if oauth.cl.name_n > 0 then begin http.addb(oauth.cl.name, 0, oauth.cl.name_n); http.add(" is asking for access."); end
+  if oauth.cl.name_n > 0 then begin oauth.addtext(oauth.cl.name, oauth.cl.name_n); http.add(" is asking for access."); end
   else http.add("An application is asking for access.");
   http.add("</p><form method=\"post\" action=\"/authorize\">\n");
   oauth.hidden("client_id", oauth.q.client, 32);

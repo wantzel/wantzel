@@ -7,7 +7,7 @@
 // exists to prevent is exactly this: a wrong answer that refuses nothing.
 //
 // The request is written straight into http.inbuf and parsed there; no socket is needed.
-include "http.wz";
+import http;
 var
   req: array[0..511] of char;
   n, i, total: int;

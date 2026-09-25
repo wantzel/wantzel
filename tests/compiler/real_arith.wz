@@ -1,6 +1,6 @@
 // real: literals, + - * /, unary minus, comparisons, constants.
 // Reals are printed through trunc/round so the test needs no formatter.
-include "io.wz";
+import io;
 const
   PI = 3.14159265358979;
   NEG = -2.5;

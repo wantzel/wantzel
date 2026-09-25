@@ -7,8 +7,8 @@
 // when the deepest fs.opendir happens), and checks every fixture file is seen EXACTLY
 // once. Before the fix this undercounts, because the deepest opendir stomps on the
 // buffer the shallower fs.next calls are still reading from.
-include "io.wz";
-include "fs.wz";
+import io;
+import fs;
 
 const
   MAXID = 26;          // one slot per letter, the fixture files are named fA.txt .. fZ.txt

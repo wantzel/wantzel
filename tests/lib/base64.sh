@@ -25,8 +25,8 @@ cleanup() { rc=$?; rm -rf "$tmp" || true; exit $rc; }
 trap cleanup EXIT
 
 cat > "$tmp/t.wz" <<'WZ'
-include "io.wz";
-include "base64.wz";
+import io;
+import base64;
 var src: array[0..63] of char;
     dst: array[0..255] of char;
     back: array[0..63] of char;

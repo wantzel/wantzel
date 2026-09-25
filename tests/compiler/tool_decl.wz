@@ -1,7 +1,7 @@
 // A tools block is a compile-time table: generated constants, the handler forward
 // declarations and tool.byname/tool.run exist without any transport included.
-include "io.wz";
-include "json.wz";
+import io;
+import json;
 type In = schema
   n: int;
 end;

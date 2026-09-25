@@ -1,9 +1,9 @@
 // lib/time.wz, lib/rand.wz, lib/uuid.wz and lib/base64.wz: the calendar
 // without a time zone, kernel randomness, UUID v4, and base64 in both
 // alphabets.  Random values are never printed, only facts about them.
-include "time.wz";
-include "uuid.wz";
-include "base64.wz";
+import time;
+import uuid;
+import base64;
 var
   enc, dec: array[0..63] of char;
   u1, u2, u3: array[0..15] of char;

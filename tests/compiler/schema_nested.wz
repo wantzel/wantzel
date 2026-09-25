@@ -1,6 +1,6 @@
 // schema v2: nested schemas, arrays of schemas, enums, json views, record results, write with nesting.
-include "io.wz";
-include "json.wz";
+import io;
+import json;
 
 type Point = schema
   x: real;

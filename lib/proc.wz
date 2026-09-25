@@ -1,7 +1,7 @@
 // lib/proc.wz -- processes: forking, reaping, and knowing how it ended.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // Why this is a library and not a compiler feature: `sys1`..`sys6` are builtins that
@@ -20,7 +20,7 @@
 // only `shr 8` and a crashed child looks like "done, code 0" -- a silent error of
 // exactly the kind this project makes most often.
 
-include "io.wz";        // io.fatal, for proc.alive's pid <= 0 check
+import io;        // io.fatal, for proc.alive's pid <= 0 check
 
 const
   PROC.WNOHANG = 1;              // wait4: do not wait when nothing is ready

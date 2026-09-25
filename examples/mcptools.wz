@@ -8,7 +8,7 @@
 // and the result writers.  The program only writes the handlers.
 
 
-include "mcphttp.wz";
+import mcphttp;
 
 type AddArgs = schema
   a: int "first term";
@@ -46,7 +46,7 @@ tools
   greet(GreetArgs): GreetResult "Greet someone, optionally more than once.";
 end;
 
-include "tools.wz";
+import tools;
 
 function tool.add(a: array of AddArgs; r: array of AddResult): int;
 begin

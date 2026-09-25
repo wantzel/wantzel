@@ -2,7 +2,7 @@
 // the tool on line 13; choose another name" -- two tools in the same block with the same
 // name. Before this it surfaced as "<tools>:N: duplicate declaration", a line of the
 // GENERATED text that names neither entry.
-include "json.wz";
+import json;
 type A = schema
   x: int;
 end;
@@ -13,7 +13,7 @@ tools
   wordcount(A): R "first";
   wordcount(A): R "second";
 end;
-include "lib/toolsmcp.wz";
+import toolsmcp;
 function tool.wordcount(a: array of A; r: array of R): int;
 begin
   return 0;

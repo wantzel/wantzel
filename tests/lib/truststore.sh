@@ -36,8 +36,8 @@ else
 fi
 
 cat > "$tmp/t.wz" <<WZ
-include "io.wz";
-include "chain.wz";
+import io;
+import chain;
 var n, i, failures: int;
 procedure expect(good: bool; what: str);
 begin

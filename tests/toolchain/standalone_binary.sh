@@ -1,92 +1,80 @@
-# The compiler works outside the repository -- with lib/ beside it, and says so without it.
+# The compiler is ONE FILE: copied alone into an empty directory, it compiles.
 #
 # THE HISTORY MATTERS FOR WHAT THIS TEST CHECKS. In 0.1.0 the published binary could not
-# resolve include "io.wz" at all: setlibdir derives the library path from argv[0], and a
-# downloaded file had no lib/ next to it. Almost every Wantzel program starts with an
-# include, so the download was useless for anything real -- and nothing noticed, because
-# the suite always runs inside the repository where lib/ is right there.
+# resolve the standard library at all: it looked for lib/ beside itself, and a downloaded
+# file had none. Almost every Wantzel program uses the library, so the download was
+# useless for anything real -- and nothing noticed, because the suite always runs inside
+# the repository where lib/ is right there. For a while after that the release shipped
+# lib/ beside the binary, and a binary copied without it failed the same way.
 #
-# That was first fixed by carrying lib/ INSIDE the compiler. On 16-09-2026 that came back
-# out: it cost a generated 238KB source, a permanent difference between the
-# two counterparts, no way to tell which copy answered an include, and no source on disk
-# for an editor or debugger to show. The release ships lib/ beside the binary instead.
+# The library is now part of the compiler file (a trailer after the ELF image; see
+# docs/design.md), so there are three properties to hold:
 #
-# So there are now TWO properties to hold, and the second is the one that used to be the
-# silent failure:
+#   1. the binary alone, in an empty directory with no lib/ anywhere near it, compiles a
+#      program that uses several library modules, and the program runs
+#   2. what it produces is byte-identical to what the compiler in the repository produces
+#      from the same source: where the compiler sits does not reach the output
+#   3. an include naming a path is still read from disk, relative to the includer
 #
-#   1. binary + lib/ in an empty directory compiles a program that includes the library
-#   2. binary WITHOUT lib/ refuses, naming the file it could not find
-#
-# Copying into an empty directory is the whole point: it reproduces what a user has after
-# unpacking a release asset.
+# Copying into an empty directory is the whole point: it is what a user has after
+# downloading the release asset.
 . "$ROOT/tests/helpers.sh"
 
 prog() {
-  cat <<'EOF'
-include "io.wz";
-include "json.wz";
-include "math.wz";
+  cat <<'WZ'
+import io;
+import json;
+import math;
 var n: int;
 begin
-  // json.wz and math.wz prove that more than one library file resolves, and that a
-  // library file including ANOTHER one works from the same search path.
+  // json.wz and math.wz prove that more than one module resolves, and that a module
+  // which uses ANOTHER one gets it from the same place.
   n := math.floor(3.7);
   io.puts(STDOUT, "alone ");
   io.putn(STDOUT, n);
   io.puts(STDOUT, "\n");
 end.
-EOF
+WZ
 }
 
-# ---- 1. with lib/ beside it, the way a release is unpacked
-mkdir -p "$T/alone/lib"
+# ---- 1. the binary alone
+mkdir -p "$T/alone"
 cp "$WANTZEL" "$T/alone/wantzel"
-cp "$ROOT"/lib/*.wz "$T/alone/lib/"
 prog > "$T/alone/p.wz"
+[ -e "$T/alone/lib" ] && { echo "the test set itself up wrong: there must be no lib/ here"; exit 1; }
 
 ( cd "$T/alone" && ./wantzel p.wz prog ) >"$T/err" 2>&1 || {
-  echo "the compiler cannot compile against lib/ beside it:"
+  echo "the compiler, copied alone, cannot compile a program that uses the library:"
   sed 's/^/    /' <"$T/err"
   echo
-  echo "setlibdir derives <dir of argv[0]>/lib/; check that a release ships lib/."
+  echo "Is the library trailer missing? ./bin/wantzel --version says; ./build.sh appends it."
   exit 1
 }
-assert_eq "a compiler with lib/ beside it builds a working program" \
-          "$( cd "$T/alone" && ./prog )" "alone 3"
+assert_eq "the compiler alone builds a working program" "$( cd "$T/alone" && ./prog )" "alone 3"
 
-# ---- 2. without lib/, it REFUSES and names the file
-#
-# This is the case that shipped broken in 0.1.0. An unhelpful failure here is as bad as a
-# wrong answer: someone who unpacked only the binary must learn what is missing, not read
-# "undeclared identifier: io.puts" and go looking in their own code.
-mkdir -p "$T/nolib"
-cp "$WANTZEL" "$T/nolib/wantzel"
-prog > "$T/nolib/p.wz"
-if ( cd "$T/nolib" && ./wantzel p.wz prog ) >"$T/err2" 2>&1; then
-  echo "a compiler with no lib/ beside it compiled a program that includes io.wz;"
-  echo "it has no library to resolve that against, so this cannot be right"
-  exit 1
-fi
-grep -q "io.wz" "$T/err2" || {
-  echo "the failure without lib/ does not name io.wz, so it does not say what is missing:"
-  sed 's/^/    /' <"$T/err2"
+# ---- 2. the same bytes as the compiler in the repository
+mkdir -p "$T/repo"
+prog > "$T/repo/p.wz"
+( cd "$T/repo" && "$WANTZEL" p.wz prog ) 2>"$T/err2" || { echo "the repository compiler failed:"; cat "$T/err2"; exit 1; }
+cmp -s "$T/alone/prog" "$T/repo/prog" || {
+  echo "the same source compiled by the same compiler in two places gave different bytes;"
+  echo "something about where the compiler sits reaches the output"
   exit 1
 }
-printf '  without lib/ it refuses and names the file\n'
 
-# ---- 3. a path is still read relative to the includer, not from the search path
+# ---- 3. a path is still read from disk, relative to the includer
 mkdir -p "$T/alone/sub"
 echo 'const HELPER_MARK = 42;' > "$T/alone/sub/helper.wz"
-cat > "$T/alone/q.wz" <<'EOF'
-include "io.wz";
+cat > "$T/alone/q.wz" <<'WZ'
+import io;
 include "sub/helper.wz";
 begin
   io.putn(STDOUT, HELPER_MARK);
   io.puts(STDOUT, "\n");
 end.
-EOF
+WZ
 ( cd "$T/alone" && ./wantzel q.wz q ) >"$T/err3" 2>&1 || {
   echo "an include naming a path no longer reads from disk:"; sed 's/^/    /' <"$T/err3"; exit 1; }
 assert_eq "a path still comes from disk" "$( cd "$T/alone" && ./q )" "42"
 
-echo "a compiler with lib/ beside it compiles; without it, it says what is missing"
+echo "the compiler alone compiles, and gives the same bytes as the one in the repository"

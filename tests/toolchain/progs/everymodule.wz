@@ -1,0 +1,73 @@
+// everymodule.wz -- one program that includes every module of the standard library.
+//
+// Not a test on its own: tests/toolchain/output_runs_identical.sh compiles it, so that a
+// change in how the library reaches the compiler is measured on all of it at once.
+// The routines below fill in the hooks the library modules call back into.
+import io;
+import json;
+type TArgs = schema
+  x: int "x";
+end;
+type TRes = schema
+  y: int;
+end;
+tools
+  t(TArgs): TRes "t." readonly idempotent;
+end;
+import tools;
+import toolsmcp;
+import openapi;
+import acme;
+import aead;
+import autocert;
+import base64;
+import certstore;
+import chacha20;
+import chain;
+import csr;
+import der;
+import dns;
+import fs;
+import hash;
+import hkdf;
+import hmac;
+import http;
+import jsonschema;
+import jws;
+import kv;
+import log;
+import math;
+import mcp;
+import mcphttp;
+import net;
+import oauth;
+import p256;
+import p384;
+import poly1305;
+import proc;
+import protobuf;
+import rand;
+import router;
+import rsa;
+import sha1;
+import sha256;
+import sha384;
+import store;
+import time;
+import tls;
+import uuid;
+import websocket;
+import x25519;
+import x509;
+function tool.t(a: array of TArgs; r: array of TRes): int; begin r[0].y := a[0].x; return 0; end;
+procedure app.request; begin end;
+function app.worthshowing(nat: int; nend: int): bool; begin return false; end;
+function app.exarray(nat: int; nend: int): bool; begin return false; end;
+function app.exstring(nat: int; nend: int): bool; begin return false; end;
+function app.authenticate(user: array of char; secret: array of char): int; begin return 0; end;
+function app.machinetoken(token: array of char): int; begin return 0; end;
+procedure app.wsframe(fd: int); begin end;
+procedure app.wsclose(fd: int); begin end;
+begin
+  io.puts(STDOUT, "every module\n");
+end.

@@ -20,8 +20,8 @@
 // WHAT IT DOES NOT DO, deliberately: no hostname resolution (an address is four numbers, DNS
 // is its own protocol), no TLS yet, and no HTTP awareness at all -- it moves bytes, so it
 // works for anything, not only for HTTP.
-include "io.wz";
-include "net.wz";
+import io;
+import net;
 
 const
   MAXPAIR = 64;                         // connections in flight

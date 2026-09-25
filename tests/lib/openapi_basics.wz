@@ -1,0 +1,162 @@
+// lib/openapi.wz: the OpenAPI 3.1 document generated from the tool declarations.
+//
+// Nothing in this repository included lib/openapi.wz before this test, so its only
+// coverage lived in another project -- which could stop using it tomorrow and let this
+// drift in silence.
+//
+// TWO KINDS OF CHECK, deliberately.  The document is compared against the .out beside
+// this test, which catches every silent change; and the structure is checked here, which
+// catches a change that is real AND wrong -- when the document moves you update the
+// expectation, and a mistake rides along unnoticed.  The structural checks are written
+// with lib/json.wz rather than an external validator: zero dependencies is a hard rule,
+// and this is what that library is for.
+// only openapi.wz and kv.wz: openapi.wz brings in what it needs itself.
+// It has to come after the tools block, because it reads the tool.list the compiler
+// bakes from it.
+import kv;
+type AddArgs = schema
+  a: int "first term";
+  b: int "second term";
+end;
+type AddResult = schema
+  sum: int;
+end;
+type GreetArgs = schema
+  name: text[64] "who to greet";
+  times: int? "how often, default 1";
+end;
+type GreetResult = schema
+  greeting: text[4096];
+end;
+tools
+  add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
+  greet(GreetArgs): GreetResult "Greet someone, optionally more than once.";
+end;
+import tools;
+import openapi;
+var
+  doc: array[0..65535] of char;
+  dn: int;
+  kbuf: array[0..63] of char;
+  pat, pend: int;
+procedure app.request;
+begin
+end;
+// lib/oauth.wz asks for these; this test only builds a document, so they stay stubs
+function app.authenticate(user: array of char; secret: array of char): int;
+begin
+  return -1;
+end;
+function app.machinetoken(token: array of char): int;
+begin
+  return -1;
+end;
+// lib/openapi.wz asks the application to fill in examples from ITS vocabulary; returning
+// false everywhere gives the library's own generic examples, which is what we test here.
+function app.worthshowing(nat: int; nend: int): bool;
+begin
+  return false;
+end;
+function app.exarray(nat: int; nend: int): bool;
+begin
+  return false;
+end;
+function app.exstring(nat: int; nend: int): bool;
+begin
+  return false;
+end;
+function tool.add(a: array of AddArgs; r: array of AddResult): int;
+begin
+  r[0].sum := a[0].a + a[0].b;
+  return 0;
+end;
+function tool.greet(a: array of GreetArgs; r: array of GreetResult): int;
+begin
+  r[0].greeting_n := io.push(r[0].greeting, 0, "hi");
+  return 0;
+end;
+procedure yn(s: str; v: bool);
+begin
+  io.puts(STDOUT, s);
+  if v then io.puts(STDOUT, "yes\n") else io.puts(STDOUT, "NO\n");
+end;
+// is `key` present at the top level of the document?  The key goes through a buffer
+// because a str VARIABLE is not an array of char -- only a literal is.
+function has(key: str): bool;
+var n: int;
+begin
+  n := io.push(kbuf, 0, key);
+  return kv.find(doc, 0, dn, kbuf[0..n - 1]);
+end;
+// is `key` present inside the value the cursor stands on?  Saves the span first, because
+// kv.find moves the cursor.
+function hasin(key: str): bool;
+var n, a, b: int;
+begin
+  a := kv.vat; b := kv.vend;
+  n := io.push(kbuf, 0, key);
+  return kv.find(doc, a, b, kbuf[0..n - 1]);
+end;
+begin
+  oauth.issuern := io.push(oauth.issuer, 0, "http://127.0.0.1:8080");
+  http.start;
+  oapi.spec("/api/", "Probe API");
+  // the body sits between the reserved header room and the write cursor
+  dn := 0;
+  while dn < http.wpos - (http.obase + 2048) do
+  begin
+    doc[dn] := http.outbuf[http.obase + 2048 + dn];
+    dn := dn + 1;
+  end;
+
+  // --- the structure, checked rather than eyeballed -------------------------
+  yn("the document is one JSON object = ", kv.isobject(doc, 0, dn));
+  yn("openapi = ", has("openapi"));
+  yn("info = ", has("info"));
+  yn("servers = ", has("servers"));
+  yn("paths = ", has("paths"));
+  yn("components = ", has("components"));
+  yn("security = ", has("security"));
+  // the version is the one we claim to emit
+  if has("openapi") then
+  begin
+    io.puts(STDOUT, "version = ");
+    io.out(STDOUT, addr(doc[kv.vat]), kv.vend - kv.vat);
+    io.puts(STDOUT, "\n");
+  end;
+  // EVERY DECLARED TOOL HAS ITS OWN PATH, and there are no others: this is the check
+  // that ties the document to the declarations instead of to a snapshot.
+  if has("paths") then
+  begin
+    io.puts(STDOUT, "paths count = ");
+    io.putn(STDOUT, kv.count(doc, kv.vat, kv.vend));
+    io.puts(STDOUT, "\n");
+    io.puts(STDOUT, "path 1 = ");
+    if kv.first(doc, kv.vat, kv.vend) >= 0 then io.out(STDOUT, addr(doc[kv.kat]), kv.kend - kv.kat);
+    io.puts(STDOUT, "\n");
+  end;
+  if has("paths") then yn("/api/add is a path = ", hasin("/api/add"));
+  if has("paths") then yn("/api/greet is a path = ", hasin("/api/greet"));
+  if has("paths") then yn("an undeclared tool has no path = ", not hasin("/api/nosuchtool"));
+  // one operation, checked through: the readonly tool must carry the reading tag and a
+  // request body with an example, because "Try it out" starting from an empty object is
+  // the thing this generator exists to avoid
+  if has("paths") then
+  if hasin("/api/add") then
+  if hasin("post") then
+  begin
+    pat := kv.vat; pend := kv.vend;
+    yn("  add has an operationId = ", hasin("operationId"));
+    kv.vat := pat; kv.vend := pend;
+    yn("  add has a requestBody = ", hasin("requestBody"));
+    kv.vat := pat; kv.vend := pend;
+    if hasin("requestBody") then yn("    the body carries an example = ", hasin("content"));
+    kv.vat := pat; kv.vend := pend;
+    yn("  add is tagged for reading = ", hasin("tags"));
+  end;
+
+  // --- and the document itself, so a silent change shows up ------------------
+  io.puts(STDOUT, "---\n");
+  io.out(STDOUT, addr(doc[0]), dn);
+  io.puts(STDOUT, "\n");
+end.

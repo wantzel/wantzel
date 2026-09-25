@@ -1,7 +1,7 @@
 // The storage system calls: files that are
 // created, appended, truncated, renamed and deleted; fsync; lseek; anonymous
 // and file-backed mmap through view(); flock; getrandom; the realtime clock.
-include "io.wz";
+import io;
 var
   name1, name2, dirn: array[0..31] of char;
   buf: array[0..63] of char;

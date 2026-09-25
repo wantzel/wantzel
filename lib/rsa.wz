@@ -24,9 +24,9 @@
 // 4096 iterations of a 64-limb shift for EVERY modular multiply, and a verification does
 // eighteen of them. So this file divides by WORDS instead: see rsa.redmod.
 
-include "io.wz";
-include "sha256.wz";
-include "sha384.wz";
+import io;
+import sha256;
+import sha384;
 
 const
   // 128 LIMBS = 4096 BITS, not 2048. Measured 22-09-2026: google.com's chain uses an

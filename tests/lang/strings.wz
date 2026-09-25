@@ -1,5 +1,5 @@
 // spec §2: text as a value is array of char + length; literals compare by character.
-include "io.wz";
+import io;
 var
   name: array[0..31] of char;
   n: int;

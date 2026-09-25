@@ -51,8 +51,8 @@
 // A records answer to type A queries, AAAA records to type AAAA queries, as a real server
 // does -- asking v6only.test for its A record gets NODATA, not its AAAA address.
 
-include "io.wz";
-include "net.wz";
+import io;
+import net;
 
 const
   QT_A    = 1;

@@ -9,7 +9,7 @@
 // that copies the wrong range or forgets to zero the new field still counts every row.
 //
 // The working directories carry the process id, so two runs never share a file.
-include "store.wz";
+import store;
 var
   tab, i, n, fd: int;
   dir: array[0..31] of char;

@@ -1,0 +1,1 @@
+ce_include_unquoted.wz:2: include takes a file name in quotes: include "io.wz"; -- for the library module write: import io;

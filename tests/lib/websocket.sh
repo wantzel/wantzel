@@ -44,7 +44,7 @@ oracle_accept() {
 port=$(free_port)
 
 cat > "$T/wssrv.wz" <<'EOF'
-include "websocket.wz";
+import websocket;
 
 // ECHO: whatever text comes in goes straight back out, so the client can tell its own
 // frame was received and reassembled correctly.
@@ -127,10 +127,10 @@ compile "$T/wssrv.wz" "$T/wssrv"
 
 # ---- the test client: raw frames, masked by hand, exactly like a browser ---------------------
 cat > "$T/wscli.wz" <<'EOF'
-include "io.wz";
-include "net.wz";
-include "base64.wz";
-include "sha1.wz";
+import io;
+import net;
+import base64;
+import sha1;
 
 const KEYB64LEN = 24;
 const GUIDLEN = 36;
@@ -404,25 +404,29 @@ assert_eq "a plain GET /ws with no Upgrade header gets a 400, not a silent upgra
 # see the PUSH/ECHO content assertions actually fail. Proves those checks are reading
 # something real rather than passing regardless of what the server sends.
 #
-# THE SABOTAGED SERVER NEEDS ITS OWN COMPILER BESIDE ITS OWN lib/, the same reason
-# tests/lib/tls.sh does this: the compiler resolves lib/ relative to its own location, so
-# copying only the sources and pointing at them does not work.
-mkdir -p "$T/pg/lib" "$T/pg/bin"
-cp "$ROOT"/lib/*.wz "$T/pg/lib/"
-cp "$ROOT/bin/wantzel" "$T/pg/bin/"
+# THE SABOTAGED MODULE IS INCLUDED AS A FILE, for the reason tests/lib/tls.sh gives: the
+# compiler reads its library from its own file, so a modified lib/ beside it changes
+# nothing. The server source includes "./websocket.wz" where the real one imports
+# websocket; what that copy imports still comes from the compiler.
+mkdir -p "$T/pg"
 awk '/ws\.out\[hn \+ i\] := a\[i\];/ && !done { print "    ws.out[hn + i] := chr(bxor(ord(a[i]), 1));"; done=1; next }
-     { print }' "$ROOT/lib/websocket.wz" > "$T/pg/lib/websocket.wz"
-if ! grep -q "bxor(ord(a\[i\]), 1)" "$T/pg/lib/websocket.wz"; then
+     { print }' "$ROOT/lib/websocket.wz" > "$T/pg/websocket.wz"
+if ! grep -q "bxor(ord(a\[i\]), 1)" "$T/pg/websocket.wz"; then
   echo "the sabotage did not apply -- 'ws.out[hn + i] := a[i];' not found in lib/websocket.wz"
   exit 1
 fi
+sed 's|^import websocket;$|include "./websocket.wz";|' "$T/wssrv.wz" > "$T/pg/wssrv.wz"
+grep -q '^include "./websocket.wz";$' "$T/pg/wssrv.wz" || {
+  echo "the sabotaged server does not include the sabotaged file -- check the sed on wssrv.wz"
+  exit 1
+}
 
 # The good server is stopped first, freeing the port, so the sabotaged one (still
 # compiled to listen on the SAME port) can bind it.
 kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
 trap - EXIT
 
-if ! "$T/pg/bin/wantzel" "$T/wssrv.wz" "$T/wssrv_sab" >"$T/sab_compile.err" 2>&1; then
+if ! "$WANTZEL" "$T/pg/wssrv.wz" "$T/wssrv_sab" >"$T/sab_compile.err" 2>&1; then
   echo "the sabotaged server does not compile:"; cat "$T/sab_compile.err"; exit 1
 fi
 "$T/wssrv_sab" >"$T/sab_server.log" 2>&1 &
@@ -457,7 +461,7 @@ echo "lib/websocket.wz: on the SAME port as lib/http.wz, handshake, echo, server
 highport=$(free_port)
 
 cat > "$T/wssrv_highfd.wz" <<'EOF'
-include "websocket.wz";
+import websocket;
 
 procedure app.wsframe(fd: int);
 var base: int;

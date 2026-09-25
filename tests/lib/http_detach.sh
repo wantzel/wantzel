@@ -15,7 +15,7 @@
 port=$(free_port)
 
 cat > "$T/detsrv.wz" <<'EOF'
-include "http.wz";
+import http;
 
 // A detached connection is handed raw bytes directly, bypassing http.add/http.finish
 // entirely -- there is nothing WebSocket-specific about http.detach itself.

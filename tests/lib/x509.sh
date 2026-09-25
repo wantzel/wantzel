@@ -41,9 +41,9 @@ want_notafter=$(openssl x509 -in "$tmp/c.pem" -noout -enddate | sed 's/notAfter=
 want_epoch=$(date -u -d "$want_notafter" +%s)
 
 cat > "$tmp/t.wz" <<WZ
-include "io.wz";
-include "fs.wz";
-include "x509.wz";
+import io;
+import fs;
+import x509;
 var base, n, i, failures: int;
     cert: array[0..8191] of char;
     path: array[0..511] of char;

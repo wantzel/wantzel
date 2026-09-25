@@ -56,8 +56,8 @@ qxhex=$(b64ud "$JX" | xxd -p -c64)
 qyhex=$(b64ud "$JY" | xxd -p -c64)
 
 cat > "$tmp/tp.wz" <<WZ
-include "io.wz";
-include "jws.wz";
+import io;
+import jws;
 var qx, qy: array[0..P.N-1] of int;
     n: int;
 begin
@@ -96,8 +96,8 @@ esac
 
 # ---- 3 and 4: a JWS an independent verifier accepts -------------------------------------------
 cat > "$tmp/s.wz" <<'WZ'
-include "io.wz";
-include "jws.wz";
+import io;
+import jws;
 var d, qx, qy: array[0..P.N-1] of int;
     payload: array[0..255] of char;
     n: int;
@@ -174,8 +174,8 @@ esac
 
 # ---- the key authorization, which is what gets served at the challenge URL --------------------
 cat > "$tmp/ka.wz" <<WZ
-include "io.wz";
-include "jws.wz";
+import io;
+import jws;
 var qx, qy: array[0..P.N-1] of int;
     buf: array[0..255] of char;
     n: int;

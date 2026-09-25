@@ -36,8 +36,10 @@ const
   // tests/toolchain/release_assets.sh checks it against the git tag: a binary that
   // cannot say which version it is cannot be matched to a published checksum.
   // bootstrap/boot.c carries the same string.
-  VERSION = "0.4.0";
+  VERSION = "0.5.0";
   SRCMAX  = 67108864;
+  FTRLEN  = 101;      // the footer of the library trailer; see loadparts
+  ZMAX    = 1048576;  // the largest packed part the compiler reads
   CODEMAX = 67108864;
   DATMAX  = 33554432;
   NAMEMAX = 8388608;
@@ -132,6 +134,7 @@ const
   KW_DOWNTO    = 140;
   KW_LOCAL     = 141;
   KW_TOOLS     = 142;
+  KW_IMPORT    = 143;
   MAXT         = 1024;
 
   SK_VAR   = 0;
@@ -141,6 +144,15 @@ const
   FX_CALL = 1;
   FX_BSS  = 2;
   FX_BSS32 = 3;
+  // A call to a FIXED code offset rather than a routine index -- trap/scan/arg, the three
+  // prelude helpers a routine calls directly (see emitprelude). Before elimination existed
+  // these were baked in on the spot with e32(target - (site + 4)), which is exactly right
+  // once and never touched again -- there was nothing to touch, the whole program was
+  // written once. eliminate MOVES routines, though, which changes site without moving
+  // target (the prelude never moves), so the baked rel32 has to become a fixup like any
+  // other reference that survives a routine moving: fxval holds the fixed prelude offset,
+  // and resolution is fadr[FX_CALL]'s formula with that constant standing in for fadr[fi].
+  FX_PCALL = 4;
 
   VBASE  = 4194304;   // 0x400000
   HDRLEN = 120;       // the ELF header: one file header and one program header
@@ -167,26 +179,34 @@ var
   // the name of the type being declared, before it is known whether it is a record or a
   // schema -- see decltypes, which reads it out of tbuf before interning
   tnamebuf: array[0..63] of char;
-  // the lib/ path that was tried for a bare include name, kept because the fallback
-  // overwrites pathbuf with the relative name -- see failinclude
-  triedlib: array[0..1023] of char;
-  triedlibn: int;
-  libdir:  array[0..1023] of char;      // where the compiler looks for its library
-  libdirlen: int;
-  // the compiler's own path, read from /proc/self/exe -- see setlibdir, which needs a
-  // buffer because readlink does not null-terminate and returns the length instead
-  selfbuf: array[0..1023] of char;
 
-  // THE LIBRARY, CARRIED INSIDE THE COMPILER.
+  // THE STANDARD LIBRARY IS PART OF THIS EXECUTABLE, as a trailer after the ELF image.
   //
-  // A compiler that was downloaded rather than built has no lib/ beside it, so
-  // include "io.wz" had nowhere to read from and the binary was useless for anything
-  // but a program that includes nothing.  The sources now travel with it.
+  // build.sh appends NAMED PARTS after the fixed-point check -- today the modules, each
+  // under the name lib/<module>.wz and packed with lib/lz.wz -- then an index with one line
+  // per part, then a footer of fixed length (see loadparts and docs/design.md). The ELF
+  // loader never maps those bytes; the compiler reads them from /proc/self/exe.
   //
+  // There is exactly ONE place a module comes from. No lib/ directory on disk, no
+  // environment variable, no flag, no search order: `import io;` is the io of this
+  // compiler, so the same source and the same compiler file give the same executable
+  // wherever either of them sits.
+  partidx: array[0..16383] of char;           // the index, as read from the trailer
+  partnm, partnmn, partoff, partlen, partsize: array[0..255] of int;
+  partlz: array[0..255] of bool;              // packed with lz, or stored as it is
+  nparts: int;                                // 0: this executable carries no trailer
+  parthash: array[0..63] of char;             // sha256 over the original parts
+  exefd: int;                                 // /proc/self/exe, to read a part from
+  ftr: array[0..FTRLEN - 1] of char;          // the footer
+  zbuf: array[0..ZMAX - 1] of char;           // one packed part, on its way to src
+  // Per source file: the part it was read from, or -1 for a file on disk. A module is
+  // recognised by its part and never by a path, so a file that happens to be called
+  // wantzel/lib/io.wz is never mistaken for the module.
+  filemod: array[0..1023] of int;
+
   // The IDENTITY of every file read in: st_dev and st_ino from stat(2).  That makes
-  // "lib/io.wz" the same file as "../../elsewhere/lib/io.wz" -- and makes a TEST called
-  // kv.wz something DIFFERENT from the library kv.wz, because the inode differs.
-  // Comparing on the path string could do neither.
+  // "src/x.wz" the same file as "../../elsewhere/src/x.wz", which comparing on the path
+  // string could not.
   stbuf:  array[0..143] of char;
   fdev:   array[0..1023] of int;
   fino:   array[0..1023] of int;
@@ -238,6 +258,28 @@ var
 
   fxoff, fxkind, fxval: array[0..MAXFIX-1] of int;
   nfx: int;
+
+  // ---- ELIMINATION OF UNUSED ROUTINES, see eliminate below ----------------------------
+  //
+  // A routine is reachable or it is not; there is no third state, so one flag per routine
+  // is the whole model. forder holds the routine indices sorted by fadr -- routines are not
+  // necessarily DEFINED in index order (a forward declaration fixes fi before the body is
+  // seen), so the code buffer's own order has to be discovered, not assumed.
+  flive:  array[0..MAXF-1] of int;      // 1 once a routine is known to be called
+  forder: array[0..MAXF-1] of int;      // routine indices, sorted by fadr
+  fnewadr: array[0..MAXF-1] of int;     // a live routine's address after compaction
+  fwork:  array[0..MAXF-1] of int;      // worklist: routines marked live, not yet scanned
+  nwork:  int;
+  // ffx0[fi]: the value of nfx at the moment fadr[fi] was set, i.e. the index of the first
+  // fixup this routine's body can have produced. fixup() only ever APPENDS at nfx, and
+  // codelen only ever grows while a routine's body is being emitted, so a routine's own
+  // fixups are exactly one CONTIGUOUS slice of fxoff/fxkind/fxval -- [ffx0[fi], ffx0[fi'])
+  // where fi' is the next routine in fadr order (or mainfx0, after the last one). No bucket
+  // structure is needed: MARK reads each live routine's slice once, O(routines + fixups)
+  // total instead of rescanning all of nfx per routine.
+  ffx0: array[0..MAXF-1] of int;
+  fxend: array[0..MAXF-1] of int;        // the end of that slice; filled by ordertroutines
+  mainfx0: int;                          // nfx when mainaddr was set: where main's own slice starts
 
   brkfix, cntfix: array[0..255] of int;
   nbrk, brkbase, ncnt, cntbase: int;
@@ -438,35 +480,6 @@ begin
   halt(1);
 end;
 
-// failinclude -- an include that could not be opened, NAMING THE PATH IT TRIED.
-//
-// "cannot open the included file" on its own is the same class of unhelpfulness as the
-// bare "undeclared identifier": the reader has the line, but a line can hold one include
-// and the path that was actually attempted is not what is written there -- a bare library
-// name is resolved against <compiler dir>/lib/ first.
-//
-// This matters most for exactly the case that shipped broken in 0.1.0: someone who
-// unpacked only the binary, without lib/ beside it. Without the path in the message they
-// go looking in their own directory for a file the compiler was expecting somewhere else.
-procedure failinclude;
-var n: int;
-begin
-  wrs(2, "wantzel: "); wrname(2); wrs(2, ":"); wrnum(2, line);
-  wrs(2, ": cannot open the included file: ");
-  n := 0;
-  while pathbuf[n] <> chr(0) do n := n + 1;
-  wrbuf(2, addr(pathbuf[0]), n);
-  // A BARE LIBRARY NAME WAS LOOKED FOR IN lib/ FIRST, and that is the path worth naming:
-  // for the case this message exists for -- a binary unpacked without lib/ beside it --
-  // the relative name above is what the source already says and tells the reader nothing.
-  if triedlibn > 0 then
-  begin
-    wrs(2, "\n  looked in the library first: ");
-    wrbuf(2, addr(triedlib[0]), triedlibn);
-  end;
-  wrs(2, "\n");
-  halt(1);
-end;
 
 // Does the name just read contain a capital?  Then the collision the caller is about to
 // report is very probably about CASE and not about the name itself.
@@ -547,7 +560,7 @@ end;
 // then failed to find.
 function iskw: bool;
 begin
-  return (tok >= KW_CONST) and (tok <= KW_TOOLS);
+  return (tok >= KW_CONST) and (tok <= KW_IMPORT);
 end;
 
 // kwnamed -- is the current keyword standing where a NAME belongs, judged by the character
@@ -658,6 +671,7 @@ begin
     if eqt("if")        then return KW_IF;
     if eqt("int")       then return KW_INT;
     if eqt("include")   then return KW_INCLUDE;
+    if eqt("import")    then return KW_IMPORT;
   end;
   if c = 108 then
   begin
@@ -1083,6 +1097,7 @@ begin
     i := i + 1;
   end;
   filelen[nfiles] := i;
+  filemod[nfiles] := 0 - 1;
   // keep this file's identity, so samefile can compare it
   fdev[nfiles] := 0; fino[nfiles] := 0;
   if stt(addr(pathbuf[0])) >= 0 then
@@ -1099,12 +1114,11 @@ end;
 
 // Clean up pathbuf: "a/./b" becomes "a/b" and "a/x/../b" becomes "a/b".
 //
-// Why this is REQUIRED and not merely tidy: the de-duplication below compares PATH
-// STRINGS.  Without cleaning, "lib/io.wz" is a different file from
-// "tests/lib/../../lib/io.wz", and then io.wz comes in twice -- with "duplicate
-// declaration" on a line in a THIRD file, which leads nobody to the real cause.  Since
-// there is a search path this happens by itself: the same library comes in through a
-// bare name and through a relative path.
+// Why this is REQUIRED and not merely tidy: the name a file carries is what messages and
+// runtime checks print, and when stat(2) cannot tell two spellings apart the
+// de-duplication below falls back to comparing PATH STRINGS. Without cleaning,
+// "src/x.wz" and "tests/../src/x.wz" are two files, x.wz comes in twice, and the result is
+// "duplicate declaration" on a line in a THIRD file, which leads nobody to the real cause.
 procedure normpath;
 var i, n, w, seg: int;
 begin
@@ -1191,6 +1205,7 @@ end;
 function samefile(fi: int): bool;
 var i: int;
 begin
+  if filemod[fi] >= 0 then return false;     // a module is never a file
   if stt(addr(pathbuf[0])) >= 0 then
     if (fdev[fi] <> 0) or (fino[fi] <> 0) then
       return (fdev[fi] = stfield(0)) and (fino[fi] = stfield(8));
@@ -1230,83 +1245,300 @@ begin
   return srclen - start;
 end;
 
-// The DIRECTORY THE COMPILER ITSELF IS IN, plus "/lib/" -- the search path for includes
-// that are not found relatively.
+// ---- THE TRAILER: NAMED PARTS AFTER THE ELF IMAGE -----------------------------------
 //
-// Why this exists: without a search path every source has to spell out the exact relative
-// path to the library ("../../lib/io.wz"), and that breaks as soon as a file moves or the
-// library sits somewhere else.  Worse: the de-duplication below works on the PATH STRING,
-// so the same file along two spellings comes in TWICE and gives "duplicate declaration"
-// in a third file.  C solves this with -I plus a system path; this is the same solution,
-// with the compiler itself as the anchor.
+// The last FTRLEN bytes of this executable are the footer
 //
-// THE ANCHOR IS THE EXECUTABLE ITSELF, read from /proc/self/exe -- not argv[0].
+//     WZPARTS1 <index offset:12> <index length:8> <parts:4> <sha256:64>\n
 //
-// argv[0] is what the CALLER chose to say, and that is not always a path.  Invoked through
-// PATH the way an editor or an agent starts it, argv[0] is the bare word "wantzel" with no
-// '/' in it at all: cut stays 0, the search path collapses to a RELATIVE "lib/", and
-// include "io.wz" then depends on the working directory.  Measured on 17-09-2026 in a
-// perfectly good installation: the same compile succeeded by absolute path and failed
-// through PATH with "cannot open the included file: io.wz".
+// and the index it points at holds one line per part, in byte order of the names:
 //
-// readlink("/proc/self/exe") answers where this process actually came from, whatever it was
-// called, and it needs no cooperation from the caller.  argv[0] stays as the fallback for
-// the case readlink cannot answer (no /proc), because a wrong-but-usual answer beats none.
+//     <name> <offset> <length> <size> <form>
 //
-// If wantzel sits in /x/y/wantzel the search path is /x/y/lib/; that works for a compiler
-// built next to its lib and just as well for an installed binary.
-procedure setlibdir;
-var i, cut, n: int;
+// offset and length locate the stored bytes, size is the length of the original text, and
+// form is `lz` (packed as lib/lz.wz packs) or `raw`. Every position counts from the start
+// of the trailer, which is therefore file size - FTRLEN - index length - index offset.
+// bootstrap/libpack.wz writes it and docs/design.md describes it. A part is any named text;
+// the standard library is the set of parts called lib/<module>.wz.
+//
+// NO FOOTER IS NOT AN ERROR HERE. The bootstrap stages that build the compiler carry no
+// trailer and need none -- the compiler's own source imports nothing. What fails is an
+// import on a compiler without one, with a message that says what is missing. A footer
+// that IS there but does not add up is an error at once: a damaged trailer must never
+// look like a smaller library, and nothing in it is trusted before it is checked.
+procedure faildamaged;
 begin
-  libdirlen := 0;
+  wrs(2, "wantzel: the library trailer of this compiler is damaged; rebuild it with ./build.sh, or download the release binary again\n");
+  halt(1);
+end;
+
+// ftrnum(at, n) -- the n decimal digits at ftr[at]
+function ftrnum(at: int; n: int): int;
+var v, i, c: int;
+begin
+  v := 0;
   i := 0;
-  cut := 0;
-  // /proc/self/exe first; on success selfbuf holds an absolute path with no trailing null
-  n := sys3(89, sadr("/proc/self/exe"), addr(selfbuf[0]), 1023);
-  if n > 0 then
+  while i < n do
   begin
-    i := 0;
-    while i < n do
-    begin
-      if selfbuf[i] = '/' then cut := i + 1;
-      i := i + 1;
-    end;
-    i := 0;
-    while i < cut do
-    begin
-      libdir[i] := selfbuf[i];
-      i := i + 1;
-    end;
-  end
-  else
+    c := ord(ftr[at + i]);
+    if (c < 48) or (c > 57) then faildamaged;
+    v := v * 10 + (c - 48);
+    i := i + 1;
+  end;
+  return v;
+end;
+
+// idxnum(at) -- the decimal number at partidx[at], ended by a space or a newline
+function idxnum(at: int): int;
+var v, c, i: int;
+begin
+  v := 0;
+  i := at;
+  while (partidx[i] <> ' ') and (partidx[i] <> chr(10)) do
   begin
-    // argv[0] as the fallback, for a system without /proc
-    while (argch(0, i) <> chr(0)) and (i < 900) do
+    c := ord(partidx[i]);
+    if (c < 48) or (c > 57) or (i - at >= 12) then faildamaged;
+    v := v * 10 + (c - 48);
+    i := i + 1;
+  end;
+  if i = at then faildamaged;
+  return v;
+end;
+
+// idxskip(at) -- past the field at partidx[at] and the one character that ends it
+function idxskip(at: int): int;
+var i: int;
+begin
+  i := at;
+  while (partidx[i] <> ' ') and (partidx[i] <> chr(10)) and (partidx[i] <> chr(0)) do i := i + 1;
+  if partidx[i] = chr(0) then faildamaged;
+  return i + 1;
+end;
+
+// loadparts -- read the footer and the index. nparts stays 0 without a trailer.
+procedure loadparts;
+var ioff, ilen, icount, tstart, fsize, got, n, at, i: int;
+begin
+  nparts := 0;
+  exefd := opn(sadr("/proc/self/exe"), 0, 0);
+  if exefd < 0 then return;
+  fsize := sys3(8, exefd, 0, 2);
+  if fsize < FTRLEN then return;
+  if sys3(8, exefd, fsize - FTRLEN, 0) < 0 then return;
+  if rdbuf(exefd, addr(ftr[0]), FTRLEN) <> FTRLEN then return;
+  i := 0;
+  while i < 9 do
+  begin
+    if ftr[i] <> schar("WZPARTS1 ", i) then return;
+    i := i + 1;
+  end;
+  ioff := ftrnum(9, 12);
+  ilen := ftrnum(22, 8);
+  icount := ftrnum(31, 4);
+  if (ilen <= 0) or (ilen >= len(partidx)) or (icount > len(partnm)) then faildamaged;
+  tstart := fsize - FTRLEN - ilen - ioff;
+  if tstart <= 0 then faildamaged;
+  i := 0;
+  while i < 64 do begin parthash[i] := ftr[36 + i]; i := i + 1; end;
+  if sys3(8, exefd, tstart + ioff, 0) <> tstart + ioff then faildamaged;
+  got := 0;
+  while got < ilen do
+  begin
+    n := rdbuf(exefd, addr(partidx[got]), ilen - got);
+    if n <= 0 then faildamaged;
+    got := got + n;
+  end;
+  if partidx[ilen - 1] <> chr(10) then faildamaged;
+  partidx[ilen] := chr(0);
+  at := 0;
+  while at < ilen do
+  begin
+    if nparts >= icount then faildamaged;
+    partnm[nparts] := at;
+    at := idxskip(at);
+    partnmn[nparts] := at - 1 - partnm[nparts];
+    if (partnmn[nparts] = 0) or (partidx[at - 1] <> ' ') then faildamaged;
+    partoff[nparts] := idxnum(at);
+    at := idxskip(at);
+    partlen[nparts] := idxnum(at);
+    at := idxskip(at);
+    partsize[nparts] := idxnum(at);
+    at := idxskip(at);
+    if (partidx[at] = 'l') and (partidx[at + 1] = 'z') and (partidx[at + 2] = chr(10)) then
+      partlz[nparts] := true
+    else if (partidx[at] = 'r') and (partidx[at + 1] = 'a') and (partidx[at + 2] = 'w')
+            and (partidx[at + 3] = chr(10)) then
+      partlz[nparts] := false
+    else faildamaged;
+    at := idxskip(at);
+    // every part lies inside the trailer, before the index
+    if partoff[nparts] + partlen[nparts] > ioff then faildamaged;
+    if (not partlz[nparts]) and (partlen[nparts] <> partsize[nparts]) then faildamaged;
+    partoff[nparts] := tstart + partoff[nparts];
+    nparts := nparts + 1;
+  end;
+  if nparts <> icount then faildamaged;
+end;
+
+// ismodule(pi) -- is part pi a library module, lib/<name>.wz?
+function ismodule(pi: int): bool;
+var b, n: int;
+begin
+  b := partnm[pi];
+  n := partnmn[pi];
+  if n < 8 then return false;
+  if (partidx[b] <> 'l') or (partidx[b + 1] <> 'i') or (partidx[b + 2] <> 'b')
+     or (partidx[b + 3] <> '/') then return false;
+  return (partidx[b + n - 3] = '.') and (partidx[b + n - 2] = 'w') and (partidx[b + n - 1] = 'z');
+end;
+
+// modfind(nm, n) -- the part holding module nm (no lib/, no .wz), or -1. Names are
+// case-insensitive, like every other name in the language.
+function modfind(nm: array of char; n: int): int;
+var pi, i, b: int;
+begin
+  pi := 0;
+  while pi < nparts do
+  begin
+    if ismodule(pi) and (partnmn[pi] = n + 7) then
     begin
-      if argch(0, i) = '/' then cut := i + 1;
-      i := i + 1;
+      b := partnm[pi] + 4;
+      i := 0;
+      while (i < n) and (ord(partidx[b + i]) = lower(ord(nm[i]))) do i := i + 1;
+      if i = n then return pi;
     end;
-    i := 0;
-    while i < cut do
+    pi := pi + 1;
+  end;
+  return 0 - 1;
+end;
+
+// oneedit(a, an, b, bn) -- are a[0..an) and partidx[b..b+bn) one insertion, deletion or
+// substitution apart? Distance one, as for a misspelt name (see onetypo).
+function oneedit(a: array of char; an: int; b: int; bn: int): bool;
+var i, j, d: int;
+begin
+  if (an - bn > 1) or (bn - an > 1) then return false;
+  i := 0; j := 0; d := 0;
+  while (i < an) and (j < bn) do
+  begin
+    if lower(ord(a[i])) = ord(partidx[b + j]) then begin i := i + 1; j := j + 1; end
+    else
     begin
-      libdir[i] := argch(0, i);
-      i := i + 1;
+      d := d + 1;
+      if d > 1 then return false;
+      if an > bn then i := i + 1
+      else if bn > an then j := j + 1
+      else begin i := i + 1; j := j + 1; end;
     end;
   end;
-  libdirlen := cut;
-  // If the compiler sits in .../bin/, its library belongs in .../lib/ beside it and not
-  // in .../bin/lib/.  That is the usual layout (prefix/bin next to prefix/lib), and it is
-  // also what happens here now that build.sh writes to bin/.  Recognised by the last
-  // directory name: if the path ends in "bin/" (or "bin\" -- see the separator above),
-  // take that off.
-  if libdirlen >= 4 then
-    if (libdir[libdirlen - 4] = 'b') and (libdir[libdirlen - 3] = 'i')
-       and (libdir[libdirlen - 2] = 'n')
-       and ((libdir[libdirlen - 1] = '/') or (libdir[libdirlen - 1] = '\\')) then
-      libdirlen := libdirlen - 4;
-  libdir[libdirlen] := 'l'; libdir[libdirlen + 1] := 'i';
-  libdir[libdirlen + 2] := 'b'; libdir[libdirlen + 3] := '/';
-  libdirlen := libdirlen + 4;
+  return d + (an - i) + (bn - j) <= 1;
+end;
+
+// modnear(nm, n) -- a module one edit away from nm, or -1
+function modnear(nm: array of char; n: int): int;
+var pi: int;
+begin
+  pi := 0;
+  while pi < nparts do
+  begin
+    if ismodule(pi) then
+      if oneedit(nm, n, partnm[pi] + 4, partnmn[pi] - 7) then return pi;
+    pi := pi + 1;
+  end;
+  return 0 - 1;
+end;
+
+// wrmodname(fd, pi) -- the module name of part pi: lib/io.wz -> io
+procedure wrmodname(fd: int; pi: int);
+begin
+  wrbuf(fd, addr(partidx[partnm[pi] + 4]), partnmn[pi] - 7);
+end;
+
+// lzunpack -- A COPY OF lz.unpack IN lib/lz.wz, and it has to stay one.
+//
+// The compiler's source includes nothing, so it cannot use the module; and a second
+// implementation of a format is how two programs come to disagree about it. So this is the
+// same routine under another name, and tests/toolchain/lz_copy_is_identical.sh compares
+// the two texts. Change it there, then copy it here.
+function lzunpack(src: array of char; n: int; dst: array of char): int;
+var p, o, t, lit, ml, b, d: int;
+begin
+  if (n < 1) or (n > len(src)) then return 0 - 1;
+  p := 0;
+  o := 0;
+  while p < n do
+  begin
+    t := ord(src[p]);
+    p := p + 1;
+    lit := t shr 4;
+    if lit = 15 then
+    begin
+      b := 255;
+      while b = 255 do
+      begin
+        if p >= n then return 0 - 1;
+        b := ord(src[p]);
+        p := p + 1;
+        lit := lit + b;
+      end;
+    end;
+    if (lit > n - p) or (lit > len(dst) - o) then return 0 - 1;
+    while lit > 0 do
+    begin
+      dst[o] := src[p];
+      o := o + 1;
+      p := p + 1;
+      lit := lit - 1;
+    end;
+    if p = n then return o;
+    if p + 2 > n then return 0 - 1;
+    d := ord(src[p]) + ord(src[p + 1]) * 256;
+    p := p + 2;
+    if (d = 0) or (d > o) then return 0 - 1;
+    ml := band(t, 15);
+    if ml = 15 then
+    begin
+      b := 255;
+      while b = 255 do
+      begin
+        if p >= n then return 0 - 1;
+        b := ord(src[p]);
+        p := p + 1;
+        ml := ml + b;
+      end;
+    end;
+    ml := ml + 4;
+    if ml > len(dst) - o then return 0 - 1;
+    while ml > 0 do
+    begin
+      dst[o] := dst[o - d];
+      o := o + 1;
+      ml := ml - 1;
+    end;
+  end;
+  return 0 - 1;
+end;
+
+// readpart(pi) -- append part pi to src, the way readfile appends a file; its length
+function readpart(pi: int): int;
+var n, got, k: int;
+begin
+  n := partsize[pi];
+  if srclen + n > SRCMAX then fail("source is too large");
+  if partlen[pi] > ZMAX then fail("a library module is larger than this compiler can read");
+  if sys3(8, exefd, partoff[pi], 0) <> partoff[pi] then faildamaged;
+  got := 0;
+  while got < partlen[pi] do
+  begin
+    if partlz[pi] then k := rdbuf(exefd, addr(zbuf[got]), partlen[pi] - got)
+    else k := rdbuf(exefd, addr(src[srclen + got]), partlen[pi] - got);
+    if k <= 0 then faildamaged;
+    got := got + k;
+  end;
+  if partlz[pi] then
+    if lzunpack(zbuf, partlen[pi], view(addr(src[srclen]), n)) <> n then faildamaged;
+  srclen := srclen + n;
+  return n;
 end;
 
 // Not in any library: still say WHICH name. The bare message meant reading the whole
@@ -1336,8 +1568,11 @@ begin
   while obuf[j] <> chr(0) do j := j + 1;
   wrbuf(2, addr(obuf[0]), j);
   wrs(2, "\n");
-  if laterinclude >= 0 then
+  j := laterinclude;
+  if j = 1 then
     wrs(2, "  there is an include further down this file; a name is only visible after the include that declares it\n");
+  if j = 2 then
+    wrs(2, "  there is an import further down this file; a name is only visible after the import that declares it\n");
   halt(1);
 end;
 
@@ -1356,22 +1591,34 @@ begin
   return true;
 end;
 
-// laterinclude -- is there still an `include` ahead of us in what has been read?
+// laterinclude -- is there still an include or an import ahead of us in this file?
+// 1 for an include, 2 for an import, -1 for neither.
 //
 // A CHEAP LOOK, NOT A SECOND PASS. Everything read so far sits in one buffer, so scanning
 // from the failure point to the end of the current file is a walk over bytes that are
 // already there -- no file is opened and nothing is parsed.
 //
-// It does not prove the name is in that include; the compiler cannot know, because the file
+// ONLY AT THE START OF A LINE. The word alone is not enough: it matched in a comment and in
+// a string, and then the hint sent the reader looking for an include that did not exist.
+// An include or an import is a top-level statement, and in practice every one starts its
+// own line.
+//
+// It does not prove the name is in that file; the compiler cannot know, because the file
 // has not been read. It proves the SHAPE of the problem is possible, and that is the whole
-// value: it sends the reader to the include order instead of to a spelling mistake.
+// value: it sends the reader to the order of the lines instead of to a spelling mistake.
 function laterinclude: int;
-var i: int;
+var i, k: int;
 begin
   i := pos;
   while i < srcend do
   begin
-    if kwhere(i, srcend, "include") then return i;
+    if src[i] = chr(10) then
+    begin
+      k := i + 1;
+      while (k < srcend) and ((src[k] = ' ') or (src[k] = chr(9))) do k := k + 1;
+      if kwhere(k, srcend, "include ") or kwhere(k, srcend, "include\"") then return 1;
+      if kwhere(k, srcend, "import ") then return 2;
+    end;
     i := i + 1;
   end;
   return 0 - 1;
@@ -1566,91 +1813,67 @@ begin
   halt(1);
 end;
 
-// failundeclared -- "undeclared identifier", and WHICH library declares it when the name
-// looks like one of ours.
+// failundeclared -- "undeclared identifier", and WHICH library module declares it when the
+// name looks like one of ours.
 //
-// io.puts -> is there a lib/io.wz? Then say so and give the include line to add. It is a
-// HINT: the worst case is that it stays quiet, and it never changes whether the program
-// compiles.
+// io.puts -> is there a module io? Then say so and give the line to add. It is a HINT: the
+// worst case is that it stays quiet, and it never changes whether the program compiles.
 //
-// ONE stat(2), NOT A SEARCH. This used to scan the library the compiler CARRIED for the
-// identifier at a declaration position -- about 110 lines, plus a preference rule because
-// store.table also occurs in oauth.wz (which includes store.wz and uses it). Once the
-// library lives on disk the naming convention does that work for free: store.* lives in
-// store.wz, so the name before the first dot IS the file name, and asking the filesystem
-// whether that file exists is the whole check.
-//
-// It is now the counterpart of the routine in boot.c line for line, which it never was
-// while one side had an embedded copy and the other did not.
+// ONE LOOKUP IN THE INDEX, NOT A SEARCH. The naming convention does the work: store.* lives
+// in module store, so the name before the first dot IS the module name, and asking the
+// trailer's index whether that module exists is the whole check.
 procedure failundeclared;
-var i, j, n, fd, mark, n2, olen, near: int;
+var j, n, pi, mark, n2, olen, near: int;
     erin: bool;
 begin
   n := 0;
   while (tbuf[n] <> chr(0)) and (tbuf[n] <> '.') do n := n + 1;
   if (tbuf[n] <> '.') or (n = 0) then failname;
-  // pathbuf := <libdir><prefix>.wz
-  i := 0;
-  while i < libdirlen do begin pathbuf[i] := libdir[i]; i := i + 1; end;
-  if i + n + 4 >= 1022 then failname;
-  j := 0;
-  while j < n do begin pathbuf[i + j] := tbuf[j]; j := j + 1; end;
-  i := i + n;
-  pathbuf[i] := '.'; pathbuf[i + 1] := 'w'; pathbuf[i + 2] := 'z'; pathbuf[i + 3] := chr(0);
-  fd := opn(addr(pathbuf[0]), 0, 0);
-  if fd < 0 then failname;
-  cls(fd);
-  // THE FILE EXISTS -- BUT IS THE NAME IN IT? That is the question the old code never
+  pi := modfind(tbuf, n);
+  if pi < 0 then failname;
+  // THE MODULE EXISTS -- BUT IS THE NAME IN IT? That is the question the old code never
   // asked, and it is the whole bug.
   //
   // MEASURED 18-09-2026: io.putc does not exist, io.wz was included three lines above, and
-  // the compiler answered "io.putc is declared in io.wz; add: include "io.wz";". Wrong
-  // twice over. A human sees the include sitting there and distrusts the message. An agent
-  // adds the include it already has, recompiles, gets the identical error, and loops -- the
-  // message has taken away the one fact it needed, which is that the name does not exist.
+  // the compiler named io.wz as the place that declares it. Wrong twice over. A human sees
+  // the include sitting there and distrusts the message. An agent adds the line it already
+  // has, recompiles, gets the identical error, and loops -- the message has taken away the
+  // one fact it needed, which is that the name does not exist.
   //
-  // ASKING ABOUT THE NAME ANSWERS BOTH HALVES AT ONCE, whether or not the file is already
-  // included, so there is no second check on the include list: if the name is not declared
-  // there, naming that library is wrong either way. (A check on "is it already included"
-  // was written first and then removed -- it could only fire where this one already had,
-  // and by exiting earlier it robbed the reader of the better message below.)
+  // ASKING ABOUT THE NAME ANSWERS BOTH HALVES AT ONCE, whether or not the module is already
+  // imported, so there is no second check on the import list: if the name is not declared
+  // there, naming that module is wrong either way.
   //
-  // THE TEXT IS READ AND THEN DROPPED: srclen goes back to where it was, so this library
+  // THE TEXT IS READ AND THEN DROPPED: srclen goes back to where it was, so this module
   // does not end up in the source being compiled. We are on our way to halt(1) either way,
   // so the read costs nothing that matters.
   olen := 0;
   while obuf[olen] <> chr(0) do olen := olen + 1;
   mark := srclen;
-  n2 := readfile;
-  if n2 > 0 then
+  n2 := readpart(pi);
+  erin := libdeclares(mark, n2, obuf, olen);
+  if not erin then
   begin
-    erin := libdeclares(mark, n2, obuf, olen);
-    if not erin then
-    begin
-      // NOT IN THERE -- BUT IS SOMETHING ONE TYPO AWAY? io.putc for io.putn is the whole
-      // point: the writer is one character from the name they wanted, and being told only
-      // "undeclared" leaves them to find it by reading the library.
-      near := nearname(mark, n2, obuf, olen);
-      srclen := mark;
-      if near > 0 then failnear(near);
-      failname;
-    end;
+    // NOT IN THERE -- BUT IS SOMETHING ONE TYPO AWAY? io.putc for io.putn is the whole
+    // point: the writer is one character from the name they wanted, and being told only
+    // "undeclared" leaves them to find it by reading the library.
+    near := nearname(mark, n2, obuf, olen);
     srclen := mark;
-  end
-  else srclen := mark;
+    if near > 0 then failnear(near);
+    failname;
+  end;
+  srclen := mark;
   wrs(2, "wantzel: "); wrname(2); wrs(2, ":"); wrnum(2, line);
   wrs(2, ": undeclared identifier: ");
   j := 0;
   while obuf[j] <> chr(0) do j := j + 1;
   wrbuf(2, addr(obuf[0]), j);
-  wrs(2, " is declared in ");
-  wrbuf(2, addr(tbuf[0]), n); wrs(2, ".wz; add: include \"");
-  wrbuf(2, addr(tbuf[0]), n); wrs(2, ".wz\";\n");
+  wrs(2, " is declared in the library module "); wrmodname(2, pi);
+  wrs(2, "; add: import "); wrmodname(2, pi); wrs(2, ";\n");
   halt(1);
 end;
 
-// pathbuf := <search path>/<name from the include>, for the second attempt
-// does the name from the include contain a '/'? then it is a path, not a library name
+// haspath -- does the name in an include contain a '/'?
 function haspath(doff: int): bool;
 var i: int;
 begin
@@ -1661,26 +1884,6 @@ begin
     i := i + 1;
   end;
   return false;
-end;
-
-procedure makelibpath(doff: int);
-var i, n: int;
-begin
-  n := 0;
-  while n < libdirlen do
-  begin
-    pathbuf[n] := libdir[n];
-    n := n + 1;
-  end;
-  i := 0;
-  while dat[doff + i] <> chr(0) do
-  begin
-    if n >= 1022 then fail("include path too long");
-    pathbuf[n] := dat[doff + i];
-    n := n + 1;
-    i := i + 1;
-  end;
-  pathbuf[n] := chr(0);
 end;
 
 procedure makepath(doff: int);
@@ -1714,55 +1917,200 @@ begin
   pathbuf[n] := chr(0);
 end;
 
+// incmodule(pi) -- read module pi in at this point: textual, once, in order, exactly as
+// an included file is.
+procedure incmodule(pi: int);
+var i, fi, start, n: int;
+begin
+  // already read? A module is recognised by its part, never by a path.
+  i := 0;
+  while i < nfiles do
+  begin
+    if filemod[i] = pi then break;
+    i := i + 1;
+  end;
+  if i < nfiles then
+  begin
+    next;
+    return;
+  end;
+  if incdepth >= 16 then fail("includes nested too deeply");
+  // THE NAME IT CARRIES IN MESSAGES AND DEBUG INFORMATION: wantzel/lib/<module>.wz, fixed,
+  // whatever directory the compiler sits in. A runtime check stores the name of its file in
+  // the executable, so a name taken from the installation made the same source compile to
+  // different bytes in a checkout and in an unpacked release.
+  n := 0;
+  while n < 8 do begin pathbuf[n] := schar("wantzel/", n); n := n + 1; end;
+  i := 0;
+  while i < partnmn[pi] do begin pathbuf[n + i] := partidx[partnm[pi] + i]; i := i + 1; end;
+  pathbuf[n + i] := chr(0);
+  fi := addfile;
+  filemod[fi] := pi;
+  fdev[fi] := 0; fino[fi] := 0;
+  incpos[incdepth] := pos; incend[incdepth] := srcend;
+  incline[incdepth] := line; incfile[incdepth] := curfile;
+  incdepth := incdepth + 1;
+  start := srclen;
+  n := readpart(pi);
+  pos := start; srcend := start + n; line := 1; curfile := fi;
+  next;
+end;
+
+// failinclude(doff) -- an include that could not be opened, NAMING THE PATH IT TRIED.
+//
+// "cannot open the included file" on its own is the same class of unhelpfulness as the
+// bare "undeclared identifier": the reader has the line, but the path that was attempted
+// is not what is written there -- it is relative to the file that holds the include, not
+// to the directory the compiler was started in.
+//
+// AND WHEN THE NAME IS A LIBRARY MODULE, THE LINE TO WRITE INSTEAD. `include "io.wz";` was
+// how the library was reached until import existed, so it is what older sources and older
+// habits write. It is a file name now and means a file; the message says so and gives the
+// import, so the fix takes one round.
+procedure failinclude(doff: int);
+var n, k, cut, pi: int;
+begin
+  k := 0;
+  cut := 0;
+  while dat[doff + k] <> chr(0) do
+  begin
+    if dat[doff + k] = '/' then cut := k + 1;
+    k := k + 1;
+  end;
+  pi := 0 - 1;
+  // the module the last segment names, if the name is <module>.wz and stood bare or in a
+  // directory called lib
+  if (k - cut > 3) and (dat[doff + k - 3] = '.') and (dat[doff + k - 2] = 'w') and (dat[doff + k - 1] = 'z') then
+    if (cut = 0) or ((cut >= 4) and (dat[doff + cut - 4] = 'l') and (dat[doff + cut - 3] = 'i')
+                     and (dat[doff + cut - 2] = 'b')) then
+      pi := modfind(view(addr(dat[doff + cut]), k - cut - 3), k - cut - 3);
+  wrs(2, "wantzel: "); wrname(2); wrs(2, ":"); wrnum(2, line);
+  if (pi >= 0) and (cut = 0) then
+  begin
+    wrs(2, ": "); wrbuf(2, addr(dat[doff]), k);
+    wrs(2, " is not a file next to this one; the library module is imported: import ");
+    wrmodname(2, pi); wrs(2, ";\n");
+    halt(1);
+  end;
+  wrs(2, ": cannot open the included file: ");
+  n := 0;
+  while pathbuf[n] <> chr(0) do n := n + 1;
+  wrbuf(2, addr(pathbuf[0]), n);
+  if pi >= 0 then
+  begin
+    wrs(2, "\n  the library module is imported: import "); wrmodname(2, pi); wrs(2, ";");
+  end;
+  wrs(2, "\n");
+  halt(1);
+end;
+
+// failincludeform -- `include io;`, `include io.wz;`: an include without the quotes. The
+// file name it meant is clear, so the message writes it out; and when that name is a
+// library module, it says that a module is imported, which is the likelier intention.
+procedure failincludeform;
+var n, pi: int;
+begin
+  if (tok <> TK_ID) and not iskw then fail("include takes a file name in quotes: include \"file.wz\";");
+  n := 0;
+  while obuf[n] <> chr(0) do n := n + 1;
+  if (n > 3) and (tbuf[n - 3] = '.') and (tbuf[n - 2] = 'w') and (tbuf[n - 1] = 'z') then n := n - 3;
+  pi := modfind(tbuf, n);
+  wrs(2, "wantzel: "); wrname(2); wrs(2, ":"); wrnum(2, line);
+  wrs(2, ": include takes a file name in quotes: include \"");
+  wrbuf(2, addr(obuf[0]), n); wrs(2, ".wz\";");
+  if pi >= 0 then
+  begin
+    wrs(2, " -- for the library module write: import "); wrmodname(2, pi); wrs(2, ";");
+  end;
+  wrs(2, "\n");
+  halt(1);
+end;
+
+// failnolibrary -- an import on a compiler that carries no library at all
+procedure failnolibrary;
+begin
+  fail("this compiler carries no standard library; run ./build.sh, or download the release binary");
+end;
+
+// failimportform(a, n) -- `import "io";`, `import "io.wz";`, `import io.wz;`: the intention
+// is clear, the notation is not, so the message carries the line to write. a[0..n) is the
+// name as written, without a trailing .wz.
+procedure failimportform(a: array of char; n: int);
+var pi: int;
+begin
+  pi := modfind(a, n);
+  wrs(2, "wantzel: "); wrname(2); wrs(2, ":"); wrnum(2, line);
+  wrs(2, ": import takes a module name, without quotes or .wz");
+  if pi >= 0 then
+  begin
+    wrs(2, ": import "); wrmodname(2, pi); wrs(2, ";\n");
+  end
+  else
+  begin
+    // not a module: then it was meant as a file of one's own, and that is include
+    wrs(2, "; a file of your own is included: include \"");
+    wrbuf(2, addr(a[0]), n); wrs(2, ".wz\";\n");
+  end;
+  halt(1);
+end;
+
+// import <name>; -- module <name> of the standard library in THIS compiler. A name, not a
+// file: no quotes, no .wz, no path. Nothing on disk is consulted.
+procedure doimport;
+var n, pi, near: int;
+begin
+  next;
+  if tok = TK_STR then
+  begin
+    n := 0;
+    while dat[tval + n] <> chr(0) do n := n + 1;
+    if (n > 3) and (dat[tval + n - 3] = '.') and (dat[tval + n - 2] = 'w') and (dat[tval + n - 1] = 'z') then
+      failimportform(view(addr(dat[tval]), n - 3), n - 3);
+    failimportform(view(addr(dat[tval]), n), n);
+  end;
+  if (tok <> TK_ID) and not iskw then fail("import takes a module name: import io;");
+  n := 0;
+  while obuf[n] <> chr(0) do n := n + 1;
+  if (n > 3) and (tbuf[n - 3] = '.') and (tbuf[n - 2] = 'w') and (tbuf[n - 1] = 'z') then
+    failimportform(obuf, n - 3);
+  // keep the name: reading the ';' overwrites tbuf
+  pi := 0;
+  while pi <= n do begin nearbuf[pi] := tbuf[pi]; pi := pi + 1; end;
+  nearbufn := n;
+  next;
+  if tok <> 59 then fail("missing ; after import");
+  if nparts = 0 then failnolibrary;
+  pi := modfind(nearbuf, n);
+  if pi < 0 then
+  begin
+    wrs(2, "wantzel: "); wrname(2); wrs(2, ":"); wrnum(2, line);
+    wrs(2, ": no library module '"); wrbuf(2, addr(nearbuf[0]), n);
+    wrs(2, "' in this compiler; wantzel --lib lists them");
+    near := modnear(nearbuf, n);
+    if near >= 0 then
+    begin
+      wrs(2, " -- did you mean: import "); wrmodname(2, near); wrs(2, ";");
+    end;
+    wrs(2, "\n");
+    halt(1);
+  end;
+  incmodule(pi);
+end;
+
 procedure doinclude;
 var doff, i, fi, n, start: int;
 begin
   next;
-  if tok <> TK_STR then fail("include needs a file name in quotes");
+  if tok <> TK_STR then failincludeform;
   doff := tval;
   next;
   if tok <> 59 then fail("missing ; after include");
-  // RELATIVE FIRST (next to the including file), THEN THE SEARCH PATH -- like C with
-  // "mine.h" and <stdio.h>, but without two spellings: if the file exists next to the
-  // includer, that wins; otherwise it is looked for in the compiler's library.  That way
-  // a source can write "io.wz" and not "../../lib/io.wz".
-  // A BARE NAME IS A LIBRARY NAME, a name with a '/' is a path.
-  //
-  // That distinction replaces three rules a newcomer would otherwise have to learn by
-  // heart.  include "io.wz" always means THE library -- even in a test file that is
-  // itself called io.wz, because that is not a path.  include "../src/foo.wz" always
-  // means a file next to the includer.  No precedence rule to remember, no file that
-  // finds itself, and no two spellings like C's <> against "".
-  //
-  // If the library name does not exist it falls back to relative: that way files lying
-  // next to each other and naming each other by name keep working.
-  //
-  // THE LIBRARY IS ON DISK AND NOWHERE ELSE, since 16-09-2026. There used to be a third
-  // step here: a copy of lib/ compiled into this binary, consulted when neither path held
-  // the file. It bought a single-file installation and charged for it in four places --
-  // a 238KB generated source in the repository, a permanent difference between this
-  // compiler and its C counterpart (which never had one), no way to tell from outside
-  // which copy had answered, and no source on disk for an editor or a debugger to show.
-  // Every one of those cost real work. The library ships beside the binary instead.
-  triedlibn := 0;
-  if haspath(doff) then makepath(doff)
-  else
-  begin
-    makelibpath(doff);
-    // KEEP THE LIBRARY PATH BEFORE THE FALLBACK OVERWRITES IT. makepath writes the
-    // relative name over pathbuf, so without this copy the error below can only name
-    // "io.wz" -- which is what the source already says, and not where we looked.
-    if not fileexists then
-    begin
-      while (pathbuf[triedlibn] <> chr(0)) and (triedlibn < 1023) do
-      begin
-        triedlib[triedlibn] := pathbuf[triedlibn];
-        triedlibn := triedlibn + 1;
-      end;
-      triedlib[triedlibn] := chr(0);
-      makepath(doff);
-    end;
-  end;
+  // A MODULE HAS NO DIRECTORY, so it has nothing to be relative to. The library reaches
+  // other modules through import; an include in it is a mistake in the library.
+  if filemod[curfile] >= 0 then fail("a library module cannot include a file; it imports other modules");
+  // ALWAYS A FILE: relative to the directory of the file that names it, or absolute.
+  // There is no second place to look and no library behind it -- a module is imported.
+  makepath(doff);
   normpath;
   datlen := datmark;
   i := 0;
@@ -1784,7 +2132,7 @@ begin
   incdepth := incdepth + 1;
   start := srclen;
   n := readfile;
-  if n < 0 then failinclude;
+  if n < 0 then failinclude(doff);
   pos := start; srcend := start + n; line := 1; curfile := fi;
   next;
 end;
@@ -2456,8 +2804,8 @@ end;
 // supposed to be reproducible, and it was not -- a build server naming its sources
 // absolutely cannot produce the artifact a developer verified. And the second is worse:
 // the build machine's directory layout, including a user's home directory, ends up inside
-// every executable anyone ships. The embedded LIBRARY files leaked it either way, because
-// they are named <libdir>/<name> and libdir is found from /proc/self/exe.
+// every executable anyone ships. The library modules carry a fixed name for the same
+// reason, wantzel/lib/<module>.wz, wherever the compiler is installed (see incmodule).
 //
 // THE RULE IS THE LAST TWO SEGMENTS OF THE DIRECTORY, AT MOST. A diagnostic has to say
 // which file and which line; what it does not have to say is where the tree was checked
@@ -2533,7 +2881,7 @@ begin
     // complete sentence so a message is never lost
     e(0x48); e(0xBF); fixup(FX_DATA, o); e64(0);
     e(0x48); e(0xBE); e64(mlen);
-    e(0xE8); e32(trapaddr - (codelen + 4));
+    e(0xE8); fixup(FX_PCALL, trapaddr); e32(0);
     return;
   end;
 
@@ -2542,7 +2890,7 @@ begin
   e(0x48); e(0xBE); e64(tphlen[h]);
   e(0x48); e(0xBA); fixup(FX_DATA, o); e64(0);
   e(0x48); e(0xB9); e64(mlen);
-  e(0xE8); e32(trapaddr - (codelen + 4));
+  e(0xE8); fixup(FX_PCALL, trapaddr); e32(0);
 end;
 
 // ------------------------------------------------------------------
@@ -3370,7 +3718,7 @@ begin
     patch(n);
     trap("scan() range lies outside the array");
     patch(ok);
-    e(0xE8); e32(scanaddr - (codelen + 4));
+    e(0xE8); fixup(FX_PCALL, scanaddr); e32(0);
     return T_INT;
   end;
   if b = 12 then
@@ -3384,7 +3732,7 @@ begin
     lparen; argint; push; comma; argint; rparen;
     push;
     e(0x5E); e(0x5F);
-    e(0xE8); e32(argaddr - (codelen + 4));
+    e(0xE8); fixup(FX_PCALL, argaddr); e32(0);
     return T_CHAR;
   end;
   if (b = 28) or (b = 29) then
@@ -5954,6 +6302,7 @@ begin
   end;
   parmbytes := frame;
   fadr[fi] := codelen;
+  ffx0[fi] := nfx;     // see eliminate: this routine's own fixups start here
   fdef[fi] := 1;
   curfn := fi;
   curret := t;
@@ -6106,6 +6455,7 @@ begin
     if (tok = TK_ID) and eqt("program") then
       fail("the 'program' header is no longer part of the language; delete that line");
     if tok = KW_INCLUDE then doinclude
+    else if tok = KW_IMPORT then doimport
     // 'schema X = record ... end' was its own top-level declaration until 17-09-2026.
     // It is now 'type X = schema ... end', so decltypes dispatches on it and there is no
     // second keyword at the start of a declaration. Naming the old form explicitly costs
@@ -6160,6 +6510,7 @@ begin
   mline := line; mfile := curfile;
   next;
   mainaddr := codelen;
+  mainfx0 := nfx;      // see eliminate: the main block's own fixups start here
   nloc := 0; frame := 0; curfn := -1; curret := T_VOID;
   nbrk := 0; ncnt := 0; brkbase := -1; cntbase := -1;
   saveline := line; line := mline;
@@ -6186,6 +6537,265 @@ begin
   begin
     dbs("main "); dbnum(codebase + mainaddr); dbc(32); dbnum(codebase + codelen); dbc(32);
     dbnum(mfile); dbc(32); dbnum(mline); dbc(32); dbnum(frame); dbs(" void\n");
+  end;
+end;
+
+// ------------------------------------------------------------------
+// elimination of unused routines
+// ------------------------------------------------------------------
+//
+// The layout that parseprogram just finished writing to `code` is always the same three
+// parts in this order: the PRELUDE (entry point, trap, scan, arg helpers -- emitted first,
+// by emitprelude, before any routine), then one contiguous range per ROUTINE at
+// [fadr[fi], fend[fi]), in whatever order their bodies were parsed, then the MAIN block
+// (mainaddr .. codelen at the time parseprogram returns). Nothing else ever calls e()
+// directly at top level -- see docs/design.md -- so those ranges cover every byte.
+//
+// A CALL between routines is always fixup(FX_CALL, fi): grep at the call site shows the
+// one place that happens. So the call graph is exactly the FX_CALL fixups, read back
+// against which range each fxoff falls in. The prelude calls the trap/scan/arg helpers and
+// the main block with a rel32 computed and baked in on the spot (both addresses are
+// already known when they are emitted) -- not a fixup -- so those calls need no edge: the
+// prelude and the main block are simply always alive, as roots.
+//
+// MARK: a worklist of routines known to be called, starting from every FX_CALL fixup whose
+// fxoff lies in the prelude or the main block (the two fixed roots) and from there
+// outward. A forward that an application fills in (`app.*`) is only reachable through
+// whoever calls it, exactly like any other routine -- there is no separate case for it.
+//
+// SWEEP: copy every live routine's bytes down over the gap left by dead ones, in fadr
+// order (forder), and remember each one's new address (fnewadr). The prelude and the data
+// mover never move.  Every FX_CALL/FX_BSS/FX_BSS32/FX_DATA fixup whose fxoff sits in a
+// live routine is kept, shifted by that routine's own shift; a fixup inside a dead routine
+// is dropped -- it addressed bytes that no longer exist. mainpatch (the prelude's own baked
+// call into the main block) is repatched last, because mainaddr moves like everything
+// after the last live routine.
+//
+// Always on, no flag: the output must stay deterministic, and a flag would be a second
+// code path nothing exercises by default. NOT run under --debug: dbline/dbfunc/the "main"
+// record write process addresses into the .wzdbg text stream AS THEY ARE EMITTED, during
+// parsing -- long before this pass knows what will move where -- so there is no offset left
+// to patch afterwards without re-serialising that whole sidecar. --debug already promises
+// "the executable is byte-identical with and without the flag" (docs/flags.md); skipping
+// elimination keeps that true rather than silently breaking it, at the cost that a --debug
+// build carries the dead routines a normal build no longer does. Revisit only if a sidecar
+// rewrite is worth the ~200 lines this already cost.
+
+// order the routines by fadr, so the code buffer's own order is known. Small (a real
+// program has dozens to a few hundred routines, never near MAXF), so plain insertion sort.
+// Also fills fxend[fi]: the end of fi's own fixup slice, i.e. ffx0 of the next routine in
+// this SAME order, or mainfx0 after the last one -- see the comment above ffx0.
+procedure ordertroutines;
+var i, j, t: int;
+begin
+  i := 0;
+  while i < nfn do
+  begin
+    forder[i] := i;
+    i := i + 1;
+  end;
+  i := 1;
+  while i < nfn do
+  begin
+    j := i;
+    while (j > 0) and (fadr[forder[j - 1]] > fadr[forder[j]]) do
+    begin
+      t := forder[j - 1]; forder[j - 1] := forder[j]; forder[j] := t;
+      j := j - 1;
+    end;
+    i := i + 1;
+  end;
+  i := 0;
+  while i < nfn do
+  begin
+    if i + 1 < nfn then fxend[forder[i]] := ffx0[forder[i + 1]]
+    else fxend[forder[i]] := mainfx0;
+    i := i + 1;
+  end;
+end;
+
+// mark fi live, and queue it for its own calls to be scanned, unless it already was
+procedure markroutine(fi: int);
+begin
+  if flive[fi] <> 0 then return;
+  flive[fi] := 1;
+  fwork[nwork] := fi; nwork := nwork + 1;
+end;
+
+// mark the target of every FX_CALL fixup in fxoff/fxkind/fxval's slice [lo, hi)
+procedure markcallslice(lo: int; hi: int);
+var i: int;
+begin
+  i := lo;
+  while i < hi do
+  begin
+    if fxkind[i] = FX_CALL then markroutine(fxval[i]);
+    i := i + 1;
+  end;
+end;
+
+procedure eliminate;
+var i, fi, preludeend, oldmainaddr, mainend, mainshift, w, dst,
+    nlivefx, shift: int;
+begin
+  if nfn = 0 then return;   // nothing to eliminate
+  ordertroutines;
+  preludeend := fadr[forder[0]];
+  oldmainaddr := mainaddr;
+  mainend := codelen;
+
+  // fixup() only ever appends at nfx, and codelen only ever grows while a routine's body
+  // is being emitted, so a routine's own fixups are exactly the CONTIGUOUS slice of
+  // fxoff/fxkind/fxval between where it and its neighbour in fadr order started
+  // (ffx0[fi]..fxend[fi], set by ordertroutines) -- no per-fixup lookup, no graph. Checked
+  // once rather than assumed: every fixup in a routine's slice must actually lie inside
+  // that routine's own [fadr, fend), or the one invariant this whole pass rests on has
+  // broken somewhere upstream, and continuing would silently drop or misplace live code
+  // instead of failing loudly.
+  i := 0;
+  while i < nfn do
+  begin
+    fi := forder[i];
+    w := ffx0[fi];
+    while w < fxend[fi] do
+    begin
+      if (fxoff[w] < fadr[fi]) or (fxoff[w] >= fend[fi]) then
+        fail("internal error: a fixup does not lie inside the routine its slice says it belongs to");
+      w := w + 1;
+    end;
+    i := i + 1;
+  end;
+
+  // MARK, from the two fixed roots outward. Every fixup that is not inside some routine's
+  // own slice belongs to the prelude ([0, ffx0 of the first routine)) or the main block
+  // ([mainfx0, nfx)) -- both always alive, whatever they call.
+  i := 0;
+  while i < nfn do begin flive[i] := 0; i := i + 1; end;
+  nwork := 0;
+  markcallslice(0, ffx0[forder[0]]);
+  markcallslice(mainfx0, nfx);
+  w := 0;
+  while w < nwork do
+  begin
+    fi := fwork[w];
+    markcallslice(ffx0[fi], fxend[fi]);
+    w := w + 1;
+  end;
+
+  // FIXUPS: rebuilt in three parts, in the same order the code itself keeps -- the
+  // prelude's own fixups, then each live routine's slice (in fadr order), then the main
+  // block's -- so the array stays exactly as easy to reason about as it was. A dead
+  // routine's slice is left out entirely: it addressed bytes that are about to disappear.
+  // Still against the ORIGINAL fxoff/fadr/fend here; the sweep and the shift both come
+  // after, once every live routine's new address is known.
+  nlivefx := 0;
+  w := 0;
+  while w < ffx0[forder[0]] do
+  begin
+    fxoff[nlivefx] := fxoff[w]; fxkind[nlivefx] := fxkind[w]; fxval[nlivefx] := fxval[w];
+    nlivefx := nlivefx + 1; w := w + 1;
+  end;
+  i := 0;
+  while i < nfn do
+  begin
+    fi := forder[i];
+    if flive[fi] <> 0 then
+    begin
+      w := ffx0[fi];
+      while w < fxend[fi] do
+      begin
+        fxoff[nlivefx] := fxoff[w]; fxkind[nlivefx] := fxkind[w]; fxval[nlivefx] := fxval[w];
+        nlivefx := nlivefx + 1; w := w + 1;
+      end;
+    end;
+    i := i + 1;
+  end;
+  w := mainfx0;
+  while w < nfx do
+  begin
+    fxoff[nlivefx] := fxoff[w]; fxkind[nlivefx] := fxkind[w]; fxval[nlivefx] := fxval[w];
+    nlivefx := nlivefx + 1; w := w + 1;
+  end;
+  nfx := nlivefx;
+
+  // SWEEP: copy every live routine's bytes down over the gap dead ones leave, in address
+  // order, and record each one's new address (fnewadr) and its own shift.
+  dst := preludeend;
+  i := 0;
+  while i < nfn do
+  begin
+    fi := forder[i];
+    if flive[fi] <> 0 then
+    begin
+      if fadr[fi] <> dst then
+      begin
+        w := fadr[fi];
+        while w < fend[fi] do
+        begin
+          code[dst + (w - fadr[fi])] := code[w];
+          w := w + 1;
+        end;
+      end;
+      fnewadr[fi] := dst;
+      dst := dst + (fend[fi] - fadr[fi]);
+    end;
+    i := i + 1;
+  end;
+  // the main block follows the last live routine, exactly as it always followed the last
+  // routine's body; move it down by however much the routines ahead of it shrank.
+  mainshift := oldmainaddr - dst;
+  if mainshift <> 0 then
+  begin
+    w := oldmainaddr;
+    while w < mainend do
+    begin
+      code[w - mainshift] := code[w];
+      w := w + 1;
+    end;
+  end;
+  mainaddr := dst;
+  codelen := mainaddr + (mainend - oldmainaddr);
+  e32at(mainpatch, mainaddr - (mainpatch + 4));   // the prelude's baked call to main
+
+  // FIXUP SHIFT: the rebuilt array is still three parts in order -- prelude (never moves),
+  // live routines (in fadr order, one shift each), main (moved as a whole by mainshift).
+  // Walk it the same way one more time to apply exactly that.
+  nlivefx := ffx0[forder[0]];    // the prelude's own count, unchanged by the rebuild above
+  i := 0;
+  while i < nfn do
+  begin
+    fi := forder[i];
+    if flive[fi] <> 0 then
+    begin
+      shift := fadr[fi] - fnewadr[fi];
+      w := nlivefx;
+      while w < nlivefx + (fxend[fi] - ffx0[fi]) do
+      begin
+        fxoff[w] := fxoff[w] - shift;
+        w := w + 1;
+      end;
+      nlivefx := nlivefx + (fxend[fi] - ffx0[fi]);
+    end;
+    i := i + 1;
+  end;
+  while nlivefx < nfx do
+  begin
+    fxoff[nlivefx] := fxoff[nlivefx] - mainshift;
+    nlivefx := nlivefx + 1;
+  end;
+
+  // fadr/fend, last: writeelf's own fixup-resolution pass reads fadr[fxval[i]] for every
+  // surviving FX_CALL, so it has to see the new addresses, not the old ones.
+  i := 0;
+  while i < nfn do
+  begin
+    fi := forder[i];
+    if flive[fi] <> 0 then
+    begin
+      fend[fi] := fnewadr[fi] + (fend[fi] - fadr[fi]);
+      fadr[fi] := fnewadr[fi];
+    end;
+    i := i + 1;
   end;
 end;
 
@@ -6229,6 +6839,10 @@ begin
   begin
     k := fxkind[i];
     if k = FX_CALL then e32at(fxoff[i], fadr[fxval[i]] - (fxoff[i] + 4))
+    // FX_PCALL: fxval is already the target CODE OFFSET (trapaddr/scanaddr/argaddr, in the
+    // prelude, which never moves), not a routine index -- same formula as FX_CALL, without
+    // the fadr[] lookup.
+    else if k = FX_PCALL then e32at(fxoff[i], fxval[i] - (fxoff[i] + 4))
     else if k = FX_BSS32 then e32at(fxoff[i], bssva + fxval[i])
     else
     begin
@@ -6349,6 +6963,9 @@ begin
   dbglen := 0;
   codebase := VBASE + HDRLEN;
   parseprogram;
+  // ELIMINATE UNUSED ROUTINES, always, except under --debug -- see the comment above
+  // eliminate for why --debug keeps the executable it has always kept.
+  if dbgmode = 0 then eliminate;
   writeelf;
   if dbgmode <> 0 then writedbg;
   return 0;
@@ -6374,10 +6991,11 @@ end;
 // included by another one: `include "wantzel.wz";` followed by your own `begin` gives
 // "text after the end of the program". That makes the compiler unusable as a component --
 // an editor that wants to compile has to find, ship and start a second binary, which is
-// where every path problem comes from: finding it on PATH, and finding lib/ beside it.
+// where every path problem comes from.
 //
 // With the body in a routine, the program below is `begin wzmain; end.` and a host can
-// include everything above it and call what it needs.
+// include everything above it and call what it needs. Such a host reads the library from
+// ITS OWN file (loadparts opens /proc/self/exe), so it has one only if it carries a trailer.
 //
 // THE halt() CALLS STAY, AND THAT IS DELIBERATE. An error is reported from 234 places
 // across 45 mutually recursive routines; threading a return value back through all of them
@@ -6386,31 +7004,54 @@ end;
 // a failed compile calls this in a fork: the child may halt, the parent reads its exit
 // code. fork, shared descriptors and waiting are all measured -- see
 // docs/design.md.
-// libhere -- is there a readable io.wz in the library directory?
+// libcmd -- `wantzel --lib` and `wantzel --lib <module>`.
 //
-// io.wz IS THE PROBE because every program that includes anything includes it, so its
-// absence is what the user will hit first. Opening one file is cheaper than listing a
-// directory and needs no readdir.
-function libhere: bool;
-var fd, n: int;
+// THE SOURCE OF THE LIBRARY THIS COMPILER CARRIES, on standard output, so whoever reads it --
+// an editor showing a definition, a debugger showing a line, an agent looking up a routine --
+// reads exactly what `import` compiles and not some other copy. Without a name it lists the
+// modules, one per line, in the order of the index; with one it writes that module, byte
+// for byte as it was in lib/.
+procedure libcmd;
+var pi, n, near: int;
 begin
-  n := libdirlen;
-  if n <= 0 then return false;
-  if n + 6 >= len(libdir) then return false;
-  libdir[n] := 'i'; libdir[n + 1] := 'o'; libdir[n + 2] := '.';
-  libdir[n + 3] := 'w'; libdir[n + 4] := 'z'; libdir[n + 5] := chr(0);
-  fd := opn(addr(libdir[0]), 0, 0);
-  // THE PROBE IS UNDONE, always: libdir is the real search path and a stray "io.wz" on the
-  // end of it would break every include after this.
-  libdir[n] := chr(0);
-  if fd < 0 then return false;
-  cls(fd);
-  return true;
+  if nparts = 0 then
+  begin
+    wrs(2, "wantzel: this compiler carries no standard library; run ./build.sh, or download the release binary\n");
+    halt(1);
+  end;
+  if argc() = 2 then
+  begin
+    pi := 0;
+    while pi < nparts do
+    begin
+      if ismodule(pi) then begin wrmodname(1, pi); wrs(1, "\n"); end;
+      pi := pi + 1;
+    end;
+    halt(0);
+  end;
+  n := 0;
+  while (argch(2, n) <> chr(0)) and (n < TBMAX - 1) do begin nearbuf[n] := argch(2, n); n := n + 1; end;
+  pi := modfind(nearbuf, n);
+  if pi < 0 then
+  begin
+    wrs(2, "wantzel: no library module '"); wrbuf(2, addr(nearbuf[0]), n);
+    wrs(2, "' in this compiler; wantzel --lib lists them");
+    near := modnear(nearbuf, n);
+    if near >= 0 then begin wrs(2, " -- did you mean: wantzel --lib "); wrmodname(2, near); end;
+    wrs(2, "\n");
+    halt(1);
+  end;
+  srclen := 0;
+  n := readpart(pi);
+  wrbuf(1, addr(src[0]), n);
+  halt(0);
 end;
 
 procedure wzmain;
-var ai: int;
+var ai, ni, si: int;
 begin
+  loadparts;
+  if argeq(1, "--lib") and (argc() <= 3) then libcmd;
   // --version before the argument count check: asking a compiler what it is should not
   // require giving it a source file and an output name.
   if argc() = 2 then
@@ -6420,26 +7061,27 @@ begin
       wrs(1, "wantzel ");
       wrs(1, VERSION);
       wrs(1, "\n");
-      // AND WHERE THE LIBRARY IS, because that is the one thing about an installation a
-      // user cannot look up and the one that breaks it. Since the standard library moved
-      // to disk, a compiler copied WITHOUT its lib/ beside it fails on `include "io.wz"`
-      // -- and the honest answer to "is my install right?" is the path itself, not a
-      // sentence about where it ought to be.
-      //
-      // IT REPORTS, IT DOES NOT CONFIGURE. There is deliberately no flag to point the
-      // include path somewhere else (docs/flags.md); printing where it already looks
-      // takes nothing away from that.
-      setlibdir;
+      // AND WHICH LIBRARY IT CARRIES. The library is part of the compiler, so this line is
+      // a fact about the file and not about where it is installed: how many modules, how
+      // many bytes, and the sha256 that build.sh recorded over them. Two compilers with the
+      // same line compile every import to the same text.
       wrs(1, "library ");
-      if libdirlen > 0 then
+      if nparts > 0 then
       begin
-        wrbuf(1, addr(libdir[0]), libdirlen);
-        // AND WHETHER IT IS ACTUALLY THERE. A path alone still leaves the user guessing:
-        // the broken case prints a perfectly plausible directory that does not exist.
-        // Saying so turns "where should it be?" into "it is not where it should be".
-        if not libhere then wrs(1, "   NOT FOUND -- copy lib/ next to the compiler");
+        ai := 0; mi := 0; ni := 0; si := 0;
+        while ai < nparts do
+        begin
+          if ismodule(ai) then
+          begin
+            mi := mi + 1; ni := ni + partsize[ai]; si := si + partlen[ai];
+          end;
+          ai := ai + 1;
+        end;
+        wrs(1, "built in: "); wrnum(1, mi); wrs(1, " modules, ");
+        wrnum(1, ni); wrs(1, " bytes ("); wrnum(1, si); wrs(1, " stored), sha256 ");
+        wrbuf(1, addr(parthash[0]), 64);
       end
-      else wrs(1, "(unknown -- the compiler could not find its own path)");
+      else wrs(1, "MISSING -- this compiler carries no standard library; run ./build.sh, or download the release binary");
       wrs(1, "\n");
       halt(0);
     end;
@@ -6452,6 +7094,8 @@ begin
     wrs(2, "Copyright (c) 2026 Floris Knol.  MIT licence.  https://github.com/wantzel/wantzel\n\n");
     wrs(2, "usage: wantzel <source.wz> <executable> [--debug]\n");
     wrs(2, "       wantzel --version\n");
+    wrs(2, "       wantzel --lib              the library modules this compiler carries\n");
+    wrs(2, "       wantzel --lib <module>     the source of one of them\n");
     halt(1);
   end;
   if argc() > 4 then
@@ -6490,7 +7134,6 @@ begin
     end;
     ai := ai + 1;
   end;
-  setlibdir;
   halt(compile);
 end;
 

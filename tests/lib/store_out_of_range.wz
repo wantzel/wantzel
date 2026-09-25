@@ -3,7 +3,7 @@
 // (a bad log record, a bad snapshot, ...) which already fill store.err. A caller reading
 // store.err after any failed call would find the reason of a PREVIOUS failure, or "",
 // which reads as "no error" -- exactly the silent false this test guards against.
-include "store.wz";
+import store;
 var
   tab, row, n: int;
   dir: array[0..31] of char;

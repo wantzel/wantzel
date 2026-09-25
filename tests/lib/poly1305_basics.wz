@@ -1,0 +1,89 @@
+// lib/poly1305.wz against the test vector in RFC 8439 section 2.5.2.
+//
+// A ONE-TIME AUTHENTICATOR THAT IS ALMOST RIGHT AUTHENTICATES NOTHING, and its output looks
+// like sixteen random bytes whether it is correct or not. The RFC's own answer is the only
+// thing that can tell the two apart.
+import io;
+import poly1305;
+
+var
+  key: array[0..31] of char;
+  msg: array[0..127] of char;
+  tag: array[0..15] of char;
+  i, n, failures: int;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ") else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+function nib(c: char): int;
+begin
+  if (c >= '0') and (c <= '9') then return ord(c) - ord('0');
+  return ord(c) - ord('a') + 10;
+end;
+
+procedure hexin(b: array of char; s: str);
+var i: int;
+begin
+  i := 0;
+  while i * 2 < slen(s) do
+  begin
+    b[i] := chr(nib(schar(s, i * 2)) * 16 + nib(schar(s, i * 2 + 1)));
+    i := i + 1;
+  end;
+end;
+
+function hexeq(b: array of char; at: int; s: str): bool;
+var i: int;
+begin
+  i := 0;
+  while i * 2 < slen(s) do
+  begin
+    if ord(b[at + i]) <> nib(schar(s, i * 2)) * 16 + nib(schar(s, i * 2 + 1)) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+begin
+  failures := 0;
+
+  // ---- RFC 8439 section 2.5.2 -------------------------------------------------------------
+  hexin(key, "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b");
+  n := io.push(msg, 0, "Cryptographic Forum Research Group");
+  expect(n = 34, "the RFC's message is 34 bytes");
+
+  po.auth(key, msg, 0, n, tag);
+  expect(hexeq(tag, 0, "a8061dc1305136c6c22b8baf0c0127a9"), "the tag is the RFC's");
+
+  // ---- A CHANGED MESSAGE MUST GIVE A DIFFERENT TAG ----------------------------------------
+  //
+  // THE CHECK THAT MATTERS MORE THAN THE FIRST. A routine that returned a constant would pass
+  // the vector above if that constant happened to be right; this one fails unless the tag
+  // actually depends on the message. One byte, changed in the middle.
+  msg[10] := chr(ord(msg[10]) + 1);
+  po.auth(key, msg, 0, n, tag);
+  expect(not hexeq(tag, 0, "a8061dc1305136c6c22b8baf0c0127a9"),
+         "one changed byte changes the tag");
+
+  // ---- AND SO MUST A CHANGED KEY -----------------------------------------------------------
+  msg[10] := chr(ord(msg[10]) - 1);
+  key[0] := chr(ord(key[0]) + 1);
+  po.auth(key, msg, 0, n, tag);
+  expect(not hexeq(tag, 0, "a8061dc1305136c6c22b8baf0c0127a9"),
+         "and so does one changed key byte");
+
+  // ---- THE EMPTY MESSAGE ------------------------------------------------------------------
+  //
+  // An edge the block loop can get wrong in a way no normal message shows: with no data the
+  // tag is just s, and a loop that runs once anyway would add a block of zeros.
+  hexin(key, "0000000000000000000000000000000036e5f6b5c5e06070f0efca96227a863e");
+  po.auth(key, msg, 0, 0, tag);
+  expect(hexeq(tag, 0, "36e5f6b5c5e06070f0efca96227a863e"),
+         "an empty message authenticates to s alone");
+
+  if failures > 0 then halt(1);
+end.

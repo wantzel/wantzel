@@ -126,6 +126,72 @@ that lives elsewhere.
 helper, check the includes of standalone tests for that file first:
 `grep -l 'src/<file>.wz' tests/**/*.wz`.
 
+### Imports and includes
+
+**The rule in one sentence: `import` takes a bare module name — no quotes, no `.wz` — and
+reads that module from the compiler; `include` takes a file name in quotes, with `.wz`,
+relative to the file it stands in.** The two never overlap: an import never reads a file,
+an include never reads the library. `wantzel --lib` lists the modules.
+
+| Wrong | Right |
+|---|---|
+| `include "io.wz";` for the library | `import io;` — `include` is always a file, so without an `io.wz` next to your file this is refused: `io.wz is not a file next to this one; the library module is imported: import io;` |
+| `import "io";` or `import "io.wz";` | `import io;` — `import takes a module name, without quotes or .wz: import io;` |
+| `import io.wz;` | `import io;` — the same message |
+| `include io;` | `include "model.wz";` for your own file, `import io;` for the library — `include takes a file name in quotes: include "io.wz"; -- for the library module write: import io;` |
+| `import "model.wz";` for your own file | `include "model.wz";` — `import takes a module name, without quotes or .wz; a file of your own is included: include "model.wz";` |
+| `import jsn;` | `import json;` — `no library module 'jsn' in this compiler; wantzel --lib lists them -- did you mean: import json;` |
+| `include "lib/json.wz";` or `include "../../lib/io.wz";` | `import json;` — a path into a `lib/` directory is a file on disk, not the library; the compiler says `the library module is imported: import json;` when it is not there |
+| `io.puts` with no import | `import io;` at the top — `undeclared identifier: io.puts is declared in the library module io; add: import io;` |
+| A file of your own named after a module (`store.wz` beside your program, next to the module `store`) | Give it a name no module has (`orders.wz`). `import store;` still reads the library and `include "store.wz";` still reads your file, but every reader — and every tool that opens "store.wz" — has to know which one is meant. This repository refuses such names outside `lib/` for that reason |
+| A copy of a module in a `lib/` directory, expecting the compiler to use it | Nothing overrides the library. To try a change, copy the module next to your program and include the copy as a file: `include "./tls.wz";` in place of `import tls;` |
+
+A program with two imports and a file of its own, and that file in turn naming another file
+of the project — every include is relative to the file it stands in:
+
+```
+app/
+  main.wz           import io;  import json;  include "orders.wz";
+  orders.wz         include "util/money.wz";
+  util/money.wz     no includes
+```
+
+```pascal
+// main.wz
+import io;
+import json;
+include "orders.wz";            // app/orders.wz, next to this file
+
+begin
+  orders.show;
+end.
+```
+
+```pascal
+// orders.wz
+include "util/money.wz";        // app/util/money.wz: relative to orders.wz, not to main.wz
+
+procedure orders.show;
+begin
+  io.puts(STDOUT, "total: ");
+  io.putn(STDOUT, money.euros(1250));
+  io.puts(STDOUT, " euro\n");
+end;
+```
+
+```pascal
+// util/money.wz
+function money.euros(cents: int): int;
+begin
+  return cents div 100;
+end;
+```
+
+`orders.wz` uses `io.*` without importing it: `main.wz` imported `io` first, and an import
+is textual, so everything read after it sees it. Import in the file that uses a module when
+that file is also compiled on its own — a test of `orders.wz`, for instance. Two imports of
+the same module, or two includes of the same file, read it once.
+
 ### Library (wrong assumptions)
 
 | Wrong | Right |
@@ -139,7 +205,7 @@ helper, check the includes of standalone tests for that file first:
 | Hand-computing a record size (`ISIZE = 16 + 8 + ...`) | Measure it: `addr(items[1]) - addr(items[0])`, or `addr(last_field) - addr(first_field) + size` |
 | `CURVE.DAYS` | The constants are `CURVE.NDAYS`, `CURVE.NHOURS`, `CURVE.DAYLEN` — `CURVE.DAYS` collides with `curve.days` |
 | Putting unescaped bytes into a `text` field of an output schema | `Out.write` places a `text` view between quotes **raw** — fill it via `json.escslice` (escaped text) or `json.putraw` (only for already-valid JSON) |
-| Forgetting `include "io.wz";` | Since 15-09-2026 the compiler names the file: `undeclared identifier: io.puts is declared in io.wz; add: include "io.wz";`. A bare message means the name is in no library — check spelling |
+| Forgetting `import io;` | The compiler names the module: `undeclared identifier: io.puts is declared in the library module io; add: import io;`. A bare message means the name is in no module — check spelling |
 | Assuming a `str` variable behaves like `array of char` | Only a literal converts implicitly; copy first: `k := io.push(buf, 0, s); ... buf[0..k-1]` |
 | Calling `parse` on a schema and ignoring what it dropped | An undeclared key is skipped and counted in `json.ignoredn`, `b[json.ignored0..json.ignored1)` gives the first one. Report it — `lib/tools.wz` does (`_meta.ignoredFields`, `X-Ignored-Field`/`X-Ignored-Count`). A key the schema *does* declare is still strict: a bad value gives `-1`, `json.badkey0..json.badkey1` names it |
 | Copying a value out of `kv.find`/`kv.first` raw | The value keeps its quotes (`"dryer"` not `dryer`) and every comparison after fails silently. Use `kv.text(b, dst, 0)` — strips quotes, decodes escapes, returns `-1` if not a string |
@@ -161,10 +227,10 @@ and `store.set` are the same name. Since 15-09-2026 the compiler says so
 store.set`) — pick a prefix that isn't already a routine's rather than a spelling that
 happens to slip past.
 
-`lib/tools.wz` includes `http.wz` (for `tool.rest`), so a program including it must define
+The module `tools` imports `http` (for `tool.rest`), so a program importing it must define
 `procedure app.request`, or get `forward declared routine is never defined` on the last
-line. A stdio-only MCP server includes `lib/toolsmcp.wz` instead — the MCP half without
-HTTP, needing no `app.request`.
+line. A stdio-only MCP server imports `toolsmcp` instead — the MCP half without HTTP,
+needing no `app.request`.
 
 ### Working copies (one global record per entity)
 
@@ -324,7 +390,7 @@ reported, and a distinct exit code for "you used it wrong" (2) versus "it did no
 — nothing here is spare.
 
 ```pascal
-include "io.wz";
+import io;
 
 var
   path: array[0..1023] of char;
@@ -374,7 +440,7 @@ per tool; only the handler is left to write. Two lines are easy to leave out and
 optional:
 
 ```pascal
-include "json.wz";
+import json;
 
 type AddArgs = schema
   a: int "the left operand";
@@ -389,7 +455,7 @@ tools
   add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
 end;
 
-include "toolsmcp.wz";                  // AFTER the tools block: it reads it
+import toolsmcp;                        // AFTER the tools block: it reads it
 
 function tool.add(a: array of AddArgs; r: array of AddResult): int;
 begin
@@ -403,14 +469,14 @@ end.
 ```
 
 That answers `initialize`, `tools/list` and `tools/call` on stdin; `mcp.name`/`mcp.version`
-are yours to set. To also serve the same table over HTTP, include `lib/tools.wz` (adds
-`tool.rest`, brings in `lib/http.wz`) and `lib/mcphttp.wz`, define `procedure app.request`,
-and call `http.serve(port, 1)`; `examples/mcptools.wz` does both.
+are yours to set. To also serve the same table over HTTP, import `tools` (adds
+`tool.rest`, brings in `http`) and `mcphttp`, define `procedure app.request`, and call
+`http.serve(port, 1)`; `examples/mcptools.wz` does both.
 
-### Program skeleton with an include
+### Program skeleton with an import
 
 ```pascal
-include "../../../lib/io.wz";       // path relative to THIS file
+import io;                          // the library: a module name, no quotes, no path
 const MAX = 10;
 var
   i, n: int;
@@ -663,7 +729,7 @@ type AddResult = schema sum: int; end;
 tools
   add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
 end;
-include "lib/tools.wz";
+import tools;
 function tool.add(a: array of AddArgs; r: array of AddResult): int;
 begin r[0].sum := a[0].a + a[0].b; return 0; end;
 ```
@@ -672,10 +738,11 @@ begin r[0].sum := a[0].a + a[0].b; return 0; end;
 
 ```pascal
 // What the test demonstrates, in one sentence.
-include "../../../lib/x.wz";
+import io;
+import math;                        // the module under test
 procedure show(s: str; v: int); begin io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n"); end;
 begin
-  show("a = ", f(1));
+  show("floor(3.7) = ", math.floor(3.7));
 end.
 ```
 
@@ -747,7 +814,7 @@ For example `wantzel: <unitref>:45: undeclared identifier`, or a line deep insid
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `undeclared identifier` in `<schemaname>` | the library the generator uses isn't included | `include "lib/json.wz";` **before** the schemas — a schema parser calls `json.*` |
+| `undeclared identifier` in `<schemaname>` | the module the generator uses isn't imported | `import json;` **before** the schemas — a schema parser calls `json.*` |
 | `name already used by a type` in generated code | a global shares a name with a schema **field** | rename your global; fields share the namespace inside generated routines |
 | `forward declared routine is never defined` on the last line | a library-required `app.*` hook is missing | search library headers for `forward` (`app.request`, `app.tools`, `app.authenticate`) |
 
@@ -761,6 +828,7 @@ file's header) and whether a global shares a name with one of its fields.
 |---|---|---|
 | the name exists, further down the same file | a routine must appear before its caller | move it up, or declare it `forward` |
 | the name is in another `src/` file | include order | move that file's include earlier |
+| the name is in a library module | a missing or late `import` | `import <module>;` above the first use — the message names the module |
 
 Quickest check: `grep -n "function <name>\|procedure <name>" src/*.wz lib/*.wz`. If it's
 there, the problem is order, not spelling.

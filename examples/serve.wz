@@ -37,13 +37,13 @@
 // lives). And it serves one fixed page rather than files, because the point is the
 // plumbing, not the content.
 
-include "io.wz";
-include "net.wz";
-include "chain.wz";
-include "tls.wz";
-include "acme.wz";
-include "certstore.wz";
-include "fs.wz";
+import io;
+import net;
+import chain;
+import tls;
+import acme;
+import certstore;
+import fs;
 
 const
   MAXEV      = 256;

@@ -1,17 +1,17 @@
 // lib/jsonschema.wz -- validating JSON against a JSON Schema (2020-12), the useful subset.
 //
-// NAMED jsonschema.wz AND NOT schema.wz, and the reason is worth the line. An include is
-// resolved against lib/ as well as against the including file's directory, so a common name
-// here SHADOWS a file of the same name in an application. Measured 22-09-2026: adding
-// lib/schema.wz silently broke a program that had its own src/tasks/schema.wz -- it compiled
-// against this one and failed with `type expected` on a type that was defined in the file it
-// could no longer see.
+// NAMED jsonschema.wz AND NOT schema.wz, and the reason is worth the line. Before `import`
+// existed, a bare include was resolved against lib/ as well as against the including file's
+// directory, so a common name here SHADOWED a file of the same name in an application.
+// Measured 22-09-2026: adding lib/schema.wz silently broke a program that had its own
+// src/tasks/schema.wz -- it compiled against this one and failed with `type expected` on a
+// type that was defined in the file it could no longer see.
 //
-// That is a trap for every application, not just that one, and it costs nothing to avoid:
-// a file in a shared library needs a name nobody else would pick.
+// import and include no longer meet, so that trap is gone; a module and a file with one
+// name still invite the wrong one to be opened, and a shared name costs nothing to avoid.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // WHAT IT CHECKS, and the list is deliberate rather than partial-for-now:
@@ -36,8 +36,8 @@
 // NOTHING IS COPIED. Both the schema and the document are walked in place, the same shape as
 // lib/json.wz which does the parsing.
 
-include "io.wz";
-include "json.wz";
+import io;
+import json;
 
 const
   SCH.MAXPATH  = 512;

@@ -1,0 +1,19 @@
+empty: 0 -> 1, back byte for byte
+one byte: 1 -> 2, back byte for byte
+one byte repeated: 100000 -> 398, back byte for byte
+no repetition: 120000 -> 120472, back byte for byte
+repeat beyond the window: 71000 -> 71280, back byte for byte
+pack into one byte: -1
+unpack into one byte: -1
+unpack into 999 bytes: -1
+unpack into 1000 bytes: 1000
+nothing at all: -1
+cut short by one byte: -1
+cut short after the first token: -1
+n beyond the source array: -1
+offset before the start: -1
+literals past the end: -1
+match length never ends: -1
+match past the destination: -1
+the same, with room: 220
+offset zero: -1

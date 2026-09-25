@@ -1,6 +1,6 @@
 // time.parseiso accepts what Python's isoformat() and Postgres produce: a bare date,
 // a timestamp with or without a zone, a fraction, Z, and a +HH:MM or +HHMM offset.
-include "time.wz";
+import time;
 var buf: array[0..63] of char;
 procedure show(s: str);
 var n, v: int;

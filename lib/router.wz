@@ -1,7 +1,7 @@
 // lib/router.wz -- a few helpers on top of lib/http.wz for routing by path
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 // and method, and the standard JSON error replies.
 //
@@ -9,7 +9,7 @@
 //   if router.post_under("/api/") then ... (the rest is http.restat..http.restend)
 //   router.notfound; router.methodnotallowed; router.error(422, "...");
 
-include "http.wz";
+import http;
 
 // GET and HEAD share a route: for HEAD, http.finish drops the body
 function router.get(path: str): bool;

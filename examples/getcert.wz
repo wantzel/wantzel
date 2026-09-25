@@ -22,10 +22,10 @@
 // to the authority; the certificate key is what the certificate is for. Using one key for
 // both works and is a bad habit: rotating either then means rotating both.
 
-include "io.wz";
-include "net.wz";
-include "acme.wz";
-include "proc.wz";
+import io;
+import net;
+import acme;
+import proc;
 
 const
   GC.MAXREP = 8192;

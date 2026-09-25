@@ -5,7 +5,7 @@
 // This used to be reported as "<tools>:19: name already used by a variable or constant",
 // a line of the GENERATED <tools> text: a file nobody can open, at a line that has
 // nothing to do with the entry below. The message must name this file and this line.
-include "json.wz";
+import json;
 type A = schema
   x: int;
 end;
@@ -15,7 +15,7 @@ end;
 tools
   count(A): R "Count something.";
 end;
-include "lib/toolsmcp.wz";
+import toolsmcp;
 function tool.count(a: array of A; r: array of R): int;
 begin
   r[0].y := a[0].x;

@@ -7,8 +7,8 @@
 // a correct mapping from one that always reports the first entry; this one can.
 //
 // Line 16 is the beta entry. Keep it there.
-include "io.wz";
-include "json.wz";
+import io;
+import json;
 type In = schema n: int; end;
 tools
   alpha(In): In "first";

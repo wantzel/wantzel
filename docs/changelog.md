@@ -10,13 +10,80 @@
 |---|---|---|
 | **Language** | anyone who **wrote** Wantzel code | a program that compiled yesterday may not today, or may mean something else |
 | **Compiler** | anyone who **compiles** | the same program, the same meaning — but different messages, different code, different limits |
-| **Library** | anyone who **includes** `lib/` | a routine, its behaviour or text it emits changed; your own code may need to follow |
+| **Library** | anyone who **imports** a library module | a routine, its behaviour or text it emits changed; your own code may need to follow |
 
 **Before 1.0, a Language entry can appear in any release.** A construct that costs more than
 it gives is removed rather than kept — see [`language.md`](language.md) §9. Read that row
 first on every upgrade.
 
 Newest first. Dates are the day the change landed.
+
+## 0.5.0 — 25 September 2026
+
+**One file.** The compiler now carries its standard library: download
+`wantzel-linux-x86_64` and it compiles anything, with no `lib/` directory beside it and no
+archive. A library module is imported with a new statement, `import io;`; `include` is for
+files of your own and nothing else. (W-0000-0284) And a program no longer carries the
+routines it never calls: a hello world is about 2 kB. (W-0000-0285)
+
+**What may need your attention** if your program compiles today:
+
+- `include "io.wz";` for a library module becomes `import io;` — no quotes, no `.wz`. The
+  old form is refused, and the message gives the line to write. For a directory of sources:
+  `for m in $(wantzel --lib); do sed -i "s/^\( *\)include \"$m\.wz\";/\1import $m;/" *.wz; done`.
+  Rename a file of your own that has a module's name first: its include must stay one.
+- `import` is a keyword now; a name `import` in your code must change.
+- A `lib/` directory beside the compiler is no longer read, and nothing replaces a module:
+  to try a changed copy, include it as a file (`include "./tls.wz";`).
+- The release is one file, `wantzel-linux-x86_64` (no version in the name, so
+  `.../releases/latest/download/wantzel-linux-x86_64` always points at the newest), with
+  `SHA256SUMS`. There is no `.tar.gz` any more.
+
+**Language**
+
+- `import <module>;` reads a module of the standard library inside the running compiler —
+  a bare name; nothing on disk, no variable, no flag.
+- `include "path.wz";` is always a file, relative to the file that contains it (or absolute).
+  A bare name is no longer looked up in the library first.
+
+**Compiler**
+
+- The standard library is a packed trailer after the compiler's ELF image; `wantzel --lib`
+  lists its modules and `wantzel --lib <module>` prints one; `--version` reports the modules,
+  their size and a sha256 over their source.
+- A library module is named `wantzel/lib/<module>.wz` in messages, runtime checks and debug
+  information, wherever the compiler is installed: the same source gives the same executable
+  from a checkout and from a download (it used to carry the install directory's name).
+- Every wrong spelling of an import or an include is refused with the right one:
+  `import "io";`, `import io.wz;`, `include io;`, `include "io.wz";` without such a file,
+  and an unknown module (with the nearest name).
+- The hint "there is an include further down this file" looks for an include or an import at
+  the start of a line; it fired on the word in comments and strings.
+- The bootstrap compiler (`bootstrap/boot.c`) carries no library and refuses `import`.
+- A routine your program never calls, directly or indirectly, no longer reaches the
+  executable: the compiler builds the call graph from its own relocations, then compacts
+  the code it keeps. Always on, no flag -- except under `--debug`, which skips this pass
+  because the sidecar's addresses are written as the code is generated, before compaction
+  would know what moved. A `--debug` build is therefore larger than a plain one, and no
+  longer byte-identical to it.
+  Measured against 0.4.0: `hello.wz` with an unused `import tls;` drops from 348 KB to
+  56 KB, `examples/serve.wz` from 500 KB to 257 KB, and `examples/mcpfiles.wz`, which uses
+  most of what it imports, from 847 KB to 707 KB. (W-0000-0285)
+
+**Library**
+
+- `lz.wz`, new: `lz.pack`, `lz.unpack`, `lz.bound` — the compression the compiler stores the
+  library with; damaged input gives `-1`, never a read past a buffer.
+- The examples `autocert.wz` and `jsonschema.wz` are now `autocertd.wz` and `jsoncheck.wz`,
+  so that no file outside `lib/` has a module's name.
+
+- `lib/oauth.wz` (security): a `redirect_uri` or `state` could carry a percent-encoded CR LF
+  into the `Location` header of the redirect (header injection), and a registered
+  `redirect_uri` or `client_name` could put markup on the sign-in page. `/register` now
+  refuses a `redirect_uri` that is not `http://` or `https://` or holds a control character,
+  space, quote, backslash, backtick or angle bracket; `/authorize` (GET and POST) refuses such
+  a `redirect_uri` or `state`, and a `state` with `&`; the client name is HTML-escaped. A
+  client that registered such a `redirect_uri` before can no longer use it. (25 September)
 
 ## 0.4.0 — 25 September 2026
 

@@ -1,0 +1,1 @@
+ce_import_unknown_far.wz:2: no library module 'nosuchmodule' in this compiler; wantzel --lib lists them

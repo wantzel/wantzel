@@ -10,8 +10,8 @@
 //
 // No socket and no running server: requests are written straight into http.inbuf and
 // parsed there, the way tests/lib/http_header_case.wz already does for lib/http.wz.
-include "io.wz";
-include "oauth.wz";
+import io;
+import oauth;
 
 var
   req: array[0..511] of char;

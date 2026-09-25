@@ -4,7 +4,7 @@
 // the author has no way to argue. So each case below is one the check has to let through:
 // the bounds themselves, a non-zero lower bound, a named constant, a runtime variable, and
 // an index into an `array of T` parameter, whose length only the caller knows.
-include "io.wz";
+import io;
 
 const
   LAST = 3;

@@ -1,7 +1,7 @@
 // lib/sha1.wz -- SHA-1 (RFC 3174).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // NOT A SECURITY PRIMITIVE. SHA-1 is broken against deliberate collisions and nothing
@@ -20,7 +20,7 @@
 //
 // MEASURED AGAINST THE RFC 3174 TEST VECTORS, including every padding boundary, because
 // the padding is where a hand-written hash goes wrong and it goes wrong only for SOME
-// lengths: see tests/lib/sha1.wz.
+// lengths: see tests/lib/sha1_basics.wz.
 
 var
   sha1.h:   array[0..4] of int;

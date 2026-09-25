@@ -26,14 +26,14 @@
 // Each of these is a real gap and each is reported rather than silently tolerated: a
 // certificate this file cannot check is REFUSED, never waved through.
 
-include "io.wz";
-include "sha256.wz";
-include "x509.wz";
-include "p256.wz";
-include "p384.wz";
-include "sha384.wz";
-include "rsa.wz";
-include "der.wz";
+import io;
+import sha256;
+import x509;
+import p256;
+import p384;
+import sha384;
+import rsa;
+import der;
 
 const
   CH.MAXCERTS = 8;        // a chain longer than this is not a chain, it is a loop

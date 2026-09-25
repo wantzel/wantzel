@@ -1,7 +1,7 @@
 // lib/protobuf.wz -- reader for the protobuf wire format.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // The wire format is five things: a varint, a 64-bit fixed, a
@@ -27,7 +27,7 @@
 // Nesting works because pb.next is re-entrant on its arguments: save
 // pb.vat/pb.vend into locals before you walk the child.
 
-include "io.wz";
+import io;
 
 const
   PB.WVAR = 0;

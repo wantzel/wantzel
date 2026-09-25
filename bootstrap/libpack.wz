@@ -1,0 +1,164 @@
+// libpack.wz -- the standard library as a trailer for the compiler.
+//
+//   libpack <sha256> <file>... > trailer
+//
+// build.sh runs this after the fixed-point check (step 6) and appends what it writes to the
+// compiler: `cat compiler trailer`. It is compiled by that same compiler, which carries no
+// library yet -- so this program imports nothing. The one thing it takes from lib/ is the
+// compressor, and it takes it as a FILE, by path, which any compiler can read.
+//
+// What it writes, in this order (docs/design.md describes it for whoever reads a binary):
+//
+//   the parts     each file, packed with lz.pack; one after the other
+//   the index     one line per part:  <name> <offset> <length> <size> lz
+//                 offset and length locate the packed bytes, counted from the start of the
+//                 trailer; size is the length of the original text; lz says how it is stored
+//   the footer    101 bytes:  WZPARTS1 <index offset:12> <index length:8> <parts:4> <sha256:64>\n
+//
+// Every position counts from the start of the trailer, so the trailer does not depend on
+// the compiler it is appended to: the same files give the same bytes, whatever they end
+// up behind. The names are the paths as given (lib/io.wz ...), in the order given; build.sh
+// passes them sorted. The sha256 is computed by build.sh over the ORIGINAL files, so a
+// reader can check it against lib/ with sha256sum and nothing else.
+include "../lib/lz.wz";
+
+const
+  BMAX = 4194304;      // the largest file this packs
+  CMAX = 4210768;      // lz.bound(BMAX)
+  IMAX = 65536;        // the index
+
+var
+  sbuf: array[0..BMAX - 1] of char;
+  cbuf: array[0..CMAX - 1] of char;
+  idx: array[0..IMAX - 1] of char;
+  idxn: int;
+  nbuf: array[0..31] of char;
+  pbuf: array[0..1023] of char;
+  ftr: array[0..100] of char;
+
+procedure die(s: str);
+begin
+  sys3(1, 2, sadr("libpack: "), 9);
+  sys3(1, 2, sadr(s), slen(s));
+  sys3(1, 2, sadr("\n"), 1);
+  halt(1);
+end;
+
+// writeall(a, n) -- to stdout, all of it
+procedure writeall(a: int; n: int);
+var k: int;
+begin
+  while n > 0 do
+  begin
+    k := sys3(1, 1, a, n);
+    if k <= 0 then die("cannot write the trailer");
+    a := a + k;
+    n := n - k;
+  end;
+end;
+
+// idxput(c) / idxnum(v) / idxarg(a) -- append to the index
+procedure idxput(c: char);
+begin
+  if idxn >= IMAX then die("the index is too large");
+  idx[idxn] := c;
+  idxn := idxn + 1;
+end;
+
+procedure idxnum(v: int);
+var n, i: int;
+begin
+  n := 0;
+  if v = 0 then begin nbuf[0] := '0'; n := 1; end;
+  while v > 0 do begin nbuf[n] := chr(48 + v mod 10); v := v div 10; n := n + 1; end;
+  i := n - 1;
+  while i >= 0 do begin idxput(nbuf[i]); i := i - 1; end;
+end;
+
+procedure idxarg(a: int);
+var i: int;
+begin
+  i := 0;
+  while argch(a, i) <> chr(0) do
+  begin
+    if argch(a, i) = ' ' then die("a part name cannot contain a space");
+    idxput(argch(a, i));
+    i := i + 1;
+  end;
+end;
+
+// digits(o, v, n) -- v as exactly n decimal digits at ftr[o]
+procedure digits(o: int; v: int; n: int);
+var i: int;
+begin
+  i := n - 1;
+  while i >= 0 do begin ftr[o + i] := chr(48 + v mod 10); v := v div 10; i := i - 1; end;
+  if v <> 0 then die("a number does not fit the footer");
+end;
+
+// readpart(a) -- the file named by argument a, whole, into sbuf; its length
+function readpart(a: int): int;
+var i, fd, n, k: int;
+begin
+  i := 0;
+  while argch(a, i) <> chr(0) do
+  begin
+    if i >= len(pbuf) - 1 then die("a file name is too long");
+    pbuf[i] := argch(a, i);
+    i := i + 1;
+  end;
+  pbuf[i] := chr(0);
+  fd := sys3(2, addr(pbuf[0]), 0, 0);
+  if fd < 0 then die("cannot open a part");
+  n := 0;
+  while true do
+  begin
+    if n >= BMAX then die("a part is too large");
+    k := sys3(0, fd, addr(sbuf[n]), BMAX - n);
+    if k < 0 then die("cannot read a part");
+    if k = 0 then break;
+    n := n + k;
+  end;
+  sys1(3, fd);
+  return n;
+end;
+
+var
+  ai, n, c, off, k: int;
+
+begin
+  if argc() < 3 then die("usage: libpack <sha256> <file>... > trailer");
+  k := 0;
+  while argch(1, k) <> chr(0) do k := k + 1;
+  if k <> 64 then die("the sha256 must be 64 hex digits");
+  idxn := 0;
+  off := 0;
+  ai := 2;
+  while ai < argc() do
+  begin
+    n := readpart(ai);
+    c := lz.pack(sbuf, n, cbuf);
+    if c < 0 then die("a part does not pack");
+    writeall(addr(cbuf[0]), c);
+    idxarg(ai); idxput(' ');
+    idxnum(off); idxput(' ');
+    idxnum(c); idxput(' ');
+    idxnum(n); idxput(' ');
+    idxput('l'); idxput('z'); idxput(chr(10));
+    off := off + c;
+    ai := ai + 1;
+  end;
+  writeall(addr(idx[0]), idxn);
+  k := 0;
+  while k < 9 do begin ftr[k] := schar("WZPARTS1 ", k); k := k + 1; end;
+  digits(9, off, 12);
+  ftr[21] := ' ';
+  digits(22, idxn, 8);
+  ftr[30] := ' ';
+  digits(31, argc() - 2, 4);
+  ftr[35] := ' ';
+  k := 0;
+  while k < 64 do begin ftr[36 + k] := argch(1, k); k := k + 1; end;
+  ftr[100] := chr(10);
+  writeall(addr(ftr[0]), 101);
+end.

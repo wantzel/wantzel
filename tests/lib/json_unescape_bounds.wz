@@ -11,7 +11,7 @@
 // buffer with one byte to spare is therefore not enough.
 //
 // Both now return -1 when it does not fit, just as they do for an invalid escape.
-include "json.wz";
+import json;
 var src: array[0..63] of char;
     small: array[0..3] of char;      // deliberately too small
     big: array[0..63] of char;

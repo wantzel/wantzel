@@ -11,7 +11,7 @@
 . "$ROOT/tests/helpers.sh"
 
 cat > "$T/stdio.wz" <<'WZ'
-include "json.wz";                     // a schema needs it before the first type
+import json;                     // a schema needs it before the first type
 type AddArgs = schema
   a: int "the left operand";
   b: int "the right operand";
@@ -22,7 +22,7 @@ end;
 tools
   add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
 end;
-include "toolsmcp.wz";
+import toolsmcp;
 function tool.add(a: array of AddArgs; r: array of AddResult): int;
 begin
   r[0].sum := a[0].a + a[0].b;
@@ -48,7 +48,7 @@ assert_contains "the tool runs" "$out" '"sum":42'
 
 # The REST half is still one include away: the same program with lib/tools.wz and without
 # app.request must keep failing on the missing hook, so the split did not quietly drop it.
-sed 's/include "toolsmcp.wz";/include "tools.wz";/' "$T/stdio.wz" > "$T/whole.wz"
+sed 's/import toolsmcp;/import tools;/' "$T/stdio.wz" > "$T/whole.wz"
 if "$WANTZEL" "$T/whole.wz" "$T/whole" 2>"$T/werr"; then
   echo "lib/tools.wz compiled without app.request -- it no longer brings lib/http.wz"; exit 1
 fi

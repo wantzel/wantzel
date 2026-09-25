@@ -4,7 +4,7 @@
 // `shared.seen`.  This file declares its OWN `hidden.n` -- which is only possible
 // because the one in the include is invisible here.  Without `local` that is a
 // "duplicate global declaration" and this program does not compile.
-include "io.wz";
+import io;
 include "progs/local_scope_helper.wz";
 
 var hidden.n: int;

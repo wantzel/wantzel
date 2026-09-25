@@ -23,7 +23,7 @@
 now_ms() { date +%s%N | cut -b1-13; }
 
 cat > "$T/hello.wz" <<'WZ'
-include "io.wz";
+import io;
 
 begin
   io.puts(STDOUT, "hello\n");

@@ -1,35 +1,29 @@
-# The compiler must find its own lib/ when it is started through PATH, by its bare name.
+# The compiler finds its own library when it is started through PATH, by its bare name.
 #
-# WHY THIS TEST EXISTS. The search path for a bare include name is anchored on the
-# compiler's own location, and that location used to be taken from argv[0] -- which is not
-# a path but whatever the caller chose to say. Started from PATH, argv[0] is the single
-# word "wantzel" with no '/' in it, so the anchor collapsed to a RELATIVE "lib/" and
-# `include "io.wz"` then depended on the working directory.
+# WHY THIS TEST EXISTS. The library is read from the compiler's own file, and "its own
+# file" used to be taken from argv[0] -- which is not a path but whatever the caller chose
+# to say. Started from PATH, argv[0] is the single word "wantzel" with no '/' in it, and
+# the compiler looked for its library relative to the working directory instead.
 #
 # It failed in a perfectly good installation, and only for callers who did the ordinary
 # thing: an editor or an agent starts "wantzel", not "/long/path/to/bin/wantzel". Measured
 # on 17-09-2026, the same compile succeeded by absolute path and failed through PATH.
 #
-# The anchor is /proc/self/exe now, which answers where the process really came from.
-# argv[0] is still the fallback for a system without /proc.
-#
-# THE WORKING DIRECTORY IS THE TRAP THIS GUARDS. Both compiles below run from a directory
-# with no lib/ in it and no lib/ above it, because that is the only way to tell the two
-# anchors apart: with a lib/ next to the source, a relative "lib/" would find it and the
-# bug would hide.
+# The compiler reads /proc/self/exe, which answers where the process really came from.
+# Both compiles below run from a directory with nothing of the compiler's near it.
 . "$ROOT/tests/helpers.sh"
+# helpers.sh has no bad(); without this line every failure below printed "not found" and
+# the test passed anyway
+bad() { echo "$1"; exit 1; }
 
 mkdir -p "$T/elsewhere"
 cat > "$T/elsewhere/hello.wz" <<'WZ'
-include "io.wz";
+import io;
 
 begin
   io.puts(STDOUT, "found it\n");
 end.
 WZ
-
-# No lib/ here, and none in any parent of it.
-[ -d "$T/elsewhere/lib" ] && bad "the test set itself up wrong: lib/ must not be beside the source"
 
 # 1. through PATH, by the bare name -- the case that used to fail
 ( cd "$T/elsewhere" && PATH="$(dirname "$WANTZEL"):$PATH" wantzel hello.wz "$T/via_path" ) \

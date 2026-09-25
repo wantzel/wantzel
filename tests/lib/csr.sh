@@ -34,8 +34,8 @@ trap cleanup EXIT
 # The hostname is an argument, so one binary makes several different requests and nothing can
 # be accidentally constant.
 cat > "$tmp/m.wz" <<'WZ'
-include "io.wz";
-include "csr.wz";
+import io;
+import csr;
 var d, qx, qy: array[0..P.N-1] of int;
     host: array[0..63] of char;
     hn: int;

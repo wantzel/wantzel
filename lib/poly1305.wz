@@ -1,7 +1,7 @@
 // lib/poly1305.wz -- the Poly1305 one-time authenticator (RFC 8439).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // WHAT IT IS FOR: the tag on every TLS 1.3 record, next to ChaCha20. It answers one
@@ -20,7 +20,7 @@
 //
 // THE REDUCTION IS THE CHEAP PART: 2^130 = 5 (mod 2^130-5), so whatever rises above limb 4
 // comes back in at the bottom multiplied by five.
-include "io.wz";
+import io;
 
 var
   po.r: array[0..4] of int;             // the key's r, clamped, in limbs

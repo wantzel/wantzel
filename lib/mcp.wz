@@ -1,7 +1,7 @@
 // lib/mcp.wz -- Model Context Protocol over JSON-RPC 2.0.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // The envelope and the tools/call parameters are described as schemas, so
@@ -32,7 +32,7 @@
 // program written before these limits could produce.  A transport of its own reads
 // view(mcp.obase, n) and calls mcp.done once the bytes have been sent.
 
-include "json.wz";
+import json;
 
 const
   // BIG ENOUGH FOR THE WORST CASE AND NOT FOR THE TYPICAL ONE. A reply carries text as a

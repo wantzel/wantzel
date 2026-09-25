@@ -1,7 +1,7 @@
 // lib/net.wz -- sockets and epoll, straight on top of the system calls.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // IPv6 (net.connect6, net.listen6, net.socket6) needs no compiler change: `sys3(SYS.socket,
@@ -9,7 +9,7 @@
 // supports without the compiler knowing what AF_INET6 means -- the same reason the rest of
 // this file needs no compiler change.
 
-include "io.wz";
+import io;
 
 const
   AF_INET      = 2;

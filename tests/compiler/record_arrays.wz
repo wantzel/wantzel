@@ -1,5 +1,5 @@
 // records in arrays, nested records, arrays inside records, array-of-record parameters, bounds checks.
-include "io.wz";
+import io;
 type
   Vec = record
     x, y: real;

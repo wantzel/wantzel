@@ -2,15 +2,15 @@
 // lib/http.wz, on the SAME port.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // TAKEOVER, NOT A FORWARD HOOK. `lib/http.wz` declares `app.request` with `forward`,
 // and Wantzel has no function pointers and no optional override (docs/language.md §4,
-// §8) -- a `forward` routine MUST be defined by every program that includes the file
+// §8) -- a `forward` routine MUST be defined by every program that imports the module
 // declaring it, whether or not that program ever uses it. Adding a second mandatory
 // hook to http.wz for the upgrade path would break every EXISTING program that
-// includes http.wz and never touches a WebSocket, which is not an acceptable cost for
+// imports http and never touches a WebSocket, which is not an acceptable cost for
 // a shared, released library.
 //
 // So the two libraries never call into each other. Instead, `app.request` -- the
@@ -37,10 +37,10 @@
 // payload XORed with it, cycling; a server that forgets this reads plausible-looking
 // rubbish instead of failing loudly. The server never masks its own frames.
 
-include "net.wz";
-include "base64.wz";
-include "http.wz";
-include "sha1.wz";
+import net;
+import base64;
+import http;
+import sha1;
 
 const
   // CONNECTIONS LIVE IN SLOTS, NOT AT THEIR fd -- the same shape lib/http.wz uses (see
@@ -213,7 +213,7 @@ begin
 
   if ws.ep = 0 then
   begin
-    // Lazily created on the first takeover: a program that includes this module but
+    // Lazily created on the first takeover: a program that imports this module but
     // never actually upgrades a connection should not pay for an epoll set it never
     // uses, and http.serve's forked workers each need their OWN set (created after
     // fork, same reason http.serve creates http.ep after forking) rather than one

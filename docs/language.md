@@ -11,13 +11,12 @@ only valid once they move here. Whoever implements something reads this file fir
 whoever changes the language updates this file in the same commit. Where the tour below
 and a numbered section seem to differ, the numbered section binds.
 
-Last updated: 2026-09-17 (phase 1 complete: real, record, slices, view, for, local const,
-schema v2, tools; a schema is `type X = schema ... end;`).
+Last updated: 2026-09-25 (`import` for the library, `include` always a file — §1b).
 
 ## A tour
 
 ```pascal
-include "lib/json.wz";
+import json;
 
 const MAX = 100;
 
@@ -134,7 +133,7 @@ one. Predictable for people and for a model generating code.
 ## 1. Program
 
 ```pascal
-include "lib/io.wz";        // textual inclusion, max 16 deep, paths relative to the file
+import io;                  // a module of the standard library; include "x.wz"; reads a file (§1b)
 
 const
   MAX = 100;                // int, char ('a'), bool, real (1.5, -2.5), str ("..."); also inside a routine
@@ -160,10 +159,57 @@ is three characters. Anything else after a backslash is refused.
 
 Comments: `// to end of line`, the only form. Identifiers and keywords are
 **case-insensitive** (`Point` and `point` are the same name). Identifiers: letters,
-digits, `_`, and a **dot** as a namespace separator (`io.puts`, `mcp.buf`) — cosmetic,
-there are no modules. First character must be a letter or `_`; a part **after** a dot may
-start with a digit (`Reading.level.1`, from a schema enum whose value is `"1"`). A real
-literal still reads as one number: `3.5` is a value, never a name.
+digits, `_`, and a **dot** as a namespace separator (`io.puts`, `mcp.buf`) — cosmetic:
+`import io;` reads source text, it does not open a namespace. First character must be a
+letter or `_`; a part **after** a dot may start with a digit (`Reading.level.1`, from a
+schema enum whose value is `"1"`). A real literal still reads as one number: `3.5` is a
+value, never a name.
+
+## 1b. Imports and includes
+
+Two statements bring in more source, and they never overlap:
+
+```pascal
+import io;               // a module of the standard library of THIS compiler
+import json;             // a name: no quotes, no .wz, no path
+import tools;            // a keyword is allowed here: it names the module
+
+include "model.wz";      // a file next to this file
+include "../lex.wz";     // a file, relative to this file
+include "/abs/x.wz";     // a file, by absolute path
+```
+
+**`import name;`** reads module `name` from the standard library that is part of the
+running compiler (`wantzel --lib` lists them). Nothing on disk is consulted: not the
+working directory, not a `lib/` directory anywhere, no environment variable, no flag. The
+name is case-insensitive, like every name.
+
+**`include "path.wz";`** reads a file: the path is relative to the directory of the file
+that contains the `include`, or absolute when it starts with `/`. A name without a `/` is
+the file *next to this one* — never a library module, even when a module has that name.
+
+Both are **textual**: the text is read in at that point, once. A second `import` of the same
+module or `include` of the same file (compared by identity, not by spelling) is skipped.
+Order counts — a name is visible after the `import` or `include` that declares it, and
+`import tools;` belongs after the `tools` block (§7b). Imports and includes nest at most 16
+deep. A module is never the same thing as a file: a copy of `lib/io.wz` included as a file
+and `import io;` are two different sources.
+
+**There is no way to replace a module.** The library is a property of the compiler version:
+the same source and the same compiler file give the same executable, wherever either sits.
+To experiment with a changed module, copy it and include the copy as a file.
+
+The wrong spellings are errors that carry the right one:
+
+| written | message |
+|---|---|
+| `import "io";`, `import "io.wz";`, `import io.wz;` | `import takes a module name, without quotes or .wz: import io;` |
+| `import "mine.wz";` (not a module) | `import takes a module name, without quotes or .wz; a file of your own is included: include "mine.wz";` |
+| `import jsn;` | `no library module 'jsn' in this compiler; wantzel --lib lists them -- did you mean: import json;` |
+| `include io;` | `include takes a file name in quotes: include "io.wz"; -- for the library module write: import io;` |
+| `include "io.wz";` with no `io.wz` beside the file | `io.wz is not a file next to this one; the library module is imported: import io;` |
+| `include "sub/x.wz";` that does not exist | `cannot open the included file: <the path it tried>` |
+| `io.puts` without `import io;` | `undeclared identifier: io.puts is declared in the library module io; add: import io;` |
 
 ## 2. Types
 
@@ -467,7 +513,7 @@ from the same declaration the parser and dispatcher use.
 ### The smallest complete program
 
 ```pascal
-include "json.wz";
+import json;
 
 type ConvertArgs = schema
   celsius: real "the temperature to convert";
@@ -481,7 +527,7 @@ tools
   convert(ConvertArgs): ConvertResult "Convert Celsius to Fahrenheit." readonly idempotent;
 end;
 
-include "toolsmcp.wz";                      // AFTER the tools block: it reads it
+import toolsmcp;                            // AFTER the tools block: it reads it
 
 function tool.convert(a: array of ConvertArgs; r: array of ConvertResult): int;
 begin
@@ -524,12 +570,12 @@ directions.
 | | `tool.run(idx, b, at, upto, dst)` — parses the arguments, calls `tool.<name>`, writes the result JSON |
 | | `tool.fail(s)` — call it from a handler to refuse with a message |
 | `function tool.<name>(a, r): int; ... end;` per tool (`forward`-checked: a missing handler is a compile error) | the dispatch that calls it from `tool.run` |
-| `include "lib/tools.wz";` or `include "lib/toolsmcp.wz";` | `app.tools`, `app.call` (MCP), and — `lib/tools.wz` only — `tool.rest(prefix)` (REST) |
+| `import tools;` or `import toolsmcp;` | `app.tools`, `app.call` (MCP), and — `tools` only — `tool.rest(prefix)` (REST) |
 
-`lib/tools.wz` is two files: `lib/toolsmcp.wz` (`app.tools`, `app.call`, MCP only, no
-HTTP) and the REST half, which brings `lib/http.wz` and with it the forward
-`app.request` the program must define. A server that speaks MCP over stdio only needs
-`lib/toolsmcp.wz` and no `app.request`. `tools` is a keyword: do not use it as a
+The module `tools` is two parts: `toolsmcp` (`app.tools`, `app.call`, MCP only, no
+HTTP) and the REST half, which brings `http` and with it the forward `app.request` the
+program must define. A server that speaks MCP over stdio only imports `toolsmcp` and needs
+no `app.request`. `tools` is a keyword: do not use it as a
 namespace in your own code.
 
 **A tool name becomes a routine name in the `tool.` namespace**, so it cannot be one the
@@ -598,7 +644,7 @@ quote or control character inside the slice ends the JSON string early.
 | `(* *)`, `{ }` | only `//` | a brace inside the comment text ended it early, and the error landed far from its cause |
 | `shl`/`shr`/`and`/`or` on ints | `shl`/`shr`, `band`/`bor`/`bxor`/`bnot`; `and`/`or` only on bool | logical and bitwise never confused |
 | `exit`, `halt` | `return`, `halt(code)` | |
-| units, `uses` | `include` | one mechanism |
+| units, `uses` | `import` for the library, `include` for a file | both textual; no module system, no namespaces |
 | `set`, `with`, `goto`, pointers | absent and not coming | |
 | `case` | absent; write an if-chain | a generator chose it once in five where it could |
 | variant records, `packed` | absent | one layout, see Records |
@@ -677,7 +723,7 @@ listed with a measured value in `tests/limits/README.md`, guarded by
 Linux x86-64 ELF: a static binary that reaches the kernel through raw syscalls. No
 assembler, linker, C library or external tool. `src/wantzel.wz` (self-hosted) implements
 the whole language; `bootstrap/boot.c` is a small C compiler that only has to build
-`src/wantzel.wz`, so it implements neither `schema`/`tools` nor
+`src/wantzel.wz`, so it implements neither `schema`/`tools`/`import` nor
 `--debug` — see [design.md](design.md#how-the-compiler-works) and
 [testing.md](testing.md#the-bootstrap-fixed-point). Every language change lands in
 `src/wantzel.wz` and in `test.sh`; it only lands in `boot.c` as well when
@@ -686,4 +732,6 @@ the compiler's own source starts using it.
 The library (`io`, `fs`, `net`, `http`, `json`, ...) and `sys1`..`sys6` are the whole
 interface to the operating system: a `sys*` call is the syscall instruction, and the number
 is an ordinary constant, so anything the kernel offers is reachable from source. The
-compiler compiles itself and reproduces itself byte-identically (`./build.sh`).
+compiler compiles itself and reproduces itself byte-identically (`./build.sh`), and it is
+one file: the standard library travels inside it (§1b and
+[design.md](design.md#one-file-the-standard-library-travels-in-the-compiler)).

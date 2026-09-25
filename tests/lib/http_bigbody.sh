@@ -20,7 +20,7 @@ command -v curl >/dev/null 2>&1 || { echo "curl is missing"; exit 1; }
 port=$(free_port)
 
 cat > "$T/bigsrv.wz" <<EOF
-include "http.wz";
+import http;
 procedure app.request;
 begin
   if http.bodyinbig then http.addn(http.bodylen)
@@ -36,7 +36,7 @@ compile "$T/bigsrv.wz" "$T/bigsrv"
 
 # ---- part of the acceptance criteria: the BSS-equivalent size does not scale with MAXCONN.
 cat > "$T/nobig.wz" <<EOF
-include "http.wz";
+import http;
 procedure app.request;
 begin
   http.add("small");

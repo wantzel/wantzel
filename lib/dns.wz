@@ -2,7 +2,7 @@
 // nameservers the system is configured with, and over TCP when an answer does not fit.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 //   n := dns.resolve("example.com", addrs);        // blocking, bounded: count or DNS.*
@@ -63,9 +63,9 @@
 // bad name), is collected through it, and collecting frees the query; dns.cancel drops one
 // that is no longer wanted. The TCP fallback connects without blocking as well.
 
-include "io.wz";
-include "net.wz";
-include "rand.wz";
+import io;
+import net;
+import rand;
 
 const
   DNS.MAXNS   = 3;          // nameservers kept, as the C library does

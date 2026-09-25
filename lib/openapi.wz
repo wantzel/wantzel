@@ -1,7 +1,7 @@
 // lib/openapi.wz -- an OpenAPI 3.1 document and a Swagger UI page, generated from
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 // the same tool declarations that feed MCP tools/list.
 //
@@ -23,10 +23,10 @@
 //
 // WHAT THE CALLER MUST PROVIDE, because none of it comes from here:
 //
-//   a `tools` block before this include   -- oapi.spec reads the tool.list the compiler
+//   a `tools` block before this import    -- oapi.spec reads the tool.list the compiler
 //                                            bakes from it
 //   oauth.issuer / oauth.issuern          -- the server URL in the document (lib/oauth.wz
-//                                            is included below for it)
+//                                            is imported below for it)
 //   function app.worthshowing(nat, nend): bool   -- is this property worth an example?
 //   function app.exarray(nat, nend): bool        -- fill a list example from your own
 //   function app.exstring(nat, nend): bool         vocabulary; return false for the
@@ -36,14 +36,14 @@
 // application's and not this file's. Returning false from all three is a valid answer
 // and gives the generic examples.
 //
-// They were not written down here until 15-09-2026, and oauth.wz was not included at
-// all, so this file only compiled when the caller happened to include it first -- and
+// They were not written down here until 15-09-2026, and oauth.wz was not imported at
+// all, so this file only compiled when the caller happened to import it first -- and
 // found out through three "forward declared routine is never defined" messages pointing
 // deep into the library.
 
-include "json.wz";
-include "http.wz";
-include "oauth.wz";
+import json;
+import http;
+import oauth;
 
 const
   OAPI.MAXTOOLS = 256;

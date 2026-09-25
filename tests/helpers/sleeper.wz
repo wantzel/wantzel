@@ -1,7 +1,7 @@
 // sleeper -- prints its own pid, then sleeps 30 seconds and says it woke up. A test
 // that stops it from another process expects never to see the second line.
-include "io.wz";
-include "proc.wz";
+import io;
+import proc;
 
 var
   ts: array[0..15] of char;

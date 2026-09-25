@@ -1,10 +1,10 @@
 // lib/mcphttp.wz -- MCP over HTTP: the endpoint routine for app.request.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
-//   include "lib/mcphttp.wz";       (brings in lib/mcp.wz and lib/http.wz)
+//   import mcphttp;                 (brings in the modules mcp and http)
 //   procedure app.request;
 //   begin
 //     if http.pathis("/mcp") then mcp.http else ...
@@ -22,8 +22,8 @@
 // naming the size (see mcp.httproom) -- an MCP client cannot read the plain-text 500 it
 // would otherwise get.
 
-include "mcp.wz";
-include "http.wz";
+import mcp;
+import http;
 
 procedure mcp.pvheader;
 begin

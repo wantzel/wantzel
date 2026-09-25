@@ -1,7 +1,7 @@
 // lib/io.wz -- output, numbers and little-endian byte packing.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // Everything here talks to the kernel directly; there is no buffering

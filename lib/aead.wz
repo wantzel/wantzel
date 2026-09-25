@@ -1,7 +1,7 @@
 // lib/aead.wz -- ChaCha20-Poly1305 as one operation (RFC 8439 section 2.8).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // WHAT AEAD MEANS: encrypt the payload AND authenticate it together with data that travels
@@ -14,9 +14,9 @@
 //
 // AND THE TAG COVERS THE LENGTHS. Without them, "AAD || ciphertext" is ambiguous: moving a
 // byte from one to the other gives the same input and therefore the same tag.
-include "io.wz";
-include "chacha20.wz";
-include "poly1305.wz";
+import io;
+import chacha20;
+import poly1305;
 
 var
   ae.pk:  array[0..63] of char;         // the derived one-time Poly1305 key

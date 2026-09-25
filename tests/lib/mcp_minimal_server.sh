@@ -10,7 +10,7 @@
 . "$ROOT/tests/helpers.sh"
 
 cat > "$T/minimal.wz" <<'WZ'
-include "json.wz";
+import json;
 type AddArgs = schema
   a: int "the left operand";
   b: int "the right operand";
@@ -21,7 +21,7 @@ end;
 tools
   add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
 end;
-include "tools.wz";
+import tools;
 function tool.add(a: array of AddArgs; r: array of AddResult): int;
 begin
   r[0].sum := a[0].a + a[0].b;

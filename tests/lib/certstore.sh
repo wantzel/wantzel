@@ -23,8 +23,8 @@ cleanup() { rc=$?; rm -rf "$tmp" || true; exit $rc; }
 trap cleanup EXIT
 
 cat > "$tmp/t.wz" <<'WZ'
-include "io.wz";
-include "certstore.wz";
+import io;
+import certstore;
 var name: array[0..255] of char;
     data: array[0..255] of char;
     n, dn, i: int;

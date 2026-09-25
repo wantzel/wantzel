@@ -1,5 +1,5 @@
 // for/to, for/downto, break and continue in for, nested for, local const, end value evaluated once.
-include "io.wz";
+import io;
 var
   i, j, s, n: int;
 procedure show(s: str; v: int);

@@ -1,7 +1,7 @@
 // lib/hash.wz -- open-addressing hash tables on caller-supplied arrays.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // A table is two arrays the caller declares: `keys` holds fixed-width keys
@@ -20,7 +20,7 @@
 // Keys shorter than klen are padded with zero bytes by the caller (or use
 // hash.putpad/hash.getpad, which pad for you).
 
-include "io.wz";
+import io;
 
 const
   HASH.EMPTY = -1;

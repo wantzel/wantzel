@@ -1,0 +1,96 @@
+// lib/chacha20.wz against the test vectors in RFC 8439.
+//
+// THE ANSWERS ARE THE RFC'S, NOT OURS. A cipher that is almost right encrypts, decrypts and
+// protects nothing -- and the output looks random either way, so the only thing that can
+// tell the difference is a known answer from the specification.
+//
+// Section 2.3.2 gives a full block for a stated key, nonce and counter; section 2.4.2 gives
+// a ciphertext for a known plaintext. Both are checked here, byte for byte.
+import io;
+import chacha20;
+
+var
+  key:   array[0..31] of char;
+  nonce: array[0..11] of char;
+  buf:   array[0..255] of char;
+  i, failures: int;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ") else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+function nib(c: char): int;
+begin
+  if (c >= '0') and (c <= '9') then return ord(c) - ord('0');
+  return ord(c) - ord('a') + 10;
+end;
+
+// hexeq(b, at, s) -- do the bytes at `at` match this lowercase hex string?
+function hexeq(b: array of char; at: int; s: str): bool;
+var i, hi, lo: int;
+begin
+  i := 0;
+  while i * 2 < slen(s) do
+  begin
+    hi := nib(schar(s, i * 2));
+    lo := nib(schar(s, i * 2 + 1));
+    if ord(b[at + i]) <> hi * 16 + lo then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
+
+begin
+  failures := 0;
+
+  // ---- RFC 8439 section 2.3.2: one keystream block ---------------------------------------
+  // key   = 00 01 02 ... 1f
+  // nonce = 00 00 00 09 00 00 00 4a 00 00 00 00
+  // counter = 1
+  i := 0;
+  while i < 32 do begin key[i] := chr(i); i := i + 1; end;
+  i := 0;
+  while i < 12 do begin nonce[i] := chr(0); i := i + 1; end;
+  nonce[3] := chr(9);
+  nonce[7] := chr(0x4a);
+
+  cc.block(key, nonce, 1);
+  expect(hexeq(cc.ks, 0,
+    "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e"),
+    "the first 32 bytes of the RFC 2.3.2 keystream block");
+  expect(hexeq(cc.ks, 32,
+    "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e"),
+    "and the second 32");
+
+  // ---- RFC 8439 section 2.4.2: encrypting a known plaintext ------------------------------
+  // The same key, nonce 00 00 00 00 00 00 00 4a 00 00 00 00, counter 1, and the sunscreen
+  // sentence as plaintext.
+  i := 0;
+  while i < 12 do begin nonce[i] := chr(0); i := i + 1; end;
+  nonce[7] := chr(0x4a);
+
+  i := io.push(buf, 0, "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.");
+  expect(i = 114, "the RFC's plaintext is 114 bytes");
+
+  cc.xor(key, nonce, 1, buf, 0, i);
+  expect(hexeq(buf, 0,
+    "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0b"),
+    "the first 32 bytes of the RFC 2.4.2 ciphertext");
+  expect(hexeq(buf, 96,
+    "5af90bbf74a35be6b40b8eedf2785e42874d"),
+    "and the last 18 bytes");
+
+  // ---- AND DECRYPTING IS THE SAME OPERATION ----------------------------------------------
+  //
+  // XOR is its own inverse, so there is no separate decrypt path to get wrong. Running the
+  // same call again must give the plaintext back -- if it does not, the counter handling is
+  // wrong somewhere, which is invisible in a single-direction test.
+  cc.xor(key, nonce, 1, buf, 0, 114);
+  expect(hexeq(buf, 0, "4c616469657320616e642047656e746c656d656e206f662074686520636c6173"),
+    "decrypting with the same call returns the plaintext");
+
+  if failures > 0 then halt(1);
+end.

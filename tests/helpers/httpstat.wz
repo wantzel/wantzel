@@ -10,7 +10,7 @@
 //                cannot go out in one send and has to wait in the slot's pending region
 //   GET /stats   open=.. free=.. chunks=.. chunkmax=.. pend=.. queued=.. refused=.. evicted=.. timedout=.. maxfd=.. slot=..
 //   POST ...     "got N" with N the body length
-include "http.wz";
+import http;
 
 var
   big: array[0..499999] of char;

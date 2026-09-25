@@ -9,10 +9,10 @@
 // shares the key schedule primitives with the server, so it proves the MECHANICS (state,
 // buffering, record boundaries, isolation) and not interoperability -- tests/lib/tls.sh and
 // tests/lib/tls_serve.sh do that against openssl, curl and a browser.
-include "io.wz";
-include "tls.wz";
-include "csr.wz";
-include "json.wz";
+import io;
+import tls;
+import csr;
+import json;
 
 var
   // the certificates the server is given

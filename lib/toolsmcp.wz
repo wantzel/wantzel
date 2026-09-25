@@ -1,20 +1,20 @@
 // lib/toolsmcp.wz -- the MCP half of the glue for a declared `tools` block.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
-// Include this after the tools block.  It defines the two hooks lib/mcp.wz leaves
+// Import this after the tools block.  It defines the two hooks lib/mcp.wz leaves
 // open, so a program with a tools block needs no app.tools/app.call of its own:
 //
 //   schema ...;  tools ... end;
-//   include "lib/toolsmcp.wz";
+//   import toolsmcp;
 //   <the handlers tool.<name>(a, r)>
 //   begin mcp.stdio; end.
 //
 // It does NOT bring lib/http.wz, so a server that only speaks MCP over standard input
 // and output needs no app.request.  lib/tools.wz is this file plus the REST half
-// (tool.rest) and lib/http.wz; include that one when the table is also served over HTTP.
+// (tool.rest) and lib/http.wz; import that one when the table is also served over HTTP.
 //
 // The generated tool.run writes the result JSON; this file wraps it as an MCP tool
 // result (content + structuredContent + isError).
@@ -31,7 +31,7 @@
 // The result is at view(tool.obase, n) after tool.run -- in tool.out only in that
 // small-limit case.  A program that calls tool.run itself can still pass tool.out.
 
-include "mcp.wz";
+import mcp;
 
 const
   TOOLBUF = 1048576;

@@ -20,10 +20,10 @@
 //
 // Every mode that waits has a bound, so a server that does not answer makes this exit
 // rather than hang the suite.
-include "io.wz";
-include "net.wz";
-include "tls.wz";
-include "json.wz";
+import io;
+import net;
+import tls;
+import json;
 
 const
   IPPROTO_TCP = 6;

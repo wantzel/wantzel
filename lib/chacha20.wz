@@ -1,7 +1,7 @@
 // lib/chacha20.wz -- the ChaCha20 stream cipher (RFC 8439).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // WHAT IT IS FOR: the record layer of TLS 1.3, together with Poly1305. It is also a
@@ -15,9 +15,9 @@
 // one of them produces output that looks random and is wrong -- which no test but a KNOWN
 // ANSWER can catch.
 //
-// THE TEST VECTORS ARE RFC 8439's OWN, in tests/lib/chacha20.wz. Cryptography that is almost
+// THE TEST VECTORS ARE RFC 8439's OWN, in tests/lib/chacha20_basics.wz. Cryptography that is almost
 // right is worse than none: it encrypts, it decrypts, and it protects nothing.
-include "io.wz";
+import io;
 
 const
   CC_ROUNDS = 20;

@@ -2,7 +2,7 @@
 // array, a slice and a view all pass where 'array of char' is expected, so a
 // library routine needs only one form; 'str' stays a literal type for the
 // builtins slen/schar/sadr.
-include "io.wz";
+import io;
 var
   buf: array[0..15] of char;
   n: int;

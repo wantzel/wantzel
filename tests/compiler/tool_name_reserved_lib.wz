@@ -4,7 +4,7 @@
 // is read the library has not been parsed yet and an ordinary name lookup cannot see the
 // clash. Before this fix the error surfaced deep inside lib/tools.wz itself, naming
 // neither the tool nor this file.
-include "json.wz";
+import json;
 type A = schema
   x: int;
 end;
@@ -14,7 +14,7 @@ end;
 tools
   rest(A): R "Clashes with tool.rest from lib/tools.wz.";
 end;
-include "lib/tools.wz";
+import tools;
 function tool.rest(a: array of A; r: array of R): int;
 begin
   r[0].y := a[0].x;

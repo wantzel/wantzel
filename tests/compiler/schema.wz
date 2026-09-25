@@ -1,6 +1,6 @@
 // schema.wz -- the compiled schema parser, end to end.
 
-include "json.wz";
+import json;
 
 type Msg = schema
   jsonrpc: text;

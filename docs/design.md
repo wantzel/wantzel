@@ -37,8 +37,8 @@ arrives with a citation.
 |---|---|
 | **No pointers, no heap, no garbage collector** | an index into an array cannot dangle, is bounds-checked at every use, and survives being written to disk — every linked structure normally built with pointers has been built this way instead |
 | **Strict typing, no implicit conversions** | what the compiler refuses is a review question nobody has to ask; a wrong call is a compile error, not a silent bug that ships |
-| **One way per concept** | a second way is a second thing to learn, review, and get wrong; `bool` and no `boolean`, `include` and no module system, errors and no warnings |
-| **No dependencies** | the standard library lives in this repository and moves in the same commit as the compiler; there is no package manager, so there is no mechanism by which a dependency could be added |
+| **One way per concept** | a second way is a second thing to learn, review, and get wrong; `bool` and no `boolean`, `import` for the library and `include` for a file and no module system, errors and no warnings |
+| **No dependencies** | the standard library lives in this repository, moves in the same commit as the compiler, and travels inside the compiler file; there is no package manager, so there is no mechanism by which a dependency could be added |
 | **No optimiser** | the generated code stays recognisable as the source you reviewed, and it is most of why compiling takes milliseconds |
 | **No warnings, only errors** | a grey zone between "wrong" and "fine, but" does not survive contact with time — it piles up and gets ignored; exit 0 has to mean correct |
 | **Schemas are compiled, not configured** | a `schema` or `tools` block *is* the parser, the writer and the JSON Schema — nothing to keep in sync, and a wrong field is a compile error instead of a run-time surprise |
@@ -88,13 +88,110 @@ floor.
 `src/wantzel.wz` is the real compiler: self-hosted, the whole language, one file.
 `bootstrap/boot.c` exists only to build the first binary from a fresh clone, so it needs to
 do exactly one thing well — compile `src/wantzel.wz` — and nothing else. It does not
-implement `schema`, `tools` or `--debug`, because the compiler's own source declares none
-of them.
+implement `schema`, `tools`, `import` or `--debug`, because the compiler's own source uses
+none of them.
 The bootstrap chain is `boot.c` → stage1 → stage2 → stage3, and the fixed point that
 matters is stage2 = stage3: the self-hosted compiler reproducing itself. Stage1 only has
 to be *correct*, not byte-identical to the others — see
 [testing.md](testing.md#the-bootstrap-fixed-point) for the check and what it does and does
 not catch.
+
+### One file: the standard library travels in the compiler
+
+`wantzel` is one file. The standard library is part of it: `import io;` compiles the `io` of
+*this* compiler, read from the compiler's own file, and from nowhere else — no `lib/`
+directory on disk, no environment variable, no flag, no search order. The same source and
+the same compiler file give the same executable wherever either of them sits, and two
+compilers whose `--version` lines agree compile every `import` to the same text.
+
+**How it is stored.** After the fixed-point check, `build.sh` appends a *trailer* to the
+compiler. The ELF loader never maps it — the program header stops before it — and the
+compiler reads it from `/proc/self/exe`:
+
+```
+<the compiler, exactly as the fixed point produced it>
+<part> <part> ...            each part's bytes, one after the other
+<index>                      one line per part:  <name> <offset> <length> <size> <form>
+<footer, 101 bytes>          WZPARTS1 <index offset:12> <index length:8> <parts:4> <sha256:64>\n
+```
+
+Every position counts from the start of the trailer, so the trailer does not depend on the
+compiler in front of it. `offset` and `length` locate the stored bytes, `size` is the length
+of the original text, and `form` is `lz` (packed as `lib/lz.wz` packs) or `raw` (stored as
+it is). The sha256 covers the original texts — it is `sha256sum` over the parts, piped
+through `sha256sum` once more — so it can be checked against the source tree with nothing
+but coreutils; `wantzel --version` prints it.
+
+**Named parts, so the one file can carry more.** The library is the set of parts called
+`lib/<module>.wz`. Nothing else is in the trailer today, but the index is a list of names,
+not a list of modules: other text — a licence, a reference page — can be appended as a part
+of its own, raw or packed, and a later `wantzel --dump <name>` would print it by name the
+way `--lib` prints a module. That is a new name in the index and a new mode on the command
+line; the format, the footer and every existing reader stay as they are.
+
+**Packed.** Each module is packed on its own with `lib/lz.wz` — the simplest LZ format there
+is, literal runs and back-references, no entropy coding — so an `import` unpacks only the
+module it names. The library packs to about half its size; unpacking `io` takes some tens
+of microseconds. The compiler cannot import `lib/lz.wz` (its own source imports nothing), so
+it carries a copy of `lz.unpack`; `tests/toolchain/lz_copy_is_identical.sh` keeps the two
+texts identical, and the unpacker checks every count and offset before it uses it, so a
+damaged trailer is refused with a message instead of read past a buffer.
+
+**The build order**, and why it is this one:
+
+1. `boot.c` → stage1 → stage2 → stage3, as always. The fixed point compares stage2 and
+   stage3 *without* a trailer: it is a property of the compiler alone.
+2. stage3 compiles `bootstrap/libpack.wz`. stage3 carries no library yet, so `libpack`
+   imports nothing; it takes the packer from `lib/lz.wz` by path, as a file.
+3. `libpack <sha256> lib/*.wz > trailer` — the modules in byte order of their names, no
+   timestamps: the same `lib/` always gives the same trailer.
+4. `cat stage3 trailer` becomes `bin/wantzel` — but only after every module read back
+   through the new compiler (`wantzel --lib <module>`) equals its file in `lib/`, and
+   `--version` carries the sum. One difference and nothing is installed.
+
+`./wztest` rebuilds when a file in `lib/` is newer than `bin/wantzel`, so a test of the
+library always runs against the library as it is on disk — packed, exactly as a user gets it.
+
+**Why nothing overrides it.** A copy of a module on disk that wins over the built-in one is
+a second place an `import` can be answered from, and then the question "which copy did
+this build use?" has no answer in the output. Experimenting with a module is still one line:
+copy it and include the copy as a file (`include "./tls.wz";`) — a file is always a file.
+
+**Why it is not precompiled.** The library is kept as source, not as compiled tables: the
+compiler is one pass with no intermediate form, so "precompiled" would mean a snapshot of
+every symbol table, in a second format that has to change with every table. Measured, it
+would save at most 7% of a large program's compile time; parsing the library is not where
+the time goes.
+
+### Unused routines never reach the executable
+
+Every module a program imports compiles in full, but only the routines it actually calls
+end up in the file: after parsing, the compiler builds the call graph from its own
+relocations and drops everything unreachable from the main block, before writing the ELF
+image.
+
+**How.** A routine's code is one contiguous range, and every reference to it (a call, a jump
+to data, a jump to bss) is a relocation recorded at the offset it sits at. A relocation's
+*kind* already says whether it is a call to a routine (as opposed to a data or bss
+reference), so the call graph does not need a separate pass over the source: a routine's own
+relocations, read back, are exactly the routines it calls. The main block and the entry
+code are the two roots; everything not reachable from them is dead. Live routines are then
+copied down over the gaps the dead ones leave, and every surviving relocation is shifted by
+however much its own bytes moved.
+
+**Always on, no flag**, because the output has to stay deterministic and a flag would be a
+second code path nothing exercises by default. **Skipped under `--debug`**: the debug
+sidecar's addresses are written into it as the code is generated, line by line, long before
+this pass knows what will move where. Rewriting the sidecar afterwards would be a second
+serialisation of every address; instead a `--debug` build keeps every routine, so its
+addresses are exactly the ones the sidecar recorded. It is therefore larger than a plain
+build, and not byte-identical to it.
+
+Measured: `hello.wz` with an unused `import tls;` — nothing from `tls` is called, so none of
+it survives — drops from 348 KB to 56 KB. A program with most of its imported modules
+genuinely in use shrinks by a smaller fraction: `examples/mcpfiles.wz` goes from 847 KB with
+0.4.0 to 707 KB; `examples/serve.wz`, which uses less of what it imports, from 500 KB to
+257 KB.
 
 ### One syscall layer
 
@@ -140,7 +237,8 @@ rejected, because that is a function pointer, and nothing checks one.
 
 ### Debug info: the `.wzdbg` sidecar
 
-`--debug` writes the executable byte-identical to a normal build, plus a text sidecar,
+`--debug` writes the executable -- with every routine kept, since unused routines are only
+dropped from a plain build (see above) -- plus a text sidecar,
 `<output>.wzdbg`, that a debugger reads to map addresses to source and memory to variables.
 Own format, not DWARF: the only reader is a debugger for this compiler, and DWARF needs a
 library on both ends that this project does not carry.

@@ -23,7 +23,7 @@ command -v curl >/dev/null 2>&1 || { echo "curl is missing"; exit 1; }
 port=$(free_port)
 
 cat > "$T/outsrv.wz" <<EOF
-include "http.wz";
+import http;
 var big: array[0..699999] of char;   // 700000 > OUTBUF (524288), on purpose
 procedure app.request;
 var i: int;

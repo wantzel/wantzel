@@ -16,8 +16,8 @@
 // on THIS machine, which a fixed or $$-derived guess can never promise.
 //
 // Usage: freeport [count]   -- default 1, one port per line, ascending is not guaranteed
-include "io.wz";
-include "net.wz";
+import io;
+import net;
 
 const
   SYS_getsockname = 51;

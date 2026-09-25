@@ -13,7 +13,7 @@ long=total_installed_peak_power_of_a_photovoltaic_system_across_every_roof_surfa
 [ ${#long} -eq 100 ] || { echo "the test name is ${#long} characters, not 100"; exit 1; }
 
 cat > "$T/long.wz" <<WZ
-include "json.wz";
+import json;
 type AddArgs = schema
   a: int;
   b: int;
@@ -24,7 +24,7 @@ end;
 tools
   $long(AddArgs): AddResult "Add two whole numbers under a long name.";
 end;
-include "toolsmcp.wz";
+import toolsmcp;
 function tool.$long(a: array of AddArgs; r: array of AddResult): int;
 begin
   r[0].sum := a[0].a + a[0].b;

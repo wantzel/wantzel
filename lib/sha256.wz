@@ -1,7 +1,7 @@
 // lib/sha256.wz -- SHA-256 (FIPS 180-4).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // A streaming interface over one global state (sha256.init / update / final)
@@ -9,7 +9,7 @@
 // 64-bit ints and masked with band(.., 0xFFFFFFFF) after every add and shift;
 // nothing here allocates.
 
-include "io.wz";
+import io;
 
 var
   sha256.k:     array[0..63] of int;    // round constants, filled by sha256.setup

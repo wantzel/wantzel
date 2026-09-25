@@ -1,7 +1,7 @@
 // lib/kv.wz -- helpers for a small JSON object kept as compact text (the
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 // `info` field of typical entities: at most a few KB, scalar or small nested
 // values).
@@ -22,7 +22,7 @@
 // ANSWER A QUESTION restore it: kv.isobject, kv.count and kv.match.  Save
 // kv.vat/kv.vend yourself before any of the first group, never after.
 
-include "json.wz";
+import json;
 
 var
   kv.kat, kv.kend: int;      // current key without quotes

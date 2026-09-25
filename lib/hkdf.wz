@@ -1,7 +1,7 @@
 // lib/hkdf.wz -- HKDF (RFC 5869) and the TLS 1.3 key schedule (RFC 8446 §7.1).
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // HKDF IS TWO STEPS AND BOTH ARE JUST HMAC. Extract turns a shared secret of any shape into
@@ -16,8 +16,8 @@
 // fixed buffer -- info, a counter byte, the previous block -- so it needs a MAC over "the
 // first n bytes of this buffer", which len() cannot express. The length-aware HMAC is here.
 
-include "io.wz";
-include "sha256.wz";
+import io;
+import sha256;
 
 const
   HK.HASHLEN = 32;                   // SHA-256

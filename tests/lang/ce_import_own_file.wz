@@ -1,0 +1,3 @@
+// import with a file name that is no library module: a file of your own is included.
+import "helper.wz";
+begin end.

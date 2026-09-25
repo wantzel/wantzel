@@ -3,7 +3,7 @@
 // The point of the checks below is that formatting must not CHANGE the document.
 // A formatter that reparses numbers, drops escapes or reorders keys has edited the
 // file while claiming to format it, and that is worse than not formatting at all.
-include "json.wz";
+import json;
 var
   src: array[0..2047] of char;
   dst: array[0..8191] of char;

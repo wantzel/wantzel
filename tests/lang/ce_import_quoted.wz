@@ -1,0 +1,3 @@
+// import names a module: no quotes. The message gives the line to write.
+import "io";
+begin end.

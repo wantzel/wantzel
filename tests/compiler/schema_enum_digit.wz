@@ -5,8 +5,8 @@
 // declaration" -- a message naming the GENERATED file, which points a writer at something
 // they never wrote.  Levels like these come from an external schema and the writer cannot
 // choose them.
-include "io.wz";
-include "json.wz";
+import io;
+import json;
 type Reading = schema
   level: text of ("1", "2", "high");
   note:  text[16]?;

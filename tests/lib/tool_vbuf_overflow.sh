@@ -12,7 +12,7 @@
 . "$ROOT/tests/helpers.sh"
 
 cat > "$T/vbuf.wz" <<'WZ'
-include "json.wz";
+import json;
 type FillArgs = schema
   n: int "how many bytes to write into the view field";
 end;
@@ -22,7 +22,7 @@ end;
 tools
   fill(FillArgs): FillResult "Write n bytes of 'a' into the reply." readonly;
 end;
-include "toolsmcp.wz";
+import toolsmcp;
 function tool.fill(a: array of FillArgs; r: array of FillResult): int;
 var at, i: int;
 begin

@@ -1,0 +1,3 @@
+// import names a module: no quotes and no .wz. The message gives the line to write.
+import "io.wz";
+begin end.

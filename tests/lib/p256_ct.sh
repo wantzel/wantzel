@@ -47,8 +47,8 @@ trap cleanup EXIT
 
 # ---- 1. THE PRIMITIVES THEMSELVES -------------------------------------------------------------
 cat > "$tmp/prim.wz" <<'WZ'
-include "io.wz";
-include "p256.wz";
+import io;
+import p256;
 var a, b, r, f, t: array[0..P.N-1] of int;
     i, failures: int;
 begin
@@ -79,8 +79,8 @@ else bad "p256.cswap/p256.csel: $pfail check(s) failed"; fi
 # wantzel", SHA-256), then frozen here so this check needs no openssl at test time and pins
 # the exact bytes the constant-time rewrite must still accept.
 cat > "$tmp/kat.wz" <<'WZ'
-include "io.wz";
-include "p256.wz";
+import io;
+import p256;
 var e, qx, qy, r, s: array[0..P.N-1] of int;
 begin
   p256.setup;
@@ -102,9 +102,9 @@ else bad "the frozen known-answer signature does not verify" "the rewrite change
 # this is the check that they still compute the SAME answer across many different scalars,
 # not just the one KAT above and the single key tests/lib/p256.sh already exercises.
 cat > "$tmp/many.wz" <<'WZ'
-include "io.wz";
-include "rand.wz";
-include "p256.wz";
+import io;
+import rand;
+import p256;
 const N = 30;
 var d, qx, qy, e: array[0..P.N-1] of int;
     rs: array[0..N*P.N-1] of int;      // N slices of P.N limbs each; no array of array here

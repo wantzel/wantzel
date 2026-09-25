@@ -1,7 +1,7 @@
 // lib/store.wz -- durable tables of fixed-size records: an append-only log
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 // as the source of truth, a snapshot for fast starts, and the rows in memory
 // as one anonymous mapping per table so a row is read through a view.
@@ -54,7 +54,7 @@
 // Until that snapshot, the old records stay in the log and are converted at every open.
 // A store written before layout versions existed (snapshot 'PHS1') reads as layout 0.
 
-include "io.wz";
+import io;
 
 const
   STORE.MAXT = 64;

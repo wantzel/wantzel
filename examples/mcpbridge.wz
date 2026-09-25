@@ -9,7 +9,7 @@
 // that keeps running between sessions, over one keep-alive connection.
 
 
-include "net.wz";
+import net;
 
 const
   BUF = 1048576;

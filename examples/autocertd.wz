@@ -1,0 +1,195 @@
+// autocertd.wz -- a web server that gets its own Let's Encrypt certificate and keeps it.
+//
+//   autocertd <port80> <port443> <hostname> [options]
+//
+//     --staging               Let's Encrypt's staging authority (test certificates)
+//     --directory <url>       another ACME authority's directory URL
+//     --store <dir>           where keys and certificates live (default: certs/ beside the binary)
+//     --email <address>       a contact address for the account
+//     --ca <file.pem>         trust this root for the authority (a private authority);
+//                             without it, the machine's bundle or the built-in roots
+//     --pin <name>=<a.b.c.d>  use this address for the authority's name instead of DNS
+//     --check <seconds>       how often to look at the certificate (default: a day)
+//     --retry <seconds>       the first retry after a failure (default: an hour)
+//     --renew-days <days>     renew when fewer days are left (default: 30)
+//
+// ONE PROCESS, ONE LOOP, AND IT IS lib/http.wz's. http.https turns the port given to
+// http.listen into a TLS listener and adds the plain one: port 80 answers the authority's
+// challenge and redirects everyone else, port 443 serves the application over the
+// certificate, and the loop steps lib/autocert.wz between requests. No certbot, no cron, no
+// reverse proxy, no second process -- the challenge is answered by the listener that is
+// already there, and a renewed certificate is used by the next handshake without a restart.
+//
+// Everything below the option parsing is the whole server:
+//
+//   http.https(host, email, store, staging);
+//   http.serve(443, 1);
+//
+// This one calls http.listen and http.poll itself only to print LISTENING once the ports
+// are open, which is what its test waits for.
+//
+// ON A REAL MACHINE: an A record for the name, ports 80 and 443 reachable from the internet,
+// and run it as `autocertd 80 443 www.example.com --staging` first -- staging certificates
+// are not trusted by browsers, but staging has generous rate limits for trying things out.
+
+import io;
+import http;
+
+var
+  arg:  array[0..1023] of char;
+  argn: int;
+  host: array[0..255] of char;
+  hostn: int;
+  email: array[0..255] of char;
+  emailn: int;
+  store: array[0..1023] of char;
+  storen: int;
+  staging: bool;
+  cafile: array[0..262143] of char;
+  port80, port443, k, n: int;
+
+procedure die(m: str);
+begin
+  io.puts(STDERR, "autocert: ");
+  io.puts(STDERR, m);
+  io.puts(STDERR, "\n");
+  halt(2);
+end;
+
+function argis(s: str): bool;
+var j: int;
+begin
+  if argn <> slen(s) then return false;
+  j := 0;
+  while j < argn do
+  begin
+    if arg[j] <> schar(s, j) then return false;
+    j := j + 1;
+  end;
+  return true;
+end;
+
+// The next argument, into arg; dies when there is none.
+procedure value(at: int);
+begin
+  if at >= argc() then die("an option is missing its value");
+  argn := io.argstr(at, arg);
+end;
+
+function num: int;
+var j, v: int;
+begin
+  v := 0;
+  j := 0;
+  if argn = 0 then die("a number was expected");
+  while j < argn do
+  begin
+    if (arg[j] < '0') or (arg[j] > '9') then die("a number was expected");
+    v := v * 10 + (ord(arg[j]) - ord('0'));
+    j := j + 1;
+  end;
+  return v;
+end;
+
+// --pin name=a.b.c.d
+procedure pin;
+var eq, j, o, v: int;
+    ip: array[0..3] of int;
+begin
+  eq := 0;
+  while (eq < argn) and (arg[eq] <> '=') do eq := eq + 1;
+  if (eq = 0) or (eq >= argn) then die("--pin wants name=a.b.c.d");
+  o := 0; v := 0;
+  j := eq + 1;
+  while j < argn do
+  begin
+    if arg[j] = '.' then begin if o < 4 then ip[o] := v; o := o + 1; v := 0; end
+    else if (arg[j] >= '0') and (arg[j] <= '9') then v := v * 10 + (ord(arg[j]) - ord('0'))
+    else die("--pin wants name=a.b.c.d");
+    j := j + 1;
+  end;
+  if o <> 3 then die("--pin wants name=a.b.c.d");
+  ip[3] := v;
+  if not autocert.pin(arg[0..eq - 1], ip[0], ip[1], ip[2], ip[3]) then die("too many --pin");
+end;
+
+// --ca file.pem: the roots in it become THE trust store for the authority.
+procedure trustfile;
+var f, got, r: int;
+begin
+  arg[argn] := chr(0);
+  f := sys3(SYS.open, addr(arg[0]), O_RDONLY, 0);
+  if f < 0 then die("cannot read the --ca file");
+  got := 0;
+  while got < len(cafile) do
+  begin
+    r := sys3(SYS.read, f, addr(cafile[got]), len(cafile) - got);
+    if r <= 0 then break;
+    got := got + r;
+  end;
+  sys1(SYS.close, f);
+  if ch.addpem(cafile, 0, got) <= 0 then die("no certificate in the --ca file");
+end;
+
+// The application: reached only over HTTPS.
+procedure app.request;
+begin
+  if http.pathis("/") then
+  begin
+    http.add("hello over a certificate of mine\r\n");
+    http.finish(200, "text/plain");
+    return;
+  end;
+  http.add("not found\n");
+  http.finish(404, "text/plain");
+end;
+
+begin
+  if argc() < 4 then
+  begin
+    io.puts(STDERR, "usage: autocertd <port80> <port443> <hostname> [--staging] [--directory <url>]\n");
+    io.puts(STDERR, "                [--store <dir>] [--email <address>] [--ca <file.pem>]\n");
+    io.puts(STDERR, "                [--pin <name>=<a.b.c.d>] [--check <s>] [--retry <s>] [--renew-days <d>]\n");
+    halt(2);
+  end;
+  port80 := io.argn(1);
+  port443 := io.argn(2);
+  hostn := io.argstr(3, host);
+
+  // The options that belong to http.https are collected first; the ones for lib/autocert.wz
+  // itself are set after it, and all of them before the listeners open.
+  k := 4;
+  while k < argc() do
+  begin
+    argn := io.argstr(k, arg);
+    if argis("--staging") then staging := true
+    else if argis("--store") then begin value(k + 1); storen := io.argstr(k + 1, store); k := k + 1; end
+    else if argis("--email") then begin value(k + 1); emailn := io.argstr(k + 1, email); k := k + 1; end
+    else if argis("--directory") or argis("--ca") or argis("--pin") or argis("--check")
+            or argis("--retry") or argis("--renew-days") then k := k + 1
+    else die("unknown option");
+    k := k + 1;
+  end;
+  http.https(host[0..hostn - 1], email[0..emailn - 1], store[0..storen - 1], staging);
+  http.redirect(port80);
+
+  k := 4;
+  while k < argc() do
+  begin
+    argn := io.argstr(k, arg);
+    if argis("--directory") then begin value(k + 1); autocert.setdirectory(arg[0..argn - 1]); k := k + 1; end
+    else if argis("--ca") then begin value(k + 1); trustfile; k := k + 1; end
+    else if argis("--pin") then begin value(k + 1); pin; k := k + 1; end
+    else if argis("--check") then begin value(k + 1); autocert.settiming(num * 1000, 0, 0, 0); k := k + 1; end
+    else if argis("--retry") then begin value(k + 1); autocert.settiming(0, 0, num * 1000, 0); k := k + 1; end
+    else if argis("--renew-days") then begin value(k + 1); autocert.settiming(0, num * AUTOCERT.DAY, 0, 0); k := k + 1; end
+    else if argis("--store") or argis("--email") then k := k + 1;
+    k := k + 1;
+  end;
+
+  // The listeners open, and a certificate in the store is installed, before the first order:
+  // the authority may look for the token the moment the challenge is accepted.
+  http.listen(port443, 1);
+  io.puts(STDOUT, "LISTENING\n");
+  while true do n := http.poll(0 - 1);
+end.

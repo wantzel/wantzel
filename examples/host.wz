@@ -11,8 +11,8 @@
 //
 // The whole resolver is lib/dns.wz: UDP to the configured server, TCP when the answer is
 // truncated, CNAME chains followed, a bounded wait.
-include "io.wz";
-include "dns.wz";
+import io;
+import dns;
 
 var
   name: array[0..255] of char;

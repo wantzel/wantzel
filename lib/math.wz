@@ -1,7 +1,7 @@
 // lib/math.wz -- real arithmetic beyond the operators: exp, log, pow, the
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 // trigonometric functions, rounding, and fixed-decimal formatting.
 //
@@ -10,7 +10,7 @@
 // dependence on a C library.  Accuracy is a few units in the last place
 // over the ranges an energy model needs; see the notes per function.
 
-include "json.wz";
+import json;
 
 const
   MATH.PI  = 3.14159265358979323846;

@@ -1,7 +1,7 @@
 # lib/autocert.wz: a server that gets its certificate and keeps it, run through its whole life
 # against a local authority over HTTPS -- no internet.
 #
-# THE PIECES. examples/autocert.wz is the server under test: one loop, port 80 and 443, the
+# THE PIECES. examples/autocertd.wz is the server under test: one loop, port 80 and 443, the
 # module stepped from its timer. tests/helpers/acmesrv.wz is the authority, in the mode that
 # behaves like a real one: it validates LATER, from a child process, so the challenge is only
 # answered if the server keeps serving port 80 while its order is pending. In front of it,
@@ -68,8 +68,8 @@ frontkey=$(hexkey front.key); cakey=$(hexkey ca.key)
   || { echo "  FAIL  the ACME fixture does not compile"; exit 1; }
 "$here/bin/wantzel" "$here/tests/helpers/tlsfront.wz" tlsfront >/dev/null 2>&1 \
   || { echo "  FAIL  the TLS front does not compile"; exit 1; }
-"$here/bin/wantzel" "$here/examples/autocert.wz" autocert 2>cerr \
-  || { echo "  FAIL  examples/autocert.wz does not compile"; cat cerr; exit 1; }
+"$here/bin/wantzel" "$here/examples/autocertd.wz" autocert 2>cerr \
+  || { echo "  FAIL  examples/autocertd.wz does not compile"; cat cerr; exit 1; }
 
 ( cd ca && exec ../acmesrv "$caport" "$p80" "https://ca.example.com:$frontport" ../ca.der "$cakey" > ../ca.log 2>&1 ) &
 started="$started $!"

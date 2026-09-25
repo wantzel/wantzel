@@ -1,4 +1,4 @@
-# lib/schema.wz and examples/jsonschema.wz: JSON validated against a schema.
+# lib/jsonschema.wz and examples/jsoncheck.wz: JSON validated against a schema.
 #
 # WHAT JUDGES THE ANSWERS HERE, and it is weaker than elsewhere in this suite. Most files in
 # tests/lib have an independent implementation as arbiter -- openssl for the crypto, python
@@ -28,8 +28,8 @@ tmp=$(mktemp -d)
 cleanup() { rc=$?; rm -rf "$tmp" || true; exit $rc; }
 trap cleanup EXIT
 
-"$here/bin/wantzel" "$here/examples/jsonschema.wz" "$tmp/js" >/dev/null 2>&1 \
-  || { echo "  FAIL  examples/jsonschema.wz does not compile"; exit 1; }
+"$here/bin/wantzel" "$here/examples/jsoncheck.wz" "$tmp/js" >/dev/null 2>&1 \
+  || { echo "  FAIL  examples/jsoncheck.wz does not compile"; exit 1; }
 ok "the validator builds, $(stat -c %s "$tmp/js") bytes"
 
 # valid <schema-file> <json> <description>

@@ -12,8 +12,8 @@
 // Must stop at run time with exit status 1 and the message below; take the
 // `if pid <= 0 then io.fatal(...)` line out of proc.alive and this prints nothing and
 // exits 0 instead.
-include "io.wz";
-include "proc.wz";
+import io;
+import proc;
 begin
   io.puts(STDOUT, "calling proc.alive(0)\n");
   if proc.alive(0) then io.puts(STDOUT, "alive\n") else io.puts(STDOUT, "not alive\n");

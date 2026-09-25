@@ -58,8 +58,8 @@ MODN=$(echo "$modn" | hexesc); MOD2=$(echo "$mod2" | hexesc)
 SIG=$(echo "$sig" | hexesc);   DIG=$(echo "$dig" | hexesc)
 
 cat > "$tmp/t.wz" <<WZ
-include "io.wz";
-include "rsa.wz";
+import io;
+import rsa;
 var nb, n2b, sb: array[0..299] of char;
     db: array[0..63] of char;
     eb: array[0..7] of char;

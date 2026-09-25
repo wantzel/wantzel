@@ -1,7 +1,7 @@
 // lib/time.wz -- calendar time without a time zone.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // A moment is an int: seconds since 1970-01-01T00:00:00Z, negative before
@@ -9,7 +9,7 @@
 // no zones, no DST and no leap seconds.  The day arithmetic (Hinnant's
 // days-from-civil) is exact for years 1..9999 and well beyond.
 
-include "io.wz";
+import io;
 
 var
   time.year, time.month, time.day: int;       // month 1..12, day 1..31

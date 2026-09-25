@@ -5,7 +5,7 @@
 // that was simply bigger than the scratch buffer was reporting the wrong reason. The
 // flag must be reset on every call, so a true from an earlier oversized document does not
 // survive into a later, ordinary failure.
-include "json.wz";
+import json;
 var
   buf: array[0..8191] of char;
   n: int;

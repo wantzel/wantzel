@@ -2,10 +2,10 @@
 // handshake, or in the middle of a record, costs tls.deadline and not forever. The peer is
 // this same process -- a connection it accepts and then never serves -- so nothing runs in
 // the background and nothing is left behind.
-include "io.wz";
-include "net.wz";
-include "proc.wz";
-include "tls.wz";
+import io;
+import net;
+import proc;
+import tls;
 
 var
   lfd, port, tries, c, sv, t0, ms, n: int;

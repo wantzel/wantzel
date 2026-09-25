@@ -1,26 +1,26 @@
 // lib/tools.wz -- MCP and REST glue for a declared `tools` block.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
-// Include this after the tools block.  It is lib/toolsmcp.wz (app.tools and app.call,
+// Import this after the tools block.  It is lib/toolsmcp.wz (app.tools and app.call,
 // the two hooks lib/mcp.wz leaves open) plus tool.rest, which answers the same table
 // over REST -- and therefore it brings lib/http.wz, whose app.request the program must
-// define.  A server that only speaks MCP over stdio includes lib/toolsmcp.wz instead
+// define.  A server that only speaks MCP over stdio imports toolsmcp instead
 // and needs no app.request.
 //
 //   schema ...;  tools ... end;
-//   include "lib/tools.wz";
+//   import tools;
 //   <the handlers tool.<name>(a, r)>
 //   procedure app.request; ... tool.rest("/tools/") ...
 //
 // The generated tool.run writes the result JSON; toolsmcp.wz wraps it as an MCP tool
-// result and this file as a REST body.  For the MCP endpoint itself over HTTP, include
-// lib/mcphttp.wz and call mcp.http from app.request.
+// result and this file as a REST body.  For the MCP endpoint itself over HTTP, import
+// mcphttp and call mcp.http from app.request.
 
-include "toolsmcp.wz";
-include "http.wz";
+import toolsmcp;
+import http;
 
 // Where the value of the leading "result" key starts, or -1 when the object does not
 // begin with one.  tool.listend is set to just past that value.

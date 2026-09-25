@@ -3,7 +3,7 @@
 // authority that speaks the protocol.
 //
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
-// changes every program that includes it, so it moves under a ticket rather than in
+// changes every program that imports it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
 //
 // WHAT IT JOINS. lib/acme.wz builds and reads the protocol messages, lib/jws.wz signs them,
@@ -60,13 +60,13 @@
 // WHAT IS NOT HERE: DNS-01 (only needed for wildcards, and it needs a DNS provider's API),
 // several names in one certificate, revocation, account key rollover.
 
-include "io.wz";
-include "net.wz";
-include "chain.wz";
-include "tls.wz";
-include "acme.wz";
-include "certstore.wz";
-include "dns.wz";
+import io;
+import net;
+import chain;
+import tls;
+import acme;
+import certstore;
+import dns;
 
 const
   AUTOCERT.PRODUCTION = "https://acme-v02.api.letsencrypt.org/directory";

@@ -9,7 +9,7 @@
 // character, because a hex escape there keeps eating hex digits -- so a generator cannot
 // write a byte and then a literal hex character without changing what it wrote. Here it
 // is three characters: A, B, C.
-include "io.wz";
+import io;
 var
   s: str;
   c: char;

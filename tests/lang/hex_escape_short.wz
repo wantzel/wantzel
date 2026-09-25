@@ -1,6 +1,6 @@
 // Must not compile: one hex digit is not two. "\x4" ends the escape at the closing quote,
 // which is exactly the case a variable-length escape would have accepted silently.
-include "io.wz";
+import io;
 var s: str;
 begin
   s := "\x4";

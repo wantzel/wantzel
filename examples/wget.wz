@@ -20,10 +20,10 @@
 // unless --insecure is given. A tool that quietly accepts anything is worse than one with no
 // encryption at all, because it looks safe.
 
-include "io.wz";
-include "net.wz";
-include "dns.wz";
-include "tls.wz";
+import io;
+import net;
+import dns;
+import tls;
 
 const
   MAXBODY = 1048576;

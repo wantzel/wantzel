@@ -18,7 +18,7 @@
 . "$ROOT/tests/helpers.sh"
 
 cat > "$T/srv.wz" <<'WZ'
-include "json.wz";
+import json;
 type AddArgs = schema
   a: int "the left operand";
   b: int "the right operand";
@@ -30,7 +30,7 @@ end;
 tools
   add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
 end;
-include "tools.wz";
+import tools;
 function tool.add(a: array of AddArgs; r: array of AddResult): int;
 begin
   r[0].sum := a[0].a + a[0].b;
@@ -106,7 +106,7 @@ assert_contains "but the caller is told which field was dropped" "$optrenamed" '
 # No socket and no port: every piece of state tool.rest reads is a global, so the request
 # can be staged directly.  That keeps this test safe to run beside anything else.
 cat > "$T/rest.wz" <<'WZ'
-include "json.wz";
+import json;
 type AddArgs = schema
   a: int;
   b: int;
@@ -117,7 +117,7 @@ end;
 tools
   add(AddArgs): AddResult "Add two whole numbers." readonly idempotent;
 end;
-include "tools.wz";
+import tools;
 function tool.add(a: array of AddArgs; r: array of AddResult): int;
 begin
   r[0].sum := a[0].a + a[0].b;

@@ -4,8 +4,8 @@
 //   resolveprobe <port>
 //
 // One line per name: "<name> <a.b.c.d>", or "<name> FAIL <why>: <detail>".
-include "io.wz";
-include "autocert.wz";
+import io;
+import autocert;
 
 var
   port: int;

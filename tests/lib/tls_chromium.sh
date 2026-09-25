@@ -25,17 +25,22 @@ pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL  $1"; }
 
+# A candidate counts only when it actually starts: on Ubuntu, /usr/bin/chromium-browser is a
+# shell script that merely says the chromium snap is missing, and picking it made this test
+# fail on a machine that had a working browser further down the list.
+runs() { [ -x "$1" ] && timeout 20 "$1" --version >/dev/null 2>&1; }
+
 browser=""
-if [ -n "${CHROMIUM:-}" ] && [ -x "$CHROMIUM" ]; then browser=$CHROMIUM; fi
+if [ -n "${CHROMIUM:-}" ] && runs "$CHROMIUM"; then browser=$CHROMIUM; fi
 if [ -z "$browser" ]; then
   for name in chrome-headless-shell chromium chromium-browser google-chrome google-chrome-stable; do
-    if command -v "$name" >/dev/null 2>&1; then browser=$(command -v "$name"); break; fi
+    if command -v "$name" >/dev/null 2>&1 && runs "$(command -v "$name")"; then browser=$(command -v "$name"); break; fi
   done
 fi
 if [ -z "$browser" ]; then
   for f in "$HOME"/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell \
            "$HOME"/.cache/ms-playwright/chromium-*/chrome-linux64/chrome; do
-    if [ -x "$f" ]; then browser=$f; break; fi
+    if runs "$f"; then browser=$f; break; fi
   done
 fi
 if [ -z "$browser" ]; then

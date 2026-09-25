@@ -16,9 +16,9 @@
 // Linux only, like the rest of the fixture: it blocks the accepted socket and bounds its
 // reads with SO_RCVTIMEO.
 
-include "io.wz";
-include "net.wz";
-include "tls.wz";
+import io;
+import net;
+import tls;
 
 var
   cert:  array[0..8191] of char;

@@ -18,8 +18,8 @@
 // floor. The interesting figure is the DIFFERENCE between that floor and a real program,
 // so always measure an empty program in the same run.
 
-include "io.wz";
-include "proc.wz";
+import io;
+import proc;
 
 var
   path: array[0..1023] of char;

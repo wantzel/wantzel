@@ -10,7 +10,7 @@
 //
 // So an arm whose body is itself an `if` without its own `else` swallows the rest of
 // the chain. Put begin/end around it. Section 6 shows both, side by side.
-include "io.wz";
+import io;
 
 var
   n, out: int;

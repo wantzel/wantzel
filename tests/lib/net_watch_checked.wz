@@ -1,7 +1,7 @@
 // lib/net.wz: net.watch and net.nonblock report failure instead of losing it silently.
 // An unwatched fd is a connection that is never served, so the result must be testable.
-include "io.wz";
-include "net.wz";
+import io;
+import net;
 var ep, s, closed: int;
 procedure yes(s2: str; b: bool);
 begin

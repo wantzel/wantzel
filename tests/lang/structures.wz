@@ -7,7 +7,7 @@
 // four stops matching its expected answer, the suite says so.
 
 
-include "io.wz";
+import io;
 
 const
   MAXN  = 64;

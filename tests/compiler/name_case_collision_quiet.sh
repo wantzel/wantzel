@@ -10,7 +10,7 @@
 . "$ROOT/tests/helpers.sh"
 
 cat > "$T/same.wz" <<'WZ'
-include "store.wz";
+import store;
 const
   store.set = 1;
 begin

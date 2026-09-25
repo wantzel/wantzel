@@ -11,8 +11,8 @@
 //
 // The key is a string literal before the colon, which needs no new keyword: a literal cannot
 // appear in that position otherwise, so it cannot collide with a name.
-include "io.wz";
-include "json.wz";
+import io;
+import json;
 
 type Reg = schema
   rdx:          int;

@@ -6,6 +6,6 @@
 // was gone before its own trap could fire. The guard was present and correct; it was
 // unreachable. See str_zeroed.wz for the other half -- slen() ANSWERS 0, because an empty
 // string has length 0, but it has no character at position 0.
-include "io.wz";
+import io;
 var s: str;
 begin io.putn(STDOUT, ord(schar(s, 0))); end.

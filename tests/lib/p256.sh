@@ -59,9 +59,9 @@ pad() { printf '%064s' "$1" | tr ' ' '0'; }
 sr=$(pad "$sr"); ss=$(pad "$ss")
 
 cat > "$tmp/t.wz" <<WZ
-include "io.wz";
-include "rand.wz";
-include "p256.wz";
+import io;
+import rand;
+import p256;
 var e, r, s, qx, qy, bad1: array[0..P.N-1] of int;
     u, v, slow, fast: array[0..P.N-1] of int;
     sig1r, sig1s: array[0..P.N-1] of int;
@@ -215,8 +215,8 @@ end.
 WZ
 
 cat > "$tmp/signer.wz" <<WZ
-include "io.wz";
-include "p256.wz";
+import io;
+import p256;
 var d, qx, qy, e: array[0..P.N-1] of int;
     hash: array[0..31] of char;
     b: array[0..63] of char;

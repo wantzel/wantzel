@@ -11,9 +11,9 @@
 // entirely inside one group and skew only its median, which is indistinguishable from a
 // real timing difference. Alternating low, high, low, high spreads any such hiccup across
 // both groups, so it moves both medians together instead of just one.
-include "io.wz";
-include "rand.wz";
-include "p256.wz";
+import io;
+import rand;
+import p256;
 
 const REPS = 15;    // odd, so the middle index is an unambiguous median
 

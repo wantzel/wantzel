@@ -5,10 +5,10 @@
 //
 // Same pattern as tests/lib/tls_deadline.wz: the peer is this same process, connected
 // through a real socket pair, so nothing runs in the background and nothing is left over.
-include "io.wz";
-include "net.wz";
-include "dns.wz";
-include "proc.wz";
+import io;
+import net;
+import dns;
+import proc;
 
 var
   lfd6, lfd4, port, tries, c, sv, n, at: int;

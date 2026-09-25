@@ -48,10 +48,10 @@ cd "$tmp"
 port=$(free_port)
 
 cat > "$tmp/t.wz" <<WZ
-include "io.wz";
-include "net.wz";
-include "csr.wz";
-include "tls.wz";
+import io;
+import net;
+import csr;
+import tls;
 var ts: array[0..15] of char;
     host: array[0..63] of char;
     d, qx, qy: array[0..P.N-1] of int;

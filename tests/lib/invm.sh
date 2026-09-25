@@ -36,8 +36,8 @@ cleanup() { rc=$?; rm -rf "$tmp" || true; exit $rc; }
 trap cleanup EXIT
 
 cat > "$tmp/t.wz" <<'WZ'
-include "io.wz";
-include "p256.wz";
+import io;
+import p256;
 var a, r, chk: array[0..P.N-1] of int;
     i, t0, t1, failures: int;
     rb: array[0..31] of char;

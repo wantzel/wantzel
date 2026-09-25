@@ -1,0 +1,188 @@
+// lib/store.wz and lib/hash.wz: tables of records with an append-only log, replay
+// after an unclean stop, snapshots, a torn log tail, capacity, and a hash index
+// rebuilt from the rows.
+//
+// The working directory carries the PROCESS ID (st_test_<pid>.d) rather than a fixed
+// name.  With a fixed name two concurrent runs collided on the same files -- this suite
+// fell over while another one was running, and on its own the same test was always green.
+// A test that depends on someone else's timing is a bug, not noise.
+import store;
+import hash;
+import fs;
+type
+  Item = record
+    id: array[0..15] of char;      // uuid-like key
+    kind: int;
+    value: real;
+    name: array[0..31] of char;
+    name_n: int;
+  end;
+const
+  ISIZE = 16 + 8 + 8 + 32 + 8;     // 72 = the record size (fields on their alignment)
+var
+  tab, i, n, row, fd: int;
+  it: Item;
+  idx.keys: array[0..16 * 256 - 1] of char;
+  idx.rows: array[0..255] of int;
+  dir: array[0..31] of char;
+  dirn: int;
+  path: array[0..63] of char;
+  buf: array[0..255] of char;
+procedure show(s: str; v: int);
+begin
+  io.puts(STDOUT, s); io.putn(STDOUT, v); io.puts(STDOUT, "\n");
+end;
+procedure setkey(k: int);
+var i: int;
+begin
+  for i := 0 to 15 do it.id[i] := chr(band(k * 7 + i * 13, 255));
+end;
+procedure keyof(k: int);            // buf[0..15] := the key of item k
+var i: int;
+begin
+  for i := 0 to 15 do buf[i] := chr(band(k * 7 + i * 13, 255));
+end;
+// fill the row view from a record: a record passes as a one-element view
+procedure copyto(dst: array of Item);
+begin
+  dst[0] := it;
+end;
+procedure copyfrom(src: array of Item);
+begin
+  it := src[0];
+end;
+function put(k: int; kind: int; v: real): int;
+var row: int;
+begin
+  row := store.alloc(tab);
+  if row < 0 then return -1;
+  setkey(k);
+  it.kind := kind;
+  it.value := v;
+  it.name_n := io.push(it.name, 0, "item");
+  it.name_n := io.pushnum(it.name, it.name_n, k);
+  copyto(view(store.rowaddr(tab, row), 1));
+  if not store.set(tab, row, view(store.rowaddr(tab, row), ISIZE)) then return -2;
+  return row;
+end;
+procedure rebuildindex;
+var r: int;
+begin
+  hash.clear(idx.rows);
+  for r := 0 to store.high(tab) - 1 do
+    if store.live(tab, r) then
+    begin
+      copyfrom(view(store.rowaddr(tab, r), 1));
+      if not hash.put(idx.keys, idx.rows, 16, it.id, r) then show("index full at ", r);
+    end;
+end;
+function find(k: int): int;
+begin
+  keyof(k);
+  return hash.get(idx.keys, idx.rows, 16, buf[0..15]);
+end;
+procedure openstore;
+begin
+  tab := store.table("items", ISIZE, 100);
+  if not store.opendir(dir[0..dirn - 1]) then begin io.puts(STDOUT, store.err); io.puts(STDOUT, "\n"); halt(1); end;
+end;
+// The path <workdir>/<suffix> in `path`, nul-terminated; returns the length without the
+// nul.  Everything goes through here so the directory name lives in ONE place (dirn/dir,
+// with the pid in it).
+function inwork(suffix: str): int;
+var n: int;
+begin
+  n := io.push(path, 0, "");
+  for n := 0 to dirn - 1 do path[n] := dir[n];
+  n := io.push(path, dirn, "/");
+  n := io.push(path, n, suffix);
+  path[n] := chr(0);
+  return n;
+end;
+procedure filesize(suffix: str);
+begin
+  if fs.stat(addr(path[0])) then show(suffix, fs.size) else show(suffix, -1);
+end;
+begin
+  // The working directory carries the PROCESS ID: with a fixed name two concurrent runs
+  // collided on the same files, and this test also removes them midway to imitate an
+  // unclean stop.  SYS.getpid lives in lib/io.wz.
+  dirn := io.push(dir, 0, "st_test_");
+  dirn := io.pushnum(dir, dirn, sys1(SYS.getpid, 0));
+  dirn := io.push(dir, dirn, ".d");
+  // a clean start: remove leftovers of an earlier run
+  n := inwork("store.log"); sys1(SYS.unlink, addr(path[0]));
+  n := inwork("store.snap"); sys1(SYS.unlink, addr(path[0]));
+  show("record size = ", addr(it.name_n) - addr(it.id[0]) + 8);
+  openstore;
+  show("count after open = ", store.count(tab));
+  for i := 1 to 10 do
+  begin
+    row := put(i, i mod 3, real(i) * 1.5);
+    if row < 0 then show("put failed ", row);
+  end;
+  show("count = ", store.count(tab));
+  show("high = ", store.high(tab));
+  if store.del(tab, 3) then show("del row 3 ", 1) else show("del row 3 ", 0);
+  show("count after del = ", store.count(tab));
+  show("alloc reuses = ", store.alloc(tab));               // 3
+  rebuildindex;
+  show("find item 5 -> row ", find(5));
+  show("find item 4 (deleted) -> ", find(4));
+  copyfrom(view(store.rowaddr(tab, find(7)), 1));
+  show("item 7 value x10 = ", trunc(it.value * 10.0));
+  io.out(STDOUT, addr(it.name[0]), it.name_n); io.puts(STDOUT, "\n");
+  // an unclean stop: close without a snapshot, reopen, replay the log
+  store.close;
+  openstore;
+  show("replayed count = ", store.count(tab));
+  if store.live(tab, 2) then show("replayed live 2 = ", 1) else show("replayed live 2 = ", 0);
+  if store.live(tab, 3) then show("replayed live 3 = ", 1) else show("replayed live 3 = ", 0);
+  rebuildindex;
+  copyfrom(view(store.rowaddr(tab, find(10)), 1));
+  show("replayed item 10 kind = ", it.kind);
+  // snapshot, add more, reopen: snapshot + log tail
+  if store.snapshot then show("snapshot ", 1) else show("snapshot ", 0);
+  n := inwork("store.log"); filesize("store.log");
+  row := put(11, 9, 11.0);
+  store.close;
+  openstore;
+  show("after snapshot+tail count = ", store.count(tab));
+  rebuildindex;
+  show("find item 11 -> row ", find(11));
+  // a torn tail: append garbage bytes to the log, reopen: the good records survive
+  store.close;
+  n := inwork("store.log");
+  fd := sys3(SYS.open, addr(path[0]), bor(O_WRONLY, O_APPEND), 0);
+  sys3(SYS.write, fd, sadr("PXL1garbage"), 11);
+  sys1(SYS.close, fd);
+  openstore;
+  show("torn tail count = ", store.count(tab));
+  row := put(12, 1, 12.0);
+  show("put after torn tail row = ", row);
+  store.close;
+  openstore;
+  show("count after repair = ", store.count(tab));
+  // capacity
+  n := 0;
+  while put(100 + n, 0, 0.0) >= 0 do n := n + 1;
+  show("filled up to = ", store.count(tab));
+  // hash table details
+  hash.clear(idx.rows);
+  for i := 1 to 170 do
+  begin
+    keyof(i);
+    if not hash.put(idx.keys, idx.rows, 16, buf[0..15], i) then begin show("hash refuses beyond 70% at ", i); break; end;
+  end;
+  keyof(17); if hash.del(idx.keys, idx.rows, 16, buf[0..15]) then show("hash del ", 1) else show("hash del ", 0);
+  show("hash get deleted ", hash.get(idx.keys, idx.rows, 16, buf[0..15]));
+  keyof(18); show("hash get 18 ", hash.get(idx.keys, idx.rows, 16, buf[0..15]));
+  if hash.putpad(idx.keys, idx.rows, 16, "short", 999) then show("padded put ", 1) else show("padded put ", 0);
+  show("padded get = ", hash.getpad(idx.keys, idx.rows, 16, "short"));
+  store.close;
+  n := inwork("store.log"); sys1(SYS.unlink, addr(path[0]));
+  n := inwork("store.snap"); sys1(SYS.unlink, addr(path[0]));
+  // the directory itself, not a file in it: so dir and not inwork
+  for n := 0 to dirn - 1 do path[n] := dir[n];
+  path[dirn] := chr(0); show("rmdir = ", sys1(SYS.rmdir, addr(path[0])));
+end.
