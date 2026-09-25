@@ -5,8 +5,8 @@
 <h1 align="center">Wantzel</h1>
 
 <p align="center">
-  <strong>A programming language for the code AI agents write.</strong><br>
-  Strict, fast and verbose. No dependencies. Errors an agent can act on.
+  <strong>A programming language built for AI-written code.</strong><br>
+  Compiles in milliseconds. Static binaries. Strict checks and clear errors.
 </p>
 
 <p align="center">
@@ -19,17 +19,16 @@
 
 ---
 
-Wantzel compiles in milliseconds into a static binary that needs almost no memory to run.
-It refuses anything it cannot prove correct, and says why. That makes it a language agents
-can write, and iterate on in large numbers, on the machine you already have.
+Wantzel compiles to small, dependency-free binaries. Invalid programs are rejected with the
+file, line and reason, so an agent can correct mistakes after every change.
 
 1. Your agent writes a program.
-2. `wantzel` answers in milliseconds: a static binary, or the file, line and reason it refused.
-3. The agent corrects the code and compiles again.
+2. `wantzel` returns a binary or a clear error in milliseconds.
+3. The agent corrects the code and tries again.
 
 The compiler is written in Wantzel and compiles itself. It emits static x86-64 Linux
-executables directly: no assembler, no linker, no C library, no runtime.
-On Windows, run it under WSL2.
+executables directly, without an assembler, linker, C library or runtime. Windows users run
+it under WSL2.
 
 > **Early days.** Anything may change before 1.0: the language, the library and the command
 > line.
@@ -44,10 +43,10 @@ mv wantzel-linux-x86_64 wantzel && chmod +x wantzel
 ./wantzel --version
 ```
 
-That one file is the compiler **and** the complete standard library: nothing to install,
-no `lib/` directory, no archive, nothing to build. `./wantzel --lib` lists the modules
-inside it, and `./wantzel --lib io` prints the source of one. To call it as `wantzel` from
-anywhere, move it to a directory on your `PATH`, for example `~/.local/bin/`.
+That file contains the compiler and the complete standard library. There is nothing else to
+install or build. `./wantzel --lib` lists the embedded modules; `./wantzel --lib io` prints
+one. Move the binary to a directory on your `PATH`, such as `~/.local/bin/`, to call it as
+`wantzel` from anywhere.
 
 ## A first program
 
@@ -64,9 +63,9 @@ $ ./wantzel hello.wz hello && ./hello
 hello, world
 ```
 
-`import io;` takes a module from the library in the compiler; `include "mine.wz";` reads a
-file of your own, next to the file that names it. The result is a static executable of
-about 2 kB. When something is wrong, the compiler says where and what, in one line:
+`import io;` loads a module embedded in the compiler. `include "mine.wz";` reads one of your
+own files. The result is a static executable of about 2 kB. Invalid code gets one clear
+error:
 
 ```console
 $ ./wantzel oops.wz oops
@@ -77,17 +76,20 @@ wantzel: oops.wz:6: type error in assignment: expected int, found str
 
 | | |
 |---|---|
-| **Compile speed** | The compiler builds its own 8,100 lines in about 10 ms: fast enough to compile on every change, inside the loop rather than after it. |
-| **No dependencies** | One static binary, and every program it produces is one too. Nothing to install per agent, nothing to tear down. |
-| **Small at run time** | No runtime, no garbage collector, no virtual machine. |
-| **Strict and verbose** | What it refuses, nobody has to review. What it accepts, it accepts in silence. Otherwise: the file, the line and the reason. |
-| **HTTPS with nothing linked** | TLS 1.3 written in the language itself: X25519, ChaCha20-Poly1305, ECDSA P-256/P-384, RSA, chain verification and a trust store. [`examples/autocertd.wz`](examples/autocertd.wz) serves HTTP and HTTPS and gets and renews its own Let's Encrypt certificate from one event loop. |
+| **Fast feedback** | The compiler builds its own 8,100 lines in about 10 ms. |
+| **No dependencies** | The compiler and generated programs are static Linux binaries. No packages or runtime to install. |
+| **Small at run time** | No virtual machine or garbage collector. |
+| **Clear errors** | Rejected code reports the file, line and reason. |
+
+Two languages shaped Wantzel. *Turbo Pascal* showed how immediate an edit-run loop can feel.
+*Go* showed the value of shipping one static binary. One shaped the feedback loop; the other
+shaped the result.
 
 ## What is in the box
 
-The standard library — its source in [`lib/`](lib/), and all of it inside the compiler file —
-covers what a networked tool needs, with no C underneath: files and processes, JSON and JSON Schema, an HTTP server, WebSocket on the same
-port, an MCP server over stdio or HTTP, OAuth, TLS 1.3, ACME, and a persistent store.
+The embedded standard library covers files, processes, JSON, HTTP, WebSocket, MCP, OAuth,
+TLS 1.3, ACME and persistent storage. Its source is in [`lib/`](lib/); none of it calls into
+C.
 
 A tool is one declared line; the compiler generates its JSON Schema, argument parsing,
 dispatch and result writing.
@@ -98,14 +100,13 @@ tools
 end;
 ```
 
-[`examples/`](examples/) holds single-file programs you can read in one sitting, among them
-an MCP server, an HTTP server, an HTTPS client and server, and a file server over MCP.
+[`examples/`](examples/) contains complete single-file programs, including MCP and HTTP
+servers, an HTTPS client and server, and a file server over MCP.
 
 ## Build from source
 
-You need `git`, a C compiler that answers to `cc` (gcc or clang), and a POSIX shell with the
-usual coreutils — `sha256sum` among them. The C compiler is used once, for
-`bootstrap/boot.c`; nothing else is linked or installed.
+You need `git`, a C compiler available as `cc`, and a POSIX shell with coreutils, including
+`sha256sum`. The C compiler is used once to build `bootstrap/boot.c`.
 
 ```sh
 git clone https://github.com/wantzel/wantzel
@@ -113,25 +114,23 @@ cd wantzel && ./build.sh
 ./bin/wantzel examples/hello.wz hello && ./hello
 ```
 
-What `./build.sh` does, in well under a second:
+`./build.sh` completes these steps in well under a second:
 
-1. `cc` builds `bootstrap/boot.c` — a small C compiler for just the part of the language the
-   compiler's own source uses — into `bin/wantzel0`.
-2. `wantzel0` compiles `src/wantzel.wz` into stage 1; stage 1 compiles it into stage 2;
-   stage 2 compiles it once more into stage 3.
-3. Stage 2 and stage 3 must be byte-identical: the fixed point, the compiler reproducing
-   itself exactly. If they differ, the build stops.
-4. The standard library in `lib/` is packed and appended to stage 3, every module is read
-   back and compared with its file, and the result becomes `bin/wantzel`.
+1. `cc` builds the minimal bootstrap compiler as `bin/wantzel0`.
+2. The bootstrap compiles `src/wantzel.wz`. That compiler compiles stage 2, which compiles
+  stage 3.
+3. Stage 2 and stage 3 must be byte-identical. The build stops if the compiler cannot
+  reproduce itself exactly.
+4. The build embeds the standard library in stage 3, reads every module back and compares
+  it with its source. The result becomes `bin/wantzel`.
 
-To check it yourself — the fixed point, the bootstrap and the whole suite:
+To check the bootstrap, fixed point and full suite:
 
 ```sh
 ./wztest --toolchain
 ```
 
-A release is reproducible: the tag of a release builds, on any machine, to exactly the
-published file.
+Each release tag builds to the exact published file:
 
 ```sh
 tag=$(git describe --tags --abbrev=0)                  # the newest release
@@ -147,7 +146,7 @@ cp bin/wantzel wantzel-linux-x86_64 && sha256sum -c SHA256SUMS
 | [Language](docs/language.md) | the binding specification, opening with a tour |
 | [Syntax](docs/syntax.md) | keywords and spelling, as a reference |
 | [Command line](docs/flags.md) | every flag, and what deliberately has none |
-| [Writing Wantzel](docs/writing-wantzel.md) | the pitfalls, and how to get from an error to its cause |
+| [Writing Wantzel](docs/writing-wantzel.md) | common mistakes and how to diagnose them |
 | [Library](docs/library.md) | the standard library: every module, and the routines of each |
 | [Conventions](docs/conventions.md) | how to lay out a project |
 | [Testing](docs/testing.md) | the suite, and how to add to it |
@@ -160,7 +159,7 @@ cp bin/wantzel wantzel-linux-x86_64 && sha256sum -c SHA256SUMS
 | | |
 |---|---|
 | `src/` | the compiler, in Wantzel |
-| `bootstrap/boot.c` | a small C compiler, used once to build the first binary -- just enough of the language to compile `src/` itself, for Linux |
+| `bootstrap/boot.c` | the minimal C compiler used once to compile `src/` for Linux |
 | `bootstrap/libpack.wz` | packs `lib/` into the trailer `build.sh` appends to the compiler |
 | `lib/` | the standard library, as source; `build.sh` packs it into the compiler |
 | `examples/` | single-file programs |
