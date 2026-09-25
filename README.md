@@ -23,12 +23,9 @@ Wantzel compiles in milliseconds into a static binary that needs almost no memor
 It refuses anything it cannot prove correct, and says why. That makes it a language agents
 can write, and iterate on in large numbers, on the machine you already have.
 
-```
-your agent  ──writes──▶  wantzel  ──▶  a static binary
-     ▲                      │
-     └────────corrects──────┘  or: file, line and reason
-                            — in milliseconds
-```
+1. Your agent writes a program.
+2. `wantzel` answers in milliseconds: a static binary, or the file, line and reason it refused.
+3. The agent corrects the code and compiles again.
 
 The compiler is written in Wantzel and compiles itself. It emits static x86-64 Linux
 executables directly: no assembler, no linker, no C library, no runtime.
