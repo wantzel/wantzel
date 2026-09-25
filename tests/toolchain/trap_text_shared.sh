@@ -1,7 +1,7 @@
 # The fixed part of a runtime message is stored ONCE, not once per check.
 #
 # Every bounds check, chr() range, division and missing return carries a message. Storing the
-# whole sentence per check made those messages a quarter of a GUI binary: six distinct texts,
+# whole sentence per check made those messages a quarter of a large binary: six distinct texts,
 # 345 copies, differing only in the file name and line number.
 #
 # The heading is now shared and the trap routine writes it before the place. This test pins

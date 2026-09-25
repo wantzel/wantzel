@@ -1,12 +1,13 @@
-# The complete programs in docs/writing-wantzel.md and docs/library.md must compile.
+# The complete programs in docs/writing-wantzel.md, docs/library.md and docs/syntax.md
+# must compile, and so must the declaration blocks in docs/syntax.md.
 #
 # A code block that reads as a whole program is there to be COPIED. Someone takes it,
 # pastes it, and expects it to work; that is what "a complete program" promises and what
 # a fragment does not. A block that does not compile is worse than no block, because the
 # reader assumes the fault is theirs.
 #
-# Two different ways to spot "a whole program" are used below, matching how the two
-# kinds of document are written:
+# Three different ways to spot "a whole program" are used below, matching how the
+# documents are written:
 #   - in docs/writing-wantzel.md, only the blocks under a "### A whole ..." heading are
 #     checked; the other code in that file is deliberately fragmentary -- a routine, a
 #     loop, a pattern -- and wrapping those in a program would test the wrapper, not the
@@ -14,6 +15,15 @@
 #   - in docs/library.md, every fenced pascal block that contains its own "end." line is
 #     checked, regardless of heading; the standard-library reference mixes short complete
 #     examples with fragments inline, so the heading text is not a reliable marker there.
+#   - in docs/syntax.md, the one block with its own "end." line (the "A program" example)
+#     is checked as-is; the `var`/`const`/`type` blocks under "Types" and "Declaring" are
+#     checked by wrapping each in a minimal `begin end.` -- declarations are exactly where
+#     a doc example once carried a type the compiler does not accept (a nested array), and a
+#     declaration-only fragment is still meant to be copied into a real program's `var`
+#     section, so it must be legal on its own. The other blocks in syntax.md (statements
+#     that name undeclared variables, the schema/tools example that references a result
+#     type the page never declares, comment/literal listings) are left alone, same as the
+#     fragments in writing-wantzel.md -- wrapping them would test the wrapper, not the page.
 . "$ROOT/tests/helpers.sh"
 cd "$ROOT"
 
@@ -95,3 +105,57 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < "$libdoc"
 
 echo "$m complete programs from docs/library.md, all compiled"
+
+# docs/syntax.md -- the form-only reference. One fenced pascal block is a complete
+# program (it has "A program" as its heading and its own "end." line); the type/const/var
+# blocks under "Types" and "Declaring" are declaration-only fragments, each wrapped here in
+# a minimal `begin end.` so it must still be legal on its own -- this is the class of bug
+# a doc example once carried a nested array type the compiler refuses.
+syndoc="$ROOT/docs/syntax.md"
+[ -f "$syndoc" ] || { echo "docs/syntax.md is missing"; exit 1; }
+
+s=0
+sblk=0
+sinblk=0
+sfile=""
+while IFS= read -r line || [ -n "$line" ]; do
+  if [ "$sinblk" = "1" ]; then
+    if [ "$line" = '```' ]; then
+      sinblk=0
+      if grep -q '^end\.' "$sfile"; then
+        # the one complete program: compile as-is
+        s=$((s + 1))
+        out="$T/syntaxdoc_${sblk}"
+        if ! "$WANTZEL" "$sfile" "$out" >"$T/cerr" 2>&1; then
+          echo "the complete program in docs/syntax.md (block $sblk) does not compile:"
+          sed 's/^/    /' "$T/cerr"
+          exit 1
+        fi
+      elif grep -qE '^(const|type|var)$' "$sfile"; then
+        # a declaration-only fragment: wrap it in a minimal program
+        s=$((s + 1))
+        wrapped="$T/syntaxdoc_${sblk}_wrapped.wz"
+        cat "$sfile" > "$wrapped"
+        printf 'begin\nend.\n' >> "$wrapped"
+        out="$T/syntaxdoc_${sblk}_wrapped"
+        if ! "$WANTZEL" "$wrapped" "$out" >"$T/cerr" 2>&1; then
+          echo "a declaration block in docs/syntax.md (block $sblk) does not compile" \
+               "when wrapped in 'begin end.':"
+          sed 's/^/    /' "$T/cerr"
+          exit 1
+        fi
+      fi
+    else
+      printf '%s\n' "$line" >> "$sfile"
+    fi
+  elif [ "$line" = '```pascal' ]; then
+    sblk=$((sblk + 1))
+    sinblk=1
+    sfile="$T/syntaxdoc_${sblk}.wz"
+    : > "$sfile"
+  fi
+done < "$syndoc"
+
+[ "$s" -ge 3 ] || { echo "expected at least 3 checkable blocks in docs/syntax.md, found $s -- has the page changed shape?"; exit 1; }
+
+echo "$s program/declaration blocks from docs/syntax.md, all compiled"

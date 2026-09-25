@@ -1,9 +1,10 @@
 # lib/dns.wz against a nameserver of our own: every answer shape the resolver must handle,
 # and every way a lookup can fail, with nothing from the internet.
 #
-# The server is tests/helpers/dnsfake.wz, three of them on ports derived from $$: one that
-# answers, one that never does, one that answers everything with SERVFAIL -- and a fourth
-# port where nothing listens. The client is tests/helpers/dnsprobe.wz, which prints each
+# The server is tests/helpers/dnsfake.wz, three of them on kernel-assigned free ports (see
+# tests/lib/portlib.sh): one that answers, one that never does, one that answers everything
+# with SERVFAIL -- and a fourth port where nothing listens. The client is
+# tests/helpers/dnsprobe.wz, which prints each
 # outcome as "<name> <address>..." or "<name> error <code> <message>", and the time each
 # lookup took on stderr.
 #
@@ -23,6 +24,7 @@
 #   - several lookups at once, driven from an epoll loop that watches dns.fd
 #   - resolv.conf: comments, several nameservers, an IPv6 one skipped, options
 . "$ROOT/tests/helpers.sh"
+. "$ROOT/tests/lib/portlib.sh"
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
@@ -31,8 +33,8 @@ bad() { fail=$((fail+1)); echo "  FAIL  $1"; shift; for r in "$@"; do echo "    
 has() { if printf '%s\n' "$2" | grep -qxF -- "$3"; then ok "$1"; else bad "$1" "wanted: $3" "got:" "$2"; fi; }
 count() { grep -cxF -- "$2" "$1" || true; }
 
-base=$(( 21000 + ($$ % 2500) * 4 ))
-good=$base; silent=$((base + 1)); sfail=$((base + 2)); closed=$((base + 3))
+set -- $(free_ports 4)
+good=$1; silent=$2; sfail=$3; closed=$4
 
 compile "$ROOT/tests/helpers/dnsfake.wz" "$T/dnsfake"
 compile "$ROOT/tests/helpers/dnsprobe.wz" "$T/probe"
@@ -57,6 +59,14 @@ start "$sfail" sfail
 
 probe() { timeout 20 "$T/probe" "$@" 2>"$T/ms"; }
 ms() { sed -n 's/^ms //p' "$T/ms" | tail -1; }
+
+# ---- a slow local resolver, with the DEFAULT timeouts -------------------------------------------
+# slow.test is answered after three seconds, the way systemd-resolved answers while it
+# re-probes its upstream server. The defaults (0 0) must wait for it: with two seconds an
+# attempt the reply to the first attempt came to a socket already closed, and the lookup
+# reported "no nameserver answered in time".
+out=$(probe "$good" 0 0 slow.test)
+has "a resolver that takes three seconds is waited for with the default timeouts" "$out" "slow.test 10.3.3.30"
 
 # ---- answers ---------------------------------------------------------------------------------
 out=$(probe "$good" 1000 3000 a.test A.Test. chain.test partial.test)

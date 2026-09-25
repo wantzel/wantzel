@@ -10,45 +10,27 @@
 # a distinction no reader can act on differently. One carried an example and one did not, so
 # the help you received depended on where your file ended.
 #
-# WHAT IS CHECKED. Two things, and the second is the one that catches a new case:
-#
-#   1. The two compilers agree. src/compiler.wz and bootstrap/boot.c are counterparts, and a
-#      message improved in one and not the other is the usual way they drift.
-#   2. No two DIFFERENT messages share an opening. A pair like "a hex escape needs ..." twice
-#      is almost always one failure described twice -- and where it is not, the two should
-#      still not begin identically, because the reader distinguishes them by their opening.
+# WHAT IS CHECKED: no two DIFFERENT messages share an opening. A pair like "a hex escape
+# needs ..." twice is almost always one failure described twice -- and where it is not, the
+# two should still not begin identically, because the reader distinguishes them by their
+# opening.
 #
 # WHY NOT A LIST OF KNOWN-GOOD MESSAGES. That is a second copy of the texts, and it goes
 # stale the first time someone improves one. This compares the compiler with itself.
+#
+# THIS USED TO ALSO CHECK bootstrap/boot.c against src/wantzel.wz, because they were
+# counterparts. They are not any more: boot.c only has to build src/wantzel.wz, so it
+# does not implement schema, tools or --debug and has none of those messages -- that is
+# expected, not drift.
 . "$ROOT/tests/helpers.sh"
 cd "$ROOT"
 
-# Every literal message the compiler can print, from both counterparts.
-wz=$(grep -oE 'fail\("[^"]{12,}"' src/compiler.wz | sed 's/^fail("//; s/"$//' | sort -u)
-bc=$(grep -oE 'fail\("[^"]{12,}"' bootstrap/boot.c  | sed 's/^fail("//; s/"$//' | sort -u)
+# Every literal message the compiler can print.
+wz=$(grep -oE 'fail\("[^"]{12,}"' src/wantzel.wz | sed 's/^fail("//; s/"$//' | sort -u)
 
-[ -n "$wz" ] || { echo "no messages found in src/compiler.wz -- has fail() been renamed?"; exit 1; }
-[ -n "$bc" ] || { echo "no messages found in bootstrap/boot.c -- has fail() been renamed?"; exit 1; }
+[ -n "$wz" ] || { echo "no messages found in src/wantzel.wz -- has fail() been renamed?"; exit 1; }
 
-# ---- 1. THE COUNTERPARTS AGREE -----------------------------------------------------------
-#
-# Only in the direction that matters: a message the Wantzel compiler has and the C bootstrap
-# does not means a fresh clone reports something different from an installed compiler. The
-# reverse is normal -- boot.c is smaller and refuses things the real compiler never reaches.
-# NO PROCESS SUBSTITUTION: the suite runs these with sh, where `<(...)` is a syntax error.
-# That is the third time it has bitten -- see docs/testing.md.
-printf '%s\n' "$wz" > "$T/wz.txt"
-printf '%s\n' "$bc" > "$T/bc.txt"
-missing=$(comm -23 "$T/wz.txt" "$T/bc.txt")
-if [ -n "$missing" ]; then
-  n=$(printf '%s\n' "$missing" | wc -l)
-  echo "$n message(s) exist in src/compiler.wz but not in bootstrap/boot.c:"
-  printf '%s\n' "$missing" | head -5 | sed 's/^/  /'
-  echo "  a fresh clone builds with boot.c, so it would report something else"
-  exit 1
-fi
-
-# ---- 2. NO FAILURE DESCRIBED TWICE -------------------------------------------------------
+# ---- NO FAILURE DESCRIBED TWICE -----------------------------------------------------
 #
 # ONE MESSAGE BEING A PREFIX OF ANOTHER is the shape that matters, and it is narrower than
 # "the same opening". "missing ) after the values" and "missing ) after a field" share four
@@ -81,4 +63,4 @@ if [ -n "$dup" ]; then
   exit 1
 fi
 
-echo "ok: $(printf '%s\n' "$wz" | wc -l) messages, none duplicated, both counterparts agree"
+echo "ok: $(printf '%s\n' "$wz" | wc -l) messages, none duplicated"

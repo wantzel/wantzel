@@ -8,7 +8,7 @@ cd "$ROOT"
 
 # Common Dutch function words, with word boundaries. A single match is not proof --
 # "de" appears in English prose and in identifiers -- so a line counts only when two
-# or more hit it. That is the same threshold the wstack scan uses.
+# or more hit it.
 #
 # "dat" is deliberately not in the list: it is the name of the data segment array in
 # both compilers (dat[datlen]), and it would match on every line that touches it.

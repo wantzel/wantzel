@@ -23,7 +23,7 @@ ordinary `.wz` files on disk — read them, step into them, change them under a 
 | `chain.wz` | does a certificate chain up to something trusted? |
 | `csr.wz` | a certificate signing request, and a self-signed certificate (RFC 2986, 5280) |
 | `der.wz` | reading DER, and the parts of X.509 a TLS client needs (X.690, RFC 5280) |
-| `dns.wz` | hostnames to IPv4 addresses: a DNS stub resolver over UDP, and TCP when truncated |
+| `dns.wz` | hostnames to IPv4 and IPv6 addresses: a DNS stub resolver over UDP, and TCP when truncated |
 | `fs.wz` | directories, file metadata and reading, on raw syscalls |
 | `hash.wz` | open-addressing hash tables on caller-supplied arrays |
 | `hkdf.wz` | HKDF (RFC 5869) and the TLS 1.3 key schedule (RFC 8446 §7.1) |
@@ -38,7 +38,7 @@ ordinary `.wz` files on disk — read them, step into them, change them under a 
 | `math.wz` | real arithmetic beyond the operators: `exp`, `log`, `pow`, trigonometry, text |
 | `mcp.wz` | Model Context Protocol over JSON-RPC 2.0 |
 | `mcphttp.wz` | MCP over HTTP: the endpoint routine for `app.request` |
-| `net.wz` | sockets and epoll, straight on top of the system calls |
+| `net.wz` | sockets and epoll, straight on top of the system calls; IPv4 and IPv6 (IPv6 on Linux only for now) |
 | `oauth.wz` | an OAuth 2.1 authorization server for MCP clients |
 | `openapi.wz` | an OpenAPI 3.1 document and a Swagger UI page, generated from a `tools` block |
 | `p256.wz` | the NIST P-256 curve and ECDSA verification (FIPS 186-4, SEC 2) |
@@ -49,6 +49,7 @@ ordinary `.wz` files on disk — read them, step into them, change them under a 
 | `rand.wz` | random bytes and numbers from the kernel |
 | `router.wz` | a few helpers on top of `http.wz` for routing by path |
 | `rsa.wz` | RSA-2048 signature verification, for certificate chains that are not ECDSA |
+| `sha1.wz` | SHA-1 (RFC 3174) -- not a security primitive; kept only for protocols that name it (`websocket.wz`'s handshake) |
 | `sha256.wz` | SHA-256 (FIPS 180-4) |
 | `sha384.wz` | SHA-384 (FIPS 180-4) |
 | `store.wz` | durable tables of fixed-size records: an append-only log |
@@ -101,7 +102,7 @@ elsewhere travels a chain undamaged), and a full buffer gets as much as fits, re
 `len(b)`. Compare the returned position to the one passed in to detect either case.
 
 `io.now`/`io.realtime` call `io.fatal` if the underlying clock read fails, rather than risk
-returning a stale or zero time that looks real. Does not arise on Windows.
+returning a stale or zero time that looks real.
 
 Limits: no formatted output beyond decimal integers, no line-oriented reading.
 
@@ -132,9 +133,10 @@ the read-only case; writing goes through `sys3(SYS.open, ...)` directly.
 | `fs.stat(a: int): bool` | fill `fs.size`, `fs.mode`, `fs.mtime` for the NUL-terminated path at `a`; `false` if unreachable |
 | `fs.isdir: bool` / `fs.isfile: bool` | read `fs.mode` from the last `fs.stat` |
 | `fs.open(a: int): int` | open the path read-only; returns the fd, or negative on failure |
-| `fs.opendir(a: int): int` | open for reading directory entries; resets the directory cursor |
-| `fs.close(fd)` | close a descriptor |
-| `fs.next(fd): bool` | step to the next entry (skips `.`/`..`); fills `fs.name`, `fs.namelen`, `fs.type`; `false` when exhausted |
+| `fs.opendir(a: int): int` | open for reading directory entries; returns the fd, or negative (with `fs.err`/`fs.errno`) on failure |
+| `fs.close(fd)` | close a descriptor, and free its directory slot if it had one |
+| `fs.next(fd): bool` | step to the next entry (skips `.`/`..`); fills `fs.name`, `fs.namelen`, `fs.type`; `false` when exhausted or on error (see `fs.err`) |
+| `fs.forget(fd)` | free `fd`'s directory slot WITHOUT closing `fd` — for a caller that owns the fd's lifecycle itself (see below) |
 | `fs.find(h, from, upto, n, nlen): int` | first occurrence of `n[0..nlen)` in `h[from..upto)`; `-1` if absent |
 
 `fs.stat` takes a raw address, not a `str` — build it with `io.push` plus a manual
@@ -142,8 +144,21 @@ the read-only case; writing goes through `sys3(SYS.open, ...)` directly.
 `DT_LNK`). `fs.find` works on any `array of char`, not just file content, and uses the SIMD
 `scan` builtin for its leading byte.
 
-Limits: no recursive walk — `fs.opendir`/`fs.next` gives one directory at a time, and
-recursing (using `fs.type = DT_DIR`) is the caller's job.
+**A recursive walk works**: each `fs.opendir` gets its own read buffer and position, so
+opening a child directory while a parent's `fs.next` loop is still in progress does not
+disturb the parent — recursing (using `fs.type = DT_DIR`) is the caller's job, same as
+before, but nesting it is now safe. Limits: at most 16 directories open at once, process-wide
+(`FS.MAXOPEN` in `lib/fs.wz`); a 17th `fs.opendir` fails with `fs.errno = 24` (`EMFILE`) and
+`fs.err` naming it, until an open one is `fs.close`d.
+
+**If you open a directory your own way** (not through `fs.opendir` — your own path
+resolution or an `openat` wrapper, say) and still read it with `fs.next`, that fd gets a
+slot the same as `fs.opendir` would give it. Close that fd your own way too, and **call
+`fs.forget(fd)` first.** Operating systems reuse fd numbers: without `fs.forget`, the next
+thing opened can get the same number, and `fs.next` on it would find the old slot still
+claimed and resume reading from the old directory's position instead of starting fresh. A
+caller that always goes through `fs.opendir`/`fs.close` never needs `fs.forget` — that pair
+already does this for you.
 
 ```pascal
 include "fs.wz";
@@ -213,8 +228,7 @@ end.
 
 `include "math.wz";` (pulls in `json.wz`, and through it `io.wz`)
 
-Plain Wantzel over `real`: range reduction plus a series, identical results on Linux and
-Windows, no C math library. A few ULP of accuracy over the ranges the routines target, not
+Plain Wantzel over `real`: range reduction plus a series, no C math library. A few ULP of accuracy over the ranges the routines target, not
 IEEE-754-exact at every corner. Constants: `MATH.PI`, `MATH.E`, `MATH.LN2`, `MATH.HALFPI`,
 `MATH.TWOPI`.
 
@@ -397,7 +411,7 @@ replies take memory only while they exist, within the limits above: at most
 `http.maxbodymem` (256 MB) of bodies once `http.maxbody` is set, one reply being built (up to
 `http.maxreply`, and as much again while it is sealed for TLS) and `http.pendmax` (128 MB) of
 output waiting for slow readers. `http.serve` raises the soft limit on open files to 65536 (never above the hard
-limit) on Linux; Windows has a fixed table of 1024 descriptors.
+limit).
 
 **Deadlines.** A connection that makes no progress is closed. Defaults, changed with
 `http.timeouts`:
@@ -530,8 +544,7 @@ into a mapping of `tool.maxout` made at the first call and kept for the next, an
 after a result larger than 1 MB; with `tool.maxout` at 1 MB or less, `tool.out` is used and
 nothing is mapped. Worst case with the defaults, while one maximum call is answered: 64 +
 64 + 160 = 288 MB on top of the program's own records; between calls, at most 1 MB more than
-the static buffers. On Windows a mapping counts against the commit limit for as long as it is
-held — for the tool result mapping, from the first call on. `mcp.mapped` and
+the static buffers. `mcp.mapped` and
 `mcp.mappedbytes` say what is held right now.
 
 **Over HTTP** the message must fit the HTTP layer too: call `http.maxbody(n)` before
@@ -541,9 +554,11 @@ for `mcp.maxout`, naming that smaller size.
 
 **A transport of your own** calls `n := mcp.handle(b, at, last)`: the reply is `n` bytes at
 `view(mcp.obase, n)` — in `mcp.buf` whenever it fits there — and `mcp.done` gives a
-mapping back once they have been sent. A result bigger than 1 MB cannot come from a
-`text`/`json` view field in the output schema, whose buffer `tool.vbuf` is 1 MB; use
-`text[N]` fields and arrays.
+mapping back once they have been sent. A `text`/`json` view field in the output schema is
+built in `tool.vbuf`, 1 MB; a handler that fills it past that limit is refused with a
+handler-side failure naming the tool and the limit (`tool <name>: reply exceeds 1048576
+bytes`), not a reply built from silently truncated text. For a result that may exceed it,
+use `text[N]` fields and arrays instead.
 
 ## `autocert` — a certificate that a server gets and keeps by itself
 
@@ -608,13 +623,13 @@ with an old certificate) and `<host>.retry`. The keys are PEM `EC PRIVATE KEY`, 
 openssl reads. A missing or read-only store works — without a cache — and says so.
 
 Limits: HTTP-01 only (no wildcards), one name per certificate, no revocation. A step blocks
-the loop for the length of one HTTPS request: the name lookup (at most 5 s), the connect and
+the loop for the length of one HTTPS request: the name lookup (at most 12 s), the connect and
 every TLS call are each bounded by the request timeout (10 s). `examples/autocert.wz` is a
 complete server on `http.https`.
 
 ## `websocket` — a WebSocket server on the same port as `http`
 
-`include "websocket.wz";` (pulls in `net.wz`, `base64.wz` and `http.wz`)
+`include "websocket.wz";` (pulls in `net.wz`, `base64.wz`, `http.wz` and `sha1.wz`)
 
 RFC 6455, on the SAME listening socket `http.wz` already has. This module never opens a
 socket of its own; it takes over a connection that `app.request` hands it.
@@ -622,7 +637,7 @@ socket of its own; it takes over a connection that `app.request` hands it.
 | routine | meaning |
 |---|---|
 | `ws.take(fd: int): bool` | call from `app.request` after `http.detach := true`; reads `Sec-WebSocket-Key`, sends `101`, returns `true` on success |
-| `procedure app.wsframe(fd: int)` | (application-defined) once per complete frame; payload at `ws.in[fd * WS.INMAX + ws.at .. +ws.len)`, opcode in `ws.op` |
+| `procedure app.wsframe(fd: int)` | (application-defined) once per complete frame; payload at `ws.in[ws.slot * WS.INMAX + ws.at .. +ws.len)`, opcode in `ws.op` |
 | `procedure app.wsclose(fd: int)` | (application-defined) once per connection end, any reason |
 | `ws.poll(timeout: int): int` | drive the loop; `timeout` ms, `0` = don't block, `-1` = block; returns connections served |
 | `ws.sendtext(fd; a: array of char; n: int): bool` | one text frame |
@@ -636,14 +651,23 @@ headers still describe the request. If `ws.take` returns `false`, undo the detac
 the fd yourself. Control frames (ping/pong/close) never reach `app.wsframe`. WebSocket runs
 on plain listeners only: on a TLS connection (`http.istls`) `ws.take` returns `false`.
 
+**Connections live in slots, not at their fd** — the same shape `http.wz` uses for its own
+`MAXCONN` connections. `ws.in` (and every other per-connection table) is sized and indexed
+by slot, not by fd, so inside `app.wsframe`/`app.wsclose` the base into `ws.in` comes from
+`ws.slot` (set by this module right before the call), never from `fd` — an fd can be
+arbitrarily large (up to `WS.MAXFD`, matching `http.wz`'s own fd range) while only
+`WS.MAXCONN` connections are open at once.
+
 Close codes: `1000` normal; `4000`–`4999` reserved by RFC 6455 for application-defined
 meanings.
 
-Limits: `WS.MAXCONN` 256 connections, `WS.INMAX` 64 KB buffered input per connection (over
-that: `ws.closefd(fd, 1009)`), `WS.OUTMAX` 64 KB per outgoing frame; `ws.take` refuses an fd
-of 256 or more. `http.serve` cannot also call `ws.poll`, so a program wanting both protocols
-runs its own loop — `http.listen` once, then `http.poll` and `ws.poll(0)` on every wake —
-instead of calling `http.serve`. A program that never includes `websocket.wz` is unaffected.
+Limits: `WS.MAXCONN` 256 connections open at once, `WS.MAXFD` 65536 (the fd range `ws.take`
+accepts — matches `http.wz`'s own), `WS.INMAX` 64 KB buffered input per connection (over
+that: `ws.closefd(fd, 1009)`), `WS.OUTMAX` 64 KB per outgoing frame; `ws.take` refuses once
+256 connections are already open, whatever the fd. `http.serve` cannot also call `ws.poll`,
+so a program wanting both protocols runs its own loop — `http.listen` once, then `http.poll`
+and `ws.poll(0)` on every wake — instead of calling `http.serve`. A program that never
+includes `websocket.wz` is unaffected.
 
 ```pascal
 include "websocket.wz";
@@ -651,7 +675,7 @@ include "websocket.wz";
 procedure app.wsframe(fd: int);
 var base: int;
 begin
-  base := fd * WS.INMAX;
+  base := ws.slot * WS.INMAX;
   ws.ignored := ws.sendtext(fd, ws.in[base + ws.at .. base + ws.at + ws.len - 1], ws.len);
 end;
 
@@ -677,55 +701,66 @@ begin
 end;
 ```
 
-## `dns` — hostnames to IPv4 addresses
+## `dns` — hostnames to IPv4 and IPv6 addresses
 
 `include "dns.wz";` (pulls in `net.wz` and `rand.wz`)
 
 A stub resolver: it asks the nameservers the system is configured with, over UDP, and again
-over TCP when an answer comes back truncated. An address is one `int`,
-`a shl 24 + b shl 16 + c shl 8 + d`. A name that is already a dotted IPv4 literal comes back
-as itself, and `localhost` as `127.0.0.1`, without a query.
+over TCP when an answer comes back truncated. `dns.resolve`/`dns.start`/`dns.poll` are A
+(IPv4) only, unchanged in shape from before: an address is one `int`,
+`a shl 24 + b shl 16 + c shl 8 + d`. `dns.resolve6`/`dns.start6`/`dns.poll6` are their AAAA
+(IPv6) counterparts: an address does not fit in one `int` (128 bits against 64), so these
+take a flat byte buffer instead, 16 bytes per address, network order. A name that is
+already a literal (a dotted IPv4 quad for the `*4`/plain calls, the colon form for the
+`*6` ones) comes back as itself, and `localhost` as `127.0.0.1` or `::1`, without a query.
 
 | routine | meaning |
 |---|---|
-| `dns.resolve(name: array of char; out: array of int): int` | look up and wait, at most the lookup's total time (5 s); the number of addresses written to `out`, or a negative `DNS.*` code |
-| `dns.connect(name: array of char; port: int): int` | resolve, then `net.connect` to the first address that accepts; the fd, or a `DNS.*` code |
-| `dns.start(name: array of char): int` | begin a lookup without blocking; a query number, or `DNS.BUSY` |
-| `dns.poll(q: int; out: array of int): int` | never blocks: `DNS.PENDING` (`0`) while running, then the count or a `DNS.*` code; collecting frees `q` |
-| `dns.fd: int` | the resolver's own epoll set — watch it for `EPOLLIN` in yours |
+| `dns.resolve(name: array of char; out: array of int): int` | look up A records and wait, at most the lookup's total time (12 s); the number of addresses written to `out`, or a negative `DNS.*` code |
+| `dns.resolve6(name: array of char; out: array of char): int` | the AAAA counterpart; `out`'s length must be a multiple of 16 |
+| `dns.connect(name: array of char; port: int): int` | resolve BOTH A and AAAA (concurrently, so one slow record type does not delay the other), then connect to the first address that accepts — IPv6 addresses tried before IPv4, each in the order its records came back; the fd, or a `DNS.*` code (`DNS.NOCONNECT` when it resolved but nothing accepted) |
+| `dns.start(name: array of char): int` · `dns.start6(name: array of char): int` | begin a lookup without blocking; a query number, or `DNS.BUSY` |
+| `dns.poll(q: int; out: array of int): int` · `dns.poll6(q: int; out: array of char): int` | never blocks: `DNS.PENDING` (`0`) while running, then the count or a `DNS.*` code; collecting frees `q` (use `dns.poll6` for a query started with `dns.start6`) |
+| `dns.fd: int` | the resolver's own epoll set — watch it for `EPOLLIN` in yours (shared between A and AAAA queries) |
 | `dns.wait: int` | milliseconds until the next deadline, for your `epoll_wait`; `-1` when nothing runs |
-| `dns.cancel(q: int)` | drop a lookup |
+| `dns.cancel(q: int)` | drop a lookup, of either kind |
 | `dns.error(code: int): str` | a sentence for a `DNS.*` code |
 | `dns.parseip(s: array of char): int` | a dotted-quad literal as an address, or `-1` |
-| `dns.ipstr(dst, at, ip: int): int` | append an address as text; returns the new position |
+| `dns.ipstr(dst, at, ip: int): int` | append an IPv4 address as text; returns the new position |
+| `dns.parseip6(s: array of char; out: array of char): bool` | an IPv6 literal (with at most one `::` run) into 16 bytes, network order |
+| `dns.ipstr6(dst, at: int; ip6: array of char): int` | append an IPv6 address as text, uncompressed (eight groups of four lower-case hex digits); returns the new position |
 | `dns.loadconf(path: array of char): int` | read nameservers and options from a `resolv.conf`-style file; the count, or a negative errno |
 | `dns.noservers` · `dns.addserver(a, b, c, d, port: int): bool` | replace the configured servers (at most `DNS.MAXNS`, 3) |
-| `dns.settimeout(tryms, totalms: int)` | per attempt (2000) and per lookup (5000); `0` keeps a value |
-| `dns.flush` | empty the cache |
+| `dns.settimeout(tryms, totalms: int)` | per attempt (5000, as the C library) and per lookup (12000); `0` keeps a value |
+| `dns.flush` | empty the cache (both A and AAAA entries) |
 
 The failures are kept apart, because they mean different things: `DNS.NXDOMAIN` (the name
-does not exist), `DNS.NODATA` (it exists, without an IPv4 address), `DNS.SERVFAIL`,
+does not exist), `DNS.NODATA` (it exists, without an address of the type asked), `DNS.SERVFAIL`,
 `DNS.REFUSED`, `DNS.TIMEOUT` (no server answered), `DNS.BADNAME` (not a hostname: a bad
 label, or a last label of digits only, such as a broken address),
 `DNS.BADREPLY` (an answer that does not parse, or a CNAME chain that loops), `DNS.NETWORK`
 (no socket, or nothing listens), `DNS.BUSY`, and from `dns.connect` `DNS.NOCONNECT`.
+`DNS.NODATA` is type-specific: a name with only AAAA records answers `DNS.NODATA` to an A
+query and its address to an AAAA one, and the other way round.
 
 **Where the servers come from.** `/etc/resolv.conf`, on the first lookup: up to three
-`nameserver` lines with an IPv4 address, and `options timeout:n attempts:n`. On Windows the
-runtime answers an open of that same path from `GetNetworkParams`, so one source finds the
-servers of either system. No server at all means `127.0.0.1`, as the C library does.
+`nameserver` lines with an IPv4 address, and `options timeout:n attempts:n`. No server at
+all means `127.0.0.1`, as the C library does.
 
 **What a lookup does.** Every attempt has a fresh random id and its own socket on a random
-source port, connected to the server; a reply counts only when its id and its question match,
-so a forged datagram is ignored rather than believed. A silent server costs one attempt's
-timeout and the next server is asked; `SERVFAIL`, `REFUSED` and an unreachable port move on
-at once; `NXDOMAIN` is final. CNAME chains are followed through the answer — only records on
-the chain count — and a chain that stops short is asked for under its last name. Compressed
-names are read with pointers followed only backwards, so a loop cannot hang it. Answers are
-cached for their TTL (32 names); failures are not.
+source port, connected to the server; a reply counts only when its id and its question
+(including the type asked, A or AAAA) match, so a forged datagram is ignored rather than
+believed. A silent server costs one attempt's timeout and the next server is asked;
+`SERVFAIL`, `REFUSED` and an unreachable port move on at once; `NXDOMAIN` is final. CNAME
+chains are followed through the answer, under either type — only records on the chain
+count — and a chain that stops short is asked for under its last name. Compressed names are
+read with pointers followed only backwards, so a loop cannot hang it. Answers are cached by
+name AND type (an A and an AAAA lookup of the same name are two cache entries), for their
+TTL (32 names total); failures are not.
 
-Limits: IPv4 only (no AAAA: `net.wz` connects over IPv4); no `search` domains and no
-`/etc/hosts` beyond `localhost`, so give a full name; `DNS.MAXQ` (8) lookups at once.
+Limits: no `search` domains and no `/etc/hosts` beyond `localhost`, so give a full name;
+`DNS.MAXQ` (8) lookups at once, of either type, sharing the same pool of slots.
+`dns.connect`'s IPv6 support goes through `net.connect6`.
 
 ```pascal
 include "dns.wz";

@@ -32,7 +32,7 @@ confusing error message is a good PR.
 Include these four things and there is a good chance it can be fixed without a round trip:
 
 1. **The output of `wantzel --version`.**
-2. **Your platform** — Linux or Windows, and which distribution if that seems relevant.
+2. **Your platform** — which Linux distribution and kernel, if that seems relevant.
 3. **A `.wz` file that reproduces it**, as small as you can make it. If a program stops
    failing when you cut it down, that itself is worth mentioning.
 4. **What you expected, and what happened** — including the exact message. Compiler errors
@@ -62,7 +62,6 @@ this is a judgement on the idea; it is about what this project is.
 - **A language feature without a count behind it.** "Other languages have it" is not an
   argument here, and neither is elegance. What counts is evidence that its absence makes
   real programs wrong.
-- **A change to only one platform.** Linux and Windows move together, always.
 - **A rewrite.** Of the compiler, the library, or a substantial part of either. Not because
   the current code is sacred but because reviewing it honestly would cost more than writing
   it, and this is a one-person project.
@@ -79,17 +78,17 @@ less than a finished pull request.
 ./wztest --toolchain    # the whole suite, including the toolchain checks
 ```
 
-Both must be green. `--toolchain` matters: it rebuilds the compiler with itself and
-checks the result is byte-identical, which is the check that catches most compiler
-changes going subtly wrong.
+Both must be green. `--toolchain` matters: it rebuilds the self-hosted compiler with
+itself and checks the result is byte-identical, which is the check that catches most
+compiler changes going subtly wrong.
 
 Four things that are easy to miss, all of which the suite will tell you about:
 
-- **`src/wantzel.wz` and `bootstrap/boot.c` are counterparts.** They implement the same
-  compiler, one in Wantzel and one in C. Change one and you change the other in the same
-  commit, or the bootstrap fixed point breaks.
-- **Both targets, always.** A change to the compiler, the runtime or `lib/` carries the
-  Linux and the Windows side. "The tests run on Linux anyway" is not an argument.
+- **`bootstrap/boot.c` only has to build `src/wantzel.wz`.**
+  It is not a full implementation of the language: no `schema`, no `tools`, no `--debug`.
+  A change to the compiler needs a change in `boot.c` too only when the
+  compiler's own source starts using something `boot.c` does not implement yet — most
+  changes do not. See [docs/testing.md](docs/testing.md#the-bootstrap-fixed-point).
 - **No external dependencies.** Zero is a hard requirement, not a score. The build and the
   test suite use nothing beyond a C compiler and a POSIX shell — not even Python.
 - **A test with the change.** [docs/testing.md](docs/testing.md) explains the forms a test

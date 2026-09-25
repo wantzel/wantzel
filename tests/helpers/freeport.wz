@@ -1,0 +1,51 @@
+// freeport -- print N free TCP ports, one per line, chosen by the KERNEL rather than
+// guessed from a range.
+//
+// A test that picks its port as `24000 + ($$ % 10000)` is choosing from a range other
+// worktrees choose from too: with ten or more `./wztest` runs going at once, two test
+// scripts can land on the same number (their $$ values need not even collide -- two
+// different bases can overlap), or the number they land on is already an ephemeral
+// source port some OTHER connection on the machine is using (the kernel hands those out
+// from 32768-60999, the same neighbourhood these ranges sit in).
+//
+// This asks the kernel instead: bind to port 0, which means "give me any free one," read
+// the real port back with getsockname, and close again. The socket is not held open, so
+// there is a small window between this process closing it and the caller's own bind --
+// same as a lease-and-release anywhere else -- which is why callers still retry a failed
+// bind rather than treat it as fatal. But the number handed back was free at THIS instant,
+// on THIS machine, which a fixed or $$-derived guess can never promise.
+//
+// Usage: freeport [count]   -- default 1, one port per line, ascending is not guaranteed
+include "io.wz";
+include "net.wz";
+
+const
+  SYS_getsockname = 51;
+
+var
+  sa: array[0..15] of char;
+  salen: array[0..3] of char;
+  i, n, fd, port: int;
+
+begin
+  n := 1;
+  if argc() > 1 then n := io.argn(1);
+  if n < 1 then n := 1;
+  i := 0;
+  while i < n do
+  begin
+    fd := net.listen(0, 1, false);
+    if fd < 0 then
+    begin
+      io.puts(STDERR, "freeport: could not bind an ephemeral port\n");
+      sys1(SYS.exit, 1);
+    end;
+    io.put32(salen, 0, 16);
+    sys3(SYS_getsockname, fd, addr(sa[0]), addr(salen[0]));
+    port := (ord(sa[2]) shl 8) + ord(sa[3]);   // network byte order, same fields net.listen sets
+    net.close(fd);
+    io.putn(STDOUT, port);
+    io.puts(STDOUT, "\n");
+    i := i + 1;
+  end;
+end.

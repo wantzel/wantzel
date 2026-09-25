@@ -25,6 +25,17 @@
 //                                     closes; the byte count, and whether "ok" came last
 //   httpload stall PORT CONNS         CONNS connections each ask for GET /bigslow and never read
 //                                     it; prints `stalled=N`, then holds them until killed
+//   httpload refuse PORT KIND         a request the server refuses without ever calling
+//                                     app.request: KIND 413 keeps writing body
+//                                     bytes past what the server will accept, unaware yet of
+//                                     the refusal, the way a real slow uploader would; KIND
+//                                     431 sends headers that never end; KIND 408 sends a
+//                                     partial request line and then nothing. Reports the
+//                                     status read (0 if none), how many body bytes went out
+//                                     before the socket stopped taking them, and whether the
+//                                     connection ended in a clean EOF (reset=0) or a reset
+//                                     (reset=1) -- the point of this mode: a reset
+//                                     before the status line is read is exactly the bug.
 include "net.wz";
 
 const
@@ -500,6 +511,115 @@ begin
   net.close(fd);
 end;
 
+// A body buffer sent in chunks past what the server will accept -- large enough that, before
+// the fix in http.refuse, the kernel's reset (RST, from closing a socket with unread input
+// still in its receive buffer) would already have broken the write well before this much
+// went out. Module-level: a local array this size overflows the stack.
+var
+  refusebody: array[0..65535] of char;
+
+// KIND 413: a request whose Content-Length is far larger than the server will ever accept
+// (INBUF, 256 kB, with no http.maxbody configured) -- the way a slow uploader looks from
+// outside before it has read anything back. KIND 431: a header line that never ends. KIND
+// 408: a request line, no more, then silence -- the server's header deadline must fire (the
+// caller configures it short with httpstat's HEADER argument).
+//
+// Reports one line: status=<code, 0 if none was read> sent=<body bytes written before the
+// socket stopped taking them> reset=<1 if the connection ended in anything other than a
+// clean EOF -- the read that answers "did it get reset before we could read the reply",
+// which is the entire question here> err=<the errno the reset showed up as,
+// 0 if none>.
+procedure refuse(kind: int);
+var fd, r, sent, i, rlen, reseterr: int;
+    reply: array[0..2047] of char;
+    reset: bool;
+    status: int;
+begin
+  if refusebody[0] <> 'z' then for i := 0 to 65535 do refusebody[i] := 'z';
+  fd := net.connect(127, 0, 0, 1, port);
+  if fd < 0 then fail("connect failed");
+  // Non-blocking from the start: kind 413 relies on EAGAIN to interleave writing and
+  // reading, and a blocking send that meets a reset blocks (or errors) in ways this loop
+  // does not expect.
+  if not net.nonblock(fd) then fail("nonblock failed");
+  reset := false;
+  reseterr := 0;
+  sent := 0;
+  rlen := 0;
+  if kind = 413 then
+  begin
+    sendstr(fd, "POST /x HTTP/1.1\r\nHost: t\r\nContent-Length: 5000000\r\n\r\n");
+    // Keep writing body the server will never ask for again once it has answered -- but
+    // like a real uploader that has not read anything back yet, stop well short of
+    // Content-Length: a realistic amount (500 kB, comfortably under HTTP.LINGERBYTES), not
+    // an adversarial stream that never stops -- that is what the byte bound exists to cut
+    // off, and cutting it off can cost such a client its reply, by design (see http.wz).
+    // Checked after every chunk, not only on EAGAIN, because on a loopback socket the
+    // server usually drains fast enough that send() never blocks at all: waiting for
+    // EAGAIN here would just race the send loop to completion without ever reading.
+    while sent < 500000 do
+    begin
+      r := net.send(fd, addr(refusebody[0]), 65536);
+      if r > 0 then sent := sent + r
+      else if r = EAGAIN then n := net.wait(ep, addr(evs[0]), 1, 20)
+      else if r <> EINTR then
+      begin
+        reset := true;
+        reseterr := r;
+        break;
+      end;
+      if (rlen < len(reply)) and not reset then
+      begin
+        r := net.recv(fd, addr(reply[rlen]), len(reply) - rlen);
+        if r > 0 then rlen := rlen + r
+        else if (r <> EAGAIN) and (r <> EINTR) then break;
+      end;
+    end;
+  end
+  else if kind = 431 then
+  begin
+    // a request line, then header bytes that never reach \r\n\r\n -- forces the "headers
+    // alone fill the slot's whole input" path rather than a slow trickle (that is
+    // http_deadlines.sh's slowloris, a different path: the header DEADLINE, not the header
+    // SIZE). Sent in one shot, well past INBUF (256 kB), so the slot fills on its own.
+    sendstr(fd, "GET /x HTTP/1.1\r\nHost: t\r\n");
+    while sent < 300000 do
+    begin
+      r := net.send(fd, addr(refusebody[0]), 65536);
+      if r > 0 then sent := sent + r
+      else if r = EAGAIN then n := net.wait(ep, addr(evs[0]), 1, 20)   // let the server drain
+      else if r <> EINTR then
+      begin
+        reset := true;
+        reseterr := r;
+        break;
+      end;
+    end;
+  end
+  else   // 408: a request line only, then silence -- the header deadline must do the rest
+    sendstr(fd, "GET /x HTTP/1.1\r\n");
+  // rlen carries over from kind 413's interleaved reads above (0 for 431 and 408, which
+  // read nothing until here) -- resetting it would throw away a reply already captured.
+  while true do
+  begin
+    r := net.recv(fd, addr(reply[rlen]), len(reply) - rlen);
+    if r > 0 then begin rlen := rlen + r; if rlen >= len(reply) then break; end
+    else if r = EAGAIN then n := net.wait(ep, addr(evs[0]), 1, 500)
+    else if r = EINTR then continue
+    else if r = 0 then break            // a clean EOF: exactly what should happen
+    else begin reset := true; reseterr := r; break; end;
+  end;
+  status := 0;
+  if rlen >= 12 then
+    status := (ord(reply[9]) - 48) * 100 + (ord(reply[10]) - 48) * 10 + (ord(reply[11]) - 48);
+  net.close(fd);
+  io.puts(STDOUT, "status="); io.putn(STDOUT, status);
+  io.puts(STDOUT, " sent="); io.putn(STDOUT, sent);
+  if reset then io.puts(STDOUT, " reset=1") else io.puts(STDOUT, " reset=0");
+  io.puts(STDOUT, " err="); io.putn(STDOUT, reseterr);
+  io.puts(STDOUT, "\n");
+end;
+
 // is argument 1 exactly s?
 function ismode(s: str): bool;
 var i: int;
@@ -509,7 +629,7 @@ begin
 end;
 
 begin
-  if argc() < 4 then fail("usage: httpload bench|open|slow|hold|cycle|pipe|idle|bigpart|stall PORT N ...");
+  if argc() < 4 then fail("usage: httpload bench|open|slow|hold|cycle|pipe|idle|bigpart|stall|refuse PORT N ...");
   port := io.argn(2);
   conns := io.argn(3);
   if conns > MAXC then fail("too many connections for this client");
@@ -526,5 +646,6 @@ begin
   else if ismode("bigpart") then bigpart
   else if ismode("stall") then stall
   else if ismode("pipebig") then pipebig
+  else if ismode("refuse") then refuse(conns)
   else fail("unknown mode");
 end.

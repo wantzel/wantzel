@@ -19,8 +19,13 @@ const
 
   FS.DIRBUF = 32768;
 
+  // Directories open at once, process-wide: a handful is plenty for a recursive walk,
+  // and a table beyond that is more likely a leak than real need.
+  FS.MAXOPEN = 16;
+
 const
   FS.ENOENT = 2;        // errno: no such file or directory
+  FS.EMFILE = 24;        // errno: too many open files -- also "no free slot in fs.dslot"
 
 var
   fs.st:   array[0..143] of char;      // struct stat
@@ -28,10 +33,61 @@ var
   fs.err:  str;                        // the reason of the last fs.stat/fs.next failure, "" for the common case
   fs.errno: int;                       // the raw -errno beside fs.err, 0 when there was none
 
-  fs.dbuf: array[0..FS.DIRBUF - 1] of char;
-  fs.dlen, fs.dpos: int;
+  // One directory read buffer per OPEN fd, not one for the whole process -- opening a
+  // subdirectory while its parent is still being walked must not touch the parent's
+  // position. fs.dslot[i] is the fd that owns slot i, -1 when the slot is free; a fresh
+  // fd is found by a linear scan of FS.MAXOPEN entries, cheap at this size.
+  fs.dslot: array[0..FS.MAXOPEN - 1] of int;
+  fs.dbuf:  array[0..FS.MAXOPEN * FS.DIRBUF - 1] of char;
+  fs.dlen:  array[0..FS.MAXOPEN - 1] of int;
+  fs.dpos:  array[0..FS.MAXOPEN - 1] of int;
+  fs.dinited: bool;
+
   fs.name: array[0..255] of char;
   fs.namelen, fs.type: int;
+
+// Set every slot free. Called lazily, once, by whichever of fs.opendir/fs.next runs
+// first -- a global array starts zeroed, and 0 is a valid fd, so the table needs an
+// explicit "empty" pass rather than relying on the zero value to mean free.
+procedure fs.dinit;
+var i: int;
+begin
+  if fs.dinited then return;
+  fs.dinited := true;
+  for i := 0 to FS.MAXOPEN - 1 do fs.dslot[i] := -1;
+end;
+
+// The slot already open for fd, or -1.
+function fs.dfind(fd: int): int;
+var i: int;
+begin
+  fs.dinit;
+  for i := 0 to FS.MAXOPEN - 1 do if fs.dslot[i] = fd then return i;
+  return -1;
+end;
+
+// A free slot for fd, allocating and clearing one if fd does not have one yet. -1 when
+// the table is full. Used by both fs.opendir (a fresh handle) and fs.next (called on an
+// fd nothing opened through fs.opendir, as tests/lib/fs_err.wz does on purpose to reach
+// a getdents error) -- either way, a directory's read position starts at the beginning.
+function fs.dslotfor(fd: int): int;
+var i, s: int;
+begin
+  s := fs.dfind(fd);
+  if s >= 0 then return s;
+  fs.dinit;
+  for i := 0 to FS.MAXOPEN - 1 do
+  begin
+    if fs.dslot[i] < 0 then
+    begin
+      fs.dslot[i] := fd;
+      fs.dlen[i] := 0;
+      fs.dpos[i] := 0;
+      return i;
+    end;
+  end;
+  return -1;
+end;
 
 // fill fs.size/mode/mtime for the NUL-terminated path at address a.  false either means the
 // path does not exist (fs.err stays "", the common case a caller checks for) or a different
@@ -64,9 +120,31 @@ begin
   return band(fs.mode, S_IFMT) = S_IFREG;
 end;
 
+// Frees fd's directory slot, if it has one, WITHOUT closing fd -- for a caller that
+// opened the directory its own way (not through fs.opendir, so it owns the fd's whole
+// lifecycle) and still wants to read it with fs.next. Harmless to call on an fd with no
+// slot.
+//
+// CALL THIS BEFORE YOU CLOSE SUCH AN fd YOURSELF. fs.next keys its slot table by fd
+// number alone, and fd numbers get REUSED: close a directory outside fs.close and the
+// kernel can hand that same number to the next thing opened, directory or not. Without
+// fs.forget first, fs.next on the new fd finds the OLD slot still claimed under that
+// number and resumes reading from the old fd's position instead of starting fresh --
+// the exact bug this file was fixed for, one level up. A caller that always goes
+// through fs.opendir/fs.close never needs this.
+procedure fs.forget(fd: int);
+var s: int;
+begin
+  s := fs.dfind(fd);
+  if s >= 0 then fs.dslot[s] := -1;
+end;
+
+// Closes fd, and frees its directory slot if fs.opendir or fs.next ever gave it one --
+// harmless to call on a plain file, which never has a slot.
 procedure fs.close(fd: int);
 begin
   sys1(SYS.close, fd);
+  fs.forget(fd);
 end;
 
 function fs.open(a: int): int;
@@ -74,12 +152,26 @@ begin
   return sys3(SYS.open, a, 0, 0);      // O_RDONLY
 end;
 
-// O_RDONLY | O_DIRECTORY (0x10000)
+// O_RDONLY | O_DIRECTORY (0x10000). Opens the directory and claims it a slot of its own
+// in fs.dslot/fs.dbuf/fs.dlen/fs.dpos, so reading it later (fs.next) never disturbs any
+// OTHER directory this process has open at the same time, so opening a child while a
+// parent is mid-walk leaves the parent's place in its own listing untouched.
+//
+// -1 with fs.err/fs.errno set to FS.EMFILE means FS.MAXOPEN directories are already
+// open; the fd this call itself opened is closed so it isn't leaked.
 function fs.opendir(a: int): int;
+var fd: int;
 begin
-  fs.dlen := 0;
-  fs.dpos := 0;
-  return sys3(SYS.open, a, 65536, 0);
+  fs.err := ""; fs.errno := 0;
+  fd := sys3(SYS.open, a, 65536, 0);
+  if fd < 0 then return fd;
+  if fs.dslotfor(fd) < 0 then
+  begin
+    sys1(SYS.close, fd);
+    fs.err := "fs.opendir: too many directories open at once"; fs.errno := FS.EMFILE;
+    return 0 - FS.EMFILE;
+  end;
+  return fd;
 end;
 
 // fs.map(a) -- map the whole NUL-terminated file at address a into memory, read-only.
@@ -123,24 +215,31 @@ end;
 // returned a negative -errno, or the buffer it filled holds a record with no length, which
 // would otherwise loop forever: fs.err then says so and fs.errno carries the raw -errno (0
 // when there was none to report, as with a corrupt record).
+//
+// Reads and positions live in fd's OWN slot (fs.dslotfor), so calling this on a second,
+// nested fd -- opening a child directory while a parent's listing is half read -- cannot
+// disturb the parent: each fd keeps its own buffer and its own place in it.
 function fs.next(fd: int): bool;
-var reclen, nameat, i: int;
+var reclen, nameat, i, s, base: int;
     c: char;
 begin
   fs.err := ""; fs.errno := 0;
+  s := fs.dslotfor(fd);
+  if s < 0 then begin fs.err := "fs.next: too many directories open at once"; fs.errno := FS.EMFILE; return false; end;
+  base := s * FS.DIRBUF;
   while true do
   begin
-    if fs.dpos >= fs.dlen then
+    if fs.dpos[s] >= fs.dlen[s] then
     begin
-      fs.dlen := sys3(SYS.getdents, fd, addr(fs.dbuf[0]), FS.DIRBUF);
-      fs.dpos := 0;
-      if fs.dlen < 0 then begin fs.err := "fs.next: getdents failed"; fs.errno := 0 - fs.dlen; return false; end;
-      if fs.dlen = 0 then return false;
+      fs.dlen[s] := sys3(SYS.getdents, fd, addr(fs.dbuf[base]), FS.DIRBUF);
+      fs.dpos[s] := 0;
+      if fs.dlen[s] < 0 then begin fs.err := "fs.next: getdents failed"; fs.errno := 0 - fs.dlen[s]; return false; end;
+      if fs.dlen[s] = 0 then return false;
     end;
-    reclen := io.get16(fs.dbuf, fs.dpos + 16);
+    reclen := io.get16(fs.dbuf, base + fs.dpos[s] + 16);
     if reclen <= 0 then begin fs.err := "fs.next: corrupt directory record"; return false; end;
-    fs.type := ord(fs.dbuf[fs.dpos + 18]);
-    nameat := fs.dpos + 19;
+    fs.type := ord(fs.dbuf[base + fs.dpos[s] + 18]);
+    nameat := base + fs.dpos[s] + 19;
     i := 0;
     while i < 255 do
     begin
@@ -151,7 +250,7 @@ begin
     end;
     fs.name[i] := chr(0);
     fs.namelen := i;
-    fs.dpos := fs.dpos + reclen;
+    fs.dpos[s] := fs.dpos[s] + reclen;
     // skip "." and ".."
     if fs.namelen = 1 then
     begin

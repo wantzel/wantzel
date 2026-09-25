@@ -1,0 +1,205 @@
+// lib/fs.wz used to keep ONE directory read buffer for the whole process (fs.dbuf /
+// fs.dlen / fs.dpos), not one per open fd. Opening a child directory while its parent's
+// listing was still being read reset that shared buffer, so the parent's fs.next calls
+// silently found fewer entries -- no error, just a truncated walk. This recursively
+// walks a small nested fixture tree, three directories deep and three OPEN AT ONCE at
+// the deepest point (root, its child, and that child's child are all still being read
+// when the deepest fs.opendir happens), and checks every fixture file is seen EXACTLY
+// once. Before the fix this undercounts, because the deepest opendir stomps on the
+// buffer the shallower fs.next calls are still reading from.
+include "io.wz";
+include "fs.wz";
+
+const
+  MAXID = 26;          // one slot per letter, the fixture files are named fA.txt .. fZ.txt
+
+var
+  path: array[0..255] of char;
+  seen: array[0..MAXID - 1] of int;
+  dirsvisited: int;
+  failures: int;
+
+procedure expect(good: bool; what: str);
+begin
+  if good then io.puts(STDOUT, "ok   ") else begin io.puts(STDOUT, "FAIL "); failures := failures + 1; end;
+  io.puts(STDOUT, what);
+  io.puts(STDOUT, "\n");
+end;
+
+// path[0..n) := prefix[0..plen) + "/" + suffix, NUL-terminated; returns the length before the NUL
+function joinpath(prefix: array of char; plen: int; suffix: str): int;
+var n: int;
+begin
+  for n := 0 to plen - 1 do path[n] := prefix[n];
+  n := io.push(path, plen, "/");
+  n := io.push(path, n, suffix);
+  path[n] := chr(0);
+  return n;
+end;
+
+// path[0..n) := prefix[0..plen), NUL-terminated: prefix itself as a path, for rmdir
+procedure setpath(prefix: array of char; plen: int);
+var n: int;
+begin
+  for n := 0 to plen - 1 do path[n] := prefix[n];
+  path[plen] := chr(0);
+end;
+
+procedure mkfile(prefix: array of char; plen: int; suffix: str);
+var fd, n: int;
+begin
+  n := joinpath(prefix, plen, suffix);
+  fd := sys3(SYS.open, addr(path[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
+  if fd < 0 then begin io.puts(STDOUT, "FAIL cannot create fixture file\n"); halt(1); end;
+  sys1(SYS.close, fd);
+end;
+
+procedure mkdirat(prefix: array of char; plen: int; suffix: str);
+var n: int;
+begin
+  n := joinpath(prefix, plen, suffix);
+  if sys2(SYS.mkdir, addr(path[0]), 493) < 0 then
+  begin
+    io.puts(STDOUT, "FAIL cannot create fixture directory\n"); halt(1);
+  end;
+end;
+
+procedure rmfile(prefix: array of char; plen: int; suffix: str);
+var n: int;
+begin
+  n := joinpath(prefix, plen, suffix);
+  sys1(SYS.unlink, addr(path[0]));
+end;
+
+procedure rmdirat(prefix: array of char; plen: int);
+begin
+  setpath(prefix, plen);
+  sys1(SYS.rmdir, addr(path[0]));
+end;
+
+// True when fs.name is "fX.txt" for some letter X; id gets X - 'A'.
+function fixturefile(id: array of int): bool;
+begin
+  if fs.namelen <> 6 then return false;
+  if fs.name[0] <> 'f' then return false;
+  if fs.name[2] <> '.' then return false;
+  if fs.name[3] <> 't' then return false;
+  if fs.name[4] <> 'x' then return false;
+  if fs.name[5] <> 't' then return false;
+  id[0] := ord(fs.name[1]) - ord('A');
+  return true;
+end;
+
+// Recursively walk dir[0..dlen), marking every fixture file "fX.txt" seen in `seen` and
+// descending into every subdirectory it finds -- WHILE this directory's own fs.next
+// loop is still in progress. That is exactly the case the bug broke: fs.opendir on a
+// child used to reset the one buffer this (parent) loop is still reading.
+procedure walk(dir: array of char; dlen: int);
+var fd, sublen: int;
+    sub: array[0..255] of char;
+    id: array[0..0] of int;
+    n: int;
+begin
+  fd := fs.opendir(addr(dir[0]));
+  if fd < 0 then begin io.puts(STDOUT, "FAIL cannot open a fixture directory mid-walk\n"); halt(1); end;
+  while fs.next(fd) do
+  begin
+    if fs.type = DT_DIR then
+    begin
+      dirsvisited := dirsvisited + 1;
+      for n := 0 to dlen - 1 do sub[n] := dir[n];
+      sublen := dlen;
+      sub[sublen] := '/'; sublen := sublen + 1;
+      for n := 0 to fs.namelen - 1 do sub[sublen + n] := fs.name[n];
+      sublen := sublen + fs.namelen;
+      sub[sublen] := chr(0);
+      walk(sub, sublen);              // NESTED: fd (this directory) is still open, mid-read
+    end
+    else if fs.type = DT_REG then
+    begin
+      if fixturefile(id) then
+        if (id[0] >= 0) and (id[0] < MAXID) then seen[id[0]] := seen[id[0]] + 1;
+    end;
+  end;
+  fs.close(fd);
+end;
+
+var
+  root: array[0..63] of char;
+  rootn, sub1n, sub2n, deepn: int;
+  sub1: array[0..127] of char;
+  sub2: array[0..127] of char;
+  deep: array[0..191] of char;
+  i, total, dupes: int;
+
+begin
+  failures := 0;
+  dirsvisited := 0;
+  for i := 0 to MAXID - 1 do seen[i] := 0;
+
+  rootn := io.push(root, 0, "fs_walk_nested_");
+  rootn := io.pushnum(root, rootn, sys1(SYS.getpid, 0));
+  rootn := io.push(root, rootn, ".d");
+  root[rootn] := chr(0);
+  sys2(SYS.mkdir, addr(root[0]), 493);
+
+  // root/fA.txt, root/sub1/, root/sub2/
+  mkfile(root, rootn, "fA.txt");
+  mkdirat(root, rootn, "sub1");
+  mkdirat(root, rootn, "sub2");
+
+  sub1n := rootn + 1 + 4;                       // "/sub1"
+  for i := 0 to rootn - 1 do sub1[i] := root[i];
+  sub1[rootn] := '/'; sub1[rootn + 1] := 's'; sub1[rootn + 2] := 'u';
+  sub1[rootn + 3] := 'b'; sub1[rootn + 4] := '1';
+
+  // root/sub1/fB.txt, root/sub1/deep/
+  mkfile(sub1, sub1n, "fB.txt");
+  mkdirat(sub1, sub1n, "deep");
+
+  deepn := sub1n + 1 + 4;                       // "/deep"
+  for i := 0 to sub1n - 1 do deep[i] := sub1[i];
+  deep[sub1n] := '/'; deep[sub1n + 1] := 'd'; deep[sub1n + 2] := 'e';
+  deep[sub1n + 3] := 'e'; deep[sub1n + 4] := 'p';
+
+  // root/sub1/deep/fC.txt, root/sub1/deep/fD.txt
+  mkfile(deep, deepn, "fC.txt");
+  mkfile(deep, deepn, "fD.txt");
+
+  sub2n := rootn + 1 + 4;                       // "/sub2"
+  for i := 0 to rootn - 1 do sub2[i] := root[i];
+  sub2[rootn] := '/'; sub2[rootn + 1] := 's'; sub2[rootn + 2] := 'u';
+  sub2[rootn + 3] := 'b'; sub2[rootn + 4] := '2';
+
+  // root/sub2/fE.txt
+  mkfile(sub2, sub2n, "fE.txt");
+
+  walk(root, rootn);
+
+  total := 0;
+  dupes := 0;
+  for i := 0 to 4 do            // A..E, the five fixture files
+  begin
+    if seen[i] <> 1 then dupes := dupes + 1;
+    total := total + seen[i];
+  end;
+  expect(dupes = 0, "every fixture file is seen exactly once (A..E)");
+  expect(total = 5, "five files total across the nested walk");
+  expect(dirsvisited = 3, "three subdirectories entered (sub1, sub1/deep, sub2)");
+
+  // cleanup, deepest first
+  rmfile(deep, deepn, "fC.txt");
+  rmfile(deep, deepn, "fD.txt");
+  rmdirat(deep, deepn);
+
+  rmfile(sub1, sub1n, "fB.txt");
+  rmdirat(sub1, sub1n);
+
+  rmfile(sub2, sub2n, "fE.txt");
+  rmdirat(sub2, sub2n);
+
+  rmfile(root, rootn, "fA.txt");
+  rmdirat(root, rootn);
+
+  if failures > 0 then halt(1);
+end.

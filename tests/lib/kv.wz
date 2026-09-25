@@ -284,7 +284,7 @@ begin
   // A routine that only ANSWERS A QUESTION must leave the cursor alone.
   // kv.find positions kv.vat/kv.vend on the stored value; kv.isobject, kv.count and
   // kv.match used to move it, and the caller then read a different value without any
-  // error -- the two application bugs behind this ticket.  Each case prints the value
+  // error -- two real application bugs came from that.  Each case prints the value
   // the cursor points at AFTER the question, so a regression shows the wrong text and
   // not merely a wrong number.
   ob_n := io.push(ob, 0, "{\"a\":{\"x\":1},\"target\":\"kept\",\"z\":[1,2]}");

@@ -1,0 +1,89 @@
+// lib/net.wz: an IPv6 listener and an IPv6 connect, on the same loopback address a
+// browser or curl would use for it, ::1 -- and a mixed check that an IPv6 listener and an
+// IPv4 connect do NOT meet (they are different address families, on purpose: net.listen
+// still means IPv4-only, net.listen6 is the new, separate one).
+//
+// Same pattern as tests/lib/tls_deadline.wz: the peer is this same process, connected
+// through a real socket pair, so nothing runs in the background and nothing is left over.
+include "io.wz";
+include "net.wz";
+include "dns.wz";
+include "proc.wz";
+
+var
+  lfd6, lfd4, port, tries, c, sv, n, at: int;
+  loopback6: array[0..15] of char;
+  buf: array[0..63] of char;
+  msg: array[0..12] of char;   // "hello over v6", 13 bytes
+
+procedure say(s: str; b: bool);
+begin
+  if b then io.puts(STDOUT, "ok   ") else io.puts(STDOUT, "FAIL ");
+  io.puts(STDOUT, s);
+  io.puts(STDOUT, "\n");
+end;
+
+// accept, retrying a while: net.accept is non-blocking and the listener has just been
+// asked to connect to, so the connection may not be queued on the very first try.
+function tryaccept(lfd: int): int;
+var s, t: int;
+begin
+  s := 0 - 1;
+  t := 0;
+  while (s < 0) and (t < 2000) do
+  begin
+    s := net.accept(lfd);
+    t := t + 1;
+  end;
+  return s;
+end;
+
+begin
+  say("dns.parseip6 reads ::1", dns.parseip6("::1", loopback6));
+  say("  (as fifteen zero bytes and a one)", (ord(loopback6[15]) = 1) and (ord(loopback6[0]) = 0) and (ord(loopback6[14]) = 0));
+
+  port := 42000 + proc.self mod 7000;
+  lfd6 := net.listen6(port, 4, false);
+  tries := 0;
+  while (lfd6 < 0) and (tries < 50) do
+  begin
+    port := port + 1;
+    lfd6 := net.listen6(port, 4, false);
+    tries := tries + 1;
+  end;
+  if lfd6 < 0 then begin io.puts(STDOUT, "no IPv6 port\n"); halt(1); end;
+
+  // ---- a real connection over ::1 --------------------------------------------------------
+  c := net.connect6(loopback6, port);
+  say("net.connect6 to a listening [::1]:port succeeds", c >= 0);
+  sv := tryaccept(lfd6);
+  say("net.accept on the IPv6 listener takes it", sv >= 0);
+
+  at := io.push(msg, 0, "hello over v6");
+  n := net.send(c, addr(msg[0]), 13);
+  say("send on the client side", n = 13);
+  n := net.recv(sv, addr(buf[0]), len(buf));
+  say("  and the server reads the same 13 bytes", (n = 13) and (buf[0] = 'h') and (buf[12] = '6'));
+  net.close(c);
+  net.close(sv);
+
+  // ---- a closed IPv6 port is refused, cleanly --------------------------------------------
+  net.close(lfd6);
+  c := net.connect6(loopback6, port);
+  say("net.connect6 to a closed IPv6 port fails", c < 0);
+  say("  with ECONNREFUSED", c = 0 - 111);
+
+  // ---- IPv4 and IPv6 are different families: an IPv4 listener refuses an IPv6 connect ---
+  lfd4 := net.listen(port + 1, 4, false);
+  tries := 0;
+  while (lfd4 < 0) and (tries < 50) do
+  begin
+    port := port + 1;
+    lfd4 := net.listen(port + 1, 4, false);
+    tries := tries + 1;
+  end;
+  if lfd4 < 0 then begin io.puts(STDOUT, "no IPv4 port\n"); halt(1); end;
+  c := net.connect6(loopback6, port + 1);
+  say("an IPv4-only listener does not answer on ::1", c < 0);
+  net.close(lfd4);
+end.

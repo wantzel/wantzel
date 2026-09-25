@@ -17,6 +17,7 @@
 # up until someone tampers with a record.
 set -e
 here=$(cd "$(dirname "$0")/../.." && pwd)
+. "$here/tests/lib/portlib.sh"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL  $1"; shift; for r in "$@"; do echo "        $r"; done; }
@@ -30,7 +31,8 @@ if ! command -v openssl >/dev/null 2>&1; then
 fi
 
 tmp=$(mktemp -d)
-port=$(( 24000 + ($$ % 10000) ))
+set -- $(free_ports 3)
+port=$1; rsaport=$2; srvport=$3
 started=""
 cleanup() {
   rc=$?
@@ -69,7 +71,7 @@ while [ $i -lt 200 ]; do
   i=$((i+1))
 done
 ss -tln 2>/dev/null | grep -q ":$port " \
-  || { echo "  FAIL  the test server never started listening"; exit 1; }
+  || { echo "  FAIL  the test server never started listening"; port_owner "$port"; cat "$tmp/srv.log"; exit 1; }
 
 # ---- the client ----------------------------------------------------------------------------
 cat > "$tmp/cli.wz" <<WZ
@@ -125,7 +127,13 @@ begin
   end;
   fd := net.connect(127, 0, 0, 1, argnum(1));
   if fd < 0 then begin io.puts(STDERR, "connect failed\n"); halt(1); end;
-  tls.now := io.realtime div 1000000000;
+  // FIVE MINUTES AHEAD, and that is the test's clock only. The certificates here are made by
+  // openssl seconds earlier with notBefore = now, and a machine whose clock is stepped back
+  // by time synchronisation (a virtual machine does that routinely: several steps of a few
+  // seconds in one afternoon, measured) then sees a certificate that is not valid yet --
+  // correctly. Real authorities backdate notBefore for exactly this reason; openssl's
+  // req -x509 cannot, so the client allows for it instead. The date check itself still runs.
+  tls.now := io.realtime div 1000000000 + 300;
   if not tls.connect(fd, hostarg) then
   begin
     io.puts(STDERR, "handshake failed: ");
@@ -231,7 +239,6 @@ esac
 # the honest answer is verified = false -- not a silent true, and not a refusal to connect.
 openssl req -x509 -newkey rsa:2048 -keyout "$tmp/rk.pem" -out "$tmp/rc.pem" \
   -days 1 -nodes -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" >/dev/null 2>&1
-rsaport=$(( port + 1 ))
 openssl s_server -accept "$rsaport" -cert "$tmp/rc.pem" -key "$tmp/rk.pem" \
   -tls1_3 -www -quiet >"$tmp/rsa.log" 2>&1 &
 started="$started $!"
@@ -313,7 +320,6 @@ fi
 #
 # It also exercises the half of the handshake the client never runs: building a ServerHello,
 # sending the certificate, and SIGNING the transcript rather than verifying it.
-srvport=$(( port + 2 ))
 D=$(openssl ec -in "$tmp/k.pem" -text -noout 2>/dev/null \
     | sed -n '/priv:/,/pub:/p' | tr -d ' :\n' | sed 's/priv//;s/pub//' | tail -c 65)
 openssl x509 -in "$tmp/c.pem" -outform DER -out "$tmp/c.der" 2>/dev/null

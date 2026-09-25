@@ -51,7 +51,7 @@ const
   MCP.MAXOUT_DEFAULT = 167772160;
 
   // MAP_NORESERVE: the mapping takes address space, and a page of memory only when it is
-  // written.  The Windows runtime ignores the flags of an anonymous mapping.
+  // written.
   MCP.NORESERVE = 16384;
   MCP.EINTR     = 0 - 4;
 

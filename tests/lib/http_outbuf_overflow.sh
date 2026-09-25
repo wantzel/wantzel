@@ -16,10 +16,11 @@
 # one buffer times MAXCONN). It catches the overflow before the write and turns http.finish
 # into a clean 500 with a short message instead of a lie about Content-Length.
 . "$ROOT/tests/helpers.sh"
+. "$ROOT/tests/lib/portlib.sh"
 
 command -v curl >/dev/null 2>&1 || { echo "curl is missing"; exit 1; }
 
-port=$(( 24000 + ($$ % 900) ))
+port=$(free_port)
 
 cat > "$T/outsrv.wz" <<EOF
 include "http.wz";

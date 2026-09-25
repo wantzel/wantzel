@@ -2,7 +2,13 @@
 # lib/http.wz, on the SAME listening port -- handshake, text frames both ways, a
 # server push with no request behind it, ping/pong, and a close that carries a code.
 # The server under test also answers plain HTTP GET on the same port, which is the
-# whole point of this design (DEC-0000-0106): one port, one origin, one cookie.
+# whole point of this design: one port, one origin, one cookie.
+#
+# ALSO: a connection whose fd is 256 or higher works exactly like any other. Connections
+# live in WS.MAXCONN (256) SLOTS, not at their fd (matching lib/http.wz's own slot
+# model) -- before that change, ws.take flatly refused fd >= WS.MAXCONN, so a busy
+# process (many fds already open, exactly what a real server accumulates) started losing
+# WebSocket upgrades long before it was anywhere near 256 WebSocket connections at once.
 #
 # TOETSGROEP: lib
 # DEKT: lib/websocket.wz lib/http.wz
@@ -14,18 +20,42 @@
 # own handshake and masks its own frames by hand, the way a browser's WebSocket
 # implementation does.
 . "$ROOT/tests/helpers.sh"
+. "$ROOT/tests/lib/portlib.sh"
 
-port=$(( 23000 + ($$ % 900) ))
+# acceptval <tag> <client output> -- pulls the value off a "TAG value" line the test
+# client printed (EXPECTACCEPT or GOTACCEPT), so the shell side can compare the two
+# without the Wantzel client itself deciding pass/fail on the RFC 6455 accept value.
+acceptval() { printf '%s\n' "$2" | sed -n "s/^$1 //p" | head -n1; }
+
+# THE ORACLE, MADE OUTSIDE lib/sha1.wz AND lib/base64.wz ENTIRELY (same idea as
+# tests/lib/sha384.sh's openssl comparison): the client's key is always the fixed
+# 16-byte nonce 'A'..'P' (see wscli.wz below), so its base64 -- and therefore the whole
+# RFC 6455 5.2.2 input -- is a compile-time constant here. Computing the expected accept
+# value with openssl catches what the Wantzel-side comparison below structurally cannot:
+# lib/sha1.wz sabotaged so BOTH the client's own computation and the server's agree on
+# the same wrong digest, since wscli.wz is compiled against the very same lib/ being
+# tested -- a client-side comparison alone stays green in exactly that case, having
+# verified only that the two sides agree, not that either is right.
+ORACLE_KEYB64="QUJDREVGR0hJSktMTU5PUA=="
+oracle_accept() {
+  printf '%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11' "$ORACLE_KEYB64" | openssl dgst -sha1 -binary | base64
+}
+
+port=$(free_port)
 
 cat > "$T/wssrv.wz" <<'EOF'
 include "websocket.wz";
 
 // ECHO: whatever text comes in goes straight back out, so the client can tell its own
 // frame was received and reassembled correctly.
+//
+// ws.in IS INDEXED BY SLOT, NOT BY fd: connections live in WS.MAXCONN
+// slots, same shape lib/http.wz uses, so the base into ws.in comes from ws.slot --
+// set by this module right before the call -- not from fd.
 procedure app.wsframe(fd: int);
 var base: int;
 begin
-  base := fd * WS.INMAX;
+  base := ws.slot * WS.INMAX;
   ws.ignored := ws.sendtext(fd, ws.in[base + ws.at .. base + ws.at + ws.len - 1], ws.len);
 end;
 
@@ -100,8 +130,10 @@ cat > "$T/wscli.wz" <<'EOF'
 include "io.wz";
 include "net.wz";
 include "base64.wz";
+include "sha1.wz";
 
 const KEYB64LEN = 24;
+const GUIDLEN = 36;
 
 var
   fd: int;
@@ -111,6 +143,13 @@ var
   req: array[0..1023] of char;
   nonce: array[0..15] of char;
   keyb64: array[0..31] of char;
+  // RFC 6455 5.2.2: the server's accept value is base64(sha1(the client's own
+  // Sec-WebSocket-Key text, verbatim, concatenated with this fixed GUID)) -- computed
+  // here from the SAME keyb64 this client sent, so a passing test proves the header
+  // came from that computation and not merely that SOME 28-character value arrived.
+  wskey: array[0..63] of char;
+  wsdig: array[0..19] of char;
+  expectaccept: array[0..31] of char;
 
 function argnum(k: int): int;
 var j, v: int;
@@ -159,6 +198,43 @@ begin
   n := net.send(fd, addr(out[0]), hn + n);
 end;
 
+// Scan the read header block h[0..hn-1] for a line "Sec-WebSocket-Accept: <value>\r\n"
+// and copy <value> into dst; returns its length, or -1 if the header is absent. A
+// plain byte-for-byte scan (the header name is fixed here, unlike a general HTTP
+// header lookup) is enough for a test client that only ever asks for this one field.
+function findaccept(h: array of char; hn: int; dst: array of char): int;
+const NAME = "Sec-WebSocket-Accept: ";
+var i, j, k, namelen, vn: int;
+    match: bool;
+begin
+  namelen := 22;
+  i := 0;
+  while i + namelen <= hn do
+  begin
+    match := true;
+    j := 0;
+    while j < namelen do
+    begin
+      if h[i + j] <> schar(NAME, j) then begin match := false; j := namelen; end
+      else j := j + 1;
+    end;
+    if match then
+    begin
+      k := i + namelen;
+      vn := 0;
+      while (k < hn) and (h[k] <> chr(13)) do
+      begin
+        dst[vn] := h[k];
+        vn := vn + 1;
+        k := k + 1;
+      end;
+      return vn;
+    end;
+    i := i + 1;
+  end;
+  return -1;
+end;
+
 begin
   fd := net.connect(127, 0, 0, 1, argnum(1));
   if fd < 0 then begin io.puts(STDERR, "connect failed\n"); halt(1); end;
@@ -169,6 +245,25 @@ begin
   i := 0;
   while i < 16 do begin nonce[i] := chr(65 + i); i := i + 1; end;
   n := base64.encode(keyb64, 0, nonce[0..15]);
+
+  // RFC 6455 5.2.2, computed independently of lib/websocket.wz: base64(sha1(the
+  // client's own key text (24 bytes, unchanged) ++ the fixed GUID (36 bytes))). If
+  // lib/sha1.wz's digest is wrong, this value is wrong the same way the server's is,
+  // so only a comparison against the SERVER's own header (below) can catch a shared
+  // bug -- this only guards against the server computing something else entirely.
+  i := 0;
+  while i < KEYB64LEN do begin wskey[i] := keyb64[i]; i := i + 1; end;
+  i := 0;
+  while i < GUIDLEN do
+  begin
+    wskey[KEYB64LEN + i] := schar("258EAFA5-E914-47DA-95CA-C5AB0DC85B11", i);
+    i := i + 1;
+  end;
+  sha1.hash(wskey[0..KEYB64LEN + GUIDLEN - 1], wsdig);
+  n := base64.encode(expectaccept, 0, wsdig[0..19]);
+  io.puts(STDOUT, "EXPECTACCEPT ");
+  io.out(STDOUT, addr(expectaccept[0]), n);
+  io.puts(STDOUT, "\n");
 
   n := io.push(req, 0, "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
   i := 0;
@@ -191,6 +286,16 @@ begin
     if n >= 1023 then begin io.puts(STDERR, "handshake header too long\n"); halt(1); end;
   end;
   io.puts(STDOUT, "HANDSHAKE-OK\n");
+
+  // THE ACTUAL POINT OF THIS TEST: pull the server's own Sec-WebSocket-Accept value
+  // out of the header block just read and print it, so the shell side can assert it
+  // equals EXPECTACCEPT above -- until this, the test only ever checked that a 101
+  // and \r\n\r\n arrived, never what the accept value itself said.
+  i := findaccept(hdrbuf, n, buf);
+  if i < 0 then begin io.puts(STDERR, "no Sec-WebSocket-Accept header\n"); halt(1); end;
+  io.puts(STDOUT, "GOTACCEPT ");
+  io.out(STDOUT, addr(buf[0]), i);
+  io.puts(STDOUT, "\n");
 
   // ---- 1. the server push, unprompted --------------------------------------------------------
   if not fillbuf(2) then begin io.puts(STDERR, "no push frame header\n"); halt(1); end;
@@ -264,6 +369,19 @@ assert_contains "an ordinary GET on the same port is answered as plain HTTP" "$b
 out=$("$T/wscli" "$port" 2>"$T/cli.err") || { echo "the test client failed:"; cat "$T/cli.err"; exit 1; }
 
 assert_contains "the handshake completes with a 101" "$out" "HANDSHAKE-OK"
+# THE ACTUAL RFC 6455 CHECK: the client computed base64(sha1(its own key ++ the GUID))
+# independently, with lib/sha1.wz and lib/base64.wz, and it must equal what the server
+# put in Sec-WebSocket-Accept -- not merely that a \r\n\r\n arrived.
+# NEITHER SIDE MAY BE EMPTY: two blank strings would otherwise compare equal and this
+# check would pass for the wrong reason if the client ever failed to print either line.
+[ -n "$(acceptval GOTACCEPT "$out")" ] || { echo "no GOTACCEPT line in client output"; echo "$out"; exit 1; }
+[ -n "$(acceptval EXPECTACCEPT "$out")" ] || { echo "no EXPECTACCEPT line in client output"; echo "$out"; exit 1; }
+assert_eq "Sec-WebSocket-Accept matches base64(sha1(key + GUID)) (RFC 6455 5.2.2)" \
+  "$(acceptval GOTACCEPT "$out")" "$(acceptval EXPECTACCEPT "$out")"
+# AND AGAINST THE ORACLE, independent of lib/sha1.wz entirely -- see its definition above
+# for why the Wantzel-side comparison alone cannot catch a shared, sabotaged sha1.wz.
+assert_eq "Sec-WebSocket-Accept matches openssl's sha1, outside lib/sha1.wz entirely" \
+  "$(acceptval GOTACCEPT "$out")" "$(oracle_accept)"
 assert_contains "the server pushes without being asked" "$out" "PUSH welcome"
 assert_contains "a text frame sent by the client is echoed back whole" "$out" "ECHO roundtrip"
 assert_contains "a ping gets a pong (opcode 10)" "$out" "PONGOP 10"
@@ -329,3 +447,123 @@ esac
 echo "the frame payload is really carried through: corrupting it breaks what the client reads, seen red by sabotage and restored from the unmodified lib/"
 
 echo "lib/websocket.wz: on the SAME port as lib/http.wz, handshake, echo, server push, ping/pong, and a close with a code all work over a real (masked) client connection, and plain HTTP keeps working before and after"
+
+# ---- fd >= 256 works exactly like any other fd -------------------------------------------------
+# The server below opens 300 throwaway sockets with net.socket BEFORE it ever calls
+# http.listen, and never closes them -- so the fd of the first connection curl or the test
+# client makes is guaranteed to land at 300 or above, past the old WS.MAXCONN=256 ceiling
+# ws.take used to check the RAW fd against. Nothing else about the server differs from the
+# one above: same echo, same push, so the SAME client and the SAME assertions apply.
+highport=$(free_port)
+
+cat > "$T/wssrv_highfd.wz" <<'EOF'
+include "websocket.wz";
+
+procedure app.wsframe(fd: int);
+var base: int;
+begin
+  base := ws.slot * WS.INMAX;
+  ws.ignored := ws.sendtext(fd, ws.in[base + ws.at .. base + ws.at + ws.len - 1], ws.len);
+end;
+
+procedure app.wsclose(fd: int);
+begin
+end;
+
+procedure app.request;
+var ok: bool;
+begin
+  if http.pathis("/ws") then
+  begin
+    if http.header("upgrade") then
+    begin
+      http.detach := true;
+      ok := ws.take(http.fd);
+      if not ok then
+      begin
+        http.detach := false;
+        net.close(http.fd);
+      end
+      else
+        ws.ignored := ws.sendtext(http.fd, "welcome", 7);
+      return;
+    end;
+    http.start;
+    http.add("no upgrade requested\n");
+    http.finish(400, "text/plain");
+    return;
+  end;
+  http.start;
+  http.add("hello from wantzel\n");
+  http.finish(200, "text/plain");
+end;
+
+procedure runloop(port: int);
+var n, i, burned: int;
+begin
+  // BURN 300 FDS BEFORE LISTENING: net.socket hands out the next free fd from the
+  // kernel's own table, exactly like accept(2) does for an incoming connection, so
+  // this is not a simulation of a busy process -- it puts the listener's own next
+  // accepted fd at 300+ for real, the same way a long-running server with many other
+  // open files or connections would. Left open for the process's whole lifetime: this
+  // test is about ws.take seeing a high fd, not about closing these again.
+  i := 0;
+  while i < 300 do
+  begin
+    burned := net.socket;
+    if burned < 0 then io.fatal("runloop: net.socket failed while burning fds");
+    i := i + 1;
+  end;
+
+  http.listen(port, 1);
+  while true do
+  begin
+    n := http.poll(50);
+    n := ws.poll(0);
+  end;
+end;
+
+begin
+  runloop(PORT);
+end.
+EOF
+sed -i "s/PORT/$highport/" "$T/wssrv_highfd.wz"
+compile "$T/wssrv_highfd.wz" "$T/wssrv_highfd"
+
+"$T/wssrv_highfd" >"$T/highfd_server.log" 2>&1 &
+highpid=$!
+highcleanup() { pkill -P "$highpid" 2>/dev/null; kill "$highpid" 2>/dev/null; wait "$highpid" 2>/dev/null; }
+trap highcleanup EXIT
+
+ready=0
+for _ in $(seq 50); do
+  if curl -s -o /dev/null "http://127.0.0.1:$highport/" 2>/dev/null; then ready=1; break; fi
+  sleep 0.1
+done
+[ $ready -eq 1 ] || { echo "the high-fd server did not come up on port $highport"; cat "$T/highfd_server.log"; exit 1; }
+
+# CONFIRM THE ACCEPTED fd IS ACTUALLY PAST THE OLD CEILING, so a passing test below is
+# known to be exercising fd >= 256 and not accidentally landing under it (a low fd would
+# make this whole block pass for the wrong reason, on this platform's fd allocation, no
+# different from the one above).
+fdcount=$(ls "/proc/$highpid/fd" 2>/dev/null | wc -l)
+if [ "$fdcount" -lt 256 ]; then
+  echo "the high-fd server only has $fdcount fds open -- the burn loop did not run, this test is not exercising fd >= 256"
+  exit 1
+fi
+
+highout=$("$T/wscli" "$highport" 2>"$T/highcli.err") || { echo "the high-fd test client failed:"; cat "$T/highcli.err"; exit 1; }
+
+assert_contains "a connection whose fd is >= 256 still completes the handshake" "$highout" "HANDSHAKE-OK"
+[ -n "$(acceptval GOTACCEPT "$highout")" ] || { echo "no GOTACCEPT line in high-fd client output"; echo "$highout"; exit 1; }
+[ -n "$(acceptval EXPECTACCEPT "$highout")" ] || { echo "no EXPECTACCEPT line in high-fd client output"; echo "$highout"; exit 1; }
+assert_eq "and its Sec-WebSocket-Accept still matches base64(sha1(key + GUID))" \
+  "$(acceptval GOTACCEPT "$highout")" "$(acceptval EXPECTACCEPT "$highout")"
+assert_eq "and still matches openssl's sha1, outside lib/sha1.wz entirely" \
+  "$(acceptval GOTACCEPT "$highout")" "$(oracle_accept)"
+assert_contains "and still gets the unprompted server push" "$highout" "PUSH welcome"
+assert_contains "and a client frame is still echoed back whole" "$highout" "ECHO roundtrip"
+assert_contains "and ping/pong still works" "$highout" "PONGOP 10"
+assert_contains "and a close from the client is still answered with a code" "$highout" "CLOSECODE 1000"
+
+echo "lib/websocket.wz: a connection whose fd is 256 or higher (confirmed via /proc/$highpid/fd, $fdcount fds open) completes the handshake, echo, push, ping/pong and close exactly like any other -- ws.take no longer refuses by raw fd"

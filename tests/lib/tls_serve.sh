@@ -17,6 +17,7 @@
 # gives up on its own.
 set -e
 here=$(cd "$(dirname "$0")/../.." && pwd)
+. "$here/tests/lib/portlib.sh"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL  $1"; shift; for r in "$@"; do echo "        $r"; done; }
@@ -62,13 +63,13 @@ mkcert "$tmp" two
 cp "$tmp/one.der" "$tmp/srv/cert.der"
 cp "$tmp/one.hex" "$tmp/srv/key.hex"
 
-base=$(( 26000 + $$ % 3000 * 3 ))
-p80=$base; p443=$((base + 1)); paux=$((base + 2))
+set -- $(free_ports 3)
+p80=$1; p443=$2; paux=$3
 ( cd "$tmp/srv" && exec "$tmp/serve" "$p80" "$p443" local.test >"$tmp/serve.log" 2>&1 ) &
 srvpid=$!
 started="$started $srvpid"
 i=0; while [ $i -lt 200 ]; do ss -tln 2>/dev/null | grep -q ":$p443 " && break; sleep 0.1; i=$((i+1)); done
-ss -tln 2>/dev/null | grep -q ":$p443 " || { echo "  FAIL  serve did not start"; cat "$tmp/serve.log"; exit 1; }
+ss -tln 2>/dev/null | grep -q ":$p443 " || { echo "  FAIL  serve did not start"; port_owner "$p443"; cat "$tmp/serve.log"; exit 1; }
 
 URL="https://local.test:$p443/"
 get() {      # get <cafile> [--max-time n]: one HTTPS request, the body on stdout

@@ -18,13 +18,14 @@
 # pass -- which is the single most important thing here to get wrong.
 set -e
 here=$(cd "$(dirname "$0")/../.." && pwd)
+. "$here/tests/lib/portlib.sh"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL  $1"; shift; for r in "$@"; do echo "        $r"; done; }
 
 tmp=$(mktemp -d)
-caport=$(( 15000 + ($$ % 4000) ))
-chport=$(( caport + 1 ))
+set -- $(free_ports 2)
+caport=$1; chport=$2
 started=""
 cleanup() {
   rc=$?
@@ -130,7 +131,7 @@ esac
 #
 # So: run the client with the challenge listener pointed at a port where nothing answers. The
 # order must be refused.
-deadport=$(( chport + 500 ))
+deadport=$(free_port)   # nothing binds this; a kernel-fresh port is guaranteed unheld
 out3=$( cd "$tmp" && timeout 60 ./getcert 127.0.0.1 "$caport" "$deadport" \
         never.example.com test@example.com 2>&1 || true )
 case "$out3" in

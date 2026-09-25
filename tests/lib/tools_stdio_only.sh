@@ -4,7 +4,7 @@
 # declares app.request forward: a program that includes it must define that hook even when
 # it never serves HTTP.  lib/toolsmcp.wz is the MCP half on its own.  This test is the
 # program a newcomer writes for stdio -- tools, a handler, mcp.stdio, nothing else -- and
-# it must compile and answer tools/list and tools/call, on both targets.
+# it must compile and answer tools/list and tools/call.
 #
 # TOETSGROEP: schema
 # DEKT: lib/toolsmcp.wz lib/tools.wz
@@ -34,7 +34,6 @@ end.
 WZ
 
 compile "$T/stdio.wz" "$T/stdio"
-compile_win "$T/stdio.wz" "$T/stdio.exe"
 
 out=$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \

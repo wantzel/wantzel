@@ -30,8 +30,9 @@ your agent  ──writes──▶  wantzel  ──▶  a static binary
                             — in milliseconds
 ```
 
-The compiler is written in Wantzel and compiles itself. It emits x86-64 executables for
-Linux and Windows directly: no assembler, no linker, no C library, no runtime.
+The compiler is written in Wantzel and compiles itself. It emits static x86-64 Linux
+executables directly: no assembler, no linker, no C library, no runtime.
+On Windows, run it under WSL2.
 
 > **Early days.** Anything may change before 1.0: the language, the library and the command
 > line.
@@ -110,7 +111,7 @@ an MCP server, an HTTP server, an HTTPS client and server, and a file server ove
 | [Conventions](docs/conventions.md) | how to lay out a project |
 | [Testing](docs/testing.md) | the suite, and how to add to it |
 | [Design](docs/design.md) | why the language is the way it is, and how the compiler works |
-| [How-to](docs/howto.md) | background work, serving HTTPS, signing a Windows executable |
+| [How-to](docs/howto.md) | background work, serving HTTPS, resolving names |
 | [Changelog](docs/changelog.md) | what changed, and what it asks of you |
 
 ## Repository layout
@@ -118,7 +119,7 @@ an MCP server, an HTTP server, an HTTPS client and server, and a file server ove
 | | |
 |---|---|
 | `src/` | the compiler, in Wantzel |
-| `bootstrap/boot.c` | the same compiler in C, used once to build the first binary |
+| `bootstrap/boot.c` | a small C compiler, used once to build the first binary -- just enough of the language to compile `src/` itself, for Linux |
 | `lib/` | the standard library |
 | `examples/` | single-file programs |
 | `tests/` | the suite: `./wztest` runs it |

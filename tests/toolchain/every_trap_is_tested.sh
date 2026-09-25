@@ -19,7 +19,7 @@ cd "$here"
 # gone by the time the script exits -- the run would report failures and still succeed. A
 # temporary file and a plain loop keep the count where the exit code can see it.
 tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
-grep -oE 'trap\("[^"]+"\)' src/compiler.wz | sed 's/^trap("//; s/")$//' | sort -u > "$tmp"
+grep -oE 'trap\("[^"]+"\)' src/wantzel.wz | sed 's/^trap("//; s/")$//' | sort -u > "$tmp"
 
 fail=0
 while IFS= read -r msg; do

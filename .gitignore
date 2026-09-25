@@ -14,8 +14,13 @@
 # if a copy ever drifts in, it must not be committed.
 .env
 
-# Worktrees for parallel work. They belong OUTSIDE the repository, in wstack/ itself,
-# where no repository sees them. This is the safety net in case one is ever created
+# Built once per worktree by tests/lib/portlib.sh, from tests/helpers/freeport.wz. Not
+# reproducible-output like /bin/wantzel (it's a test tool, not the compiler), but the same
+# reasoning applies: it's a build product, not a source.
+/tests/helpers/.freeport-bin
+
+# Worktrees for parallel work. They belong OUTSIDE the repository, in a directory next to
+# it, where no repository sees them. This is the safety net in case one is ever created
 # inside: a worktree in a commit would carry the whole tree twice, and this repository
 # is public.
 /wt-*/

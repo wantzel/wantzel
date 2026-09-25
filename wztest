@@ -6,22 +6,12 @@
 #   ./wztest tests/lang/hello.wz   one test
 #   ./wztest --time                show how long each test took
 #   ./wztest --toolchain           also the bootstrap fixed point and test.sh
-#   ./wztest --toolchain --windows also the Windows tests, through Wine (slower)
 #   ./wztest --bench               also tests/bench/ (skipped by default); see below
 #
 # This suite tests THE LANGUAGE AND THE COMPILER: does the language do what the
 # specification says, and does the compiler translate that correctly?  The tests live in
 # tests/lang, tests/compiler and tests/lib, and take a little over a second together.
 # tests/toolchain runs only with --toolchain (the bootstrap fixed point and test.sh).
-#
-# THE WINDOWS TESTS SIT BEHIND --windows, AND THAT IS A DELIBERATE SPLIT.  Everything the
-# language itself does is tested natively; Wine is there for two narrower questions --
-# does the compiler still cross-compile to a working .exe, and do the two backends reach
-# the same fixed point.  Those cannot regress from an ordinary change to lib/ or to a
-# test, but they are the slowest thing here: measured 14-09-2026, the Windows tests were
-# 19 of the 40 seconds of a full --toolchain run, and Wine starts a server of its own.
-# Keeping them out of the everyday loop is what makes that loop worth running on every
-# change; a release runs them, because release.py passes --windows.
 #
 # The conventions are all decided by files sitting next to each other:
 #   foo.wz + foo.out    compile, run, compare stdout+stderr
@@ -45,7 +35,7 @@ export WANTZEL WANTZEL0 ROOT
 
 [ -x "$WANTZEL" ] || { echo "wztest: $WANTZEL is missing; run ./build.sh" >&2; exit 2; }
 
-verbose=0; update=0; listonly=0; timing=0; toolchain=0; bench=0; windows=0; filter=""; targets=""
+verbose=0; update=0; listonly=0; timing=0; toolchain=0; bench=0; filter=""; targets=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -v) verbose=1 ;;
@@ -53,7 +43,6 @@ while [ $# -gt 0 ]; do
     --list) listonly=1 ;;
     --time) timing=1 ;;
     --toolchain) toolchain=1 ;;
-    --windows) windows=1 ;;
     --bench) bench=1 ;;
     -k) shift; filter="$1" ;;
     -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
@@ -65,7 +54,7 @@ done
 [ -n "$targets" ] || targets="tests"
 
 have_timeout=0; command -v timeout >/dev/null 2>&1 && have_timeout=1
-pass=0; fail=0; skip=0; updated=0; toolskipped=0; winskipped=0
+pass=0; fail=0; skip=0; updated=0; toolskipped=0
 failed=""
 now_ms() { date +%s%3N 2>/dev/null || echo 0; }
 elapsed() { if [ $timing -eq 1 ]; then printf ' (%s ms)' $(( $(now_ms) - t0 )); fi; }
@@ -81,9 +70,6 @@ run() { secs="$1"; shift; if [ $have_timeout -eq 1 ]; then timeout "$secs" "$@";
 # for a test that never ran. Measured 22-09-2026: a ticket closed green while the test it
 # named was deliberately broken, because the name reached this runner in a form it could
 # not find and nothing said so in the exit code.
-#
-# That is the same trap the demo runner carries a comment about (P-0000-0037), from the
-# other side: there it was an empty match, here a missing file.
 missing=0
 list=$(for t in $targets; do
   if [ -d "$t" ]; then find "$t" -type f \( -name '*.wz' -o -name '*.sh' \) | sort
@@ -102,19 +88,6 @@ for f in $list; do
   # server doing exactly its job.
   case "$f" in tests/helpers/*) continue ;; esac
   case "$f" in tests/toolchain/*) [ $toolchain -eq 1 ] || { toolskipped=$((toolskipped+1)); continue; } ;; esac
-  # The Windows tests need Wine and are the slowest thing in the suite; --windows asks
-  # for them.  Only tests that actually START Wine belong here: win_backend_bytes.sh
-  # compares .exe bytes and runs in every --toolchain run.
-  #
-  # This list named freeze.sh until 15-09-2026, and freeze.sh had been renamed to
-  # all_suites_green.sh -- so the entry matched nothing and that script, which called
-  # test-win.sh unconditionally, ran Wine on every --toolchain run. Twenty-nine orphan
-  # wine processes later, the call is gone from it. A name in this list is
-  # only as good as the file it names: check it after a rename.
-  case "$f" in
-    tests/toolchain/win_syscalls.sh|tests/toolchain/win_exe_runs.sh|tests/toolchain/win_same_output.sh|tests/toolchain/win_getprocaddress.sh|tests/toolchain/win_winproc.sh|tests/toolchain/win_recv_reset.sh|tests/toolchain/win_dns.sh|tests/toolchain/win_mcp_big.sh)
-      [ $windows -eq 1 ] || { winskipped=$((winskipped+1)); continue; } ;;
-  esac
   case "$f" in tests/bench/*) [ $bench -eq 1 ] || continue ;; esac
   case "$f" in *"$filter"*) ;; *) continue ;; esac
   case "$f" in */progs/*) continue ;; esac
@@ -207,7 +180,6 @@ $(limit <"$T/out")"
 done
 
 [ $toolskipped -gt 0 ] && echo "($toolskipped toolchain tests not run; use --toolchain)"
-[ $winskipped -gt 0 ] && echo "($winskipped Windows tests not run; use --windows)"
 if [ $toolchain -eq 1 ]; then
   echo "toolchain"
   t0=$(now_ms)

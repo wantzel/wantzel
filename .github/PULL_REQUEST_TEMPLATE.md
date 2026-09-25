@@ -9,9 +9,9 @@
 ---
 
 - [ ] `./build.sh` and `./wztest --toolchain` are both green
-- [ ] `src/wantzel.wz` and `bootstrap/boot.c` are in step (they are counterparts — a
-      compiler change touches both, or the bootstrap fixed point breaks)
-- [ ] both targets are covered, Linux and Windows
+- [ ] if this touches something `src/wantzel.wz` needs to compile itself,
+      `bootstrap/boot.c` implements it too (it only has to build the compiler's
+      own source — most changes do not need it; see docs/testing.md)
 - [ ] a test comes with the change
 - [ ] `docs/changelog.md` has an entry, if this changes the language, the compiler or `lib/`
 - [ ] the commits are signed off (`git commit -s`) — see CONTRIBUTING.md

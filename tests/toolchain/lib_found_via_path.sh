@@ -11,8 +11,7 @@
 # on 17-09-2026, the same compile succeeded by absolute path and failed through PATH.
 #
 # The anchor is /proc/self/exe now, which answers where the process really came from.
-# argv[0] is still the fallback for a system without /proc -- and the Windows target is
-# exactly that case, which is why __wsys returns -1 for readlink instead of trapping.
+# argv[0] is still the fallback for a system without /proc.
 #
 # THE WORKING DIRECTORY IS THE TRAP THIS GUARDS. Both compiles below run from a directory
 # with no lib/ in it and no lib/ above it, because that is the only way to tell the two

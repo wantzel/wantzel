@@ -1,10 +1,14 @@
 #!/bin/sh
 # build.sh -- bootstrap the Wantzel compiler.
 #
-# Step 1 is the only step that uses an external compiler.  After it, the
-# language compiles itself and the result is verified to be a fixpoint:
-# the compiler produced by the bootstrap and the compiler produced by
-# that compiler must be byte-identical.
+# Step 1 is the only step that uses an external compiler.  After that, the
+# language compiles itself and the result is verified to be a fixed point:
+# stage2 and stage3 -- both produced by the self-hosted compiler -- must be
+# byte-identical.  Stage1, produced by bootstrap/boot.c, does not have to
+# match them byte for byte: boot.c only has to produce a
+# CORRECT stage1, not an identical one.  It does not implement schema, tools
+# or --debug -- none of which src/wantzel.wz's own source uses -- so it is
+# free to be much smaller than the compiler it bootstraps.
 set -e
 cd "$(dirname "$0")"
 mkdir -p bin
@@ -13,7 +17,7 @@ mkdir -p bin
 # place.  A rename within one filesystem is atomic: a reader sees either the old file or
 # the new one, never half of one.  That matters because the suite rebuilds while the
 # rest of it is running -- tests/toolchain/all_suites_green.sh calls this script, and
-# test.sh and test-win.sh read bin/wantzel0.  Writing in place gave those readers a
+# test.sh reads bin/wantzel0.  Writing in place gave those readers a
 # truncated file: `cc -o bin/wantzel0` empties the target first, so a concurrent
 # ./bin/wantzel0 got "Permission denied" (measured: 2 failures in 176 attempts during one
 # build).
@@ -37,8 +41,8 @@ echo "3. stage1 src/wantzel.wz       -> bin/wantzel.stage2 (compiled by itself)"
 echo "4. stage2 src/wantzel.wz       -> bin/wantzel.stage3 (and once more)"
 ./bin/wantzel.stage2 src/wantzel.wz bin/wantzel.stage3
 
-if cmp -s bin/wantzel.stage1 bin/wantzel.stage2 && cmp -s bin/wantzel.stage2 bin/wantzel.stage3; then
-    echo "5. fixpoint reached: stage1 = stage2 = stage3 ($(wc -c < bin/wantzel.stage2) bytes)"
+if cmp -s bin/wantzel.stage2 bin/wantzel.stage3; then
+    echo "5. fixpoint reached: stage2 = stage3 ($(wc -c < bin/wantzel.stage2) bytes)"
 else
     echo "5. FIXPOINT FAILED -- the compiler does not reproduce itself" >&2
     exit 1

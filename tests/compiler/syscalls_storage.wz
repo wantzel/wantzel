@@ -1,4 +1,4 @@
-// The storage system calls, identical on Linux and Windows: files that are
+// The storage system calls: files that are
 // created, appended, truncated, renamed and deleted; fsync; lseek; anonymous
 // and file-backed mmap through view(); flock; getrandom; the realtime clock.
 include "io.wz";

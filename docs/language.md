@@ -352,7 +352,7 @@ a complete loop it is one past the end value. No `case`: write an if-chain, and 
 | `band bor bxor bnot`, `shl shr` | bits |
 | `argc()`, `argch(k, i)` | number of arguments; i-th byte of argument `k` (`chr(0)` at the end, and for any `k`/`i` out of range — it answers rather than traps) |
 | `halt(code)` | exit |
-| `sys1(nr, a)` … `sys6(nr, a..f)` | raw Linux syscall (translated by the runtime on Windows) |
+| `sys1(nr, a)` … `sys6(nr, a..f)` | raw Linux syscall |
 
 Library routines (`lib/`) are ordinary Wantzel: `io.*`, `net.*`, `http.*`, `json.*`,
 `mcp.*`, `fs.*` — see [`library.md`](library.md).
@@ -361,8 +361,7 @@ Library routines (`lib/`) are ordinary Wantzel: `io.*`, `net.*`, `http.*`, `json
 
 `sys1`..`sys6` are builtins the compiler translates straight to machine code: no wrapper,
 no error handling, no errno translation. Arguments go into the System V registers, and
-the compiler emits the two bytes of the x86-64 `SYSCALL` instruction literally (on
-Windows a shim call stands there instead — the only place the two platforms differ).
+the compiler emits the two bytes of the x86-64 `SYSCALL` instruction literally.
 
 The syscall number is an ordinary constant (`SYS.fork = 57`, `SYS.wait4 = 61` in
 `lib/io.wz`); the compiler knows no syscall by name. **Everything the operating system
@@ -573,7 +572,12 @@ buffer.
 For `text`/`json` fields (views) in the output schema, the compiler generates the buffer
 `tool.vbuf` (1 MB) and fill position `tool.vn` (0 at every call): the handler writes text
 into `tool.vbuf` from `tool.vn` and points `f_at`/`f_end` at it; `tool.run` writes the
-result with `tool.vbuf` as the source of the views. **A view field is written LITERALLY**,
+result with `tool.vbuf` as the source of the views. A handler that fills `tool.vbuf` to
+its limit is refused loudly: `tool.run` checks `tool.vn` right after the handler returns
+and, at or past `len(tool.vbuf)`, fails with `tool <name>: reply exceeds 1048576 bytes`
+instead of writing a reply built from silently truncated text (`io.push` and
+`json.escslice`, the appenders a handler uses to fill it, stop at `len(tool.vbuf)` by
+their own contract rather than refuse). **A view field is written LITERALLY**,
 byte for byte, with no escaping (`Result.write` uses `json.putraw`). A `text[N]` field is
 escaped automatically (`json.putslice`). So a handler building a `json`-view or
 `text`-view field's content from anything not already valid JSON / JSON-string-safe must
@@ -627,7 +631,7 @@ overloading, implicit conversions.
 
 ## 10. Runtime errors
 
-Always with file:line, identical on Windows and Linux: array index out of bounds ·
+Always with file:line: array index out of bounds ·
 division by zero · `chr()` outside 0..255 · `schar()`/`scan()` out of range · function
 without `return`.
 
@@ -668,167 +672,18 @@ globals/locals/routines/schemas/tools, source and code size, static memory, stac
 listed with a measured value in `tests/limits/README.md`, guarded by
 `tests/limits/limits.sh`.
 
-## 12. Targets
+## 12. Target
 
-Linux x86-64 ELF (raw syscalls) and Windows x86-64 PE32+: static binaries that talk to
-`kernel32.dll`, `ws2_32.dll` and `advapi32.dll` directly. No assembler, linker, C library
-or external tool on either target. `bootstrap/boot.c` and `src/wantzel.wz` produce
-byte-identical output, ELF and `.exe` alike; every language change lands in both and in
-`test.sh`.
+Linux x86-64 ELF: a static binary that reaches the kernel through raw syscalls. No
+assembler, linker, C library or external tool. `src/wantzel.wz` (self-hosted) implements
+the whole language; `bootstrap/boot.c` is a small C compiler that only has to build
+`src/wantzel.wz`, so it implements neither `schema`/`tools` nor
+`--debug` — see [design.md](design.md#how-the-compiler-works) and
+[testing.md](testing.md#the-bootstrap-fixed-point). Every language change lands in
+`src/wantzel.wz` and in `test.sh`; it only lands in `boot.c` as well when
+the compiler's own source starts using it.
 
-### What is portable, and what is not
-
-Almost everything. The library (`io`, `fs`, `net`, `http`, `json`, ...) and `sys1`..`sys6`
-mean the same on both targets: on Linux a `sys*` call is the syscall instruction, on
-Windows the runtime translates it to the matching `kernel32`/`ws2_32` function. **A
-program written against those calls compiles and runs on both, unchanged** —
-`examples/winfacts.wz` does a file round trip, an existence check, a delete and a
-directory listing, and the ELF and the `.exe` print the same thing
-(`tests/toolchain/win_same_output.sh`).
-
-The one exception is `winapi(slot, ...)`, calling an imported DLL function directly. No
-Linux equivalent, so **it does not compile for a Linux target at all**:
-
-```
-winfacts.wz:2: winapi() is only available in a Windows executable
-```
-
-That is the compile-time half of the rule: a program reaching for a Windows-only facility
-cannot be built for Linux by accident and fail later. The other half is the slot itself —
-a literal outside the import table is refused the same way:
-
-```
-x.wz:3: winapi(): that import slot does not exist
-```
-
-So a program that builds for both targets uses nothing Windows-specific; a program using
-`winapi` gets told so at the point it names the wrong target.
-
-**`winapi` can also name the DLL and the function**, reaching an API the compiler has
-never heard of:
-
-```pascal
-winapi("user32.dll", "MessageBoxA", 0, text, title, 0);
-```
-
-The name is recorded while translating and written into the import table — a new Windows
-API is data, not a compiler change — but checking then happens at three different
-moments:
-
-| what is wrong | when you find out | what you see |
-|---|---|---|
-| built for the wrong target | **compile time** | `winapi() is only available in a Windows executable` |
-| the DLL does not exist | **load time**, before your program runs | the loader refuses to start the process |
-| the function does not exist in it | **run time**, at the call | the process starts, then aborts on that line |
-
-The last row matters most: a missing DLL is fatal before `main`, but a *misspelled
-function* in a DLL that does exist gets a stub that only complains when called — a typo
-on a rarely-taken path can sit unnoticed. The compiler cannot check this (it does not
-know what a DLL on the target machine exports), so **exercise every `winapi` call at
-least once in a test**.
-
-**Naming a function the compiler already imports costs nothing extra.** The compiler
-carries 48 imports of its own — what the runtime needs before your first line runs, such
-as `GetStdHandle`, `WriteFile`, `ExitProcess`. Writing `winapi("kernel32.dll",
-"WriteFile", ...)` reuses that entry rather than adding a second one (case-insensitive
-match). The reuse is per **function**, not per DLL:
-
-| what you name | what happens |
-|---|---|
-| a DLL it has, a function it has | the existing slot; nothing added |
-| a DLL it has, a function it does not | a new entry, and a second directory entry for that DLL |
-| a DLL it does not have | a new directory entry and new slots |
-
-A function the compiler does not have gets its own entry, which can put a **second
-directory entry for the same DLL** in the executable — legal and deliberate: the built-in
-names and source-named ones are two separate runs in the name table, and interleaving
-them would put the address table out of step with the names.
-
-The 48 built-ins exist because the loader fills the import table **before the first
-instruction runs**, so a program cannot look itself up to start; the rest of what a
-program touches is data, which is the point of naming imports in source. `lib/` is
-compiled **into** the compiler, so a library routine that names an import is understood
-by the C bootstrap too — the two produce identical bytes, and nothing circular arises:
-the imports a library routine names land in **your** executable, not the compiler's own.
-
-### `winproc(name)`: letting Windows call your routine
-
-On Windows the operating system calls *you* — a window procedure, a window enumerator, a
-hook, a timer. This language has no function pointers on purpose, so there is exactly one
-way to produce that address:
-
-```pascal
-poke64(wc, 8, winproc(wndproc));                  // WNDCLASSEXA.lpfnWndProc
-winapi("user32.dll", "EnumWindows", winproc(onwindow), 0);
-```
-
-`winproc` takes the **name of a routine you declared** — not an expression, not a
-variable — and gives back an address. Valid only when building for Windows; on Linux it
-does not compile, since a callback is a Windows notion.
-
-**What it returns is not your routine's address.** Windows and this language read
-arguments from different registers, so the compiler writes a small adapter beside your
-routine and hands back that address instead. The adapter moves arguments across, reserves
-the 32-byte shadow space Windows requires, and preserves `rdi`, `rsi`, `rbx` — yours to
-destroy on Linux, Windows' to find untouched.
-
-The routine itself is ordinary: up to four `int` parameters, returning `int` — the shape
-of every Windows API callback, so one adapter carries all of them.
-
-```pascal
-function wndproc(hw: int; m: int; wp: int; lp: int): int;
-begin
-  if m = WM_DESTROY then begin ... end;
-  return winapi("user32.dll", "DefWindowProcA", hw, m, wp, lp);
-end;
-```
-
-Why this exists: a button click is **sent** straight to a window procedure and never
-appears in a message queue, so no message loop can see one — there is no way to write an
-interactive Windows program without a callback.
-
-### `--target`
-
-**The target comes from `--target=` and nowhere else.** Default is Linux; the output name
-decides nothing:
-
-```bash
-./bin/wantzel examples/hello.wz bin/hello                     # Linux ELF
-./bin/wantzel examples/hello.wz bin/hello.exe --target=windows # Windows PE32+
-./bin/wantzel examples/hello.wz bin/hello --target=windows    # PE, whatever the name
-./bin/wantzel examples/hello.wz bin/app.exe --target=linux    # ELF under a .exe name
-./bin/wantzel examples/hello.wz bin/hello.exe                 # refused: which target?
-```
-
-A `.exe` name used to select Windows on its own — a second, invisible way to choose the
-target — so it is now refused rather than quietly built for Linux. `--target=linux` and
-`--target=windows` (short: `-tlinux`, `-twindows`) are the only values; the ELF output is
-unchanged.
-
-**The language is identical on both platforms.** Everything above holds for a `.exe`;
-what differs is underneath: Linux gets the `SYSCALL` instruction, Windows a runtime shim
-translating to the Win32 equivalent. Reads and writes, files, directory listing and
-`stat`, sockets (including an outgoing `connect`), `epoll` (emulated over `WSAPoll`), time,
-`nanosleep`, `mmap`/`msync`, `fsync`, `rename`, `flock`, `getrandom`, `getpid`, `kill` and
-the command line are all translated. The compiler
-compiles itself into a working `wantzel.exe`, which compiles Wantzel source and
-reproduces itself byte-identically: self-hosting on Windows.
-
-Four differences remain, all properties of the Windows runtime rather than of the language:
-
-- **No `fork`.** Windows lacks it, so `fork` returns `0` and the caller becomes the only
-  worker — a multi-worker HTTP server runs single-process there: it works, but does not
-  use every core the way it does on Linux.
-- **No `execve`.** Replacing the running program has no Win32 counterpart; `proc.exec`
-  stops with "an unsupported system call was made on Windows".
-- **At most 16 `epoll` sets at once.** They behave as on Linux — independent, and one
-  can be watched inside another — but a seventeenth `epoll_create1` returns `EMFILE`,
-  where Linux is limited only by the number of open files.
-- **No PE checksum, no signature.** Not needed to run, but a fresh unsigned `.exe` is
-  blocked by SmartScreen and some Defender ASR policies on managed machines — not
-  specific to Wantzel, and fixed by an Authenticode signature the machine trusts, a
-  folder exclusion from an administrator, or testing in Windows Sandbox.
-
-`./wztest --toolchain` runs the Windows output under Wine (`run_win` in
-`tests/helpers.sh`), so both targets are tested together rather than one being assumed to
-still work.
+The library (`io`, `fs`, `net`, `http`, `json`, ...) and `sys1`..`sys6` are the whole
+interface to the operating system: a `sys*` call is the syscall instruction, and the number
+is an ordinary constant, so anything the kernel offers is reachable from source. The
+compiler compiles itself and reproduces itself byte-identically (`./build.sh`).

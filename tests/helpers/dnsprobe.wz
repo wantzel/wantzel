@@ -7,6 +7,14 @@
 // keeps the default). Then each word, in order:
 //   <name>          looked up with dns.resolve: "<name> <address>..." or "<name> error
 //                   <code> <message>"; the milliseconds it took go to stderr as "ms <n>"
+//   !6=<name>       the AAAA counterpart, with dns.resolve6: "<name> <address6>..." (each
+//                   address the uncompressed form dns.ipstr6 writes) or the same error form
+//   !connect=<name>:<port>
+//                   dns.connect(name, port): "<name> connect ok" when a connection was
+//                   made (and closed again at once), or the error form. Needs a listener
+//                   this same process opened first, with !listen4= or !listen6=.
+//   !listen4=<port> open (and keep open) a plain IPv4 TCP listener on 127.0.0.1:<port>
+//   !listen6=<port> the IPv6 counterpart, on [::1]:<port>
 //   !flush          dns.flush
 //   !conf=<path>    dns.loadconf: "conf <n> <address>... timeout <ms> attempts <n>"
 //   !cat=<path>     the file itself, as a program reading it sees it
@@ -18,12 +26,29 @@ include "dns.wz";
 var
   ports, word: array[0..255] of char;
   addrs: array[0..DNS.MAXADDR - 1] of int;
+  addrs6: array[0..DNS.MAXADDR * 16 - 1] of char;
   qs: array[0..15] of int;
   qarg: array[0..15] of int;
   line: array[0..1023] of char;
-  n, i, k, p, at, t0, w, ep, left, r, nq, fd: int;
+  n, i, j, k, p, at, t0, w, ep, left, r, nq, fd: int;
   async: bool;
   ev: array[0..95] of char;
+  lfd4, lfd6: int;             // !listen4= / !listen6=, or -1 when not opened
+
+// Is word[0..pn-1] the literal prefix s (of that exact length)?
+function haspfx(pn: int; s: str): bool;
+var sn, i: int;
+begin
+  sn := slen(s);
+  if pn < sn then return false;
+  i := 0;
+  while i < sn do
+  begin
+    if word[i] <> schar(s, i) then return false;
+    i := i + 1;
+  end;
+  return true;
+end;
 
 procedure show(arg: int; r: int);
 var j, m: int;
@@ -57,7 +82,80 @@ begin
   io.out(STDOUT, addr(line[0]), at + 1);
 end;
 
+// name, then either an error (as show does) or each of r addresses (16 bytes each, in
+// addrs6), uncompressed.
+procedure show6(namebuf: array of char; namen: int; r: int);
+var j: int;
 begin
+  at := 0;
+  j := 0;
+  while j < namen do begin line[at] := namebuf[j]; at := at + 1; j := j + 1; end;
+  if r > 0 then
+  begin
+    j := 0;
+    while j < r do
+    begin
+      at := io.push(line, at, " ");
+      at := dns.ipstr6(line, at, addrs6[j * 16..j * 16 + 15]);
+      j := j + 1;
+    end;
+    line[at] := chr(10);
+    io.out(STDOUT, addr(line[0]), at + 1);
+    return;
+  end;
+  at := io.push(line, at, " error ");
+  if r < 0 then begin line[at] := '-'; at := at + 1; r := 0 - r; end;
+  at := io.pushnum(line, at, r);
+  at := io.push(line, at, " ");
+  io.out(STDOUT, addr(line[0]), at);
+  io.puts(STDOUT, dns.error(0 - r));
+  io.puts(STDOUT, "\n");
+end;
+
+// dns.connect(name, port): "<name> connect ok" or the error form.
+procedure showconnect(namebuf: array of char; namen: int; port: int);
+var fd, j, sv, tries: int;
+begin
+  fd := dns.connect(namebuf[0..namen - 1], port);
+  at := 0;
+  j := 0;
+  while j < namen do begin line[at] := namebuf[j]; at := at + 1; j := j + 1; end;
+  if fd >= 0 then
+  begin
+    net.close(fd);
+    at := io.push(line, at, " connect ok via ");
+    // WHICH LISTENER TOOK IT: try v6 first, then v4, a few times each -- the accept is
+    // non-blocking and the connection may not be queued on the very first try, but by
+    // now the client side has already closed, so it will not take long to appear.
+    sv := 0 - 1;
+    if lfd6 >= 0 then
+    begin
+      tries := 0;
+      while (sv < 0) and (tries < 500) do begin sv := net.accept(lfd6); tries := tries + 1; end;
+      if sv >= 0 then begin net.close(sv); at := io.push(line, at, "v6\n"); end;
+    end;
+    if (sv < 0) and (lfd4 >= 0) then
+    begin
+      tries := 0;
+      while (sv < 0) and (tries < 500) do begin sv := net.accept(lfd4); tries := tries + 1; end;
+      if sv >= 0 then begin net.close(sv); at := io.push(line, at, "v4\n"); end;
+    end;
+    if sv < 0 then at := io.push(line, at, "?\n");
+    io.out(STDOUT, addr(line[0]), at);
+    return;
+  end;
+  at := io.push(line, at, " error ");
+  line[at] := '-'; at := at + 1;
+  at := io.pushnum(line, at, 0 - fd);
+  at := io.push(line, at, " ");
+  io.out(STDOUT, addr(line[0]), at);
+  io.puts(STDOUT, dns.error(fd));
+  io.puts(STDOUT, "\n");
+end;
+
+begin
+  lfd4 := 0 - 1;
+  lfd6 := 0 - 1;
   if argc() < 4 then
   begin
     io.puts(STDERR, "usage: dnsprobe <ports|-> <tryms> <totalms> <name|!flush|!conf=path|!async>...\n");
@@ -109,6 +207,26 @@ begin
         net.close(fd);
       end;
     end
+    else if haspfx(n, "!connect=") then
+    begin
+      // <name>:<port> after the "!connect=" prefix -- CHECKED BEFORE THE "!c" BRANCH
+      // BELOW (!conf=), which would otherwise catch every "!c..." word, "!connect="
+      // included.
+      i := 9;
+      while (i < n) and (word[i] <> ':') do i := i + 1;
+      p := 0;
+      if i < n then
+      begin
+        j := i + 1;
+        while j < n do begin p := p * 10 + (ord(word[j]) - ord('0')); j := j + 1; end;
+      end;
+      // net.connect / net.connect6 are blocking: on a loopback listener that already
+      // exists (!listen4= / !listen6=, above), the three-way handshake is done by the
+      // time connect() returns, whether or not the listener has called accept() yet --
+      // the kernel queues it. So showconnect's "connect ok" already proves the address
+      // dns.connect picked was reachable; nothing here needs to accept it.
+      showconnect(word[9..i - 1], i - 9, p);
+    end
     else if (n > 6) and (word[0] = '!') and (word[1] = 'c') then
     begin
       r := dns.loadconf(word[6..n - 1]);
@@ -129,6 +247,31 @@ begin
       at := io.pushnum(line, at, dns.attempts);
       line[at] := chr(10);
       io.out(STDOUT, addr(line[0]), at + 1);
+    end
+    else if haspfx(n, "!6=") then
+    begin
+      t0 := io.now;
+      r := dns.resolve6(word[3..n - 1], addrs6);
+      io.puts(STDERR, "ms ");
+      io.putn(STDERR, (io.now - t0) div 1000000);
+      io.puts(STDERR, "\n");
+      show6(word[3..n - 1], n - 3, r);
+    end
+    else if haspfx(n, "!listen4=") then
+    begin
+      p := 0;
+      i := 9;
+      while i < n do begin p := p * 10 + (ord(word[i]) - ord('0')); i := i + 1; end;
+      lfd4 := net.listen(p, 4, false);
+      if lfd4 < 0 then begin io.puts(STDOUT, "listen4: failed\n"); halt(1); end;
+    end
+    else if haspfx(n, "!listen6=") then
+    begin
+      p := 0;
+      i := 9;
+      while i < n do begin p := p * 10 + (ord(word[i]) - ord('0')); i := i + 1; end;
+      lfd6 := net.listen6(p, 4, false);
+      if lfd6 < 0 then begin io.puts(STDOUT, "listen6: failed\n"); halt(1); end;
     end
     else if async then
     begin

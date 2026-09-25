@@ -6,7 +6,7 @@
 # the compiler's own message rather than truncated.
 #
 # TOETSGROEP: schema
-# DEKT: src/compiler.wz bootstrap/boot.c lib/toolsmcp.wz
+# DEKT: src/wantzel.wz bootstrap/boot.c lib/toolsmcp.wz
 . "$ROOT/tests/helpers.sh"
 
 long=total_installed_peak_power_of_a_photovoltaic_system_across_every_roof_surface_in_kilowatt_peak_today
@@ -36,7 +36,6 @@ end.
 WZ
 
 compile "$T/long.wz" "$T/long"
-compile_win "$T/long.wz" "$T/long.exe"
 
 out=$(printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}' \

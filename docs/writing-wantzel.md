@@ -24,7 +24,7 @@ it under the heading it belongs to.
 |---|---|---|
 | `const STORE.SET = 1;` next to `procedure store.set` | Give constants a name no routine has: `STORE.OPSET`, `CURVE.NDAYS`, `HTTP.GET` | `name already used by a variable or constant` / `duplicate global declaration` |
 | Parameter `N` next to global `n`; type `Out` next to variable `out` | One name per concept; local names that don't collide with globals (`cnt`, `res`) | `name already used by a type` / `duplicate declaration` |
-| A builtin as a name: `procedure f(len: int)`, `var len: int` | Use `n`, `count`, `nbytes` instead. Builtins: `len addr view scan ord chr real trunc round sqrt pack32 unpack32 slen schar sadr band bor bxor bnot shl shr argc argch halt sys1..sys6 winapi` | `that name is built in` |
+| A builtin as a name: `procedure f(len: int)`, `var len: int` | Use `n`, `count`, `nbytes` instead. Builtins: `len addr view scan ord chr real trunc round sqrt pack32 unpack32 slen schar sadr band bor bxor bnot shl shr argc argch halt sys1..sys6` | `that name is built in` |
 | `tools` as a namespace (`tools.list`) | `tool.list`, `tool.run` — `tools` is a keyword | `variable name expected` |
 | A type name is also an ordinary identifier: `schema Point` and `var point: ...` collide | `var p: Point` | — |
 | Assuming `mcp.buf` and `mcp.Buf` differ, or that `a.b` scopes to a module | Dotted names are cosmetic; there is no module scope | — |
@@ -210,8 +210,8 @@ indices instead ([language.md](language.md) §10b).
 - A test that measures time is a benchmark (`tests/bench/`, `--bench` only); pair it with a
   `.min`/`.max` to turn it into a hard limit.
 - `progs/` directories hold helper programs, not tests.
-- No ticket number in a test header — which tests belong to a ticket lives in the ticket's
-  `tests:` field. Open with a line saying what the test guards instead.
+- No ticket or issue number in a test header. Open with a line saying what the test
+  guards instead.
 
 ### A wrong result that looks like a choice
 
@@ -743,7 +743,7 @@ not listed here.
 ### The message points at a file you did not write
 
 For example `wantzel: <unitref>:45: undeclared identifier`, or a line deep inside
-`refdata.wz` — that's **generated** code (a schema, the `tools` block, the Windows runtime).
+`refdata.wz` — that's **generated** code (a schema, the `tools` block).
 
 | Symptom | Cause | Fix |
 |---|---|---|

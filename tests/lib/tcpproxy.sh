@@ -14,15 +14,20 @@
 # happens to be running, so the test does not depend on the machine.
 set -e
 here=$(cd "$(dirname "$0")/../.." && pwd)
+. "$here/tests/lib/portlib.sh"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL  $1"; shift; for r in "$@"; do echo "        $r"; done; }
 
 tmp=$(mktemp -d)
-# PORTS FROM THE PID, so two runs of the suite cannot collide -- the same rule the rest of
-# the suite follows.
-back=$(( 20000 + ($$ % 10000) ))
-front=$(( back + 1 ))
+# PORTS FROM THE KERNEL (tests/lib/portlib.sh), not from $$: a $$-derived guess collides
+# under many parallel `./wztest` runs, because different worktrees' PIDs and even different
+# scripts' ranges can overlap. See tests/lib/portlib.sh for the reasoning. FOUR ports, not
+# two: the slow-read check below used to reuse back/front as "+10", which is exactly the
+# same guess-a-neighbour mistake one level down -- a free_port for back or front says
+# nothing about whether back+10 is free too.
+set -- $(free_ports 5)
+back=$1; front=$2; bigback=$3; bigfront=$4; deadfront=$5
 
 # EVERY BACKGROUND PROCESS, EVEN AFTER AN EARLY EXIT.
 #
@@ -259,19 +264,19 @@ else bad "the proxy died" "$(cat "$tmp/proxy.log" 2>/dev/null)"; fi
 # 5 MB at 2500 kB/s does both in about two seconds; the first version used 8 MB at 400 kB/s
 # and took twenty seconds PER READ, which pushed the file past wztest's 30-second limit.
 big=5000000
-"$tmp/srv" "$(( back + 10 ))" "$big" >/dev/null 2>&1 &
+"$tmp/srv" "$bigback" "$big" >/dev/null 2>&1 &
 bigpid=$!; started="$started $bigpid"
 i=0
 while [ $i -lt 50 ]; do
-  ss -tln 2>/dev/null | grep -q ":$(( back + 10 )) " && break
+  ss -tln 2>/dev/null | grep -q ":$bigback " && break
   sleep 0.1; i=$((i+1))
 done
 
-"$tmp/tcpproxy" "$(( front + 10 ))" 127 0 0 1 "$(( back + 10 ))" >"$tmp/p3.log" 2>&1 &
+"$tmp/tcpproxy" "$bigfront" 127 0 0 1 "$bigback" >"$tmp/p3.log" 2>&1 &
 p3=$!; started="$started $p3"
 i=0
 while [ $i -lt 50 ]; do
-  ss -tln 2>/dev/null | grep -q ":$(( front + 10 )) " && break
+  ss -tln 2>/dev/null | grep -q ":$bigfront " && break
   sleep 0.1; i=$((i+1))
 done
 
@@ -279,12 +284,12 @@ done
 # comparing a slow read through the proxy against a fast read direct would compare two
 # different things.
 direct_big=$(timeout 60 curl -s --limit-rate 2500k --max-time 25 -o /dev/null \
-  -w "%{size_download}" "http://127.0.0.1:$(( back + 10 ))/" 2>/dev/null || true)
+  -w "%{size_download}" "http://127.0.0.1:$bigback/" 2>/dev/null || true)
 if [ "$direct_big" = "$big" ]; then ok "the backend delivers $big bytes to a slow reader"
 else bad "the backend itself truncates" "got '$direct_big', wanted $big"; fi
 
 slow=$(timeout 60 curl -s --limit-rate 2500k --max-time 25 -o /dev/null \
-  -w "%{size_download}" "http://127.0.0.1:$(( front + 10 ))/" 2>/dev/null || true)
+  -w "%{size_download}" "http://127.0.0.1:$bigfront/" 2>/dev/null || true)
 if [ "$slow" = "$big" ]; then ok "and all $big bytes survive the proxy"
 else bad "the proxy lost bytes on a transfer larger than a socket buffer" \
   "got '$slow' of $big" "$(cat "$tmp/p3.log" 2>/dev/null)"; fi
@@ -295,10 +300,10 @@ kill "$p3" "$bigpid" 2>/dev/null
 #
 # The caller must be refused rather than left hanging on a connection that can never be
 # answered. Port 1 is reserved and nothing listens there.
-"$tmp/tcpproxy" $(( front + 1 )) 127 0 0 1 1 >"$tmp/p2.log" 2>&1 &
+"$tmp/tcpproxy" "$deadfront" 127 0 0 1 1 >"$tmp/p2.log" 2>&1 &
 p2=$!; started="$started $p2"
 sleep 1
-out=$(curl -s --max-time 3 "http://127.0.0.1:$(( front + 1 ))/" 2>&1 || true)
+out=$(curl -s --max-time 3 "http://127.0.0.1:$deadfront/" 2>&1 || true)
 if [ -z "$out" ]; then ok "a dead backend closes the caller instead of hanging"
 else bad "a dead backend returned something" "got: '$out'"; fi
 kill "$p2" 2>/dev/null

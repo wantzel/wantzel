@@ -22,6 +22,7 @@
 #   8. a read-only store: it works, without a cache, and says so
 set -e
 here=$(cd "$(dirname "$0")/../.." && pwd)
+. "$here/tests/lib/portlib.sh"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL  $1"; shift; for r in "$@"; do echo "        $r"; done; }
@@ -32,8 +33,8 @@ if ! command -v openssl >/dev/null 2>&1; then
 fi
 
 tmp=$(mktemp -d)
-base=$(( 24000 + ($$ % 2000) * 4 ))
-caport=$base; frontport=$((base + 1)); p80=$((base + 2)); p443=$((base + 3))
+set -- $(free_ports 4)
+caport=$1; frontport=$2; p80=$3; p443=$4
 host=test.example.org
 started=""
 SRV=""

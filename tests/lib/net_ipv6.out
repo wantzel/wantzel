@@ -1,0 +1,9 @@
+ok   dns.parseip6 reads ::1
+ok     (as fifteen zero bytes and a one)
+ok   net.connect6 to a listening [::1]:port succeeds
+ok   net.accept on the IPv6 listener takes it
+ok   send on the client side
+ok     and the server reads the same 13 bytes
+ok   net.connect6 to a closed IPv6 port fails
+ok     with ECONNREFUSED
+ok   an IPv4-only listener does not answer on ::1

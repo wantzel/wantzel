@@ -1,4 +1,4 @@
-# A hello-world must compile in single-digit milliseconds, on both targets.
+# A hello-world must compile in single-digit milliseconds.
 #
 # WHY THIS HAS A CEILING OF ITS OWN, next to the throughput measurement in
 # compile_self.sh. That one asks how fast the compiler is over thousands of lines; this one
@@ -11,18 +11,11 @@
 # this machine, so there is five times the headroom -- which is the point: a ceiling only
 # earns its place if crossing it means something really changed.
 #
-# WHAT THIS DOES NOT MEASURE, and it matters because the 150 ms report was real:
-#
-#   the compiler, native on Linux      2 ms     <- what this test guards
-#   an EMPTY .exe started under Wine   48 ms    <- Wine's process startup, before any work
-#   the compiler under Wine, direct    54 ms
-#   the same through `cmd.exe /c`     141 ms    <- what the editor's own timer reports
-#
-# So the editor showing 150 ms is not a compiler regression: about 50 ms is Wine starting a
-# process at all, and another 90 ms is cmd.exe starting before that. On real Windows there
-# is no Wine and no wrapper, and the editor's own measurement of 2 ms for a compile has been
-# seen there. Measuring the compiler through two layers of process creation and calling the
-# result "compile time" is the mistake this comment exists to prevent.
+# WHAT THIS DOES NOT MEASURE, and it matters because the 150 ms report was real: the
+# compiler started through a shell wrapper and a second process layer measured 141 ms,
+# of which the compiler itself was 2 ms. Measuring the compiler through layers of process
+# creation and calling the result "compile time" is the mistake this comment exists to
+# prevent.
 #
 # Which is also why this test runs the compiler DIRECTLY. Anything else measures the harness.
 . "$ROOT/tests/helpers.sh"
@@ -49,20 +42,6 @@ for i in 1 2 3; do
 done
 [ -x "$T/hello.bin" ] || { echo "no executable produced"; exit 1; }
 
-# AND THE WINDOWS TARGET TOO, because that is what the editor compiles and it walks a
-# different path through the code generator -- the import table, the PE headers. A ceiling
-# that only covers ELF would miss a regression the editor would be the first to feel.
-bestwin=999999
-for i in 1 2 3; do
-  t0=$(now_ms)
-  "$WANTZEL" "$T/hello.wz" "$T/hello.exe" --target=windows >/dev/null || { echo "compiling for windows failed"; exit 1; }
-  t1=$(now_ms)
-  ms=$((t1 - t0))
-  [ "$ms" -lt "$bestwin" ] && bestwin=$ms
-done
-
 [ "$best" -lt 1 ] && best=1
-[ "$bestwin" -lt 1 ] && bestwin=1
 
 bench_report compile_hello_ms "$best" ms
-bench_report compile_hello_windows_ms "$bestwin" ms

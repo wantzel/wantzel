@@ -1,0 +1,7 @@
+sha1("") = da39a3ee5e6b4b0d3255bfef95601890afd80709
+sha1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d
+sha1(55 x 'a') one-block padding = c1c8bbdc22796e28c0e15163d20899b65621d65a
+sha1(56 x 'a') two-block padding = c2db330f6083854c99d4b5bfb6e8f29f201be699
+sha1(64 x 'a') exact block = 0098ba824b5c16427bd7a1122a5a442a25ec644d
+sha1(two-block, RFC 3174) = 84983e441c3bd26ebaae4aa1f95129e5e54670f1
+sha1(a x 1000000, RFC 3174) = 34aa973cd4c4daa4f61eeb2bdbad27316534016f

@@ -10,8 +10,9 @@
 # here, separately from the handshake/framing test in tests/lib/websocket.sh, proves
 # that fact rather than merely asserting it in a comment.
 . "$ROOT/tests/helpers.sh"
+. "$ROOT/tests/lib/portlib.sh"
 
-port=$(( 24800 + ($$ % 900) ))
+port=$(free_port)
 
 cat > "$T/detsrv.wz" <<'EOF'
 include "http.wz";

@@ -26,6 +26,8 @@ begin
 end;
 
 var fd, d: int;
+    many: array[0..31] of int;
+    j, opened: int;
 
 begin
   failures := 0;
@@ -63,13 +65,95 @@ begin
   setpath("fs_err_plain_file.wz");
   fd := fs.open(addr(pad[0]));
   if fd < 0 then begin io.puts(STDOUT, "FAIL cannot reopen the sample file\n"); halt(1); end;
-  fs.dlen := 0; fs.dpos := 0;
   expect(not fs.next(fd), "getdents on a plain file is refused");
   expect(slen(fs.err) > 0, "and fs.err names the reason, not silent exhaustion");
   fs.close(fd);
 
   setpath("fs_err_plain_file.wz");
   sys1(SYS.unlink, addr(pad[0]));
+
+  // ---- fs.opendir: the table of open directories is small and bounded, and says so ----
+  //
+  // FS.MAXOPEN (16) directories at once is already generous for a recursive walk; one
+  // more must fail cleanly -- not corrupt an existing handle's buffer, not crash -- with
+  // FS.EMFILE, the same errno the kernel itself would give for "too many open files".
+  setpath(".");
+  opened := 0;
+  for j := 0 to 19 do
+  begin
+    many[j] := fs.opendir(addr(pad[0]));
+    if many[j] >= 0 then opened := opened + 1;
+  end;
+  expect(opened = 16, "exactly FS.MAXOPEN directories can be open at once");
+  expect(many[16] < 0, "a 17th fs.opendir is refused");
+  expect(fs.errno = 24, "with FS.EMFILE, the same errno the kernel would give");
+  expect(slen(fs.err) > 0, "and fs.err names the reason");
+  for j := 0 to 19 do if many[j] >= 0 then fs.close(many[j]);
+
+  // Freeing a slot with fs.close makes room again -- the table is bounded, not exhausted
+  // for the rest of the program.
+  d := fs.opendir(addr(pad[0]));
+  expect(d >= 0, "after closing them, a directory can be opened again");
+  if d >= 0 then fs.close(d);
+
+  // ---- fs.forget: a directory opened OUTSIDE fs.opendir, closed OUTSIDE fs.close -------
+  //
+  // A caller that opens a directory its own way (its own openat wrapper, say) still uses
+  // fs.next to read it, and fs.next gives that fd a slot the same as fs.opendir would.
+  // If that caller then closes the fd its OWN way (a raw sys1(SYS.close, ...), not
+  // fs.close), the slot is never freed -- and fd NUMBERS GET REUSED.
+  //
+  // The hazard only shows with an UNFINISHED read: read one entry out of several (so the
+  // slot's buffer still holds more, dpos < dlen -- an exhausted directory would leave
+  // dpos = dlen and fs.next would call getdents again regardless, masking the bug), close
+  // the fd raw, then open a DIFFERENT directory (the kernel very likely hands back the
+  // same fd number). Without fs.forget in between, fs.next on the new fd finds the old
+  // slot still claimed and returns the FIRST directory's leftover entries, not the
+  // second's -- fs.forget, called between the raw close and the next use, is what a
+  // caller in this position must do to avoid that.
+  setpath("fs_err_forget_a");
+  sys2(SYS.mkdir, addr(pad[0]), 493);
+  setpath("fs_err_forget_a/a1.txt");
+  fd := sys3(SYS.open, addr(pad[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
+  if fd < 0 then begin io.puts(STDOUT, "FAIL cannot create a fixture file\n"); halt(1); end;
+  sys1(SYS.close, fd);
+  setpath("fs_err_forget_a/a2.txt");
+  fd := sys3(SYS.open, addr(pad[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
+  if fd < 0 then begin io.puts(STDOUT, "FAIL cannot create a fixture file\n"); halt(1); end;
+  sys1(SYS.close, fd);
+  setpath("fs_err_forget_a/a3.txt");
+  fd := sys3(SYS.open, addr(pad[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
+  if fd < 0 then begin io.puts(STDOUT, "FAIL cannot create a fixture file\n"); halt(1); end;
+  sys1(SYS.close, fd);
+
+  setpath("fs_err_forget_b");
+  sys2(SYS.mkdir, addr(pad[0]), 493);
+  setpath("fs_err_forget_b/b1.txt");
+  fd := sys3(SYS.open, addr(pad[0]), bor(bor(O_WRONLY, O_CREAT), O_TRUNC), 420);
+  if fd < 0 then begin io.puts(STDOUT, "FAIL cannot create a fixture file\n"); halt(1); end;
+  sys1(SYS.close, fd);
+
+  setpath("fs_err_forget_a");
+  fd := sys3(SYS.open, addr(pad[0]), 65536, 0);           // O_RDONLY | O_DIRECTORY, no fs.opendir
+  if fd < 0 then begin io.puts(STDOUT, "FAIL cannot open fs_err_forget_a\n"); halt(1); end;
+  expect(fs.next(fd), "one of the three entries is read, two left unread in the slot's buffer");
+  sys1(SYS.close, fd);                                    // raw close: fd's number is now free
+  fs.forget(fd);                                           // the fix: release the slot too
+
+  setpath("fs_err_forget_b");
+  fd := sys3(SYS.open, addr(pad[0]), 65536, 0);           // likely reuses the same fd number
+  if fd < 0 then begin io.puts(STDOUT, "FAIL cannot open fs_err_forget_b\n"); halt(1); end;
+  j := 0;
+  while fs.next(fd) do j := j + 1;
+  expect(j = 1, "after fs.forget, the reused fd reads its OWN one entry, not directory a's leftovers");
+  fs.close(fd);
+
+  setpath("fs_err_forget_a/a1.txt"); sys1(SYS.unlink, addr(pad[0]));
+  setpath("fs_err_forget_a/a2.txt"); sys1(SYS.unlink, addr(pad[0]));
+  setpath("fs_err_forget_a/a3.txt"); sys1(SYS.unlink, addr(pad[0]));
+  setpath("fs_err_forget_a"); sys1(SYS.rmdir, addr(pad[0]));
+  setpath("fs_err_forget_b/b1.txt"); sys1(SYS.unlink, addr(pad[0]));
+  setpath("fs_err_forget_b"); sys1(SYS.rmdir, addr(pad[0]));
 
   if failures > 0 then halt(1);
 end.

@@ -10,8 +10,7 @@
 // different fixes, and lib/dns.wz keeps them apart so a tool can say which one it is.
 //
 // The whole resolver is lib/dns.wz: UDP to the configured server, TCP when the answer is
-// truncated, CNAME chains followed, a bounded wait. The same source builds a .exe, which
-// asks the DNS servers Windows is configured with.
+// truncated, CNAME chains followed, a bounded wait.
 include "io.wz";
 include "dns.wz";
 

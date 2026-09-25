@@ -298,8 +298,6 @@ const
 // whatever io.ts held before -- the previous reading, or a zero timestamp on the first
 // call.  That is why the result is checked instead of decoded: a wrong time that is
 // stored is afterwards indistinguishable from a real one, so stopping beats carrying on.
-// On Windows the call is served by GetSystemTimeAsFileTime, which cannot fail and
-// always reports success; the check is then simply never taken.
 function io.now: int;
 var i, sec, ns, r: int;
 begin
@@ -330,8 +328,7 @@ end;
 // call, which is 1 January 1970.  This result feeds dates (time.nowsec, and the log
 // timestamps of lib/log.wz and lib/http.wz), and a wrong date that is stored is
 // afterwards indistinguishable from a real one: that is unrecoverable, so stopping
-// beats carrying on.  On Windows the call is served by GetSystemTimeAsFileTime, which
-// cannot fail and always reports success; the check is then simply never taken.
+// beats carrying on.
 function io.realtime: int;
 var i, sec, ns, r: int;
 begin

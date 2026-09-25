@@ -1,20 +1,30 @@
-# lib/p256.wz: the modular inverse, and that it stays fast.
+# lib/p256.wz: the modular inverse -- correct, and not absurdly slow.
 #
 # TOETSGROEP: lib
 # DEKT: lib/p256.wz
 #
-# WHY A SPEED TEST AT ALL, when nothing else here measures time. Because this one routine was
-# 81% of a TLS handshake and the cause was invisible: p256.invm used Fermat's inverse,
-# a^(m-2), which is ~256 modular multiplications -- and modulo n there is no Solinas shortcut,
-# so every one took the slow bit-by-bit reduction. Measured 22-09-2026: p256.sign 9.2 ms,
-# handshake 12.2 ms against nginx's 2.1 ms.
+# THIS USED TO BE A SPEED REGRESSION GUARD AGAINST FERMAT'S INVERSE, and it said so here in
+# some detail: p256.invm was Fermat's a^(m-2) until 22-09-2026 (~256 modular multiplications,
+# 81% of a TLS handshake), was replaced with a binary extended GCD for speed (4.0 ms per
+# sign), and this test asserted an inverse stayed well under Fermat's cost as the guard
+# against that regression.
 #
-# Binary extended GCD does no modular multiplication at all, and brought sign to 4.0 ms.
-# A future change that reintroduces Fermat, or that makes redc the default path again, would
-# be invisible in every other test in this suite -- they all still pass, just slowly.
+# THAT GUARD WAS BACKWARDS, and constant-time signing is why: the binary extended GCD branches on the
+# parity and relative size of values derived from its input, and that input is the ECDSA
+# nonce k in p256.sign -- exactly the secret-dependent timing that let Minerva and TPM-Fail
+# recover ECDSA keys, and now exposed to the network on every TLS handshake rather than only
+# to a local ACME operator. So p256.invm is Fermat exponentiation again, deliberately,
+# with a constant-time select in place of the branch p256.powm used to have -- see
+# lib/p256.wz's own notes at p256.powm and p256.invm. Slower (an inverse mod n now costs on
+# the order of 6 ms, not the ~2.5 ms Fermat cost this test once compared against, because a
+# constant-time square-and-always-multiply does roughly twice the multiplies of a plain
+# square-and-multiply) is the accepted cost of not leaking k's bits through timing.
 #
-# THE THRESHOLD IS DELIBERATELY LOOSE. This is a regression guard, not a benchmark: it fires
-# on a return to the old algorithm (more than twice as slow) and not on a busy machine.
+# So this file keeps only what still needs checking: that an inverse is still correct, and
+# that it still finishes in bounded time (a hang, or an accidental return to something far
+# slower than either algorithm, would otherwise pass silently -- every OTHER test in this
+# suite still passes even if signing is minutes slow). The constant-time PROPERTY itself is
+# tests/lib/p256_ct.sh's job, not this file's.
 set -e
 here=$(cd "$(dirname "$0")/../.." && pwd)
 pass=0; fail=0
@@ -62,15 +72,17 @@ begin
   end;
   expect(failures = 0, "a * (1/a) = 1 for twenty random values, mod p and mod n");
 
-  // ONE IS ITS OWN INVERSE, and the loop must notice before doing any work.
+  // ONE IS ITS OWN INVERSE: 1^(m-2) mod m = 1.
   p256.zero(a); a[0] := 1;
   p256.invm(r, a, p256.n);
   expect(p256.isone(r), "1 inverts to 1");
 
-  // ZERO HAS NO INVERSE, and the honest answer is zero rather than a hang.
+  // ZERO HAS NO INVERSE, and the honest answer is zero: 0^(m-2) mod m = 0, no special case
+  // needed (unlike the old binary GCD, which had to refuse zero explicitly before its loop
+  // or spin forever -- zero is even forever, so it never left the "make it odd" step).
   p256.zero(a);
   p256.invm(r, a, p256.n);
-  expect(p256.iszero(r), "0 has no inverse and does not loop");
+  expect(p256.iszero(r), "0 has no inverse, and 0 is the honest answer");
 
   // AND THE SPEED. Twenty inverses modulo n, which is the expensive modulus.
   rand.bytes(rb);
@@ -99,12 +111,14 @@ while read -r line; do
 done < "$tmp/out.txt"
 
 us=$(grep '^USEC ' "$tmp/out.txt" | awk '{print $2}')
-# FERMAT WAS ~2500 us HERE; the binary algorithm is a few hundred. 1500 sits between them
-# with room for a loaded machine on either side.
-if [ -n "$us" ] && [ "$us" -lt 1500 ]; then
-  ok "an inverse mod n takes ${us} us, well under the Fermat cost"
+# MEASURED 25-09-2026, the constant-time Fermat inverse: ~6 ms on a quiet machine. 50000 (50
+# ms) is not a tight regression bound -- it is a hang/sanity bound, generous enough for a
+# busy machine, that would still catch an inverse that stopped terminating or that regressed
+# to something far slower than either algorithm this file has used.
+if [ -n "$us" ] && [ "$us" -lt 50000 ]; then
+  ok "an inverse mod n takes ${us} us"
 else
-  bad "an inverse mod n takes ${us:-?} us -- Fermat's inverse may be back"
+  bad "an inverse mod n takes ${us:-?} us -- unexpectedly slow, or it did not finish"
 fi
 
 grep -q ALLGOOD "$tmp/out.txt" || { echo "  FAIL  the test program did not run to the end"; fail=$((fail+1)); }

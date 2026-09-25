@@ -4,8 +4,8 @@
 # fixed point. Two things it does not cover, and both only matter when bytes leave this
 # machine:
 #
-#   1. The Windows binary. test.sh compares ELF only, yet the .exe is the artefact a
-#      Windows user downloads. If it were not reproducible, nobody could check it.
+#   1. Reproducibility of the published binary: built twice, byte-identical, and the
+#      bytes in bin/ are the bytes the source produces.
 #   2. The version the binary reports. A published SHA256SUMS is useless if the binary
 #      cannot tell you which release it belongs to -- you would not know which checksum
 #      to compare against.
@@ -27,8 +27,9 @@ assert_eq "the C bootstrap reports the same version" \
 
 # AND BOTH SAY WHERE THE LIBRARY IS. Since the standard library moved to disk, a compiler
 # without lib/ beside it cannot resolve `include "io.wz"` -- so "where does it look?" became
-# a question an install can be wrong about, and the answer belongs in --version. The two
-# compilers are counterparts and must not drift on this either.
+# a question an install can be wrong about, and the answer belongs in --version. This one
+# behaviour is still shared with the bootstrap compiler: --version and library lookup are
+# unrelated to what it does not implement (schema, tools, --debug).
 assert_contains "the Wantzel compiler reports its library path" \
   "$(./bin/wantzel --version)" "library "
 assert_contains "the C bootstrap reports its library path" \
@@ -41,15 +42,12 @@ if [ -n "$tag" ]; then
   assert_eq "the tag matches the reported version" "$tag" "v$version"
 fi
 
-# Both targets, built twice, must be byte-identical -- that is what lets anyone rebuild
+# Built twice, the compiler must be byte-identical -- that is what lets anyone rebuild
 # from the tag and compare against the published checksum.
 ./bin/wantzel src/wantzel.wz "$T/linux_a"              >/dev/null 2>&1 || { echo "Linux build failed"; exit 1; }
 ./bin/wantzel src/wantzel.wz "$T/linux_b"              >/dev/null 2>&1
-./bin/wantzel src/wantzel.wz "$T/win_a.exe" --target=windows >/dev/null 2>&1 || { echo "Windows build failed"; exit 1; }
-./bin/wantzel src/wantzel.wz "$T/win_b.exe" --target=windows >/dev/null 2>&1
 
 cmp -s "$T/linux_a" "$T/linux_b"   || { echo "the Linux build is not reproducible"; exit 1; }
-cmp -s "$T/win_a.exe" "$T/win_b.exe" || { echo "the Windows build is not reproducible"; exit 1; }
 
 # The Linux compiler must be the one in bin/, or the checksum we publish would cover
 # bytes that are not the ones people get when they build.
@@ -59,10 +57,6 @@ cmp -s "$T/linux_a" ./bin/wantzel || { echo "bin/wantzel differs from what src/w
 case "$(head -c 20 "$T/linux_a" | od -An -tx1 | tr -d ' \n')" in
   7f454c46*) ;;
   *) echo "the Linux output is not an ELF binary"; exit 1 ;;
-esac
-case "$(head -c 2 "$T/win_a.exe")" in
-  MZ) ;;
-  *) echo "the Windows output is not a PE binary"; exit 1 ;;
 esac
 
 # The banner belongs on a bare run and nowhere else. A compiler that announces itself on
@@ -79,13 +73,16 @@ case "$banner" in
   *) echo "a bare run does not say where the project lives"; exit 1 ;;
 esac
 assert_eq "a successful compile prints nothing" "$(./bin/wantzel examples/hello.wz "$T/quiet" 2>&1)" ""
-assert_eq "both compilers print the same banner" "$(./bin/wantzel0 2>&1)" "$banner"
+# wantzel0's bare-run banner is intentionally its own: it is the bootstrap
+# compiler, not a release artefact, and its banner says so rather than repeating wantzel's.
+assert_contains "wantzel0's banner names itself as the bootstrap compiler" \
+  "$(./bin/wantzel0 2>&1)" "the C bootstrap compiler"
 
 # Finally the thing a release actually publishes: checksums over the bytes just built.
-( cd "$T" && sha256sum linux_a win_a.exe > SUMS && sha256sum -c --quiet SUMS ) \
+( cd "$T" && sha256sum linux_a > SUMS && sha256sum -c --quiet SUMS ) \
   || { echo "the checksums do not match the bytes that were built"; exit 1; }
 
-echo "wantzel $version: both targets reproducible, ELF static, PE valid, checksums verified"
+echo "wantzel $version: reproducible, ELF static, checksums verified"
 
 # THE README NAMES THE BINARY BY VERSION, and nothing updates it automatically.
 #

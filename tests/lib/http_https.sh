@@ -17,6 +17,7 @@
 # give up on their own, and the runner's limit is in http_https.timeout.
 set -e
 here=$(cd "$(dirname "$0")/../.." && pwd)
+. "$here/tests/lib/portlib.sh"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL  $1"; shift; for r in "$@"; do echo "        $r"; done; }
@@ -52,13 +53,21 @@ openssl ecparam -name prime256v1 -genkey -noout -out "$tmp/two.key" 2>/dev/null
 openssl req -x509 -key "$tmp/two.key" -out "$tmp/two.pem" -days 30 -subj "/CN=local.test" \
   -addext "subjectAltName=DNS:local.test" 2>/dev/null
 
-base=$(( 30000 + ($$ % 1000) * 6 ))
-p443=$base; p80=$((base + 1)); paux=$((base + 2)); pbare=$((base + 3)); pshort=$((base + 4)); pshort80=$((base + 5))
+set -- $(free_ports 6)
+p443=$1; p80=$2; paux=$3; pbare=$4; pshort=$5; pshort80=$6
 listening() { i=0; while [ $i -lt 50 ]; do ss -tln 2>/dev/null | grep -q ":$1 " && return 0; sleep 0.1; i=$((i+1)); done; return 1; }
 
 # The server under test, with a 400000-byte big-body region; and a second one whose header
 # deadline is 2 s, so a deadline is seen inside the test.
-"$tmp/app" "$p443" "$p80" "$tmp/one.pem" "$tmp/one.key" 30 400000 "cert2=$tmp/two.pem" "key2=$tmp/two.key" \
+#
+# 90 s, NOT 30. p256.sign is constant-time: 520 sequential handshakes in
+# check 4 below now cost roughly 7 s of signing alone on a quiet machine, and considerably
+# more loaded -- and a completed handshake with no request after it is held to this SAME
+# header deadline (checked earlier in this file), so the earliest of the 520 connections
+# were being timed out before the last one finished shaking hands. 30 s was already close
+# to that cost before the change; 90 s leaves real room without weakening check 3, which
+# only needs "clearly longer than a few seconds".
+"$tmp/app" "$p443" "$p80" "$tmp/one.pem" "$tmp/one.key" 90 400000 "cert2=$tmp/two.pem" "key2=$tmp/two.key" \
   >"$tmp/app.log" 2>&1 &
 srv=$!
 started="$started $srv"
@@ -66,7 +75,7 @@ started="$started $srv"
 short=$!
 started="$started $short"
 listening "$p443" && listening "$p80" && listening "$pshort" \
-  || { echo "  FAIL  the servers did not start"; cat "$tmp/app.log" "$tmp/short.log"; exit 1; }
+  || { echo "  FAIL  the servers did not start"; port_owner "$p443"; port_owner "$p80"; port_owner "$pshort"; cat "$tmp/app.log" "$tmp/short.log"; exit 1; }
 
 U="https://local.test:$p443"
 get() {    # get <path> [cafile]: the body, over HTTPS
@@ -220,7 +229,7 @@ kill -0 "$srv" 2>/dev/null && ok "the server is still running" || bad "the serve
 "$tmp/app" "$pbare" "$paux" - - 2 0 >"$tmp/bare.log" 2>&1 &
 bare=$!
 started="$started $bare"
-listening "$pbare" || bad "the server without a certificate did not start" "$(cat "$tmp/bare.log")"
+listening "$pbare" || bad "the server without a certificate did not start" "$(port_owner "$pbare")" "$(cat "$tmp/bare.log")"
 if timeout 5 openssl s_client -connect "127.0.0.1:$pbare" -servername local.test </dev/null >/dev/null 2>&1; then
   bad "a handshake succeeded without a certificate"
 else ok "without a certificate a handshake is closed at once"; fi

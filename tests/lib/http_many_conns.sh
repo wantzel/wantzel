@@ -9,11 +9,12 @@
 # ALL before it sends a single request, so the server has to hold every one of them at the
 # same moment to answer the last.
 . "$ROOT/tests/helpers.sh"
+. "$ROOT/tests/lib/portlib.sh"
 
 command -v curl >/dev/null 2>&1 || { echo "curl is missing"; exit 1; }
 
 N=1100
-port=$(( 28000 + ($$ % 900) ))
+port=$(free_port)
 
 # The client holds N descriptors of its own.
 ulimit -Sn 4096 2>/dev/null

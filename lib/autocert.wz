@@ -589,9 +589,8 @@ var r: int;
 begin
   io.put64(autocert.tv, 0, ms div 1000);
   io.put64(autocert.tv, 8, (ms mod 1000) * 1000);
-  // SO_RCVTIMEO is 20 and SO_SNDTIMEO 21 on Linux. The result is not checked: a platform
-  // without them (the Windows runtime ignores both) still works, just without this bound,
-  // and the epoll wait below still applies.
+  // SO_RCVTIMEO is 20 and SO_SNDTIMEO 21. The result is not checked: without this bound
+  // the epoll wait below still applies.
   r := sys5(SYS.setsockopt, fd, SOL_SOCKET, opt, addr(autocert.tv[0]), 16);
 end;
 

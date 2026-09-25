@@ -6,8 +6,8 @@
 // trigonometric functions, rounding, and fixed-decimal formatting.
 //
 // Everything is plain Wantzel on the `real` type: range reduction plus a short
-// series, so the results are identical on Linux and Windows and there is
-// no dependence on a C library.  Accuracy is a few units in the last place
+// series, so the results are the same on every machine and there is no
+// dependence on a C library.  Accuracy is a few units in the last place
 // over the ranges an energy model needs; see the notes per function.
 
 include "json.wz";

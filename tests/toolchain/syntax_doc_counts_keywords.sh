@@ -10,11 +10,7 @@
 #
 # The list is checked against $WZSRC rather than against a number kept here, so
 # removing a keyword means editing the compiler and the page -- never this test.
-# THE COMPILER IS TWO FILES SINCE 17-09-2026: compiler.wz holds everything and has no
-# main program, so it can be included; wantzel.wz is the command-line program around it
-# A scan that reads only one of them finds nothing and reports a rename
-# that never happened -- which is exactly what this test said when the split landed.
-WZSRC="src/compiler.wz src/wantzel.wz"
+WZSRC="src/wantzel.wz"
 
 . "$ROOT/tests/helpers.sh"
 cd "$ROOT"

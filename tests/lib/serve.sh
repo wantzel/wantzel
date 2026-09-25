@@ -17,6 +17,7 @@
 #   5. exactly ONE process, which is the claim this file exists to check
 set -e
 here=$(cd "$(dirname "$0")/../.." && pwd)
+. "$here/tests/lib/portlib.sh"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL  $1"; }
@@ -41,9 +42,11 @@ cd "$tmp"
   || { echo "  FAIL  serve.wz does not compile"; cat build.log; exit 1; }
 ok "the server builds, $(stat -c%s "$tmp/serve") bytes"
 
-# TWO FREE PORTS, picked high enough to avoid the usual suspects.
-p80=$(( 19000 + RANDOM % 900 ))
-p443=$(( p80 + 1 ))
+# FOUR free ports (two servers, each with its own plain and TLS port), from the kernel via
+# tests/lib/portlib.sh -- not guessed from a range "picked high enough to avoid the usual
+# suspects", which is exactly the guess that collides under many parallel ./wztest runs.
+set -- $(free_ports 4)
+p80=$1; p443=$2; p80b=$3; p443b=$4
 
 # ---- 1. WITHOUT A CERTIFICATE ------------------------------------------------------------
 "$tmp/serve" "$p80" "$p443" local.wantzel.com >nocert.log 2>&1 &
@@ -89,7 +92,6 @@ h=$(printf '%s' "$h" | tail -c 64)
 while [ ${#h} -lt 64 ]; do h="0$h"; done
 printf '%s' "$h" > key.hex
 
-p80b=$(( p443 + 1 )); p443b=$(( p80b + 1 ))
 "$tmp/serve" "$p80b" "$p443b" local.wantzel.com >cert.log 2>&1 &
 started="$started $!"
 i=0; while [ $i -lt 50 ]; do ss -tln 2>/dev/null | grep -q ":$p443b " && break; sleep 0.1; i=$((i+1)); done

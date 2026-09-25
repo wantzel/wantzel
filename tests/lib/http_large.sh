@@ -16,6 +16,7 @@
 # Every wait has a bound (curl --max-time, the helpers' own limits, http_large.timeout).
 set -e
 here=$(cd "$(dirname "$0")/../.." && pwd)
+. "$here/tests/lib/portlib.sh"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL  $1"; shift; for r in "$@"; do echo "        $r"; done; }
@@ -42,14 +43,14 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -keyout "$tmp/key.pem" -out "$tmp/cert.pem" -days 30 -subj "/CN=local.test" \
   -addext "subjectAltName=DNS:local.test" 2>/dev/null
 
-base=$(( 38000 + ($$ % 1500) * 3 ))
-ptls=$base; predir=$((base + 1)); pplain=$((base + 2))
+set -- $(free_ports 3)
+ptls=$1; predir=$2; pplain=$3
 # bodies up to 50 MB, 64 MB of them at once; replies up to 50 MB
 "$tmp/app" "$ptls" "$predir" "$tmp/cert.pem" "$tmp/key.pem" 30 50000000 \
   app="$pplain" maxreply=50000000 bodymem=64000000 >"$tmp/app.log" 2>&1 &
 srv=$!
 started="$started $srv"
-i=0; while [ $i -lt 50 ]; do ss -tln 2>/dev/null | grep -q ":$pplain " && break; sleep 0.1; i=$((i+1)); done
+wait_port "$pplain" || { echo "  FAIL  httpsapp did not start"; port_owner "$pplain"; cat "$tmp/app.log"; exit 1; }
 
 P="http://127.0.0.1:$pplain"
 S="https://local.test:$ptls"

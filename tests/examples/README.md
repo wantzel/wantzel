@@ -8,9 +8,7 @@ Nothing guarded them until 13-09-2026 — the suite only ever looked inside `tes
 the nine programs in `examples/` could have stopped compiling without a single test
 turning red.
 
-`examples_compile.sh` compiles every `examples/*.wz`, **for Linux and for Windows**. The
-second target is not an extra: the README promises that either host builds either target,
-so an example that only compiles to ELF quietly contradicts it.
+`examples_compile.sh` compiles every `examples/*.wz`.
 
 Adding an example costs nothing here: the loop picks it up on its own.
 

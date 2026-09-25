@@ -16,6 +16,7 @@
 #   4. a malformed URL is refused rather than guessed at
 set -e
 here=$(cd "$(dirname "$0")/../.." && pwd)
+. "$here/tests/lib/portlib.sh"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL  $1"; shift; for r in "$@"; do echo "        $r"; done; }
@@ -26,7 +27,8 @@ if ! command -v openssl >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; th
 fi
 
 tmp=$(mktemp -d)
-port=$(( 26000 + ($$ % 8000) ))
+set -- $(free_ports 4)
+port=$1; httpport=$2; rsaport=$3; caport=$4
 started=""
 cleanup() {
   rc=$?
@@ -49,11 +51,7 @@ openssl req -x509 -key "$tmp/k.pem" -out "$tmp/c.pem" -days 1 \
 openssl s_server -accept "$port" -cert "$tmp/c.pem" -key "$tmp/k.pem" \
   -tls1_3 -www -quiet >"$tmp/srv.log" 2>&1 &
 started="$started $!"
-i=0
-while [ $i -lt 50 ]; do
-  ss -tln 2>/dev/null | grep -q ":$port " && break
-  sleep 0.1; i=$((i+1))
-done
+wait_port "$port" || { echo "  FAIL  openssl s_server did not start"; port_owner "$port"; cat "$tmp/srv.log"; exit 1; }
 
 # ---- 2. HTTPS, AND THE BYTES MUST MATCH WHAT CURL GETS -----------------------------------------
 #
@@ -98,7 +96,6 @@ esac
 # with its key. That is the ordinary shape of a public site (the browser holds the root,
 # the server does not send it), and the one case that exercises the by-name lookup: a
 # self-signed certificate in --cafile IS the chain's top and is found by comparing bytes.
-caport=$(( port + 3 ))
 openssl ecparam -name prime256v1 -genkey -noout -out "$tmp/ca.key" 2>/dev/null
 openssl req -x509 -key "$tmp/ca.key" -out "$tmp/ca.pem" -days 1 -subj "/CN=Test Root" \
   -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1
@@ -155,7 +152,6 @@ esac
 # that check from wget.wz left the file at 7 ok, 0 fail, because every other refusal happens
 # earlier, inside the handshake. A client that ignores verified would connect to a server
 # that never proved it holds the key -- which is exactly what an attacker in the middle does.
-rsaport=$(( port + 2 ))
 openssl req -x509 -newkey rsa:2048 -keyout "$tmp/rk.pem" -out "$tmp/rc.pem" -days 1 -nodes \
   -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost" >/dev/null 2>&1
 openssl s_server -accept "$rsaport" -cert "$tmp/rc.pem" -key "$tmp/rk.pem" \
@@ -190,7 +186,6 @@ esac
 #
 # A tiny HTTP server in Wantzel rather than borrowing one: the test then does not depend on
 # what happens to be installed.
-httpport=$(( port + 1 ))
 cat > "$tmp/h.wz" <<WZ
 include "io.wz";
 include "net.wz";

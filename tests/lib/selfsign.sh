@@ -44,7 +44,8 @@ cleanup() {
 trap cleanup EXIT
 cd "$tmp"
 
-port=$(( 19600 + RANDOM % 300 ))
+. "$here/tests/lib/portlib.sh"
+port=$(free_port)
 
 cat > "$tmp/t.wz" <<WZ
 include "io.wz";

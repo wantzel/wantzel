@@ -28,19 +28,38 @@
 //                   send it: the owner a pointer, MNAME and RNAME ending in pointers, the
 //                   RNAME's pointing into the MNAME of the same record
 //   nodatasoa.test  no error, no answer, and that SOA: the name has no IPv4 address
+//   slow.test       A 10.3.3.30, but only after three seconds
 //   unknown.test    a record of a type the resolver does not know, whose RDATA holds bytes
 //                   that look like pointers, before A 10.6.6.6: skipped by its RDLENGTH
 //   opt.test        A 10.4.4.4 and an OPT record (EDNS, with a cookie) in the additional
 //                   section
 //   referral.test   A 10.3.3.3, two NS records in the authority section and their glue in
 //                   the additional section (A 6.6.6.1, A 6.6.6.2) -- glue is not an answer
+//   v6only.test     AAAA 2001:db8::1 -- no A record at all, so a connect-by-name that does
+//                   not ask AAAA cannot reach it: the case this fixture exists to cover
+//   v6dual.test     AAAA 2001:db8::53 AND (asked separately) A 10.11.12.13 -- for the
+//                   "tries both families, in order" side of dns.connect
+//   v6cname.test    CNAME v6only.test, answered under type AAAA the same way chain.test is
+//                   answered under type A
+//   v6loop.test     AAAA ::1 -- no A record. A REAL loopback address, unlike v6only.test's
+//                   documentation one: for a connect-by-name test against a listener this
+//                   same machine can actually answer on
+//   dualoop.test    AAAA ::1 AND (asked separately) A 127.0.0.1 -- both real, for proving
+//                   which family a dual-stack connect-by-name reaches first
 //   anything else   NXDOMAIN
+//
+// A records answer to type A queries, AAAA records to type AAAA queries, as a real server
+// does -- asking v6only.test for its A record gets NODATA, not its AAAA address.
 
 include "io.wz";
 include "net.wz";
 
+const
+  QT_A    = 1;
+  QT_AAAA = 28;
+
 var
-  port, mode, udp, lfd, ep, n, i, fd, t0, salen: int;
+  port, mode, udp, lfd, ep, n, i, fd, t0, salen, qtype: int;
   qb: array[0..4095] of char;       // the query as received
   qn: int;
   rb: array[0..4095] of char;       // the reply being built, after two bytes of TCP length
@@ -53,12 +72,15 @@ var
   ts: array[0..15] of char;
   modes: array[0..15] of char;
 
+// SECONDS AND NANOSECONDS APART: nanosleep refuses a tv_nsec of a second or more (EINVAL)
+// and returns at once, so a nap of 3000 ms written as 3e9 ns did not sleep at all.
 procedure nap(ms: int);
 var k: int;
 begin
   k := 0;
   while k < 16 do begin ts[k] := chr(0); k := k + 1; end;
-  io.put64(ts, 8, ms * 1000000);
+  io.put64(ts, 0, ms div 1000);
+  io.put64(ts, 8, (ms mod 1000) * 1000000);
   sys2(SYS.nanosleep, addr(ts[0]), 0);
 end;
 
@@ -75,8 +97,9 @@ begin
   return true;
 end;
 
-// The question: its name into nm, and qend just past its type and class. False when the
-// query does not parse -- the fixture only has to read what the resolver sends.
+// The question: its name into nm, its type into qtype, and qend just past its type and
+// class. False when the query does not parse -- the fixture only has to read what the
+// resolver sends.
 function readq: bool;
 var p, l, k: int;
     c: char;
@@ -103,7 +126,9 @@ begin
     p := p + 1 + l;
   end;
   qend := p + 5;
-  return qend <= qn;
+  if qend > qn then return false;
+  qtype := ord(qb[p + 1]) shl 8 + ord(qb[p + 2]);
+  return true;
 end;
 
 procedure b(v: int);
@@ -167,6 +192,25 @@ begin
   b16(4); b(a1); b(a2); b(a3); b(a4);
 end;
 
+// An AAAA record whose owner is the compression pointer ptr, address a hex string of
+// exactly 32 characters (as dns.ipstr6 writes one, without the colons).
+procedure aaaarec(ptr: int; ttl: int; a: str);
+var k, hi, v: int;
+    c: char;
+begin
+  b16(ptr); b16(28); b16(1);
+  b16(ttl shr 16); b16(ttl);
+  b16(16);
+  k := 0;
+  while k < 32 do
+  begin
+    c := schar(a, k);
+    if (c >= '0') and (c <= '9') then v := ord(c) - ord('0') else v := ord(c) - ord('a') + 10;
+    if band(k, 1) = 0 then hi := v else b(hi * 16 + v);
+    k := k + 1;
+  end;
+end;
+
 // The reply for the current question into rb[2..rn), under id; tcp says how it will go.
 procedure answer(id: int; tcp: bool);
 var p1, p2, rd: int;
@@ -174,9 +218,83 @@ begin
   if mode = 2 then begin head(id, false, 2, 0); return; end;
   if isname("a.test") then
   begin
-    head(id, false, 0, 2);
-    arec(0xC00C, 60, 10, 1, 2, 3);
-    arec(0xC00C, 60, 10, 1, 2, 4);
+    if qtype = QT_AAAA then head(id, false, 0, 0)
+    else
+    begin
+      head(id, false, 0, 2);
+      arec(0xC00C, 60, 10, 1, 2, 3);
+      arec(0xC00C, 60, 10, 1, 2, 4);
+    end;
+  end
+  else if isname("v6only.test") then
+  begin
+    if qtype = QT_A then head(id, false, 0, 0)          // no A record at all: NODATA
+    else
+    begin
+      head(id, false, 0, 1);
+      aaaarec(0xC00C, 60, "20010db8000000000000000000000001");   // 2001:db8::1
+    end;
+  end
+  else if isname("v6dual.test") then
+  begin
+    if qtype = QT_AAAA then
+    begin
+      head(id, false, 0, 1);
+      aaaarec(0xC00C, 60, "20010db8000000000000000000000053");   // 2001:db8::53
+    end
+    else
+    begin
+      head(id, false, 0, 1);
+      arec(0xC00C, 60, 10, 11, 12, 13);
+    end;
+  end
+  else if isname("v6cname.test") then
+  begin
+    if qtype = QT_A then head(id, false, 0, 0)
+    else
+    begin
+      // v6cname.test CNAME v6only.test, then v6only.test AAAA 2001:db8::1 -- the same
+      // shape as chain.test, under type AAAA
+      head(id, false, 0, 2);
+      b16(0xC00C); b16(5); b16(1); b16(0); b16(300);
+      p1 := rn - 2;
+      b16(9); lit("\x07v6only\xc0\x12");
+      aaaarec(0xC000 + p1 + 2, 60, "20010db8000000000000000000000001");
+    end;
+  end
+  else if isname("v6loop.test") then
+  begin
+    // AAAA ::1 -- no A record, so a connect-by-name against a REAL loopback listener
+    // proves both that AAAA was asked and that net.connect6 was used to reach it.
+    if qtype = QT_A then head(id, false, 0, 0)
+    else
+    begin
+      head(id, false, 0, 1);
+      aaaarec(0xC00C, 60, "00000000000000000000000000000001");   // ::1
+    end;
+  end
+  else if isname("dualoop.test") then
+  begin
+    // A 127.0.0.1 AND AAAA ::1, both real loopback listeners: for the "IPv6 first"
+    // ordering of dns.connect, provable by which listener actually took the connection.
+    if qtype = QT_AAAA then
+    begin
+      head(id, false, 0, 1);
+      aaaarec(0xC00C, 60, "00000000000000000000000000000001");   // ::1
+    end
+    else
+    begin
+      head(id, false, 0, 1);
+      arec(0xC00C, 60, 127, 0, 0, 1);
+    end;
+  end
+  else if isname("slow.test") then
+  begin
+    // A LOCAL CACHING RESOLVER THAT HAS TO ASK UPSTREAM THE SLOW WAY answers seconds later,
+    // not milliseconds: systemd-resolved does this while it re-probes an upstream server.
+    nap(3000);
+    head(id, false, 0, 1);
+    arec(0xC00C, 60, 10, 3, 3, 30);
   end
   else if isname("chain.test") then
   begin

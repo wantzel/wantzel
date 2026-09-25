@@ -10,12 +10,13 @@
 # (http.maxbody), not in http.inbuf; before mcp.http looked there, such a request was parsed
 # from the wrong buffer. The server allows replies up to 4 MB (http.maxreply).
 . "$ROOT/tests/helpers.sh"
+. "$ROOT/tests/lib/portlib.sh"
 
 command -v curl >/dev/null 2>&1 || { echo "curl is missing"; exit 1; }
 compile "$ROOT/tests/lib/progs/mcpbig.wz" "$T/mcpbig"
 
 MB=1048576
-port=$(( 23000 + ($$ % 900) ))
+port=$(free_port)
 
 pat() { yes '0123456789abcd"\' | tr -d '\n' | head -c "$1"; }
 esc() { sed 's/\\/\\\\/g; s/"/\\"/g'; }

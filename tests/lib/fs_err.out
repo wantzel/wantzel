@@ -6,3 +6,10 @@ ok   with the raw errno beside it
 ok   an exhausted directory leaves fs.err empty
 ok   getdents on a plain file is refused
 ok   and fs.err names the reason, not silent exhaustion
+ok   exactly FS.MAXOPEN directories can be open at once
+ok   a 17th fs.opendir is refused
+ok   with FS.EMFILE, the same errno the kernel would give
+ok   and fs.err names the reason
+ok   after closing them, a directory can be opened again
+ok   one of the three entries is read, two left unread in the slot's buffer
+ok   after fs.forget, the reused fd reads its OWN one entry, not directory a's leftovers

@@ -1,0 +1,101 @@
+// Measures p256.mulpoint (k*G, variable-base ladder), p256.mulbase (k*G, fixed-base comb)
+// and p256.invm (1/k mod n) over scalars of very different Hamming weight -- 1 set bit
+// against 255 set bits, both with the same bit length (bit 255 forced set on both, so this
+// measures a per-bit/per-digit branch in the secret-scalar paths, not the separate
+// top-bit-position caveat p256.mulpoint's own comment documents -- p256.mulbase does not
+// have that caveat, since it always runs exactly COMB.T columns regardless of k). Prints,
+// per routine, the two medians; the calling test computes and judges the ratio.
+//
+// INTERLEAVED, NOT LOW-THEN-HIGH. Measuring all ten "low" calls and then all ten "high"
+// calls lets one scheduler hiccup -- a moment where this process is preempted -- land
+// entirely inside one group and skew only its median, which is indistinguishable from a
+// real timing difference. Alternating low, high, low, high spreads any such hiccup across
+// both groups, so it moves both medians together instead of just one.
+include "io.wz";
+include "rand.wz";
+include "p256.wz";
+
+const REPS = 15;    // odd, so the middle index is an unambiguous median
+
+var lowk, highk: array[0..P.N-1] of int;
+    lotimes, hitimes: array[0..REPS-1] of int;
+    kinv:  array[0..P.N-1] of int;
+    t0, t1: int;
+
+procedure setweight(k: array of int; nbits: int);
+var b, i: int;
+begin
+  p256.zero(k);
+  k[7] := 0x80000000;             // bit 255, always set -- see the header comment above
+  b := 1;                          // one bit is already set (bit 255); add (nbits - 1) more
+  while b < nbits do
+  begin
+    // spread the extra set bits across the low 255 bits, low to high, deterministic
+    i := b - 1;
+    k[i shr 5] := bor(k[i shr 5], 1 shl band(i, 31));
+    b := b + 1;
+  end;
+end;
+
+// insertion sort, REPS is tiny
+procedure sorttimes(t: array of int);
+var a, b, v: int;
+begin
+  a := 1;
+  while a < REPS do
+  begin
+    v := t[a];
+    b := a - 1;
+    while (b >= 0) and (t[b] > v) do
+    begin
+      t[b + 1] := t[b];
+      b := b - 1;
+    end;
+    t[b + 1] := v;
+    a := a + 1;
+  end;
+end;
+
+procedure runboth(which: int; lo: array of int; hi: array of int);
+var r: int;
+begin
+  r := 0;
+  while r < REPS do
+  begin
+    t0 := io.now;
+    if which = 0 then p256.mulpoint(p256.gx, p256.gy, lowk)
+    else if which = 1 then p256.invm(kinv, lowk, p256.n)
+    else p256.mulbase(lowk);
+    t1 := io.now;
+    lo[r] := t1 - t0;
+
+    t0 := io.now;
+    if which = 0 then p256.mulpoint(p256.gx, p256.gy, highk)
+    else if which = 1 then p256.invm(kinv, highk, p256.n)
+    else p256.mulbase(highk);
+    t1 := io.now;
+    hi[r] := t1 - t0;
+
+    r := r + 1;
+  end;
+  sorttimes(lo);
+  sorttimes(hi);
+end;
+
+begin
+  p256.setup;
+  setweight(lowk, 1);
+  setweight(highk, 255);
+
+  runboth(0, lotimes, hitimes);
+  io.puts(STDOUT, "MULPOINT_LOW ");  io.putn(STDOUT, lotimes[REPS div 2]); io.puts(STDOUT, "\n");
+  io.puts(STDOUT, "MULPOINT_HIGH "); io.putn(STDOUT, hitimes[REPS div 2]); io.puts(STDOUT, "\n");
+
+  runboth(1, lotimes, hitimes);
+  io.puts(STDOUT, "INVM_LOW ");      io.putn(STDOUT, lotimes[REPS div 2]); io.puts(STDOUT, "\n");
+  io.puts(STDOUT, "INVM_HIGH ");     io.putn(STDOUT, hitimes[REPS div 2]); io.puts(STDOUT, "\n");
+
+  runboth(2, lotimes, hitimes);
+  io.puts(STDOUT, "MULBASE_LOW ");   io.putn(STDOUT, lotimes[REPS div 2]); io.puts(STDOUT, "\n");
+  io.puts(STDOUT, "MULBASE_HIGH ");  io.putn(STDOUT, hitimes[REPS div 2]); io.puts(STDOUT, "\n");
+end.

@@ -20,6 +20,7 @@
 # fails the handshake, which is exactly what this guards.
 set -e
 here=$(cd "$(dirname "$0")/../.." && pwd)
+. "$here/tests/lib/portlib.sh"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL  $1"; }
@@ -52,7 +53,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-port=$(( 20000 + $$ % 5000 ))
+port=$(free_port)
 
 "$here/bin/wantzel" "$here/examples/localhttps.wz" "$tmp/localhttps" >"$tmp/build.log" 2>&1 \
   || { echo "  FAIL  examples/localhttps.wz does not compile"; cat "$tmp/build.log"; exit 1; }

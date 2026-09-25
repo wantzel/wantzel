@@ -24,4 +24,4 @@ labels: bug
 
 ```
 
-**Platform** — Linux or Windows, and the distribution if it seems to matter:
+**Platform** — the Linux distribution and kernel, if it seems to matter:

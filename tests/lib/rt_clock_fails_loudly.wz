@@ -30,11 +30,6 @@
 // The clock ids the library actually asks for (CLOCK_MONOTONIC, CLOCK_REALTIME) are
 // always available on Linux, so the guard cannot be provoked through io.now itself; the
 // failing id is the only way to exercise the path at all.
-//
-// On Windows there is no clock_gettime: the compiler serves syscall 228 from
-// GetSystemTimeAsFileTime, which returns void and cannot fail, so __wsys reports 0 for
-// every clock id -- including 99. The check is correct there but never taken, and this
-// test is a Linux test for that reason.
 include "io.wz";
 
 var

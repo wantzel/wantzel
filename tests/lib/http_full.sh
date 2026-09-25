@@ -9,11 +9,12 @@
 # TOETSGROEP: lib
 # DEKT: lib/http.wz
 . "$ROOT/tests/helpers.sh"
+. "$ROOT/tests/lib/portlib.sh"
 
 command -v curl >/dev/null 2>&1 || { echo "curl is missing"; exit 1; }
 
-port=$(( 29800 + ($$ % 900) ))
-port2=$((port + 900))
+set -- $(free_ports 2)
+port=$1; port2=$2
 ulimit -Sn 4096 2>/dev/null
 
 compile "$ROOT/tests/helpers/httpstat.wz" "$T/srv"

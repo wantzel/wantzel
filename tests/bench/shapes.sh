@@ -87,11 +87,17 @@ echo "  schema and tools:  ${tr} kB/s  (${t} ms)"
 echo "  procedural code:   ${pr} kB/s  (${p} ms)"
 echo "  the spread between them is the point: no single rate describes this compiler"
 
-# THE FLOORS, one per shape, in the .min files beside this script. Each sits at roughly
-# half the lowest figure measured over repeated runs (data 148,000-170,000; tools
-# 2,960-3,060; procedural 15,800-18,500 kB/s on 15-09-2026). Half is deliberate: a bound
-# tight enough to flap gets raised until it means nothing, and a halving of throughput is
-# a regression by any reading.
+# THE FLOORS, one per shape, in the .min files beside this script. Data and procedural
+# sit at roughly half the lowest figure measured over repeated runs (data 148,000-170,000;
+# procedural 15,800-18,500 kB/s on 15-09-2026). Half is deliberate: a bound tight enough to
+# flap gets raised until it means nothing, and a halving of throughput is a regression by
+# any reading.
+#
+# tools is tighter -- about 80% of the median (2,552-2,784 kB/s over five runs) -- because
+# half the 2,960-3,060 kB/s measured on 15-09-2026 (1,400) already missed a real 30%
+# regression: per-tool generated code that grew with the tool count, unnoticed until the
+# shape itself was bisected. A floor loose enough to hide the thing it exists to catch is
+# not a floor.
 #
 # They are per shape BECAUSE a single bound cannot exist here. A change that slowed
 # schema generation by a third would disappear entirely into an average dominated by the

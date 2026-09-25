@@ -1,0 +1,3 @@
+ok   every fixture file is seen exactly once (A..E)
+ok   five files total across the nested walk
+ok   three subdirectories entered (sub1, sub1/deep, sub2)

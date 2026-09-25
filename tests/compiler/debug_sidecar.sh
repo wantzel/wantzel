@@ -3,8 +3,7 @@
 # The sidecar is checked against the BYTES of the executable, not against what the compiler
 # says about itself: the code at the address the line table gives for `x := 1234567` must be
 # `mov eax, 1234567; mov [x], rax` with x at the address the global table gives, and the
-# same for a local through its rbp offset. On both targets, because the PE puts the code at
-# a different place than the ELF. The format is docs/design.md.
+# same for a local through its rbp offset. The format is docs/design.md.
 . "$ROOT/tests/helpers.sh"
 
 cat > "$T/p.wz" <<'EOF'
@@ -56,11 +55,10 @@ check() {  # check <target> <header bytes before the code> [compile options]
   textva=$(field text 2); textlen=$(field text 3)
   bssva=$(field bss 2)
 
-  # the globals: items (10 records of 32 bytes) follows x, s follows items. On Linux x is
-  # the first global after the reserved slot at bss offset 0; on Windows the runtime's own
-  # globals come first, so there x is only checked against the bytes below.
+  # the globals: items (10 records of 32 bytes) follows x, s follows items. x is the first
+  # global after the reserved slot at bss offset 0.
   xva=$(field 'global x' 3)
-  [ "$tgt" = linux ] && assert_eq "linux: x sits at bss + 8" "$xva" "$(( bssva + 8 ))"
+  assert_eq "linux: x sits at bss + 8" "$xva" "$(( bssva + 8 ))"
   assert_eq "$tgt: global x"      "$(grep -m1 '^global x ' "$D")"     "global x $xva int 0 0 0"
   assert_eq "$tgt: global items"  "$(grep -m1 '^global items ' "$D")" "global items $(( xva + 8 )) item 1 0 9"
   assert_eq "$tgt: global s"      "$(grep -m1 '^global s ' "$D")"     "global s $(( xva + 328 )) str 0 0 0"
@@ -93,13 +91,8 @@ check() {  # check <target> <header bytes before the code> [compile options]
 }
 
 check linux 120
-check windows 512 --target=windows
 
-# the options may come in either order
-"$WANTZEL" "$T/p.wz" "$T/o.exe" --debug --target=windows 2>"$T/cerr" || { cat "$T/cerr"; exit 1; }
-cmp -s "$T/o.exe" "$T/dbg-windows" || { echo "--debug before --target= gives a different binary"; exit 1; }
-cmp -s "$T/o.exe.wzdbg" "$T/dbg-windows.wzdbg" || { echo "--debug before --target= gives a different sidecar"; exit 1; }
-# and an unknown one is still refused
+# an unknown option is refused
 if "$WANTZEL" "$T/p.wz" "$T/o" --debugg 2>"$T/cerr"; then echo "--debugg was accepted"; exit 1; fi
 assert_contains "the message names the options" "$(cat "$T/cerr")" "--debug"
-echo "  the sidecar matches the bytes of the executable on both targets"
+echo "  the sidecar matches the bytes of the executable"

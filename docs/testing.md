@@ -16,13 +16,12 @@ compiler translate that correctly? Everything lives in `tests/`; the runner is `
 | `tests/lang/` | the language itself: types, expressions, control flow, error messages |
 | `tests/compiler/` | the translation: code generation, optimisations, edge cases |
 | `tests/lib/` | the standard library |
-| `tests/examples/` | every program in `examples/` still compiles, for both targets |
+| `tests/examples/` | every program in `examples/` still compiles |
 | `tests/limits/` | measured limits (schema fields, tools, include depth) |
-| `tests/toolchain/` | the bootstrap fixed point, `test.sh`, the Windows side through Wine, editor grammar keyword coverage |
+| `tests/toolchain/` | the bootstrap fixed point, `test.sh`, reproducibility, editor grammar keyword coverage |
 | `tests/bench/` | speed, with a hard bound beside it |
 
-`tests/toolchain/` runs only with `--toolchain`; its Windows tests need Wine and run only
-with `--windows` on top of that; `tests/bench/` only with `--bench`.
+`tests/toolchain/` runs only with `--toolchain`; `tests/bench/` only with `--bench`.
 
 ## Running
 
@@ -31,53 +30,41 @@ with `--windows` on top of that; `tests/bench/` only with `--bench`.
 ./wztest tests/lang               # one directory
 ./wztest tests/lang/hello.wz      # one test
 ./wztest -k curve                 # path filter
-./wztest -t W-hhhh-llll           # the tests of one ticket
 ./wztest -v tests/lang/x.wz       # full diff on failure
 ./wztest --time                   # duration per test
 ./wztest --toolchain              # plus the bootstrap fixed point and test.sh
-./wztest --toolchain --windows    # and the Windows side, through Wine (twice as slow)
 ./wztest --bench                  # plus tests/bench/
 ```
 
 **Don't run the suite more often than necessary.** One green run covers everything in it;
 use `-k <pattern>` while working, run the whole suite once before committing. Always use
 `--toolchain` when working on the compiler or the bootstrap — it's the only way to notice
-`src/wantzel.wz` and `bootstrap/boot.c` have drifted apart.
+the fixed point has broken.
 
-Two Windows checks need no emulator and run in every `--toolchain` run:
-`tests/toolchain/win_backend_bytes.sh` reads the PE header and compares the `.exe` bytes of
-`bootstrap/boot.c` against those of `src/wantzel.wz` — a check that once caught the two
-counterparts drifting apart on the Windows side while Linux stayed byte-identical, for the
-cost of milliseconds. What `--windows` adds on top is *running* a `.exe`
-(`win_exe_runs.sh`, `win_syscalls.sh`), the slowest part of the suite — needed when you
-touch the Windows runtime, a syscall shim, or the code generator, and for a release (which
-`release.py` passes automatically).
-
-A test switched off by a flag must never be started by another test: `win_exe_runs.sh`
-fails if a Wine process of its own run outlives its cleanup.
+A test switched off by a flag must never be started by another test: `tests/bench/` runs
+only when `--bench` was typed, and nothing under `tests/toolchain/` calls it.
 
 ## The bootstrap fixed point
 
-`bootstrap/boot.c` is the compiler in C, `src/wantzel.wz` the same compiler in Wantzel. The
-chain is `boot.c` → `wantzel.stage1` → `stage2` → `stage3`, and stage2 and stage3 must be
-**byte-identical** — the proof the compiler translates itself correctly. The two sources are
-counterparts: same logic, line by line, same output. Change one and you change the other in
-the same commit. `./build.sh` builds the chain, `./wztest --toolchain` checks it.
+`bootstrap/boot.c` is a small C compiler for exactly what `src/wantzel.wz` needs to compile
+itself: no `schema`, no `tools`, no `--debug`. `src/wantzel.wz` is the real compiler,
+self-hosted, and it implements the whole language.
 
-**What the fixed point doesn't catch:** two counterparts can disagree about whether to
-*refuse* a program and still reach a fixed point — each still builds itself
-byte-identically even if one accepts a program the other rejects. So for any change to the
-counterparts, compile the same source with both binaries and compare:
+The chain is `boot.c` → `wantzel.stage1` → `stage2` → `stage3`. **stage2 and stage3 must be
+byte-identical** — the proof that the self-hosted compiler reproduces itself correctly.
+Stage1 does not have to match them: `boot.c` only has to produce a *correct* stage1, not an
+identical one. `./build.sh` builds the chain, `./wztest --toolchain` checks
+it.
 
-```bash
-./bin/wantzel0 case.wz /tmp/a    # the C bootstrap
-./bin/wantzel  case.wz /tmp/b    # the self-hosted compiler
-```
-
-For a program that should build, the two executables must be byte-identical —
-`tests/toolchain/counterparts_agree.sh` checks this. For a program that should be
-**refused**, both must refuse it with the same message, and nothing checks that
-automatically: an `.err` test compiles with `bin/wantzel` only.
+This is why `boot.c` and `src/wantzel.wz` are **not** counterparts any more, and nothing
+keeps them in step: a change to the self-hosted compiler only touches `boot.c` when it
+changes something `src/wantzel.wz` itself needs to compile — a new keyword or construct
+the compiler's own source starts using, for example.
+Anything the compiler's source does not use (schema, tools, `real` arithmetic beyond what
+it already has, `--debug`) can change freely in the self-hosted compiler without touching
+`boot.c` at all. What `boot.c` must still do is *refuse* anything it does not implement,
+loudly and with a clear message, rather than miscompile it — `test.sh` checks that for
+`schema`, `tools` and `--debug`.
 
 ## Watching the speed
 
@@ -123,22 +110,35 @@ test one with a comma in it.
 3. Open with one line saying what the test guards — for an error test, the assertion itself:
    `// Must not compile: "..."` or `// Must stop at run time: "...", with exit status 1.`
 4. Keep it small and deterministic: no time, no randomness, no network beyond 127.0.0.1,
-   derive ports from `$$`, clean up any background process with a `trap`.
+   pick a port with `tests/lib/portlib.sh` (see *Picking a port*, below), clean up any
+   background process with a `trap`.
 5. Run it alone, then run the whole suite.
 
 **Never use a word from the language's own vocabulary as a test value.** A constant
 `"wantzel"` or `"pascal"` is indistinguishable later from a real reference to the language —
 pick a neutral word.
 
-**Before a Windows test reaches for Wine, ask whether the bytes answer the question.** Most
-of what a compiler gets wrong about Windows is visible in the file: the PE header, the
-import table, emission order. Those checks are a `cmp` — milliseconds, no prefix, no
-`wineserver`, nothing left running. `wine_only_where_needed.sh` keeps the count from
-drifting: if your test really has to run the program, raise the ceiling there and say why.
+**Before a test runs a program, ask whether the bytes answer the question.** Most of what
+a compiler gets wrong is visible in the file: the header, emission order, reproducibility.
+Those checks are a `cmp` — milliseconds, nothing started, nothing left running.
 
 **A test must never skip anything silently.** If it skips a check because something is
 missing, it prints what and why — a test that quietly does nothing is indistinguishable from
 one that passes.
+
+## Picking a port
+
+A test that needs a TCP port sources `tests/lib/portlib.sh` and calls `free_port` (one) or
+`free_ports <n>` (several, always distinct from each other): each asks the kernel for a
+currently-unused port by binding port 0 and reading the real number back with
+`getsockname`, rather than guessing one from a fixed range or from `$$`. A guessed range —
+even one derived from the test's own PID — is not safe under many parallel `./wztest` runs:
+different worktrees' PIDs can coincide, different scripts' ranges can overlap, and the
+number guessed can already be an ephemeral *source* port some unrelated connection on the
+machine is using. `wait_port <port> [<tries>]` polls until something listens, and
+`port_owner <port>` names who (if anyone) holds a port, for a clear failure message instead
+of a bare "did not start" — see `tests/lib/portlib.sh` for the reasoning and the four
+functions it provides.
 
 ## On failure
 

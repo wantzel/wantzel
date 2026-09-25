@@ -12,6 +12,7 @@
 # the chain is swapped in while it runs, with leaf and intermediate (must succeed).
 set -e
 here=$(cd "$(dirname "$0")/../.." && pwd)
+. "$here/tests/lib/portlib.sh"
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "  ok    $1"; }
 bad() { fail=$((fail+1)); echo "  FAIL  $1"; shift; for r in "$@"; do echo "        $r"; done; }
@@ -65,11 +66,11 @@ mkdir srv
 cp leaf.der srv/cert.der
 printf '%s' "$h" > srv/key.hex
 
-base=$(( 29000 + $$ % 3000 * 2 ))
-p80=$base; p443=$((base + 1))
+set -- $(free_ports 2)
+p80=$1; p443=$2
 ( cd "$tmp/srv" && exec "$tmp/serve" "$p80" "$p443" local.test >"$tmp/serve.log" 2>&1 ) &
 started="$started $!"
-i=0; while [ $i -lt 50 ]; do ss -tln 2>/dev/null | grep -q ":$p443 " && break; sleep 0.1; i=$((i+1)); done
+wait_port "$p443" || { echo "  FAIL  serve did not start"; port_owner "$p443"; cat "$tmp/serve.log"; exit 1; }
 
 get() {
   curl -s --http1.1 --max-time 10 --resolve "local.test:$p443:127.0.0.1" --cacert "$tmp/root.pem" \

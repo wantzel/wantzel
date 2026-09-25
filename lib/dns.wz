@@ -15,16 +15,14 @@
 //
 // WHERE THE NAMESERVERS COME FROM. /etc/resolv.conf, read on the first lookup: up to three
 // `nameserver` lines with an IPv4 address (IPv6 ones are skipped: lib/net.wz connects over
-// IPv4 only), plus `options timeout:n attempts:n`; `#` and `;` start comments. On Windows the
-// runtime answers an open of that path from GetNetworkParams, so the same code finds the
-// servers Windows is configured with. With no server at all, 127.0.0.1 is asked, as the C
-// library does. dns.noservers and dns.addserver replace the list (a test points them at a
+// IPv4 only), plus `options timeout:n attempts:n`; `#` and `;` start comments. With no
+// server at all, 127.0.0.1 is asked, as the C library does. dns.noservers and dns.addserver replace the list (a test points them at a
 // server of its own); dns.loadconf reads another file.
 //
 // WHAT A LOOKUP DOES. The query goes to the first server; an attempt that is not answered
-// within the per-attempt timeout (2 s, or `options timeout`) moves on to the next server,
-// round after round (2, or `options attempts`), and the whole lookup ends after at most
-// 5 s however many servers there are. dns.settimeout changes both bounds.
+// within the per-attempt timeout (5 s as in the C library, or `options timeout`) moves on
+// to the next server, round after round (2, or `options attempts`), and the whole lookup
+// ends after at most 12 s however many servers there are. dns.settimeout changes both.
 //
 // SPOOFING IS MADE HARD THE USUAL WAY: every attempt gets a fresh random query id AND a
 // fresh socket bound to a random source port, and a reply counts only when its id, its
@@ -77,6 +75,9 @@ const
   DNS.NCACHE  = 32;         // names cached
   DNS.MAXRR   = 64;         // answer records examined per reply
 
+  DNS.TYPE_A    = 1;
+  DNS.TYPE_AAAA = 28;
+
   DNS.PENDING   = 0;
   DNS.NXDOMAIN  = -1;
   DNS.NODATA    = -2;
@@ -101,7 +102,7 @@ local const
   DNS.DONE       = 4;       // finished; res holds the outcome until dns.poll collects it
 
 type DnsQuery = record
-  state, fd, id, ns, tries, hops, res, ttl, lasterr, qn, repn, naddr: int;
+  state, fd, id, ns, tries, hops, res, ttl, lasterr, qn, repn, naddr, qtype: int;
   trydl, dl: int;           // deadlines, monotonic ns: this attempt, the whole lookup
   tcp: bool;
   name: array[0..255] of char;          // the name being asked, lower case, no final dot
@@ -110,7 +111,8 @@ type DnsQuery = record
   key_n: int;
   q: array[0..299] of char;             // the query, after its two-byte TCP length
   rep: array[0..65537] of char;         // the reply (after its TCP length, over TCP)
-  addrs: array[0..DNS.MAXADDR - 1] of int;
+  addrs: array[0..DNS.MAXADDR - 1] of int;              // qtype = DNS.TYPE_A: one int each
+  addrs6: array[0..DNS.MAXADDR * 16 - 1] of char;       // qtype = DNS.TYPE_AAAA: 16 bytes each
 end;
 
 var
@@ -130,13 +132,16 @@ local var
   dns.path: array[0..1023] of char;
   dns.tmp, dns.tgt: array[0..255] of char;        // decoded names
   dns.tn, dns.tgtn: int;
-  dns.out: array[0..DNS.MAXADDR - 1] of int;      // dns.connect's addresses
+  dns.out: array[0..DNS.MAXADDR - 1] of int;      // dns.connect's A addresses
+  dns.out6: array[0..DNS.MAXADDR * 16 - 1] of char;   // dns.connect's AAAA addresses
   // the answer records of one reply: where each starts, and what it holds
   dns.rrat, dns.rrtype, dns.rrcls, dns.rrttl, dns.rrdata, dns.rrlen: array[0..DNS.MAXRR - 1] of int;
-  // the cache
+  // the cache -- keyed on name AND qtype, so an A and an AAAA lookup of the same name
+  // occupy two different slots rather than one overwriting the other's addresses
   dns.ckey: array[0..DNS.NCACHE * 256 - 1] of char;
-  dns.ckeyn, dns.cexp, dns.cn: array[0..DNS.NCACHE - 1] of int;
+  dns.ckeyn, dns.cexp, dns.cn, dns.cqtype: array[0..DNS.NCACHE - 1] of int;
   dns.caddr: array[0..DNS.NCACHE * DNS.MAXADDR - 1] of int;
+  dns.caddr6: array[0..DNS.NCACHE * DNS.MAXADDR * 16 - 1] of char;
 
 // ---- addresses as text --------------------------------------------------------------------
 
@@ -184,6 +189,139 @@ begin
   return io.pushnum(dst, at, band(ip, 255));
 end;
 
+// The hex digit of value v (0..15), lower case.
+local function dns.hexch(v: int): char;
+begin
+  if v < 10 then return chr(48 + v);
+  return chr(87 + v);
+end;
+
+// The value of hex digit c, or -1 when c is not one.
+local function dns.hexval(c: char): int;
+begin
+  if (c >= '0') and (c <= '9') then return ord(c) - ord('0');
+  if (c >= 'a') and (c <= 'f') then return ord(c) - ord('a') + 10;
+  if (c >= 'A') and (c <= 'F') then return ord(c) - ord('A') + 10;
+  return 0 - 1;
+end;
+
+// The IPv6 literal s as 16 bytes into out (network order), or false when s is not one.
+//
+// THE ORDINARY FORM: up to eight groups of 1-4 hex digits, separated by ':', with at most
+// one run of consecutive zero groups written as "::" (which may also open or close the
+// address, as in "::1" or "ff02::"). A trailing IPv4 dotted quad ("::ffff:127.0.0.1") is
+// not accepted here -- nothing in this library produces or needs one; dns.parseip already
+// covers plain IPv4, and a caller that has a v4-mapped literal can write it as hex groups.
+function dns.parseip6(s: array of char; out: array of char): bool;
+var i, n, ngroups, dbl, g, v, nd, j, k: int;
+    groups: array[0..7] of int;
+begin
+  n := len(s);
+  if n < 2 then return false;
+  i := 0;
+  ngroups := 0;
+  dbl := 0 - 1;                         // the group index where "::" sits, or -1
+  if (n >= 2) and (s[0] = ':') and (s[1] = ':') then
+  begin
+    dbl := 0;
+    i := 2;
+  end;
+  while i < n do
+  begin
+    if (s[i] = ':') and (dbl < 0) and (i + 1 < n) and (s[i + 1] = ':') then
+    begin
+      dbl := ngroups;
+      i := i + 2;
+      if i = n then break;
+      continue;
+    end;
+    v := 0;
+    nd := 0;
+    while (i < n) and (s[i] <> ':') do
+    begin
+      k := dns.hexval(s[i]);
+      if k < 0 then return false;
+      v := v * 16 + k;
+      nd := nd + 1;
+      if nd > 4 then return false;
+      i := i + 1;
+    end;
+    if nd = 0 then return false;
+    if ngroups >= 8 then return false;
+    groups[ngroups] := v;
+    ngroups := ngroups + 1;
+    if i < n then
+    begin
+      if s[i] <> ':' then return false;
+      i := i + 1;
+      if i = n then return false;       // a lone trailing ':' with no "::"
+    end;
+  end;
+  if dbl < 0 then
+  begin
+    if ngroups <> 8 then return false;
+  end
+  else
+  begin
+    if ngroups >= 8 then return false;  // "::" must stand for at least one group
+  end;
+  // lay the groups out, with the zero run (dbl) taking up the slack
+  j := 0;
+  g := 0;
+  while g < ngroups do
+  begin
+    if g = dbl then
+    begin
+      k := 0;
+      while k < 8 - ngroups do
+      begin
+        out[j] := chr(0);
+        out[j + 1] := chr(0);
+        j := j + 2;
+        k := k + 1;
+      end;
+    end;
+    out[j] := chr(groups[g] shr 8);
+    out[j + 1] := chr(band(groups[g], 255));
+    j := j + 2;
+    g := g + 1;
+  end;
+  if dbl = ngroups then
+  begin
+    while j < 16 do
+    begin
+      out[j] := chr(0);
+      j := j + 1;
+    end;
+  end;
+  return j = 16;
+end;
+
+// Append ip6 (16 bytes) as a full, uncompressed IPv6 literal (eight groups of four lower
+// case hex digits); returns the new position (an appender, like io.push). Uncompressed on
+// purpose: it is unambiguous to read back and to compare, and nothing here needs the
+// shorter "::" form to be pretty.
+function dns.ipstr6(dst: array of char; at: int; ip6: array of char): int;
+var g: int;
+begin
+  g := 0;
+  while g < 8 do
+  begin
+    dst[at] := dns.hexch(band(ord(ip6[g * 2]) shr 4, 15));
+    dst[at + 1] := dns.hexch(band(ord(ip6[g * 2]), 15));
+    dst[at + 2] := dns.hexch(band(ord(ip6[g * 2 + 1]) shr 4, 15));
+    dst[at + 3] := dns.hexch(band(ord(ip6[g * 2 + 1]), 15));
+    at := at + 4;
+    if g < 7 then
+    begin
+      dst[at] := ':';
+      at := at + 1;
+    end;
+    g := g + 1;
+  end;
+  return at;
+end;
+
 // A sentence for a DNS.* code, for a message to a person.
 function dns.error(code: int): str;
 begin
@@ -223,7 +361,7 @@ begin
 end;
 
 // The time one attempt may take, and the whole lookup, in milliseconds; 0 keeps the default
-// (2000 and 5000; `options timeout` sets the first).
+// (5000 and 12000; `options timeout` sets the first).
 procedure dns.settimeout(tryms: int; totalms: int);
 begin
   if tryms > 0 then dns.tryms := tryms;
@@ -356,8 +494,13 @@ begin
     dns.nsport[0] := 53;
     dns.nns := 1;
   end;
-  if dns.tryms <= 0 then dns.tryms := 2000;
-  if dns.totalms <= 0 then dns.totalms := 5000;
+  // THE C LIBRARY'S DEFAULTS: five seconds an attempt, two attempts. A local caching
+  // resolver is not always quick -- systemd-resolved, while it re-probes an upstream server
+  // after a failure, answers a name it has not cached seconds later rather than in
+  // milliseconds -- and a resolver that gives up sooner than the system expects reports a
+  // timeout for a name that was about to be answered.
+  if dns.tryms <= 0 then dns.tryms := 5000;
+  if dns.totalms <= 0 then dns.totalms := 12000;
   if dns.attempts <= 0 then dns.attempts := 2;
   if not dns.epon then
   begin
@@ -511,8 +654,8 @@ begin
   return dns.be16(p, at) shl 16 + dns.be16(p, at + 2);
 end;
 
-// The query for k's name, type A, class IN, recursion desired, under a fresh random id.
-// q[0..1] is its length for TCP; the message itself starts at q[2].
+// The query for k's name, type dns.q[k].qtype (A or AAAA), class IN, recursion desired,
+// under a fresh random id. q[0..1] is its length for TCP; the message itself starts at q[2].
 local procedure dns.encode(k: int);
 var p, i, st, id: int;
 begin
@@ -548,7 +691,7 @@ begin
   end;
   dns.q[k].q[p] := chr(0);
   dns.q[k].q[p + 1] := chr(0);
-  dns.q[k].q[p + 2] := chr(1);                          // type A
+  dns.q[k].q[p + 2] := chr(band(dns.q[k].qtype, 255));  // type A or AAAA
   dns.q[k].q[p + 3] := chr(0);
   dns.q[k].q[p + 4] := chr(1);                          // class IN
   p := p + 5;
@@ -577,13 +720,25 @@ begin
   i := 0;
   while i < DNS.NCACHE do
   begin
-    if (dns.cexp[i] > now) and dns.same(dns.ckey[i * 256..i * 256 + dns.ckeyn[i] - 1], dns.q[k].key[0..dns.q[k].key_n - 1]) then
+    if (dns.cexp[i] > now) and (dns.cqtype[i] = dns.q[k].qtype) and dns.same(dns.ckey[i * 256..i * 256 + dns.ckeyn[i] - 1], dns.q[k].key[0..dns.q[k].key_n - 1]) then
     begin
-      j := 0;
-      while j < dns.cn[i] do
+      if dns.q[k].qtype = DNS.TYPE_AAAA then
       begin
-        dns.q[k].addrs[j] := dns.caddr[i * DNS.MAXADDR + j];
-        j := j + 1;
+        j := 0;
+        while j < dns.cn[i] * 16 do
+        begin
+          dns.q[k].addrs6[j] := dns.caddr6[i * DNS.MAXADDR * 16 + j];
+          j := j + 1;
+        end;
+      end
+      else
+      begin
+        j := 0;
+        while j < dns.cn[i] do
+        begin
+          dns.q[k].addrs[j] := dns.caddr[i * DNS.MAXADDR + j];
+          j := j + 1;
+        end;
       end;
       dns.q[k].naddr := dns.cn[i];
       return true;
@@ -598,12 +753,12 @@ var i, j, pick, now: int;
 begin
   if dns.q[k].ttl <= 0 then return;
   now := io.now;
-  // the same name, else a free or expired slot, else the one that expires first
+  // the same name and qtype, else a free or expired slot, else the one that expires first
   pick := 0 - 1;
   i := 0;
   while (i < DNS.NCACHE) and (pick < 0) do
   begin
-    if (dns.cexp[i] > now) and dns.same(dns.ckey[i * 256..i * 256 + dns.ckeyn[i] - 1], dns.q[k].key[0..dns.q[k].key_n - 1]) then pick := i;
+    if (dns.cexp[i] > now) and (dns.cqtype[i] = dns.q[k].qtype) and dns.same(dns.ckey[i * 256..i * 256 + dns.ckeyn[i] - 1], dns.q[k].key[0..dns.q[k].key_n - 1]) then pick := i;
     i := i + 1;
   end;
   i := 0;
@@ -629,11 +784,24 @@ begin
     j := j + 1;
   end;
   dns.ckeyn[pick] := dns.q[k].key_n;
-  j := 0;
-  while j < dns.q[k].naddr do
+  dns.cqtype[pick] := dns.q[k].qtype;
+  if dns.q[k].qtype = DNS.TYPE_AAAA then
   begin
-    dns.caddr[pick * DNS.MAXADDR + j] := dns.q[k].addrs[j];
-    j := j + 1;
+    j := 0;
+    while j < dns.q[k].naddr * 16 do
+    begin
+      dns.caddr6[pick * DNS.MAXADDR * 16 + j] := dns.q[k].addrs6[j];
+      j := j + 1;
+    end;
+  end
+  else
+  begin
+    j := 0;
+    while j < dns.q[k].naddr do
+    begin
+      dns.caddr[pick * DNS.MAXADDR + j] := dns.q[k].addrs[j];
+      j := j + 1;
+    end;
   end;
   dns.cn[pick] := dns.q[k].naddr;
   dns.cexp[pick] := now + dns.q[k].ttl * 1000000000;
@@ -805,11 +973,12 @@ begin
 end;
 
 // Walk the answer section of reply p (an records from pos) for k's name, through any
-// CNAMEs. Returns the number of addresses (in dns.q[k].addrs), DNS.NODATA, DNS.BADREPLY,
-// or 0 when the chain ends at a name this reply holds no address for -- that name is then
-// in dns.tgt, to be asked for itself.
+// CNAMEs. Returns the number of addresses (in dns.q[k].addrs for DNS.TYPE_A, or
+// dns.q[k].addrs6 for DNS.TYPE_AAAA), DNS.NODATA, DNS.BADREPLY, or 0 when the chain ends
+// at a name this reply holds no address for -- that name is then in dns.tgt, to be asked
+// for itself.
 local function dns.answers(k: int; p: array of char; pos: int; an: int): int;
-var i, n, t, rdl, ttl, hops, found, cname: int;
+var i, n, t, rdl, ttl, hops, found, cname, wantlen, j: int;
 begin
   n := 0;
   i := 0;
@@ -843,6 +1012,8 @@ begin
     i := i + 1;
   end;
   dns.tgtn := dns.q[k].name_n;
+  wantlen := 4;
+  if dns.q[k].qtype = DNS.TYPE_AAAA then wantlen := 16;
   hops := 0;
   while true do
   begin
@@ -850,12 +1021,21 @@ begin
     i := 0;
     while i < n do
     begin
-      if (dns.rrcls[i] = 1) and (dns.rrtype[i] = 1) and (dns.rrlen[i] = 4) and (found < DNS.MAXADDR) then
+      if (dns.rrcls[i] = 1) and (dns.rrtype[i] = dns.q[k].qtype) and (dns.rrlen[i] = wantlen) and (found < DNS.MAXADDR) then
       begin
         t := dns.getname(p, dns.rrat[i]);
         if dns.same(dns.tmp[0..dns.tn - 1], dns.tgt[0..dns.tgtn - 1]) then
         begin
-          dns.q[k].addrs[found] := dns.be32(p, dns.rrdata[i]);
+          if dns.q[k].qtype = DNS.TYPE_AAAA then
+          begin
+            j := 0;
+            while j < 16 do
+            begin
+              dns.q[k].addrs6[found * 16 + j] := p[dns.rrdata[i] + j];
+              j := j + 1;
+            end;
+          end
+          else dns.q[k].addrs[found] := dns.be32(p, dns.rrdata[i]);
           if dns.rrttl[i] < dns.q[k].ttl then dns.q[k].ttl := dns.rrttl[i];
           found := found + 1;
         end;
@@ -910,7 +1090,7 @@ begin
   if pos < 0 then return false;
   if not dns.same(dns.tmp[0..dns.tn - 1], dns.q[k].name[0..dns.q[k].name_n - 1]) then return false;
   if pos + 4 > len(p) then return false;
-  if (dns.be16(p, pos) <> 1) or (dns.be16(p, pos + 2) <> 1) then return false;
+  if (dns.be16(p, pos) <> dns.q[k].qtype) or (dns.be16(p, pos + 2) <> 1) then return false;
   pos := pos + 4;
   // IT IS THE ANSWER TO OUR QUESTION. Truncated first: the rest of it is then unreliable.
   if (band(ord(p[2]), 2) <> 0) and (not dns.q[k].tcp) then
@@ -1074,10 +1254,11 @@ end;
 
 // ---- the calls ------------------------------------------------------------------------------
 
-// Start looking up name. Returns a query number for dns.poll, or DNS.BUSY when DNS.MAXQ
-// lookups are already running. Never blocks.
-function dns.start(name: array of char): int;
-var k, ip: int;
+// The part of dns.start / dns.start6 before a name is known to need a server: claim a
+// slot and reset it. Returns the slot, or DNS.BUSY when DNS.MAXQ lookups are already
+// running.
+local function dns.startcommon(name: array of char; qtype: int): int;
+var k: int;
 begin
   k := 0;
   while (k < DNS.MAXQ) and (dns.q[k].state <> DNS.FREE) do k := k + 1;
@@ -1090,6 +1271,59 @@ begin
   dns.q[k].tcp := false;
   dns.q[k].ttl := DNS.MAXTTL;
   dns.q[k].naddr := 0;
+  dns.q[k].qtype := qtype;
+  return k;
+end;
+
+// The part of dns.start / dns.start6 once name is a hostname that is not answered locally:
+// the cache, then a real lookup.
+local function dns.startlookup(k: int): int;
+begin
+  if dns.cacheget(k) then
+  begin
+    dns.q[k].res := dns.q[k].naddr;
+    return k;
+  end;
+  if not dns.setup then
+  begin
+    dns.q[k].res := DNS.NETWORK;
+    return k;
+  end;
+  dns.q[k].dl := io.now + dns.totalms * 1000000;
+  dns.q[k].ns := 0;
+  dns.attempt(k);
+  return k;
+end;
+
+local procedure dns.zero16(dst: array of char; at: int);
+var i: int;
+begin
+  i := 0;
+  while i < 16 do
+  begin
+    dst[at + i] := chr(0);
+    i := i + 1;
+  end;
+end;
+
+local procedure dns.copy16(dst: array of char; at: int; src: array of char; sat: int);
+var i: int;
+begin
+  i := 0;
+  while i < 16 do
+  begin
+    dst[at + i] := src[sat + i];
+    i := i + 1;
+  end;
+end;
+
+// Start looking up name's A records. Returns a query number for dns.poll, or DNS.BUSY
+// when DNS.MAXQ lookups are already running. Never blocks.
+function dns.start(name: array of char): int;
+var k, ip: int;
+begin
+  k := dns.startcommon(name, DNS.TYPE_A);
+  if k < 0 then return k;
   ip := dns.parseip(name);
   if ip >= 0 then
   begin
@@ -1108,25 +1342,42 @@ begin
     dns.q[k].res := 1;
     return k;
   end;
-  if dns.cacheget(k) then
+  return dns.startlookup(k);
+end;
+
+// Start looking up name's AAAA records, the same way dns.start looks up A records. A
+// literal IPv6 address (dns.parseip6) or "localhost" needs no server either.
+function dns.start6(name: array of char): int;
+var k: int;
+    lit: array[0..15] of char;
+begin
+  k := dns.startcommon(name, DNS.TYPE_AAAA);
+  if k < 0 then return k;
+  if dns.parseip6(name, lit) then
   begin
-    dns.q[k].res := dns.q[k].naddr;
+    dns.copy16(dns.q[k].addrs6, 0, lit, 0);
+    dns.q[k].res := 1;
     return k;
   end;
-  if not dns.setup then
+  if not dns.setname(k, name) then
   begin
-    dns.q[k].res := DNS.NETWORK;
+    dns.q[k].res := DNS.BADNAME;
     return k;
   end;
-  dns.q[k].dl := io.now + dns.totalms * 1000000;
-  dns.q[k].ns := 0;
-  dns.attempt(k);
-  return k;
+  if dns.same(dns.q[k].name[0..dns.q[k].name_n - 1], "localhost") then
+  begin
+    dns.zero16(dns.q[k].addrs6, 0);
+    dns.q[k].addrs6[15] := chr(1);                      // ::1
+    dns.q[k].res := 1;
+    return k;
+  end;
+  return dns.startlookup(k);
 end;
 
 // The outcome of query q, without blocking: DNS.PENDING (0) while it runs; when it is
 // done, the number of addresses copied into out (at most len(out), which must be at least
-// one) or a negative DNS.* code -- and q is free again.
+// one) or a negative DNS.* code -- and q is free again. For a query started with
+// dns.start6, use dns.poll6 instead: an IPv6 address does not fit in an int.
 function dns.poll(q: int; out: array of int): int;
 var r, i: int;
 begin
@@ -1140,6 +1391,30 @@ begin
   while i < r do
   begin
     out[i] := dns.q[q].addrs[i];
+    i := i + 1;
+  end;
+  if r = 0 then r := dns.q[q].res;                      // an empty out: still say how it ended
+  dns.q[q].state := DNS.FREE;
+  return r;
+end;
+
+// The outcome of a query started with dns.start6, without blocking: the same contract as
+// dns.poll, but out is a flat byte buffer (len(out) must be a multiple of 16) and each
+// address written is 16 bytes, network order.
+function dns.poll6(q: int; out: array of char): int;
+var r, i, cap: int;
+begin
+  if (q < 0) or (q >= DNS.MAXQ) then return DNS.BUSY;
+  if dns.q[q].state = DNS.FREE then return DNS.BUSY;
+  if dns.q[q].state <> DNS.DONE then dns.pump(0);
+  if dns.q[q].state <> DNS.DONE then return DNS.PENDING;
+  r := dns.q[q].res;
+  cap := len(out) div 16;
+  if r > cap then r := cap;
+  i := 0;
+  while i < r * 16 do
+  begin
+    out[i] := dns.q[q].addrs6[i];
     i := i + 1;
   end;
   if r = 0 then r := dns.q[q].res;                      // an empty out: still say how it ended
@@ -1196,21 +1471,87 @@ begin
   return DNS.TIMEOUT;
 end;
 
-// Resolve name and connect to port on the first address that accepts, as net.connect does
-// (blocking). Returns the fd, or a negative DNS.* code -- DNS.NOCONNECT when the name
-// resolved but no address took the connection.
-function dns.connect(name: array of char; port: int): int;
-var n, i, fd, ip: int;
+// The AAAA counterpart of dns.resolve: looks name up and waits for the answer. out is a
+// flat byte buffer (len(out) must be a multiple of 16); returns the number of addresses
+// written (16 bytes each), or a negative DNS.* code.
+function dns.resolve6(name: array of char; out: array of char): int;
+var q, r, w: int;
 begin
-  n := dns.resolve(name, dns.out);
-  if n < 0 then return n;
-  i := 0;
-  while i < n do
+  q := dns.start6(name);
+  if q < 0 then return q;
+  while true do
   begin
-    ip := dns.out[i];
-    fd := net.connect(band(ip shr 24, 255), band(ip shr 16, 255), band(ip shr 8, 255), band(ip, 255), port);
-    if fd >= 0 then return fd;
-    i := i + 1;
+    r := dns.poll6(q, out);
+    if r <> DNS.PENDING then return r;
+    w := dns.wait;
+    if (w < 0) or (w > 1000) then w := 1000;
+    dns.pump(w);
+  end;
+  return DNS.TIMEOUT;
+end;
+
+// Resolve name (A and AAAA, run together so one slow record type does not delay the
+// other) and connect to port on the first address that accepts. Returns the fd, or a
+// negative DNS.* code -- DNS.NOCONNECT when the name resolved but no address took the
+// connection.
+//
+// THE ORDER TRIED IS IPv6 FIRST, THEN IPv4, each in the order its records came back --
+// the common "prefer v6" convention (RFC 6724 without the full policy table this would
+// need to be a faithful implementation of it: a single AAAA-then-A pass is enough to
+// reach an AAAA-only host, which is the gap this exists to close, and it still reaches an
+// A-only one when no AAAA record exists or every v6 address refuses the connection).
+//
+// A NAME THAT HAS ONLY ONE FAMILY IS NOT SLOWED DOWN BY THE OTHER: both lookups are
+// started before either is waited for, so they run concurrently, and a NXDOMAIN/NODATA on
+// one family does not wait out the other's timeout -- only a real failure on the family
+// that IS tried costs time, exactly as dns.resolve already costs it for A alone.
+function dns.connect(name: array of char; port: int): int;
+var q4, q6, r4, r6, w: int;
+    fd, i: int;
+    pending6, pending4: bool;
+begin
+  q6 := dns.start6(name);
+  q4 := dns.start(name);
+  pending6 := (q6 >= 0) and (dns.q[q6].state <> DNS.DONE);
+  pending4 := (q4 >= 0) and (dns.q[q4].state <> DNS.DONE);
+  while pending6 or pending4 do
+  begin
+    w := dns.wait;
+    if (w < 0) or (w > 1000) then w := 1000;
+    dns.pump(w);
+    pending6 := (q6 >= 0) and (dns.q[q6].state <> DNS.DONE);
+    pending4 := (q4 >= 0) and (dns.q[q4].state <> DNS.DONE);
+  end;
+  r6 := DNS.NODATA;
+  if q6 >= 0 then r6 := dns.poll6(q6, dns.out6);
+  r4 := DNS.NODATA;
+  if q4 >= 0 then r4 := dns.poll(q4, dns.out);
+  if (r6 < 0) and (r4 < 0) then
+  begin
+    // one error to report: the one that says more about what went wrong (dns.rank's
+    // ordering fits here too -- an answer beats silence beats no connection at all)
+    if dns.rank(0 - r4) >= dns.rank(0 - r6) then return r4;
+    return r6;
+  end;
+  if r6 > 0 then
+  begin
+    i := 0;
+    while i < r6 do
+    begin
+      fd := net.connect6(dns.out6[i * 16..i * 16 + 15], port);
+      if fd >= 0 then return fd;
+      i := i + 1;
+    end;
+  end;
+  if r4 > 0 then
+  begin
+    i := 0;
+    while i < r4 do
+    begin
+      fd := net.connect(band(dns.out[i] shr 24, 255), band(dns.out[i] shr 16, 255), band(dns.out[i] shr 8, 255), band(dns.out[i], 255), port);
+      if fd >= 0 then return fd;
+      i := i + 1;
+    end;
   end;
   return DNS.NOCONNECT;
 end;

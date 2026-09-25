@@ -51,10 +51,9 @@ wantzel: src/theme.wz:1: missing begin of the main program
 3. Several programs in one project each get their own directory with a `main.wz` in it.
 
 Every multi-file application measured already follows it, with one exception:
-**`wantzel/src/wantzel.wz`**, the compiler's own source. It has a counterpart in
-`bootstrap/boot.c` that must stay in step with it line for line, and is named throughout
-scripts and docs — renaming it is risk with no return, so it stays. New applications follow
-the rule; existing ones are left alone.
+**`wantzel/src/wantzel.wz`**, the compiler's own source, named throughout scripts and
+docs — renaming it is risk with no return, so it stays. New applications follow the rule;
+existing ones are left alone.
 
 **Not a compiler requirement**: `wantzel anything.wz out` works regardless, and the compiler
 never searches for a `main.wz` on your behalf — that would guess wrong the moment a
@@ -140,7 +139,7 @@ generator should emit the marker itself.
 
 ```
 wantzel: t.wz:6: undeclared identifier: prnit -- did you mean print?
-wantzel: t.wz:9: winapi(): a DLL name ends in .dll, for example "user32.dll"
+wantzel: t.wz:9: a schema is declared as 'type X = schema ... end;'
 wantzel: t.wz:3: { } is not a comment; use // to the end of the line
 ```
 
@@ -148,8 +147,8 @@ wantzel: t.wz:3: { } is not a comment; use // to the end of the line
 that out.** The reader needs to know `prnit` doesn't exist first; the nearest name is help,
 not the finding.
 
-**A repair is offered only when it can be derived, never guessed.** `"user32"` plus `.dll` is
-derived; "check your spelling" is not — a wrong suggestion costs more than none, because the
+**A repair is offered only when it can be derived, never guessed.** The spelling of a
+declaration is derived; "check your spelling" is not — a wrong suggestion costs more than none, because the
 reader stops trusting the next one.
 
 | level | what it adds | when |
@@ -159,8 +158,8 @@ reader stops trusting the next one.
 | the repair | `-- did you mean X?`, `; use Y`, `, for example "Z"` | only when derivable |
 
 Most messages need only the fact — `identifier too long` is complete as it stands, padding
-it is noise. The parameter earns its place where a call has several arguments: `winapi()`
-takes six, so "the DLL name is empty" beats "an argument is empty".
+it is noise. The parameter earns its place where a call has several arguments: "the
+result type of a tool is a schema" beats "an argument has the wrong type".
 
 This is a convention and not a rule because the compiler can't check it; the rest is
 judgement.

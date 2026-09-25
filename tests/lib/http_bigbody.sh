@@ -13,10 +13,11 @@
 # this compiler emits no section headers for `size` to read) with and without the call, not
 # just by reading the source and assuming.
 . "$ROOT/tests/helpers.sh"
+. "$ROOT/tests/lib/portlib.sh"
 
 command -v curl >/dev/null 2>&1 || { echo "curl is missing"; exit 1; }
 
-port=$(( 22000 + ($$ % 900) ))
+port=$(free_port)
 
 cat > "$T/bigsrv.wz" <<EOF
 include "http.wz";

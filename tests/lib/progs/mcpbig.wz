@@ -1,5 +1,5 @@
-// An MCP server for the large-message tests (mcp_big_stdio.sh, mcp_big_http.sh and the
-// Windows one): a tool that measures its argument, a tool that returns as many bytes as it
+// An MCP server for the large-message tests (mcp_big_stdio.sh and mcp_big_http.sh): a
+// tool that measures its argument, a tool that returns as many bytes as it
 // is asked for, and a tool that reports the mappings the library holds.
 //
 //   mcpbig [maxin maxout toolmax [port]]     0 keeps a default; with a port it serves
@@ -134,30 +134,12 @@ begin
   return c;
 end;
 
-// True on Linux.  The Windows runtime answers readlink with -1 (there is no
-// /proc/self/exe), and it stops a program that asks for a system call it does not
-// translate -- mincore is one -- so the kernel's counts are only asked for on Linux.  An
-// open of /proc/self/status is no test: under Wine a path starting with / is a Unix path,
-// and the file is there.
-function probe.linux: bool;
-var n: int;
-begin
-  n := io.push(probe.path, 0, "/proc/self/exe");
-  probe.path[n] := chr(0);
-  return sys3(89, addr(probe.path[0]), addr(probe.buf[0]), len(probe.buf)) > 0;
-end;
-
 function tool.probe(a: array of ProbeArgs; r: array of ProbeResult): int;
 begin
   r[0].mapped := mcp.mapped;
   r[0].mappedbytes := mcp.mappedbytes;
-  r[0].vmsize := -1;
-  r[0].toolpages := -1;
-  if probe.linux then
-  begin
-    r[0].vmsize := probe.vmsize;
-    r[0].toolpages := probe.toolpages;
-  end;
+  r[0].vmsize := probe.vmsize;
+  r[0].toolpages := probe.toolpages;
   return 0;
 end;
 

@@ -1,8 +1,9 @@
 # lib/autocert.wz finds the authority through DNS (lib/dns.wz), with autocert.pin still
 # winning over it: asked of a fake nameserver on 127.0.0.1, never the machine's own.
 . "$ROOT/tests/helpers.sh"
+. "$ROOT/tests/lib/portlib.sh"
 
-port=$(( 23000 + ($$ % 2000) ))
+port=$(free_port)
 compile "$ROOT/tests/helpers/dnsfake.wz" "$T/dnsfake"
 compile "$ROOT/tests/lib/progs/resolveprobe.wz" "$T/probe"
 

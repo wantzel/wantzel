@@ -321,9 +321,9 @@ end;
 // a handshake or a record then costs the caller the deadline, not the rest of its life.
 //
 // THE SOCKET IS PUT IN NON-BLOCKING MODE for this, and waited on with epoll for exactly the
-// time that is left. A blocking read cannot be given a limit portably -- the Windows
-// runtime does not carry socket timeouts -- and a loop that retries EAGAIN without waiting
-// burns a core and has no idea how long it has been at it.
+// time that is left. A blocking read cannot be given a limit without a socket timeout
+// per call, and a loop that retries EAGAIN without waiting burns a core and has no idea
+// how long it has been at it.
 
 var
   tls.deadline: int;                   // ms per call; 0 means 30000

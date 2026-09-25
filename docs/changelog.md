@@ -18,6 +18,101 @@ first on every upgrade.
 
 Newest first. Dates are the day the change landed.
 
+## 0.4.0 — 25 September 2026
+
+**One target: Linux x86-64.** The compiler now emits a static ELF for Linux and nothing else.
+The Windows backend -- the PE writer, the Windows runtime, `winapi` and `winproc` -- is gone,
+and with it a quarter of the compiler's source: it is one file again, `src/wantzel.wz`, and
+compiles itself in about 9 ms. On Windows, run Wantzel under WSL. The library gains IPv6 and
+AAAA lookups, re-entrant directory walks, and constant-time ECDSA signing.
+
+**What may need your attention** if your program compiles today:
+
+- `--target=` is no longer an option, and `winapi(...)` / `winproc(...)` no longer exist. A
+  program or build script that uses either stops compiling. There is no replacement on
+  Linux, where `sys1`..`sys6` reach the kernel directly.
+- `lib/websocket.wz`: inside `app.wsframe` and `app.wsclose`, the base into `ws.in` is
+  `ws.slot * WS.INMAX`, no longer `fd * WS.INMAX`.
+- `lib/fs.wz`: a directory opened without `fs.opendir` and closed without `fs.close` must
+  call `fs.forget(fd)`; code that read `fs.dbuf`/`fs.dlen`/`fs.dpos` directly no longer
+  compiles (they are per-directory now, and internal).
+- A `tools` handler that fills `tool.vbuf` to its 1 MB limit is now refused with an error
+  instead of answering with truncated text.
+
+**Compiler**
+
+- A `tools` handler that fills `tool.vbuf` (1 MB, a `text`/`json` view field in the output
+  schema) to its limit is now refused loudly, naming the tool and the limit, instead of
+  the generated writer silently going on with truncated text (W-0000-0257). The check is
+  generated once as a shared routine rather than copied into every tool's arm, so a
+  program with many tools no longer pays for it per tool (W-0000-0275).
+- The compiler targets Linux only: a static x86-64 ELF. Windows output (`--target=windows`,
+  the PE writer and the runtime that translated syscalls to the Windows API) and the
+  `winapi`/`winproc` builtins are gone, and `--target=` is no longer an option.
+- `bootstrap/boot.c`, the C bootstrap compiler, no longer implements `schema`, `tools`
+  or `--debug`: none of that is needed to compile `src/wantzel.wz` itself, which is the
+  only job this file has. It refuses those loudly instead of miscompiling them. The
+  bootstrap fixed point is now stage2 = stage3
+  (both produced by the self-hosted compiler); stage1, produced by `boot.c`, only has to be
+  correct, not byte-identical. See [design.md](design.md#bootstrapping-one-small-c-compiler-once).
+- `src/compiler.wz` is folded back into `src/wantzel.wz`: one file holds the compiler and
+  its command line, as before 17-09-2026. The split let a host include the compiler
+  without its own executable ending the program; nothing ended up using that from outside
+  this repository, and one file is simpler.
+
+**Library**
+
+- `lib/net.wz` gains IPv6 sockets: `net.connect6`, `net.listen6`, `net.socket6`, on top of
+  `AF_INET6` and a 28-byte `sockaddr_in6`. `net.listen6` sets `IPV6_V6ONLY`, so it can share a port
+  number with a `net.listen` on the same machine instead of colliding with it.
+- `lib/dns.wz` resolves AAAA records: `dns.resolve6`, `dns.start6`, `dns.poll6`, alongside
+  the existing A-only `dns.resolve`/`dns.start`/`dns.poll`, sharing the same lookup
+  machinery, cache (now keyed on name and record type) and CNAME-chain following.
+  `dns.connect` now resolves both A and AAAA for a name and tries every address --
+  IPv6 first, IPv4 as the fallback -- so a host with only AAAA records, previously
+  unreachable from Wantzel at all, can be connected to by name.
+- `lib/fs.wz`: directory iteration is re-entrant. `fs.opendir`/`fs.next` used to share one
+  read buffer and position for the whole process, so opening a subdirectory while its
+  parent was still being read silently reset the parent's place in its own listing --
+  fewer entries, no error. Each open directory now gets its own slot (a small table, up
+  to 16 at once; a 17th `fs.opendir` fails with `fs.errno = 24`, `EMFILE`), so a recursive
+  walk works. New: `fs.forget(fd)`, for a caller that opens a directory its own way (not
+  through `fs.opendir`) and closes it its own way too -- call it before that close, or a
+  reused fd number can inherit another directory's old read position.
+- `lib/dns.wz` waits as long as the C library does: 5 s an attempt, 12 s a lookup (was 2 s
+  and 5 s). A local caching resolver that has to ask upstream the slow way -- systemd-resolved
+  while it re-probes its upstream server -- answers seconds later, and the old bounds turned
+  such an answer into "no nameserver answered in time".
+- `lib/http.wz` refuses (413, 431, 503) by half-closing the connection and draining what the
+  client still sends, instead of closing it outright: closing a socket with unread input
+  still in its receive buffer answers with a reset, so a client mid-upload could lose the
+  status that told it why. A header block that never ends now answers 431, and one that
+  never arrives in time answers 408, both of which used to be a silent close. `net.wz` gains
+  `net.shutdown` (W-0000-0259).
+- New module `lib/sha1.wz` (RFC 3174), moved out of `lib/websocket.wz`, which now includes
+  it. A program that needs SHA-1 for something other than the WebSocket handshake no longer
+  has to copy the routine out of a module that also pulls in `lib/http.wz` (W-0000-0243).
+- `lib/websocket.wz` connections now live in `WS.MAXCONN` slots, not at their fd -- the same
+  shape `lib/http.wz` already uses. `ws.take` used to refuse any fd of 256 or more outright;
+  now it refuses only once 256 connections are already open, whatever the fd. Inside
+  `app.wsframe`/`app.wsclose`, the base into `ws.in` comes from the new `ws.slot`, not from
+  `fd` (W-0000-0258).
+- `p256.sign` and the arithmetic it uses on the secret nonce and private key -- scalar
+  multiplication and modular inversion -- are constant-time: no branch or table/array index
+  keyed on a secret bit. Scalar multiplication is now a Montgomery ladder with constant-time
+  conditional swaps; modular inversion is Fermat exponentiation with a constant-time select
+  instead of the previous branchy binary GCD. `lib/tls.wz` signs every TLS server handshake
+  with this routine, so its timing is now exposed to any network client, not just a local
+  ACME operator -- measured (a quiet machine, best of several): signing went from about 4 ms
+  to about 14 ms, the cost of removing that timing channel (W-0000-0266).
+- `p256.sign`/`p256.genkey`'s k*G now uses a precomputed fixed-base comb table
+  (`p256.mulbase`) instead of the general Montgomery ladder, while staying constant-time: the
+  table lookup scans every entry and selects with a constant-time fold, never reads at a
+  secret index, and the additions never take a secret-dependent shortcut (a fixed public
+  blinding point keeps the running total away from the point at infinity for the whole
+  multiply, so there is no secret-conditional case to branch on). Measured (a quiet machine,
+  median of ten): signing dropped from about 14 ms back down to about 8.5 ms (W-0000-0260).
+
 ## 0.3.2 — 24 September 2026
 
 **A patch release for servers that face the internet.** A program that includes `lib/http.wz`

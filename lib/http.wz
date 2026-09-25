@@ -104,8 +104,12 @@ const
   HTTP.PHEAD  = 1;          // the rest of a request line and headers
   HTTP.PBODY  = 2;          // the rest of a body
   HTTP.PSEND  = 3;          // the socket, to take the rest of a reply
-  HTTP.PLINGER = 4;         // TLS, after a refusal: swallowing the rest of the request, then close
+  HTTP.PLINGER = 4;         // after a refusal: swallowing the rest of the request, then close
   HTTP.LINGERSECS = 5;      // how long at most
+  HTTP.LINGERBYTES = 1048576; // how much at most: a client that keeps sending past this is
+                              // not going to stop on its own, and lingering exists to let a
+                              // client that is ALMOST done writing its body read its answer,
+                              // not to read an unbounded stream from one that refuses to stop
 
   HTTP.CONTINUE = "HTTP/1.1 100 Continue\r\n\r\n";
 
@@ -136,7 +140,8 @@ var
   http.slis:   array[0..MAXCONN - 1] of int;    // the listener it was accepted on
   http.spos:   array[0..MAXCONN - 1] of int;    // its place in http.act
   http.sclose: array[0..MAXCONN - 1] of bool;   // close once the pending reply is out
-  http.slinger: array[0..MAXCONN - 1] of bool;  // TLS: linger instead (http.linger)
+  http.slinger: array[0..MAXCONN - 1] of bool;  // after a refusal: linger instead (http.linger)
+  http.slinbytes: array[0..MAXCONN - 1] of int; // bytes swallowed while lingering, this connection
   http.pbase:  array[0..MAXCONN - 1] of int;    // pending output: region address
   http.psize:  array[0..MAXCONN - 1] of int;    //   its mapped size, 0 = nothing pending
   http.pat:    array[0..MAXCONN - 1] of int;    //   first byte still to send
@@ -566,12 +571,14 @@ begin
   else if status = 403 then n := io.push(http.hdr, n, " Forbidden\r\n")
   else if status = 404 then n := io.push(http.hdr, n, " Not Found\r\n")
   else if status = 405 then n := io.push(http.hdr, n, " Method Not Allowed\r\n")
+  else if status = 408 then n := io.push(http.hdr, n, " Request Timeout\r\n")
   else if status = 409 then n := io.push(http.hdr, n, " Conflict\r\n")
   else if status = 413 then n := io.push(http.hdr, n, " Payload Too Large\r\n")
   else if status = 414 then n := io.push(http.hdr, n, " URI Too Long\r\n")
   else if status = 415 then n := io.push(http.hdr, n, " Unsupported Media Type\r\n")
   else if status = 422 then n := io.push(http.hdr, n, " Unprocessable Entity\r\n")
   else if status = 429 then n := io.push(http.hdr, n, " Too Many Requests\r\n")
+  else if status = 431 then n := io.push(http.hdr, n, " Request Header Fields Too Large\r\n")
   else if status = 500 then n := io.push(http.hdr, n, " Internal Server Error\r\n")
   else if status = 501 then n := io.push(http.hdr, n, " Not Implemented\r\n")
   else if status = 503 then n := io.push(http.hdr, n, " Service Unavailable\r\n")
@@ -863,7 +870,6 @@ end;
 // ---------------------------------------------------------------- slots
 
 local const
-  HTTP.SYSREADLINK  = 89;
   HTTP.SYSGETRLIMIT = 97;
   HTTP.SYSSETRLIMIT = 160;
   HTTP.RLIMITNOFILE = 7;
@@ -1033,19 +1039,10 @@ end;
 // a service started with the usual soft limit of 1024 runs out of descriptors long before
 // it runs out of slots.  Never lowers the limit, never goes above the hard limit, and a
 // refusal only means fewer connections -- not a reason to stop.
-//
-// WINDOWS HAS NO RLIMIT_NOFILE: its runtime keeps a fixed table of descriptors, and an
-// unknown system call there stops the program.  So the call is made only when a Linux
-// kernel is known to be listening, and the test for that is one that fails safe on both
-// sides: reading the link /proc/self/exe succeeds on Linux, and the Windows runtime answers
-// every readlink with -1.  A Linux without /proc keeps its limit, which is merely the
-// situation before this routine existed.
 procedure http.nofile;
 var cur, hard, want: int;
     lim: array[0..15] of char;
-    probe: array[0..255] of char;
 begin
-  if sys3(HTTP.SYSREADLINK, sadr("/proc/self/exe\0"), addr(probe[0]), 256) <= 0 then return;
   if sys2(HTTP.SYSGETRLIMIT, HTTP.RLIMITNOFILE, addr(lim[0])) < 0 then return;
   cur := io.get64(lim, 0);
   hard := io.get64(lim, 8);
@@ -1086,6 +1083,7 @@ begin
   http.slis[s] := li;
   http.sclose[s] := false;
   http.slinger[s] := false;
+  http.slinbytes[s] := 0;
   http.pbase[s] := 0;
   http.psize[s] := 0;
   http.pat[s] := 0;
@@ -1522,32 +1520,45 @@ begin
   return 0;
 end;
 
-// A refused TLS connection, its refusal sent: close_notify, then swallow what the client
-// still sends for at most HTTP.LINGERSECS, and close when it stops.  Closing at once, with
-// the rest of its body unread, makes the kernel answer with a reset -- and a TLS client
-// that is still writing its body then never reads the 413 that was sent to it.
+// A refused connection, its refusal already queued or sent: half-close our side (TLS:
+// close_notify; plain: shutdown(SHUT_WR)) and swallow what the client still sends, for at
+// most HTTP.LINGERSECS and HTTP.LINGERBYTES, closing when it stops or a bound is hit.
+// Closing outright, with the rest of its request unread, makes the kernel answer with a
+// reset instead of the normal FIN -- and a client still writing its body then never reads
+// the 413 (or 503, 431) that was sent to it; it just sees the connection die.  SHUT_WR
+// leaves the read side open, so what we already queued for send is unaffected and what the
+// client sends next is still ours to read and drop.
 procedure http.linger(s: int);
 var w, r: int;
 begin
-  w := tls.shut(http.stls[s], http.tshut);
-  if w > 0 then r := net.send(http.sfd[s], addr(http.tshut[0]), w);
+  if http.stls[s] >= 0 then
+  begin
+    w := tls.shut(http.stls[s], http.tshut);
+    if w > 0 then r := net.send(http.sfd[s], addr(http.tshut[0]), w);
+  end
+  else net.shutdown(http.sfd[s], SHUT_WR);
   http.sphase[s] := HTTP.PLINGER;
   http.shs[s] := 0;
+  http.slinbytes[s] := 0;
   http.sdl[s] := http.now + HTTP.LINGERSECS * 1000000000;
   if not http.mask(s, EPOLLIN) then http.closeslot(s);
 end;
 
-// Slot s is done: closed, or lingering when it was refused over TLS.
+// Slot s is done: closed at once, or lingering first when it was refused (http.refuse).
 procedure http.endslot(s: int);
 begin
   if http.slinger[s] then http.linger(s) else http.closeslot(s);
 end;
 
-// Read and drop what a lingering slot is sent; close it at the end of the stream.
+// Read and drop what a lingering slot is sent; close it at the end of the stream, or once
+// HTTP.LINGERBYTES is read (the deadline set by http.linger bounds the time already).  A
+// client that keeps sending past that bound is not about to stop on its own, and lingering
+// exists to let an answer be read, not to read an unbounded stream from a client that
+// never will.
 procedure http.swallow(s: int);
 var r: int;
 begin
-  while true do
+  while http.slinbytes[s] < HTTP.LINGERBYTES do
   begin
     r := net.recv(http.sfd[s], addr(http.traw[0]), HTTP.TLSRAW);
     if r = EAGAIN then return;
@@ -1556,7 +1567,9 @@ begin
       http.closeslot(s);
       return;
     end;
+    if r > 0 then http.slinbytes[s] := http.slinbytes[s] + r;
   end;
+  http.closeslot(s);
 end;
 
 // ---------------------------------------------------------------- serving a slot
@@ -1807,8 +1820,13 @@ begin
 end;
 
 // Answer slot s with a short error and close it: a 413 for a body that will never fit, a 503
-// when there is no room to read a request right now.  `parsed` says whether the headers are
-// known, for the log line.
+// when there is no room to read a request right now, a 431 for headers that do not fit.
+// `parsed` says whether the headers are known, for the log line.
+//
+// The connection lingers after the reply goes out (http.linger) rather than closing at
+// once: unread input still sitting in the socket's receive buffer turns an immediate close
+// into a reset, plain or TLS alike, and a client is not guaranteed to have read the reply
+// before that reset arrives -- it would see the connection die with no status at all.
 procedure http.refuse(s: int; status: int; msg: str; parsed: bool);
 begin
   http.fd := http.sfd[s];
@@ -1831,7 +1849,7 @@ begin
   http.finish(status, "text/plain");
   http.sused[s] := 0;
   http.sclose[s] := true;
-  http.slinger[s] := http.stls[s] >= 0;
+  http.slinger[s] := true;
   if http.emitreply(s) then
     if http.psize[s] = 0 then http.endslot(s);
 end;
@@ -1981,10 +1999,12 @@ begin
       end
       else if http.sused[s] >= http.scap[s] then
       begin
-        // The headers alone fill the area.  Past INBUF that is not a request any more.
+        // The headers alone fill the area, and still no end of them in sight.  Past INBUF
+        // that is not a request any more: answer honestly (431) instead of a reset, the
+        // same reasoning as the 413 above for an oversized body.
         if http.scap[s] >= INBUF then
         begin
-          http.closeslot(s);
+          http.refuse(s, 431, "request header fields too large\n", false);
           return;
         end;
         if not http.grow(s) then
@@ -2135,6 +2155,12 @@ end;
 
 // Close every connection whose deadline has passed, and accept again if accepting was
 // paused.  http.poll calls this once per HTTP.TICKMS.
+//
+// A connection timing out while its request line and headers are still coming in (plain,
+// not the TLS handshake's own share of http.shs -- there is no HTTP session yet to answer
+// on) gets a 408 instead of a bare close: it has a slot, a socket and, once http.refuse
+// answers it, a reply the client can still read (http.linger keeps the connection open
+// long enough for that instead of resetting it out from under an unread answer).
 procedure http.sweep;
 var i, s: int;
 begin
@@ -2144,7 +2170,15 @@ begin
   while i < http.nopen do
   begin
     s := http.act[i];
-    if (http.sdl[s] <= http.now) or ((http.shs[s] > 0) and (http.shs[s] <= http.now)) then
+    if (http.sdl[s] <= http.now) and (http.sphase[s] = HTTP.PHEAD) and (http.shs[s] = 0) then
+    begin
+      http.timedout := http.timedout + 1;
+      http.refuse(s, 408, "request headers took too long\n", false);
+      // http.refuse may have closed the slot outright (nothing to send it) or moved it to
+      // HTTP.PLINGER; either way it is no longer due for the plain close below, and i is
+      // left where it is so the slot that replaced it (if any) is still checked.
+    end
+    else if (http.sdl[s] <= http.now) or ((http.shs[s] > 0) and (http.shs[s] <= http.now)) then
     begin
       if http.sphase[s] <> HTTP.PLINGER then http.timedout := http.timedout + 1;
       http.closeslot(s);                    // moves the last open slot into place i

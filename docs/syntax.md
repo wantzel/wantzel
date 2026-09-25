@@ -89,7 +89,7 @@ var
   c:    char;
   name: str;
   buf:  array[0..255] of char;
-  line: array[0..9] of array[0..79] of char;
+  grid: array[0..799] of char;      // 10 rows of 80: row * 80 + col, no nested array
 ```
 
 ## Declaring

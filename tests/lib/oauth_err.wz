@@ -92,14 +92,34 @@ begin
   show("newsession-ok", oauth.newsession(1));             // room available: succeeds, quiet
 
   // Exhaust the token table so the next session has nowhere to go, and confirm the
-  // resulting oauth.err names the real cause instead of a generic refusal.  Filling it
-  // through oauth.newsession itself (rather than store.alloc directly) is what actually
-  // marks each row live -- store.alloc alone hands back the same free row every time
-  // until something writes it.  http.xlen normally resets once per request (http.wz's own
-  // loop does it); this test calls oauth.newsession thousands of times without a request
-  // in between, so it has to reset it itself or the Set-Cookie header oauth.newsession
-  // appends every time eventually runs past http.xhdr's end.
+  // resulting oauth.err names the real cause instead of a generic refusal.
+  //
+  // store.alloc alone hands back the same free row every time until something marks it
+  // live, so the row still has to be MARKED, not just allocated -- but marking it live
+  // does not have to mean the full durable path.  store.write (what oauth.newsession
+  // calls through store.set) appends to the log and fsyncs before returning, once per
+  // row; over OAUTH.MAXTOKENS - 1 (4095) rows that is 4095 fsyncs, measured at ~8ms each
+  // on spinning disks -- comfortably over this suite's 30s per-test budget even though
+  // the language and the store are doing exactly what they promise (durable storage with
+  // crash recovery, lib/store.wz). That promise is the point of store.wz and stays as
+  // is; only the last row needs the real, fsynced path to prove "no room" is genuine.
+  //
+  // store.apply is the same in-memory half store.write uses when it replays the log at
+  // startup -- it marks a row live and copies a payload, with no log write and no fsync.
+  // Reusing the row's own (already zeroed, already allocated) memory as that payload is
+  // a no-op copy, so filling 4094 of the 4095 rows this way costs no real I/O at all; the
+  // 4095th row still goes through oauth.newsession -> store.savetoken -> store.write, so
+  // the fsynced path and the Set-Cookie header it appends are both still exercised, and
+  // store.alloc still walks its live-row scan exactly as it does outside a test.
   row := 0;
+  while row < OAUTH.MAXTOKENS - 2 do
+  begin
+    n := store.alloc(oauth.ttok);
+    if n < 0 then io.fatal("test setup: token table not big enough to pre-fill");
+    if not store.apply(oauth.ttok, STORE.OPSET, n, view(store.rowaddr(oauth.ttok, n), OTOKEN_SIZE)) then
+      io.fatal("test setup: store.apply refused the pre-fill row");
+    row := row + 1;
+  end;
   http.xlen := 0;
   while oauth.newsession(1) do begin row := row + 1; http.xlen := 0; end;
   oauth.err := "";

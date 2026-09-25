@@ -3,16 +3,24 @@
 // agent-permissions: read -- the standard library is not a scratchpad. Changing it
 // changes every program that includes it, so it moves under a ticket rather than in
 // passing. See docs/conventions.md §4.
+//
+// IPv6 (net.connect6, net.listen6, net.socket6) needs no compiler change: `sys3(SYS.socket,
+// AF_INET6, ...)` is the literal socket() syscall, so it takes any family the kernel
+// supports without the compiler knowing what AF_INET6 means -- the same reason the rest of
+// this file needs no compiler change.
 
 include "io.wz";
 
 const
   AF_INET      = 2;
+  AF_INET6     = 10;
   SOCK_STREAM  = 1;
   SOL_SOCKET   = 1;
   SO_REUSEADDR = 2;
   SO_REUSEPORT = 15;
   MSG_NOSIGNAL = 16384;
+  IPPROTO_IPV6 = 41;
+  IPV6_V6ONLY  = 26;
 
   O_NONBLOCK = 2048;
   F_SETFL    = 4;
@@ -28,14 +36,25 @@ const
   EAGAIN = -11;
   EINTR  = -4;
 
+  // shutdown(fd, how): SHUT_WR, no more sends
+  SHUT_WR = 1;
+
 var
   net.sa:  array[0..15] of char;
+  net.sa6: array[0..27] of char;        // sockaddr_in6: family, port, flowinfo, 16-byte address, scope id
   net.one: array[0..3] of char;
   net.ev:  array[0..11] of char;
 
 function net.socket: int;
 begin
   return sys3(SYS.socket, AF_INET, SOCK_STREAM, 0);
+end;
+
+// An AF_INET6 socket. On Linux this is an ordinary socket() call, like net.socket; see
+// net.connect6 for what it takes to actually reach a peer over it.
+function net.socket6: int;
+begin
+  return sys3(SYS.socket, AF_INET6, SOCK_STREAM, 0);
 end;
 
 procedure net.close(fd: int);
@@ -50,6 +69,17 @@ begin
   net.one[2] := chr(0);
   net.one[3] := chr(0);
   sys5(SYS.setsockopt, fd, SOL_SOCKET, opt, addr(net.one[0]), 4);
+end;
+
+// The same as net.setopt, but at protocol level (IPPROTO_IPV6 for IPV6_V6ONLY) instead of
+// SOL_SOCKET.
+procedure net.setoptlevel(fd: int; level: int; opt: int);
+begin
+  net.one[0] := chr(1);
+  net.one[1] := chr(0);
+  net.one[2] := chr(0);
+  net.one[3] := chr(0);
+  sys5(SYS.setsockopt, fd, level, opt, addr(net.one[0]), 4);
 end;
 
 // Put the socket in non-blocking mode.  True when it worked.
@@ -102,6 +132,51 @@ begin
   return fd;
 end;
 
+// net.listen6(port, backlog, reuseport) -- the same as net.listen, but on [::]:port, so it
+// takes connections over IPv6. IPV6_V6ONLY is set explicitly (see below), so this listener
+// never also answers IPv4-mapped addresses the way an IPv6 wildcard bind otherwise would.
+function net.listen6(port: int; backlog: int; reuseport: bool): int;
+var fd, r, i: int;
+begin
+  fd := net.socket6;
+  if fd < 0 then return fd;
+  net.setopt(fd, SO_REUSEADDR);
+  if reuseport then net.setopt(fd, SO_REUSEPORT);
+  // IPV6_V6ONLY, so this listener is only ever reached over IPv6 and never shadows (or
+  // is shadowed by) an IPv4 listener bound to the same port -- without it, an IPv6
+  // wildcard bind also accepts IPv4-mapped connections on Linux, and the two listeners
+  // could not coexist at all on the same port (EADDRINUSE).
+  net.setoptlevel(fd, IPPROTO_IPV6, IPV6_V6ONLY);
+  i := 0;
+  while i < 28 do
+  begin
+    net.sa6[i] := chr(0);
+    i := i + 1;
+  end;
+  net.sa6[0] := chr(AF_INET6);
+  net.sa6[2] := chr(port shr 8);         // network byte order
+  net.sa6[3] := chr(band(port, 255));
+  // address left at all zeros: "::", every address -- the IPv6 counterpart of 0.0.0.0
+  r := sys3(SYS.bind, fd, addr(net.sa6[0]), 28);
+  if r < 0 then
+  begin
+    net.close(fd);
+    return r;
+  end;
+  r := sys2(SYS.listen, fd, backlog);
+  if r < 0 then
+  begin
+    net.close(fd);
+    return r;
+  end;
+  if not net.nonblock(fd) then
+  begin
+    net.close(fd);
+    return -9;                           // EBADF: the fd did not take O_NONBLOCK
+  end;
+  return fd;
+end;
+
 // net.connect(ip, port) -- an outgoing connection to a numeric IPv4 address.
 //
 // THE ADDRESS IS FOUR BYTES, NOT A NAME. Resolving a hostname means DNS, which is a protocol
@@ -143,6 +218,43 @@ begin
   return fd;
 end;
 
+// net.connect6(addr6, port) -- an outgoing connection to a numeric IPv6 address.
+//
+// addr6 IS SIXTEEN BYTES, network order, as lib/dns.wz's AAAA lookups and dns.parseip6
+// produce them -- an IPv6 address does not fit in one int (128 bits against 64), which is
+// why it is not a set of parameters the way net.connect's four octets are.
+//
+// Otherwise the same contract as net.connect: blocking, the fd closed and a negative
+// errno returned on failure, so a caller that only tests the sign cannot leak one.
+function net.connect6(addr6: array of char; port: int): int;
+var fd, r, i: int;
+begin
+  fd := net.socket6;
+  if fd < 0 then return fd;
+  i := 0;
+  while i < 28 do
+  begin
+    net.sa6[i] := chr(0);
+    i := i + 1;
+  end;
+  net.sa6[0] := chr(AF_INET6);
+  net.sa6[2] := chr(port shr 8);          // network byte order, as in net.connect
+  net.sa6[3] := chr(band(port, 255));
+  i := 0;
+  while i < 16 do
+  begin
+    net.sa6[8 + i] := addr6[i];
+    i := i + 1;
+  end;
+  r := sys3(SYS.connect, fd, addr(net.sa6[0]), 28);
+  if r < 0 then
+  begin
+    net.close(fd);
+    return r;
+  end;
+  return fd;
+end;
+
 // accept4 with SOCK_NONBLOCK, so the connection is ready to use
 function net.accept(lfd: int): int;
 begin
@@ -157,6 +269,16 @@ end;
 function net.recv(fd: int; a: int; n: int): int;
 begin
   return sys3(SYS.read, fd, a, n);
+end;
+
+// Half-close: no more of OUR bytes will follow (how = SHUT_WR), while the peer's already
+// in flight are still readable.  Closing a socket outright with unread input still sitting
+// in its receive buffer makes the kernel answer with RST instead of the normal FIN
+// sequence, and a peer that has not read our last bytes yet sees the reset before it ever
+// gets to read them -- http.linger uses this to let a refused client read its error reply.
+procedure net.shutdown(fd: int; how: int);
+begin
+  sys2(SYS.shutdown, fd, how);
 end;
 
 function net.epoll: int;

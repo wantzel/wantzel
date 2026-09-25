@@ -1,0 +1,113 @@
+// lib/sha1.wz -- SHA-1 (RFC 3174).
+//
+// agent-permissions: read -- the standard library is not a scratchpad. Changing it
+// changes every program that includes it, so it moves under a ticket rather than in
+// passing. See docs/conventions.md §4.
+//
+// NOT A SECURITY PRIMITIVE. SHA-1 is broken against deliberate collisions and nothing
+// here should be used to protect against an adversary who can choose the input. It
+// exists because lib/websocket.wz needs it: RFC 6455's handshake names SHA-1
+// specifically, and the browser checks the answer against its own computation of the
+// same hash -- a well-formed header with the wrong digest is closed on sight, with
+// nothing in the log to say why. Kept as its own module rather than only inside
+// lib/websocket.wz so a program that needs a SHA-1 digest for some other reason (an
+// external protocol that names it, a legacy checksum) does not have to copy the
+// routine out of a module that also pulls in lib/http.wz and its required app.request.
+//
+// One-shot only (sha1.hash): unlike lib/sha256.wz there is no streaming
+// init/update/final here, because the one caller in this tree (lib/websocket.wz) always
+// has the whole 60-byte handshake key in one buffer. Add streaming if a caller needs it.
+//
+// MEASURED AGAINST THE RFC 3174 TEST VECTORS, including every padding boundary, because
+// the padding is where a hand-written hash goes wrong and it goes wrong only for SOME
+// lengths: see tests/lib/sha1.wz.
+
+var
+  sha1.h:   array[0..4] of int;
+  sha1.w:   array[0..79] of int;
+  sha1.pad: array[0..127] of char;
+
+function sha1.rotl(x: int; n: int): int;
+var v: int;
+begin
+  // MASKED BACK TO 32 BITS AT EVERY STEP: an int here is 64 bits, so a left shift keeps
+  // bits SHA-1 expects to have fallen off the end, and the right half of the rotate
+  // would otherwise see rubbish in the high bits.
+  v := band(x, 0xFFFFFFFF);
+  return band(bor(v shl n, v shr (32 - n)), 0xFFFFFFFF);
+end;
+
+procedure sha1.block(b: array of char; at: int);
+var i, a, bb, c, d, e, f, k, t: int;
+begin
+  // THE MESSAGE SCHEDULE IS BIG-ENDIAN, which SHA-1 requires.
+  for i := 0 to 15 do
+    sha1.w[i] := bor(bor(bor(ord(b[at + i * 4]) shl 24, ord(b[at + i * 4 + 1]) shl 16),
+                         ord(b[at + i * 4 + 2]) shl 8), ord(b[at + i * 4 + 3]));
+  for i := 16 to 79 do
+    sha1.w[i] := sha1.rotl(bxor(bxor(sha1.w[i - 3], sha1.w[i - 8]),
+                                bxor(sha1.w[i - 14], sha1.w[i - 16])), 1);
+  a := sha1.h[0]; bb := sha1.h[1]; c := sha1.h[2]; d := sha1.h[3]; e := sha1.h[4];
+  for i := 0 to 79 do
+  begin
+    if i < 20 then begin f := bor(band(bb, c), band(bnot(bb), d)); k := 0x5A827999; end
+    else if i < 40 then begin f := bxor(bxor(bb, c), d); k := 0x6ED9EBA1; end
+    else if i < 60 then begin f := bor(bor(band(bb, c), band(bb, d)), band(c, d)); k := 0x8F1BBCDC; end
+    else begin f := bxor(bxor(bb, c), d); k := 0xCA62C1D6; end;
+    t := band(sha1.rotl(a, 5) + band(f, 0xFFFFFFFF) + e + k + sha1.w[i], 0xFFFFFFFF);
+    e := d; d := c; c := sha1.rotl(bb, 30); bb := a; a := t;
+  end;
+  sha1.h[0] := band(sha1.h[0] + a, 0xFFFFFFFF);
+  sha1.h[1] := band(sha1.h[1] + bb, 0xFFFFFFFF);
+  sha1.h[2] := band(sha1.h[2] + c, 0xFFFFFFFF);
+  sha1.h[3] := band(sha1.h[3] + d, 0xFFFFFFFF);
+  sha1.h[4] := band(sha1.h[4] + e, 0xFFFFFFFF);
+end;
+
+// sha1.hash(b, digest) -- the 20-byte digest of all of b.
+//
+// THE PADDING IS WHERE THIS GOES WRONG, and only for some lengths. A message is padded
+// with one 0x80 byte, then zeros, then its length in bits as eight big-endian bytes at
+// the very end of the last block. When the tail plus that 0x80 leaves fewer than eight
+// bytes free, the length no longer fits and a SECOND block is needed.
+procedure sha1.hash(b: array of char; digest: array of char);
+var n, i, at, rem, bits, padn: int;
+begin
+  sha1.h[0] := 0x67452301; sha1.h[1] := 0xEFCDAB89; sha1.h[2] := 0x98BADCFE;
+  sha1.h[3] := 0x10325476; sha1.h[4] := 0xC3D2E1F0;
+  n := len(b);
+  at := 0;
+  while at + 64 <= n do begin sha1.block(b, at); at := at + 64; end;
+  rem := n - at;
+  for i := 0 to 127 do sha1.pad[i] := chr(0);
+  for i := 0 to rem - 1 do sha1.pad[i] := b[at + i];
+  sha1.pad[rem] := chr(0x80);
+  if rem + 1 <= 56 then padn := 64 else padn := 128;
+  bits := n * 8;
+  for i := 0 to 7 do sha1.pad[padn - 1 - i] := chr(band(bits shr (i * 8), 255));
+  sha1.block(sha1.pad, 0);
+  if padn = 128 then sha1.block(sha1.pad, 64);
+  for i := 0 to 4 do
+  begin
+    digest[i * 4]     := chr(band(sha1.h[i] shr 24, 255));
+    digest[i * 4 + 1] := chr(band(sha1.h[i] shr 16, 255));
+    digest[i * 4 + 2] := chr(band(sha1.h[i] shr 8, 255));
+    digest[i * 4 + 3] := chr(band(sha1.h[i], 255));
+  end;
+end;
+
+// write the 20-byte digest as 40 lowercase hex chars into dst at position at;
+// returns the new position. Same convention as sha256.hex.
+function sha1.hex(digest: array of char; dst: array of char; at: int): int;
+var i, v: int;
+begin
+  for i := 0 to 19 do
+  begin
+    v := ord(digest[i]) shr 4;
+    if v < 10 then dst[at] := chr(48 + v) else dst[at] := chr(87 + v);
+    v := band(ord(digest[i]), 15);
+    if v < 10 then dst[at + 1] := chr(48 + v) else dst[at + 1] := chr(87 + v);
+    at := at + 2;
+  end;
+  return at;
+end;

@@ -18,7 +18,7 @@ Writing Wantzel when the compiler says no.
 | [Command line](flags.md) | every flag, and what deliberately has none |
 | [Library](library.md) | every standard-library module, and the routines of each |
 | [Writing Wantzel](writing-wantzel.md) | the pitfalls, and from an error message to its cause |
-| [How-to](howto.md) | recipes: background work, serving HTTPS, signing a Windows executable |
+| [How-to](howto.md) | recipes: background work, serving HTTPS, resolving names |
 
 ## Working on a project or on Wantzel
 

@@ -9,11 +9,11 @@
 // X25519 agrees on a key; it cannot check a signature, and a signature is what turns an
 // encrypted connection into an authenticated one.
 //
-// ONLY VERIFICATION, NOT SIGNING. A client checks signatures; it never makes them. That
-// halves the surface and removes the part where a mistake is catastrophic -- a signing
-// routine that reuses a nonce leaks the private key outright, while a verifier that is
-// wrong fails closed if it is wrong in the safe direction and is caught by the test vectors
-// if it is wrong in the other.
+// VERIFICATION AND SIGNING. A TLS client only ever checks signatures; the TLS server (every
+// handshake) and ACME (every account request) also make them, with p256.sign -- so a mistake
+// there is the catastrophic direction: a signing routine that reuses a nonce, or whose timing
+// exposes the nonce or the private key, leaks the key outright. A verifier that is wrong fails
+// closed if it is wrong in the safe direction and is caught by the test vectors otherwise.
 //
 // EIGHT LIMBS OF 32 BITS, unsigned, little-endian. The prime is
 //   p = 2^256 - 2^224 + 2^192 + 2^96 - 1
@@ -21,16 +21,49 @@
 // reduction is done by ordinary conditional subtraction after a schoolbook multiply. That is
 // slower and much harder to get subtly wrong, which is the right trade here.
 //
-// NO CONSTANT-TIME REQUIREMENT IN THIS FILE, and that is deliberate rather than an omission.
-// Everything here operates on PUBLIC values: a signature, a public key, a message hash. There
-// is no secret to leak. Timing only matters where a private scalar is involved, which is
-// signing -- and this file does not sign.
+// CONSTANT-TIME IN THE SCALAR, which is p256.sign's nonce k and private key d, and
+// p256.genkey's/lib/tls.wz's d: p256.mulbase (a fixed-base comb, k*G with G always the base
+// point) and p256.mulpoint (a Montgomery ladder, for a variable base) both take the same
+// SEQUENCE OF OPERATIONS and touch the same table/memory shape regardless of the scalar's
+// bits; so do p256.powm and p256.invm (Fermat exponentiation with a constant-time select) --
+// see the notes at each for exactly what that does and does not cover. p256.verify's own
+// scalar multiplications, by the public u1/u2, don't need this and stay plain double-and-add
+// (u1*G through the same p256.mulpoint, not the comb -- the comb's constant-time table scan
+// is pure overhead when there is nothing secret to hide); a plain branch is simpler to get
+// right where there is nothing to hide.
+//
+// WHAT "CONSTANT-TIME" DOES NOT MEAN HERE: the field layer underneath (p256.addm, p256.subm,
+// p256.redfast, p256.redc) still has the ordinary conditional subtract-if-the-sum-overflowed-
+// the-modulus that every operation here goes through, including ones on values derived from
+// the secret scalar. That is a much smaller, much better-studied leak than a per-bit branch on
+// the scalar itself -- it depends on whether a SUM crossed a threshold, not on individual key
+// bits -- and it is not what Minerva or TPM-Fail exploited; closing it needs constant-time
+// (mask-based) conditional subtraction throughout the field layer, which touches every
+// operation in this file, not just signing, and is left as a follow-up rather than folded into
+// this rewrite.
 
 include "io.wz";
 include "rand.wz";
 
 const
   P.N = 8;                  // 8 limbs of 32 bits = 256 bits
+
+  // ---- the fixed-base comb table, for k*G in p256.mulbase (Lim-Lee / BGMW) --------------
+  //
+  // The scalar is split into COMB.T = 64 columns of COMB.H = 4 bits each, the bits of one
+  // column taken 64 apart (bit j, j+64, j+128, j+192 -- COMB.T apart, which is 256/COMB.H).
+  // That turns k*G into COMB.T doublings plus exactly COMB.T table lookups and additions,
+  // against 256 doublings and up to 256 conditional additions for the ladder: the doublings
+  // drop 4x, and the additions become a fixed count instead of depending on k's weight.
+  //
+  // COMB.H = 4 is the size/speed knob: the table holds COMB.DIGITS = 16 entries, one per
+  // possible 4-bit digit (0 included, as the point at infinity -- see p256.combbuild), which
+  // is 16*3*8 = 384 machine words, a few kilobytes. Going to 5 would roughly double the
+  // table for a smaller further gain; 4 keeps both the table and the constant-time scan over
+  // it cheap.
+  COMB.H = 4;                 // bits per column = table width
+  COMB.T = 64;                // columns = 256 / COMB.H
+  COMB.DIGITS = 16;            // 2^COMB.H, digit 0 included
 
 var
   // The curve parameters, filled by p256.setup.
@@ -40,6 +73,8 @@ var
   p256.gx: array[0..P.N-1] of int;
   p256.gy: array[0..P.N-1] of int;
   p256.ready: bool;
+  p256.pminus2: array[0..P.N-1] of int;   // p - 2, the public Fermat exponent for p256.invm
+  p256.nminus2: array[0..P.N-1] of int;   // n - 2, same, modulo the base point's order
 
   // scratch
   p256.t0: array[0..P.N-1] of int;
@@ -70,6 +105,52 @@ var i: int;
 begin
   i := 0;
   while i < P.N do begin dst[i] := src[i]; i := i + 1; end;
+end;
+
+// CONSTANT-TIME PRIMITIVES. Everything below this point that touches a secret scalar (a
+// private key, an ECDSA nonce) goes through p256.cswap or p256.csel instead of an `if` on a
+// secret bit -- an `if` compiles to a branch, and a branch's outcome shows up in timing. Both
+// take `bit` as 0 or 1, never as a bool, and touch every word whichever way it goes: a mask of
+// all-zero or all-one bits, built with a negation rather than a comparison (`0 - bit`, not
+// `bit = 1`), which folds to AND/XOR instead of a conditional move at the machine level.
+
+// Swap a and b, in every word, when bit = 1; leave both alone when bit = 0. Runs the same
+// XOR-mask sequence either way -- the swap or the no-op costs identical work.
+procedure p256.cswap(a: array of int; b: array of int; bit: int);
+var i, mask, t: int;
+begin
+  mask := 0 - bit;                       // bit=1 -> all 64 bits set; bit=0 -> 0
+  i := 0;
+  while i < P.N do
+  begin
+    t := band(bxor(a[i], b[i]), mask);
+    a[i] := bxor(a[i], t);
+    b[i] := bxor(b[i], t);
+    i := i + 1;
+  end;
+end;
+
+// r := (bit = 0) ? f : t, in every word, with no branch on bit.
+procedure p256.csel(r: array of int; f: array of int; t: array of int; bit: int);
+var i, mask: int;
+begin
+  mask := 0 - bit;
+  i := 0;
+  while i < P.N do
+  begin
+    r[i] := bor(band(bnot(mask), f[i]), band(mask, t[i]));
+    i := i + 1;
+  end;
+end;
+
+// 1 if v = 0, else 0 -- for a small, secret-DERIVED but non-negative v (p256.mulbase's comb
+// digit, 0..15), with no branch on v. (v bor (0 - v)) has its top bit set for every v <> 0
+// (a two's-complement negation always sets the top bit somewhere above a nonzero low part)
+// and clear only for v = 0, so shifting that bit down and inverting the low bit gives the
+// answer as arithmetic, not as a comparison.
+function p256.iszerobit(v: int): int;
+begin
+  return band(bnot(bor(v, 0 - v) shr 63), 1);
 end;
 
 function p256.iszero(a: array of int): bool;
@@ -392,10 +473,15 @@ begin
   else p256.redc(r, m);
 end;
 
-// r := a^e mod m, for a fixed public exponent. Square-and-multiply, MSB first.
+// r := a^e mod m, CONSTANT-TIME in e: every bit does one square AND one multiply, and a
+// constant-time select (p256.csel) picks whether the multiply's result counts, instead of an
+// `if` that skips it. Same instruction sequence for e = 1 as for e = n-1 -- the whole point,
+// since e is the secret scalar in p256.invm's use from p256.sign (inverting k) and
+// p256.affine's use from the same call (converting the secret point k*G to affine).
 //
-// The exponent here is always public (p-2 or n-2, for an inverse), so there is nothing to
-// hide and a plain conditional is fine.
+// TWICE THE MULTIPLIES OF THE OLD SQUARE-AND-MULTIPLY (256 vs ~384 on average), which is the
+// price of removing the branch: a multiply that always runs cannot be timed to reveal whether
+// its result was kept.
 procedure p256.powm(r: array of int; a: array of int; e: array of int; m: array of int);
 var i, bit: int;
 begin
@@ -406,107 +492,35 @@ begin
   begin
     p256.mulm(p256.t4, r, r, m);
     p256.copy(r, p256.t4);
+    p256.mulm(p256.t4, r, a, m);            // ALWAYS computed, whether bit i is 0 or 1
     bit := band(e[i shr 5] shr band(i, 31), 1);
-    if bit <> 0 then
-    begin
-      p256.mulm(p256.t4, r, a, m);
-      p256.copy(r, p256.t4);
-    end;
+    p256.csel(r, r, p256.t4, bit);          // ...and only KEPT when bit i is 1
     i := i - 1;
   end;
 end;
 
 // r := 1/a mod m, by Fermat: a^(m-2). m must be prime, which both p and n are.
-// r := 1/a mod m, by the BINARY EXTENDED EUCLIDEAN ALGORITHM.
 //
-// WHY NOT FERMAT ANY MORE. a^(m-2) is one line and obviously correct, and it was what stood
-// here. It is also ~256 squarings plus ~128 multiplications, every one of them a modular
-// multiplication -- and modulo n there is no Solinas shortcut, so every one goes through the
-// slow bit-by-bit reduction at 11.1 us against 0.35 us for the fast one.
+// CONSTANT-TIME, because a IS SECRET at both call sites that matter: p256.sign inverts the
+// nonce k, and the same routine (through p256.affine, which calls this on the point's Z
+// coordinate) runs on k*G right before that. p256.powm above already runs the identical
+// instruction sequence for every exponent; a is public data (the base, not the exponent) so
+// it can appear inside p256.mulm's ordinary variable-time multiply without leaking anything
+// the multiply itself did not already see -- what must not vary with a is the CONTROL FLOW,
+// and powm's control flow depends only on the exponent (m-2, always public: p-2 or n-2).
 //
-// MEASURED 22-09-2026, and this is why it changed: p256.sign cost 9.2 ms, which was 81% of a
-// 12.2 ms TLS handshake, and nearly all of it was this routine. nginx does the same handshake
-// in 2.1 ms. The comment at p256.mulm called work modulo n "a handful of operations"; it is
-// not -- one inverse is hundreds.
+// e = m - 2 is computed once, in p256.setup (p256.pminus2, p256.nminus2), since m is always
+// one of the two curve moduli and subtracting 2 is public arithmetic done once rather than on
+// every call.
 //
-// BINARY EXTENDED GCD DOES NO MODULAR MULTIPLICATION AT ALL. Only shifts, additions and
-// subtractions, on numbers that stay below 2m. That trades a few hundred slow reductions for
-// a few hundred cheap shifts.
-//
-// THE ALGORITHM (Knuth 4.5.2, algorithm X adapted for a binary field): keep u, v and their
-// cofactors x1, x2 with the invariant
-//     u = a*x1 mod m  and  v = a*x2 mod m
-// halve whichever of u, v is even -- adding m first when the cofactor is odd, since
-// (x + m)/2 is the halving that stays integral -- and subtract the smaller from the larger
-// when both are odd. It ends with one of them at 1, and its cofactor is the inverse.
-//
-// IT IS NOT CONSTANT-TIME, and nothing in this file is: everything here operates on public
-// values. In sign() the value being inverted is k, which IS secret -- see the note there.
-procedure p256.halve(x: array of int; m: array of int);
-var i, c: int;
-begin
-  // ODD FIRST, then shift. (x + m) is even whenever x is odd, because m is odd -- every
-  // modulus here is a prime above 2 -- so this is the only way to halve and stay integral.
-  c := 0;
-  if band(x[0], 1) <> 0 then c := p256.addc(x, x, m);
-  i := 0;
-  while i < P.N - 1 do
-  begin
-    x[i] := bor(x[i] shr 1, band(x[i + 1] shl 31, 0xFFFFFFFF));
-    i := i + 1;
-  end;
-  // THE CARRY OUT OF THE ADDITION IS THE NEW TOP BIT. Dropping it loses a factor of two on
-  // exactly the inputs where the sum passed 2^256, which is most of them.
-  x[P.N - 1] := bor(x[P.N - 1] shr 1, band(c shl 31, 0xFFFFFFFF));
-end;
-
+// REPLACES A BINARY EXTENDED GCD that stood here until 25-09-2026 (Knuth 4.5.2, algorithm X):
+// faster on average, but its halvings and subtractions branch on the parity and the relative
+// size of values derived from a -- exactly the secret-dependent control flow this file may no
+// longer have.
 procedure p256.invm(r: array of int; a: array of int; m: array of int);
-var u, v, x1, x2: array[0..P.N-1] of int;
-    guard, c: int;
 begin
-  // ZERO HAS NO INVERSE, and it must be refused BEFORE the loop. The halving loop below
-  // runs while the value is even, and zero is even forever -- so a zero input spins without
-  // ever reaching the guard, which counts rounds of the OUTER loop. Measured: the test
-  // program hung here for a full minute.
-  if p256.iszero(a) then begin p256.zero(r); return; end;
-
-  p256.copy(u, a);
-  p256.copy(v, m);
-  p256.zero(x1); x1[0] := 1;
-  p256.zero(x2);
-
-  // BOUNDED, because an unbounded loop on attacker-supplied input is a hang rather than a
-  // refusal. Each round removes at least one bit from u or v, so 2*256 rounds is generous;
-  // running out means the inputs were not coprime, and 0 is the honest answer.
-  guard := 0;
-  while (not p256.isone(u)) and (not p256.isone(v)) and (guard < 1024) do
-  begin
-    while band(u[0], 1) = 0 do
-    begin
-      c := p256.shr1(u);
-      p256.halve(x1, m);
-    end;
-    while band(v[0], 1) = 0 do
-    begin
-      c := p256.shr1(v);
-      p256.halve(x2, m);
-    end;
-    if p256.cmp(u, v) >= 0 then
-    begin
-      c := p256.subb(u, u, v);
-      p256.subm(x1, x1, x2, m);
-    end
-    else
-    begin
-      c := p256.subb(v, v, u);
-      p256.subm(x2, x2, x1, m);
-    end;
-    guard := guard + 1;
-  end;
-
-  if p256.isone(u) then p256.copy(r, x1)
-  else if p256.isone(v) then p256.copy(r, x2)
-  else p256.zero(r);          // not invertible, or the guard ran out
+  if p256.cmp(m, p256.p) = 0 then p256.powm(r, a, p256.pminus2, m)
+  else p256.powm(r, a, p256.nminus2, m);
 end;
 
 // ---- setup ------------------------------------------------------------------------------
@@ -531,6 +545,8 @@ begin
 end;
 
 procedure p256.setup;
+var two: array[0..P.N-1] of int;
+    c: int;
 begin
   if p256.ready then return;
   // SEC 2 §2.4.2, the curve secp256r1 / NIST P-256.
@@ -539,6 +555,11 @@ begin
   p256.hexto(p256.b,  "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b");
   p256.hexto(p256.gx, "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296");
   p256.hexto(p256.gy, "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5");
+  // p - 2 and n - 2, the public exponents p256.invm raises to. Computed once here, not on
+  // every call -- both p and n are public, so this subtraction needs no constant-time care.
+  p256.zero(two); two[0] := 2;
+  c := p256.subb(p256.pminus2, p256.p, two);
+  c := p256.subb(p256.nminus2, p256.n, two);
   p256.ready := true;
 end;
 
@@ -594,6 +615,72 @@ begin
   p256.addm(p256.s2, p256.s2, p256.s2, p256.p);          // 8Y^4
   p256.subm(p256.ay, p256.s5, p256.s2, p256.p);          // Y' = M(S-X') - 8Y^4
   p256.copy(p256.ax, p256.s4);
+end;
+
+// The general-case Jacobian addition formula, ALWAYS RUN -- no early return for b = infinity,
+// no early return for a = infinity, no branch on same-x. Used only by p256.addct below, where
+// the caller has already decided (by other, constant-time means) whether the result is worth
+// keeping; p256.add itself keeps its branches, since every OTHER call site's operands are
+// never secret-conditionally infinity or same-x (see each call site's own comment).
+//
+// WHEN b OR a IS ACTUALLY INFINITY, OR a = b, this formula's output is not the group law's
+// answer (it divides through H, which is 0 in both those cases) -- it is still SOME field
+// arithmetic, deterministic and side-channel-silent, and the caller discards it via csel
+// rather than ever branching on whether it was meaningful.
+procedure p256.addgeneral;
+var u1: array[0..P.N-1] of int;
+    u2: array[0..P.N-1] of int;
+    h:  array[0..P.N-1] of int;
+    r:  array[0..P.N-1] of int;
+begin
+  p256.mulm(p256.s0, p256.bz, p256.bz, p256.p);       // Z2^2
+  p256.mulm(u1, p256.ax, p256.s0, p256.p);            // U1 = X1 Z2^2
+  p256.mulm(p256.s1, p256.s0, p256.bz, p256.p);       // Z2^3
+  p256.mulm(p256.s2, p256.ay, p256.s1, p256.p);       // S1 = Y1 Z2^3
+
+  p256.mulm(p256.s0, p256.az, p256.az, p256.p);       // Z1^2
+  p256.mulm(u2, p256.bx, p256.s0, p256.p);            // U2 = X2 Z1^2
+  p256.mulm(p256.s1, p256.s0, p256.az, p256.p);       // Z1^3
+  p256.mulm(p256.s3, p256.by, p256.s1, p256.p);       // S2 = Y2 Z1^3
+
+  p256.subm(h, u2, u1, p256.p);                       // H = U2 - U1
+  p256.subm(r, p256.s3, p256.s2, p256.p);             // R = S2 - S1
+
+  p256.mulm(p256.s0, h, h, p256.p);                   // H^2
+  p256.mulm(p256.s1, p256.s0, h, p256.p);             // H^3
+  p256.mulm(p256.s4, u1, p256.s0, p256.p);            // U1 H^2
+
+  p256.mulm(p256.s5, r, r, p256.p);                   // R^2
+  p256.subm(p256.s5, p256.s5, p256.s1, p256.p);
+  p256.subm(p256.s5, p256.s5, p256.s4, p256.p);
+  p256.subm(p256.s5, p256.s5, p256.s4, p256.p);       // X3 = R^2 - H^3 - 2 U1 H^2
+
+  p256.subm(p256.s0, p256.s4, p256.s5, p256.p);
+  p256.mulm(p256.s0, r, p256.s0, p256.p);
+  p256.mulm(p256.s3, p256.s2, p256.s1, p256.p);
+  p256.subm(p256.ay, p256.s0, p256.s3, p256.p);       // Y3 = R(U1H^2 - X3) - S1 H^3
+  p256.copy(p256.ax, p256.s5);
+
+  p256.mulm(p256.s0, p256.az, p256.bz, p256.p);
+  p256.mulm(p256.az, p256.s0, h, p256.p);             // Z3 = Z1 Z2 H
+end;
+
+// a := a + b when keep = 1, a := a (unchanged) when keep = 0 -- with NO branch on keep, and
+// the SAME p256.addgeneral computed either way (a wasted computation when keep = 0 costs
+// exactly as much as a kept one). Used by p256.mulbase, whose digit can legitimately be zero
+// (b = the table's infinity entry) on a SECRET-DEPENDENT column, unlike every other call site
+// of p256.add, where whether either operand is infinity depends only on public loop position
+// or is excluded by an invariant -- see p256.mulpoint's and p256.mulacc's own comments.
+procedure p256.addct(keep: int);
+var savex, savey, savez: array[0..P.N-1] of int;
+begin
+  p256.copy(savex, p256.ax);
+  p256.copy(savey, p256.ay);
+  p256.copy(savez, p256.az);
+  p256.addgeneral;
+  p256.csel(p256.ax, savex, p256.ax, keep);
+  p256.csel(p256.ay, savey, p256.ay, keep);
+  p256.csel(p256.az, savez, p256.az, keep);
 end;
 
 // Add point b (Jacobian) into the accumulator.
@@ -719,29 +806,75 @@ begin
 end;
 
 // Multiply the point (px, py) by the scalar k, leaving the result in the accumulator.
-// Double-and-add, MSB first. The scalar is public here (it is derived from the signature and
-// the message), so a plain branch is fine.
+//
+// A MONTGOMERY LADDER, constant-time in k: k is the ECDSA nonce or the private key at every
+// call that matters (p256.sign's k*G, p256.genkey's and lib/tls.wz's d*G), and it was a plain
+// double-and-add with an `if bit <> 0 then add` before 25-09-2026 -- whether that add ran, and
+// therefore how long each of the 256 rounds took, depended directly on a secret bit.
+//
+// THE INVARIANT: two registers R0, R1 with R1 - R0 = (px,py) always, starting at R0 = infinity,
+// R1 = (px,py). Each round -- regardless of the bit -- does exactly one add and one doubling;
+// the bit only selects, through p256.cswap, WHICH register plays which role:
+//
+//   cswap(R0, R1, bit); R1 := R0 + R1; R0 := 2*R0; cswap(R0, R1, bit)
+//
+// Both branches of the original (bit = 0 or bit = 1) now run the identical sequence of Jacobian
+// operations on data that has been conditionally swapped instead of conditionally computed, so
+// the instruction trace no longer depends on k. p256.cswap moves every word whichever way the
+// bit goes, for the same reason.
+//
+// R0 and R1 never coincide while the loop runs: the invariant forces R1 = R0 + (px,py), and
+// (px,py) is never infinity (checked on-curve before this is ever reached), so p256.add's
+// same-x branch -- doubling instead of adding -- is never taken here.
+//
+// WHAT THIS DOES NOT CLOSE: R0 starts at infinity, and stays there for every round above k's
+// highest set bit -- p256.add's `if iszero(bz)`/`if iszero(az)` early-return is itself a
+// branch on whether that round's operand is infinity, so those rounds run a shorter path than
+// the rest. For a uniformly random 256-bit k that leaks only the position of the top set bit
+// (on the order of a handful of bits of k's magnitude, half the time it is bit 255 itself and
+// nothing leaks at all) -- nowhere near the per-bit, every-round leak that let Minerva and
+// TPM-Fail recover a key from branch timing. Closing it fully needs complete (unified)
+// addition formulas that have no infinity case to branch on; that is a larger rewrite of
+// p256.add/p256.dbl than this code does, and is left for when a tighter bound is
+// ever needed. See the timing-shape test below, which checks exactly this: it MEASURES the
+// magnitude leak stays small, and says so rather than claiming there is none.
 procedure p256.mulpoint(px: array of int; py: array of int; k: array of int);
 var i, bit: int;
+    r0x, r0y, r0z: array[0..P.N-1] of int;
+    r1x, r1y, r1z: array[0..P.N-1] of int;
 begin
-  p256.zero(p256.ax);
-  p256.zero(p256.ay);
-  p256.zero(p256.az);                            // start at infinity
+  p256.zero(r0x); p256.zero(r0y); p256.zero(r0z);     // R0 = infinity
+  p256.copy(r1x, px); p256.copy(r1y, py);
+  p256.zero(r1z); r1z[0] := 1;                        // R1 = (px, py)
+
   i := 255;
   while i >= 0 do
   begin
-    p256.dbl;
     bit := band(k[i shr 5] shr band(i, 31), 1);
-    if bit <> 0 then
-    begin
-      p256.copy(p256.bx, px);
-      p256.copy(p256.by, py);
-      p256.zero(p256.bz);
-      p256.bz[0] := 1;
-      p256.add;
-    end;
+
+    p256.cswap(r0x, r1x, bit);
+    p256.cswap(r0y, r1y, bit);
+    p256.cswap(r0z, r1z, bit);
+
+    // R1 := R0 + R1
+    p256.copy(p256.ax, r0x); p256.copy(p256.ay, r0y); p256.copy(p256.az, r0z);
+    p256.copy(p256.bx, r1x); p256.copy(p256.by, r1y); p256.copy(p256.bz, r1z);
+    p256.add;
+    p256.copy(r1x, p256.ax); p256.copy(r1y, p256.ay); p256.copy(r1z, p256.az);
+
+    // R0 := 2*R0
+    p256.copy(p256.ax, r0x); p256.copy(p256.ay, r0y); p256.copy(p256.az, r0z);
+    p256.dbl;
+    p256.copy(r0x, p256.ax); p256.copy(r0y, p256.ay); p256.copy(r0z, p256.az);
+
+    p256.cswap(r0x, r1x, bit);
+    p256.cswap(r0y, r1y, bit);
+    p256.cswap(r0z, r1z, bit);
+
     i := i - 1;
   end;
+
+  p256.copy(p256.ax, r0x); p256.copy(p256.ay, r0y); p256.copy(p256.az, r0z);
 end;
 
 // Add k*(px,py) into the accumulator, leaving the sum there.
@@ -763,6 +896,232 @@ begin
   p256.copy(p256.ax, sx);
   p256.copy(p256.ay, sy);
   p256.copy(p256.az, sz);
+  p256.add;
+end;
+
+// ---- fixed-base multiplication (k*G), constant-time, by a precomputed comb table --------
+//
+// k*G happens on p256.sign's r = k*G and p256.genkey's/lib/tls.wz's Q = d*G, and it is
+// ALWAYS against the same point, the base point G -- unlike p256.mulpoint's variable-base
+// use in p256.verify, where Q is a different public key every time and there is nothing to
+// precompute. That difference is the whole idea: pay for the doublings of G once, at
+// p256.setup, and reuse them for every fixed-base scalar multiplication afterwards.
+//
+// k, HERE, IS SECRET (the nonce in p256.sign, the private key in p256.genkey/tls.wz), so
+// this cannot be the ordinary "look the digit up in the table" comb: an array read at a
+// secret index is itself a timing (and cache-timing) side channel, the same class of leak
+// p256.mulpoint's ladder closes for the doublings and adds. So the table SCAN below reads
+// EVERY one of the COMB.DIGITS entries on every column and uses p256.csel to fold in only
+// the one whose digit matches -- the same instruction sequence and the same memory access
+// pattern regardless of which digit k actually has there.
+//
+// THE TABLE: COMB.T = 64 columns of COMB.H = 4 bits, the bits of one column 64 apart (see
+// the constants above). p256.combtab entry d (0..15) holds the sum of 2^(64*i) * G over
+// every bit i set in d -- including d = 0, which is the point at infinity, kept as a REAL
+// table entry (not a special case) so the scan and the csel-fold below never need to know
+// which digit is the "empty" one.
+//
+// THE MULTIPLY: seed the accumulator with column 63's lookup, then for column j from 62
+// downto 0, double the accumulator once, scan the table for digit(j) and fold it in with
+// p256.addct. COMB.T = 64 doublings and exactly COMB.T - 1 additions -- always the same
+// count, not up to 256 depending on k's weight, unlike a plain double-and-add.
+//
+// WHY NOT p256.add: its same-x branch and, more importantly, its infinity early-return ARE
+// secret-dependent here in a way they are not at p256.mulpoint's call sites -- a comb digit
+// is 0 on close to 1/16 of all columns for a UNIFORMLY RANDOM k, not just above the scalar's
+// top set bit, so p256.add's own `if iszero(bz) then return` would take a visibly shorter
+// path on close to 1/16 of all 64 additions, correlated with k. (This is exactly what the
+// first version of this routine did, and what its own timing-shape test caught: a scalar
+// with only 1 bit set has nearly every column's digit at 0, one with 255 bits set has nearly
+// none, and p256.add's branch turned that into a large, easily measured timing difference --
+// not the small top-bit-position residual p256.mulpoint accepts.) p256.addct instead always
+// runs the full addition formula and uses p256.csel to decide, without a branch, whether to
+// keep its result or discard it and leave the accumulator alone -- see p256.addct's and
+// p256.addgeneral's own comments for exactly what that trades away (a wasted computation on
+// a zero digit) and does not (no branch, no shorter path, on any column).
+var
+  p256.combtab_x: array[0..COMB.DIGITS*P.N-1] of int;
+  p256.combtab_y: array[0..COMB.DIGITS*P.N-1] of int;
+  p256.combtab_z: array[0..COMB.DIGITS*P.N-1] of int;
+  p256.combready: bool;
+  // THE BLINDING POINT, and why p256.mulbase needs one at all: p256.addct's p256.addgeneral
+  // is only valid when the accumulator (a) is NOT infinity (see p256.addgeneral's own
+  // comment) -- and starting the accumulator at infinity, the obvious seed, makes it exactly
+  // that for every column up to and including k's first nonzero digit, which is
+  // SECRET-DEPENDENT (close to 1/16 of the time the very first column is already nonzero,
+  // but sometimes several columns pass before one is). So the accumulator instead starts at
+  // a FIXED PUBLIC point H = 2^256 * G, unrelated to any partial sum a genuine k*G could
+  // reach at any prefix of the comb loop other than by a curve-order coincidence (order n is
+  // ~2^256 and H is a specific 257-bit-scaled multiple of G, so a collision is exactly the
+  // same negligible probability as any other point coincidence this file already accepts --
+  // see p256.mulpoint's own note on R0/R1 never coinciding). Every column, INCLUDING what
+  // used to be the seed column, now runs the identical p256.dbl + p256.addct as every other,
+  // so H is doubled COMB.T times over the whole multiply; p256.mulbase subtracts 2^COMB.T H
+  // back out at the very end, with one ordinary (branching, but on PUBLIC data only -- H and
+  // COMB.T are both fixed and public) p256.add.
+  p256.blindx: array[0..P.N-1] of int;
+  p256.blindy: array[0..P.N-1] of int;
+  p256.blindz: array[0..P.N-1] of int;
+  // 2^COMB.T * H, precomputed once alongside H, at p256.setup -- so the one correction at
+  // the end of every p256.mulbase call is a single p256.add of a value already sitting in
+  // memory, not COMB.T more doublings on every call.
+  p256.blindcorrx: array[0..P.N-1] of int;
+  p256.blindcorry: array[0..P.N-1] of int;
+  p256.blindcorrz: array[0..P.N-1] of int;
+
+// r := 2^(64*e) * (px, py), by e*64 plain doublings. e, here, is a small PUBLIC loop count
+// (0..3), not a scalar -- this only ever builds the public table from the public point G, at
+// p256.setup, so no constant-time care is needed here.
+procedure p256.combbase(px: array of int; py: array of int; e: int);
+var i: int;
+begin
+  p256.zero(p256.ax); p256.copy(p256.ay, py); p256.zero(p256.az); p256.az[0] := 1;
+  p256.copy(p256.ax, px);
+  i := 0;
+  while i < e * COMB.T do begin p256.dbl; i := i + 1; end;
+end;
+
+// Build p256.combtab from the four base powers B0=G, B1=2^64 G, B2=2^128 G, B3=2^192 G:
+// entry d = sum of Bi over the bits set in d, for d = 0..15 (d = 0 is the point at infinity).
+// Filled once, at p256.setup -- everything here is public (G and its multiples), so the
+// build itself is ordinary variable-time code; only the LOOKUP in p256.mulbase, against a
+// secret digit, needs the constant-time scan.
+procedure p256.combbuild;
+var bx: array[0..4*P.N-1] of int;
+    by: array[0..4*P.N-1] of int;
+    bz: array[0..4*P.N-1] of int;
+    i, bit, d: int;
+begin
+  i := 0;
+  while i < 4 do
+  begin
+    p256.combbase(p256.gx, p256.gy, i);
+    p256.copy(bx[i*P.N..(i+1)*P.N-1], p256.ax);
+    p256.copy(by[i*P.N..(i+1)*P.N-1], p256.ay);
+    p256.copy(bz[i*P.N..(i+1)*P.N-1], p256.az);
+    i := i + 1;
+  end;
+  d := 0;
+  while d < COMB.DIGITS do
+  begin
+    p256.zero(p256.ax); p256.zero(p256.ay); p256.zero(p256.az);   // infinity
+    bit := 0;
+    while bit < 4 do
+    begin
+      if band(d shr bit, 1) <> 0 then
+      begin
+        p256.copy(p256.bx, bx[bit*P.N..(bit+1)*P.N-1]);
+        p256.copy(p256.by, by[bit*P.N..(bit+1)*P.N-1]);
+        p256.copy(p256.bz, bz[bit*P.N..(bit+1)*P.N-1]);
+        p256.add;
+      end;
+      bit := bit + 1;
+    end;
+    p256.copy(p256.combtab_x[d*P.N..(d+1)*P.N-1], p256.ax);
+    p256.copy(p256.combtab_y[d*P.N..(d+1)*P.N-1], p256.ay);
+    p256.copy(p256.combtab_z[d*P.N..(d+1)*P.N-1], p256.az);
+    d := d + 1;
+  end;
+
+  // THE BLINDING POINT H = 2^256 G (four more comb-widths of doubling past B3 above), and
+  // its own image after COMB.T further doublings, 2^(256+64) G -- both public, both built
+  // here once. See the long comment at p256.blindx for why p256.mulbase needs either.
+  p256.combbase(p256.gx, p256.gy, 4);
+  p256.copy(p256.blindx, p256.ax);
+  p256.copy(p256.blindy, p256.ay);
+  p256.copy(p256.blindz, p256.az);
+  i := 0;
+  while i < COMB.T do begin p256.dbl; i := i + 1; end;
+  p256.copy(p256.blindcorrx, p256.ax);
+  p256.copy(p256.blindcorry, p256.ay);
+  p256.copy(p256.blindcorrz, p256.az);
+
+  p256.combready := true;
+end;
+
+// Scan every table entry and fold in the one matching digit, with no branch and no
+// secret-indexed read: p256.bx/by/bz start at entry 0 and, for every entry after it, csel
+// either keeps what is there or replaces it with that entry -- touching all COMB.DIGITS
+// entries on every call regardless of what digit actually is.
+procedure p256.comblookup(digit: int);
+var d, hit: int;
+begin
+  p256.copy(p256.bx, p256.combtab_x[0..P.N-1]);
+  p256.copy(p256.by, p256.combtab_y[0..P.N-1]);
+  p256.copy(p256.bz, p256.combtab_z[0..P.N-1]);
+  d := 1;
+  while d < COMB.DIGITS do
+  begin
+    // hit = 1 iff d = digit, computed without branching on digit: (d xor digit) is 0 only
+    // on a match, and "is this word zero" folds to a single bit the same way for every d.
+    hit := p256.iszerobit(bxor(d, digit));
+    p256.csel(p256.bx, p256.bx, p256.combtab_x[d*P.N..(d+1)*P.N-1], hit);
+    p256.csel(p256.by, p256.by, p256.combtab_y[d*P.N..(d+1)*P.N-1], hit);
+    p256.csel(p256.bz, p256.bz, p256.combtab_z[d*P.N..(d+1)*P.N-1], hit);
+    d := d + 1;
+  end;
+end;
+
+// digit(col) = bit(col) | bit(col+64)<<1 | bit(col+128)<<2 | bit(col+192)<<3 -- reads exactly
+// 4 bits of k, at fixed (public) offsets from a public col, so this itself needs no
+// constant-time care; only what is done WITH the digit (the table lookup and the add) does.
+function p256.digitat(k: array of int; col: int): int;
+var bit, j, digit: int;
+begin
+  digit := 0;
+  bit := 0;
+  while bit < 4 do
+  begin
+    j := col + bit * COMB.T;
+    digit := bor(digit, band(k[j shr 5] shr band(j, 31), 1) shl bit);
+    bit := bit + 1;
+  end;
+  return digit;
+end;
+
+// k*G, left in the accumulator -- the constant-time, fixed-base counterpart of
+// p256.mulpoint(gx, gy, k). See the long comment above this section for what "constant-time"
+// covers here and what it still shares with p256.mulpoint's documented residual.
+//
+// SEEDED WITH COLUMN 63's LOOKUP DIRECTLY, not with infinity followed by an add -- the same
+// reason p256.mulpoint seeds R1 with (px,py) rather than starting both registers at infinity:
+// p256.addct's p256.addgeneral is only valid when a is NOT actually infinity (see its own
+// comment), and the accumulator would be exactly that on the very first column if it started
+// at infinity. Seeding directly sidesteps the one column where that would matter; every
+// column after the first runs p256.dbl (never infinity-conditional after a real seed) and
+// p256.addct, which is safe for a genuinely-infinity b (a zero digit) by construction.
+procedure p256.mulbase(k: array of int);
+var col, digit: int;
+begin
+  if not p256.combready then p256.combbuild;
+  // Seed with H, not infinity -- see p256.blindx's comment for why. Every one of the
+  // COMB.T columns below is now identical: double, look up, fold in with p256.addct. None
+  // of them is special, so there is no secret-dependent "which column starts it" case left.
+  p256.copy(p256.ax, p256.blindx);
+  p256.copy(p256.ay, p256.blindy);
+  p256.copy(p256.az, p256.blindz);
+  col := COMB.T - 1;
+  while col >= 0 do
+  begin
+    p256.dbl;
+    digit := p256.digitat(k, col);
+    p256.comblookup(digit);          // every entry read, none skipped -- see above
+    // keep = 0 iff digit = 0 (b is the table's infinity entry -- adding it must be a no-op,
+    // and p256.addgeneral's output for an infinity b is not that, so it is discarded here
+    // instead of kept), computed as arithmetic on the public column and the secret digit,
+    // never as a branch.
+    p256.addct(bxor(p256.iszerobit(digit), 1));
+    col := col - 1;
+  end;
+  // Subtract 2^COMB.T H back out. H and its doubled image are both PUBLIC (built once in
+  // p256.combbuild from G), so this one p256.add -- with its ordinary branches -- costs
+  // nothing secret: p256.add's branches depend on whether ITS OWN operand is infinity or
+  // same-x as the accumulator, and that operand here is fixed public data, not anything
+  // derived from k.
+  p256.copy(p256.bx, p256.blindcorrx);
+  p256.copy(p256.by, p256.blindcorry);
+  p256.copy(p256.bz, p256.blindcorrz);
+  p256.subm(p256.by, p256.p, p256.by, p256.p);   // negate Y: -H_corr, to add instead of subtract
   p256.add;
 end;
 
@@ -809,25 +1168,32 @@ end;
 
 // ---- signing ------------------------------------------------------------------------------
 //
-// THE DANGEROUS HALF OF THIS FILE, and it is here only because ACME needs it: every ACME
-// request is a JWS, signed with the account key. Nothing in the TLS client signs anything.
+// THE DANGEROUS HALF OF THIS FILE. It signs every ACME request (a JWS with the account key)
+// and, since lib/tls.wz calls it from every TLS server handshake, every connection a Wantzel
+// TLS server accepts -- which means the timing is now exposed to any network client, not just
+// a local operator. See the note below.
 //
 // THE NONCE IS THE WHOLE PROBLEM. ECDSA needs a random k per signature, and:
 //   - the same k used twice, with two different messages, reveals the private key outright
 //     by simple algebra. This is how a games console and a cryptocurrency wallet were both
 //     broken in public.
 //   - a k that is even slightly biased leaks the key over a few hundred signatures.
+//   - a k whose TIMING is biased -- even without ever repeating -- leaks the key the same
+//     way, over enough signatures; this is how Minerva and TPM-Fail recovered ECDSA keys from
+//     nonce-generation and scalar-multiplication timing rather than from a repeated nonce.
 //
 // So k comes straight from getrandom(2) via rand.wz -- the kernel's CSPRNG, the same source
 // used for TLS keys -- and a k that lands outside 1..n-1 is REDRAWN rather than reduced.
 // Reducing it (k mod n) is the obvious shortcut and it introduces exactly the bias above.
 //
-// AND THIS ROUTINE IS NOT CONSTANT-TIME, which matters here in a way it did not for
-// verification. The scalar multiplication walks the bits of k with a branch. A local
-// attacker who can time it could recover k and therefore the key. For signing ACME requests
-// on a machine the operator controls that is an acceptable risk and a deliberate one; it
-// would NOT be acceptable for signing on behalf of others, and this comment is the record
-// that the question was asked rather than missed.
+// AND, SINCE 25-09-2026, THE SCALAR MULTIPLICATION AND THE MODULAR INVERSION ARE
+// CONSTANT-TIME IN k: p256.mulpoint (k*G) is a Montgomery ladder, and the inversion of k
+// (p256.invm, by way of p256.powm) is Fermat exponentiation with a constant-time select
+// instead of a branch. Until then this routine walked the bits of k with a plain
+// double-and-add, and a local attacker who could time it could recover k -- an acceptable
+// risk while only ACME (an operator's own machine) called this, not once a TLS server started
+// signing every handshake with it. p256.mulpoint's own comment records what is and is not
+// covered; this is not a proof of zero leakage, only a closing of the dominant, per-bit leak.
 
 var
   p256.k:    array[0..P.N-1] of int;
@@ -859,8 +1225,8 @@ begin
     // private key over a few hundred signatures.
     if p256.inrange(p256.k) then
     begin
-      // r = (k*G).x mod n
-      p256.mulpoint(p256.gx, p256.gy, p256.k);
+      // r = (k*G).x mod n, via the constant-time fixed-base comb (p256.mulbase)
+      p256.mulbase(p256.k);
       // k IS IN RANGE (1..n-1) AND G HAS ORDER n, so k*G = infinity is not a retry case --
       // it is the multiplication getting a mathematically impossible answer. Retrying would
       // hide a broken scalar multiplication behind "no valid signature could be made".
@@ -906,7 +1272,7 @@ begin
     p256.frombytes(d, p256.kb, 0);
     if p256.inrange(d) then
     begin
-      p256.mulpoint(p256.gx, p256.gy, d);
+      p256.mulbase(d);        // via the constant-time fixed-base comb (p256.mulbase)
       // Same invariant as in p256.sign: d is in range, so d*G = infinity can only mean the
       // arithmetic itself is wrong, not that this draw of d was unlucky.
       if p256.iszero(p256.az) then
